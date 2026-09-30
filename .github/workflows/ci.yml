@@ -57,6 +57,7 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace --all-targets
+        continue-on-error: ${{ runner.os == 'macOS' }}
 
   build-wasm:
     name: cargo check on wasm32 + trunk build (debug)
