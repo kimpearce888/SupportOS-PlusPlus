@@ -36,6 +36,7 @@ pub mod ai_provider;
 pub mod automation;
 pub mod backup;
 pub mod config;
+pub mod copilot;
 pub mod db;
 pub mod demo;
 pub mod embeddings;
