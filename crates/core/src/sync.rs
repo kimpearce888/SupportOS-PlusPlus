@@ -29,6 +29,9 @@ pub const SYNC_RESOURCES: &[&str] = &[
     "tags",
     "conversations",
     "customers",
+    "beacon_chats",
+    "docs",
+    "ratings",
 ];
 
 /// The overlap window in minutes. Per A9: re-fetch events from
@@ -496,7 +499,7 @@ mod tests {
     fn enqueue_full_sync_creates_six_jobs() {
         let conn = fresh_db();
         let ids = enqueue_full_sync(&conn).unwrap();
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 9);
         for (i, id) in ids.iter().enumerate() {
             assert!(*id > 0, "job {} must have a positive id", i);
         }
@@ -717,7 +720,7 @@ mod tests {
 
         // Enqueue sync jobs.
         let ids = enqueue_full_sync(&conn).unwrap();
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 9);
 
         // Build a registry with handlers for each sync resource.
         // For M2-T03 we use the sync handlers that call the Fake provider.
@@ -763,9 +766,12 @@ mod tests {
         let mut runner = Runner::new(&mut conn, &registry);
         let summary = runner.run_until_idle(100).unwrap();
 
-        // All 6 jobs should succeed.
-        assert_eq!(summary.processed, 6);
+        // The 3 new resources (beacon_chats, docs, ratings) are enqueued but
+        // have no registered handler → they fail with "no handler registered".
+        // The 6 original resources succeed. M2-T11 will add proper handlers
+        // for the new resources.
+        assert_eq!(summary.processed, 9);
         assert_eq!(summary.succeeded, 6);
-        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.failed, 3); // beacon_chats, docs, ratings — no handler
     }
 }

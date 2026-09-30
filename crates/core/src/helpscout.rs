@@ -110,6 +110,39 @@ pub struct Page<T> {
     pub next_cursor: Option<String>,
 }
 
+/// A Beacon chat session (M2-T09).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsBeaconChat {
+    pub remote_id: i64,
+    pub customer_id: i64,
+    pub mailbox_id: i64,
+    pub status: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// A Docs article (M2-T09).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsDocArticle {
+    pub remote_id: i64,
+    pub collection_id: i64,
+    pub slug: Option<String>,
+    pub name: String,
+    pub text: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// A CSAT rating (M2-T10).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsRating {
+    pub remote_id: i64,
+    pub conversation_id: i64,
+    pub rating: u32,
+    pub comment: Option<String>,
+    pub created_at: Option<String>,
+}
+
 /// Query parameters for listing conversations.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationQuery {
@@ -163,6 +196,17 @@ pub trait HelpScoutProvider: Send + Sync {
 
     /// List customers with pagination + filtering.
     async fn list_customers(&self, query: &CustomerQuery) -> Result<Page<HsCustomer>>;
+
+    /// List Beacon chat sessions (M2-T09). Beacon chats live on the same
+    /// Help Scout API as conversations but use a different endpoint.
+    async fn list_beacon_chats(&self) -> Result<Vec<HsBeaconChat>>;
+
+    /// List Docs articles (M2-T09). Docs use a separate API key
+    /// (`docsapi.helpscout.net`) with HTTP Basic auth.
+    async fn list_docs(&self) -> Result<Vec<HsDocArticle>>;
+
+    /// List CSAT ratings (M2-T10). Used by the ratings watcher poller.
+    async fn list_ratings(&self) -> Result<Vec<HsRating>>;
 
     /// Reset the provider's state (Fake only; Real is a no-op).
     /// Used by tests to get a clean slate.
@@ -483,6 +527,88 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
         })
     }
 
+    async fn list_beacon_chats(&self) -> Result<Vec<HsBeaconChat>> {
+        // Fake: return 2 demo Beacon chats.
+        Ok(vec![
+            HsBeaconChat {
+                remote_id: 5001,
+                customer_id: 2001,
+                mailbox_id: 101,
+                status: "active".into(),
+                created_at: Some("2026-01-15T10:00:00Z".into()),
+                updated_at: Some("2026-01-15T10:30:00Z".into()),
+            },
+            HsBeaconChat {
+                remote_id: 5002,
+                customer_id: 2002,
+                mailbox_id: 102,
+                status: "closed".into(),
+                created_at: Some("2026-01-16T14:00:00Z".into()),
+                updated_at: Some("2026-01-16T14:15:00Z".into()),
+            },
+        ])
+    }
+
+    async fn list_docs(&self) -> Result<Vec<HsDocArticle>> {
+        // Fake: return 3 demo Docs articles.
+        Ok(vec![
+            HsDocArticle {
+                remote_id: 6001,
+                collection_id: 101,
+                slug: Some("getting-started".into()),
+                name: "Getting Started Guide".into(),
+                text: Some("Welcome to SupportOS++! This guide covers the basics.".into()),
+                created_at: Some("2026-01-01T00:00:00Z".into()),
+                updated_at: Some("2026-01-10T12:00:00Z".into()),
+            },
+            HsDocArticle {
+                remote_id: 6002,
+                collection_id: 101,
+                slug: Some("faq".into()),
+                name: "FAQ".into(),
+                text: Some("Frequently asked questions about SupportOS++.".into()),
+                created_at: Some("2026-01-05T00:00:00Z".into()),
+                updated_at: Some("2026-01-12T09:00:00Z".into()),
+            },
+            HsDocArticle {
+                remote_id: 6003,
+                collection_id: 102,
+                slug: Some("troubleshooting".into()),
+                name: "Troubleshooting".into(),
+                text: Some("Common issues and how to resolve them.".into()),
+                created_at: Some("2026-01-08T00:00:00Z".into()),
+                updated_at: Some("2026-01-14T16:00:00Z".into()),
+            },
+        ])
+    }
+
+    async fn list_ratings(&self) -> Result<Vec<HsRating>> {
+        // Fake: return 3 demo ratings (mix of 5-star and 3-star).
+        Ok(vec![
+            HsRating {
+                remote_id: 7001,
+                conversation_id: 1001,
+                rating: 5,
+                comment: Some("Great support!".into()),
+                created_at: Some("2026-01-10T12:00:00Z".into()),
+            },
+            HsRating {
+                remote_id: 7002,
+                conversation_id: 1002,
+                rating: 3,
+                comment: Some("It was okay.".into()),
+                created_at: Some("2026-01-11T15:00:00Z".into()),
+            },
+            HsRating {
+                remote_id: 7003,
+                conversation_id: 1004,
+                rating: 5,
+                comment: None,
+                created_at: Some("2026-01-12T09:00:00Z".into()),
+            },
+        ])
+    }
+
     fn reset(&self) {
         let mut world = self
             .world
@@ -615,5 +741,33 @@ mod tests {
     fn kind_is_fake() {
         let p = provider();
         assert_eq!(p.kind(), "fake");
+    }
+
+    #[tokio::test]
+    async fn list_beacon_chats_returns_two() {
+        let p = provider();
+        let chats = p.list_beacon_chats().await.unwrap();
+        assert_eq!(chats.len(), 2);
+        assert_eq!(chats[0].customer_id, 2001);
+        assert_eq!(chats[1].status, "closed");
+    }
+
+    #[tokio::test]
+    async fn list_docs_returns_three() {
+        let p = provider();
+        let docs = p.list_docs().await.unwrap();
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].name, "Getting Started Guide");
+        assert!(docs[1].slug.as_ref().is_some_and(|s| s == "faq"));
+    }
+
+    #[tokio::test]
+    async fn list_ratings_returns_three() {
+        let p = provider();
+        let ratings = p.list_ratings().await.unwrap();
+        assert_eq!(ratings.len(), 3);
+        assert_eq!(ratings[0].rating, 5);
+        assert_eq!(ratings[1].rating, 3);
+        assert!(ratings[2].comment.is_none());
     }
 }
