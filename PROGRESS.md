@@ -11,7 +11,7 @@
 | Current milestone | M1 — Foundation |
 | Current task ID | M1-T13 (next up) — M1-T05 ✅, M1-T14 ✅ done this session |
 | Last completed task | M1-T05 (job queue closed out with JobHandler trait + JobRegistry + Runner + end-to-end integration tests) + M1-T14 (cargo xtask audit binary with checks::path_exists + checks::config_a0) |
-| Last commit hash | _(set after push)_ |
+| Last commit hash | `f570511` (f570511c61946570c1c079e4b8fc8a039e5ec04c) — M1-T05/M1-T14 done pushed to `main` |
 | Last updated | Session 5 |
 
 ## Next 3 tasks
