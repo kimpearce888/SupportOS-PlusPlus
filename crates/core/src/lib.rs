@@ -45,6 +45,7 @@ pub mod runner;
 pub mod saved_views;
 pub mod settings;
 pub mod sync;
+pub mod ticket_states;
 pub mod webhook;
 pub mod webhook_handler;
 
