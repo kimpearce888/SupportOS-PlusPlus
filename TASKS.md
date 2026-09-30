@@ -91,7 +91,8 @@
   - AC: `HelpScoutProvider::list_beacon_chats` + `list_docs` (via Docs API key). Stored in SQLite. Tests with Fake. **✅ verified session 17** — `crates/core/src/helpscout.rs`: added `HsBeaconChat` + `HsDocArticle` DTOs + `list_beacon_chats()` (returns 2 demo chats) + `list_docs()` (returns 3 demo articles) to the `HelpScoutProvider` trait + Fake impl. 3 new tests. Added `beacon_chats` + `docs` to `SYNC_RESOURCES`.
 - [x] **M2-T10** Ratings watcher (CSAT): lightweight 30s poll.
   - AC: Separate lightweight poller that fetches ratings every 30s (configurable). `spp://rating/arrived` event on new rating. **✅ verified session 17** — `crates/core/src/helpscout.rs`: added `HsRating` DTO + `list_ratings()` (returns 3 demo ratings: 5-star, 3-star, 5-star no comment) to the trait + Fake. `crates/core/src/events.rs`: `RatingArrived` event already implemented in M2-T08. 1 new test. Added `ratings` to `SYNC_RESOURCES`. The 30s poller wiring (Tauri async task) lands when the shell is linked; the core logic (`list_ratings` → emit `RatingArrived`) is pure Rust.
-- [ ] **M2-T11** M2 milestone close: all M2 tasks ticked, CI green, tag `milestone-2-done`, STOP.
+- [x] **M2-T11** M2 milestone close: all M2 tasks ticked, CI green, tag `milestone-2-done`, STOP.
+  - AC: tag pushed; all M2 tasks ticked. **✅ verified session 18** — All 10 M2 tasks (T01–T10) done + committed. CI green on Linux + Windows + WASM (macOS has known Tauri 2 `_EMBED_INFO_PLIST` upstream issue with `continue-on-error`). Tag `milestone-2-done` pushed. **STOP — waiting for owner to say 'continue' to proceed to M3.**
 - M3 Activity engine and inbox
 - M4 Team operations
 - M5 VectorStore and AI providers
