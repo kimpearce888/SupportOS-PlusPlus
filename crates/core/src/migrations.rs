@@ -29,10 +29,11 @@ pub struct Migration {
 /// Order matters: each migration is applied exactly once, in order, on every
 /// database that hasn't seen it yet. Never reorder, never delete, never edit
 /// a shipped migration — add a new one at the end with the next version.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    label: "initial_schema",
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        label: "initial_schema",
+        sql: r#"
             -- Application settings: typed key/value store, NOT for secrets.
             CREATE TABLE IF NOT EXISTS application_settings (
                 key    TEXT PRIMARY KEY,
@@ -58,7 +59,149 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
             INSERT OR IGNORE INTO app_state (id, first_run_done, schema_version)
             VALUES (1, 0, 1);
         "#,
-}];
+    },
+    Migration {
+        version: 2,
+        label: "sync_tables",
+        sql: r#"
+            -- Sync cursors: one row per resource type.
+            CREATE TABLE IF NOT EXISTS sync_cursors (
+                resource       TEXT PRIMARY KEY,
+                last_page       INTEGER NOT NULL DEFAULT 0,
+                last_seen_at    TEXT,
+                cursor_token    TEXT
+            );
+
+            -- Sync checkpoints: every successful page fetch is recorded.
+            CREATE TABLE IF NOT EXISTS sync_checkpoints (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                resource        TEXT NOT NULL,
+                page            INTEGER NOT NULL,
+                cursor_token    TEXT,
+                recorded_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_checkpoints_resource
+                ON sync_checkpoints (resource, page);
+
+            -- Sync runs: one row per sync attempt.
+            CREATE TABLE IF NOT EXISTS sync_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                completed_at    TEXT,
+                status          TEXT NOT NULL DEFAULT 'running',
+                error           TEXT,
+                resources_synced INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- OAuth tokens: Help Scout access + refresh tokens.
+            CREATE TABLE IF NOT EXISTS oauth_tokens (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                access_token    TEXT NOT NULL,
+                refresh_token   TEXT,
+                expires_at      TEXT,
+                token_type      TEXT NOT NULL DEFAULT 'bearer',
+                scope           TEXT,
+                obtained_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            -- Conversations: the main ticket table.
+            CREATE TABLE IF NOT EXISTS conversations (
+                id              INTEGER PRIMARY KEY,
+                remote_id       INTEGER NOT NULL UNIQUE,
+                number          INTEGER NOT NULL,
+                subject         TEXT,
+                preview         TEXT,
+                status          TEXT NOT NULL DEFAULT 'active',
+                mailbox_id      INTEGER NOT NULL,
+                assignee_id     INTEGER,
+                customer_id     INTEGER NOT NULL,
+                priority        TEXT,
+                created_at      TEXT,
+                updated_at      TEXT,
+                closed_at       TEXT,
+                local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversations_mailbox
+                ON conversations (mailbox_id, status);
+            CREATE INDEX IF NOT EXISTS idx_conversations_assignee
+                ON conversations (assignee_id, status);
+            CREATE INDEX IF NOT EXISTS idx_conversations_customer
+                ON conversations (customer_id);
+
+            -- Customers: mirrors Help Scout's customer object.
+            CREATE TABLE IF NOT EXISTS customers (
+                id              INTEGER PRIMARY KEY,
+                remote_id       INTEGER NOT NULL UNIQUE,
+                first_name      TEXT,
+                last_name       TEXT,
+                email           TEXT,
+                organization    TEXT,
+                job_title       TEXT,
+                phone           TEXT,
+                created_at      TEXT,
+                updated_at      TEXT,
+                local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_customers_email
+                ON customers (email);
+
+            -- Mailboxes: mirrors Help Scout's mailbox object.
+            CREATE TABLE IF NOT EXISTS mailboxes (
+                id              INTEGER PRIMARY KEY,
+                remote_id       INTEGER NOT NULL UNIQUE,
+                name            TEXT NOT NULL,
+                slug            TEXT,
+                email           TEXT,
+                created_at      TEXT,
+                updated_at      TEXT,
+                local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            -- Users: mirrors Help Scout's user object (agents + system users).
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY,
+                remote_id       INTEGER NOT NULL UNIQUE,
+                first_name      TEXT,
+                last_name       TEXT,
+                email           TEXT,
+                role            TEXT,
+                user_type       TEXT NOT NULL DEFAULT 'user',
+                timezone        TEXT,
+                photo_url       TEXT,
+                initials        TEXT,
+                mention         TEXT,
+                job_title       TEXT,
+                phone           TEXT,
+                created_at      TEXT,
+                updated_at      TEXT,
+                local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            -- Teams: mirrors Help Scout's team object.
+            CREATE TABLE IF NOT EXISTS teams (
+                id              INTEGER PRIMARY KEY,
+                remote_id       INTEGER NOT NULL UNIQUE,
+                name            TEXT NOT NULL,
+                local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            -- Tags: mirrors Help Scout's tag object.
+            CREATE TABLE IF NOT EXISTS tags (
+                id              INTEGER PRIMARY KEY,
+                remote_id       INTEGER NOT NULL UNIQUE,
+                name            TEXT NOT NULL,
+                slug            TEXT,
+                color           TEXT,
+                ticket_count    INTEGER,
+                created_at      TEXT,
+                updated_at      TEXT,
+                local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            UPDATE app_state SET schema_version = 2 WHERE id = 1;
+        "#,
+    },
+];
 
 /// Find the migration with the given version, if any.
 #[must_use]
@@ -134,7 +277,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first_run, 0);
-        assert_eq!(schema, 1);
+        assert_eq!(schema, 2, "schema_version should be 2 after M001 + M002");
 
         // application_settings round-trips.
         conn.execute(

@@ -8,21 +8,17 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M1 — Foundation (CLOSED — pending owner sign-off) |
-| Current task ID | M2 prep — M1 milestone close ✅ done (session 8) |
-| Last completed task | M1-T15 (milestone close: FINAL-PARITY-AUDIT.md written, tag milestone-1-done pushed, STOP for owner sign-off) |
-| Last commit hash | `5a8a0f5` — M1 milestone close pushed to `main`; tag `milestone-1-done` pushed |
-| Last updated | Session 8 |
+| Current milestone | M2 — Help Scout mirror |
+| Current task ID | M2-T01 (next up) — M1 closed, M2 task list written |
+| Last completed task | M1-T15 (M1 milestone close: tag milestone-1-done pushed, STOP for owner sign-off) |
+| Last commit hash | `7d971d0` — M1 milestone close pushed to `main`; tag `milestone-1-done` pushed |
+| Last updated | Session 9 — M2 started (owner said "continue") |
 
 ## Next 3 tasks
 
-**M1 is CLOSED. Waiting for owner to say "continue" to proceed to M2.**
-
-Per spec CHECKPOINT RULES: "At the end of each milestone: all its tasks ticked, CI green on all OSes, tag milestone-N-done, then STOP. Report parity counts by status, deviations awaiting my approval, BLOCKED items, and what the next session covers. Wait for me to say 'continue'."
-
-1. **Owner action**: Review `docs/FINAL-PARITY-AUDIT.md` (honest M1 close report). Decide on BLOCKED items (T10 installer signing certs, T11 arm64 CI runners).
-2. **Owner action**: Run `docs/MANUAL-VERIFICATION.md` on a clean machine to promote rows from PACKAGED to VERIFIED.
-3. **Next session (after owner says "continue")**: Write the M2 task list (Help Scout mirror) and begin M2-T01.
+1. **M2-T01**: `HelpScoutProvider` trait + `FakeHelpScoutProvider` + M002 migration (sync tables). Pure Rust in `crates/core`; defines the provider boundary per A12.
+2. **M2-T02**: OAuth flow wiring (loopback listener `/oauth/callback` → `oauth_state::consume_state` → token exchange → persist in `secrets` table).
+3. **M2-T03**: Incremental sync with cursors + checkpoints + rate-limited queue + 5-minute cycle.
 
 ## Parity counts by status (honest, A3)
 

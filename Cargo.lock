@@ -4515,6 +4515,7 @@ name = "supportos-plusplus-core"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "axum",
  "chrono",
  "hyper",

@@ -30,6 +30,7 @@ pub use spp_catalog;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod helpscout;
 pub mod jobs;
 pub mod logging;
 pub mod loopback;

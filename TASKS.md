@@ -63,11 +63,35 @@
 - [x] **M1-T15** M1 milestone close: every M1 task ticked, CI green on all 3 OSes, tag `milestone-1-done`, report parity counts + deviations + BLOCKED, STOP, wait for owner sign-off.
   - AC: tag pushed; `docs/PARITY-MATRIX.md` updated; `PROGRESS.md` shows M1 closed. **✅ verified session 8** — `docs/FINAL-PARITY-AUDIT.md` written (honest report, not a completion claim); `docs/PARITY-MATRIX.md` updated with M1 close note; tag `milestone-1-done` pushed. 12 of 15 tasks done; 2 partial (T02, T04); 2 BLOCKED (T10 installer signing, T11 Qdrant arm64). CI green on all 3 OSes (commit `d27f413`). **STOP — waiting for owner to say 'continue' to proceed to M2.**
 
-## Milestones 2–11
+## Milestone 2 — Help Scout mirror
 
-Task lists will be written at the start of each milestone, per spec: "Write the full task list for a milestone before starting it."
+> Per spec M2: "provider trait (Real and Fake), OAuth, rate-limited queue, checkpointed sync, Beacon chat,
+> Docs mirror, ratings, webhook listener and Webhook push screen, live events, demo mode and demo tools (A10),
+> first-run onboarding."
+>
+> Task IDs follow `M2-T##`. Each is sized 30–90 min.
 
-- M2 Help Scout mirror
+- [ ] **M2-T01** `HelpScoutProvider` trait + `FakeHelpScoutProvider` + M002 migration (sync tables).
+  - AC: trait defined with list_conversations/get_conversation/list_customers/etc.; Fake returns deterministic demo data; M002 creates `sync_cursors`, `sync_checkpoints`, `sync_runs`, `oauth_tokens`, `conversations`, `customers`, `mailboxes`, `users`, `teams` tables. Tests pass.
+- [ ] **M2-T02** OAuth flow: loopback listener `/oauth/callback` handler + token exchange + persist token.
+  - AC: `oauth_state::issue_state` → redirect to Help Scout → callback → `consume_state` → token exchange → store in `secrets` table. `RealHelpScoutProvider` uses the stored token. Tests cover the full flow with Fake.
+- [ ] **M2-T03** Incremental sync: cursors + checkpoints + rate-limited queue + 5-minute cycle.
+  - AC: `SyncCoordinator` runs `run_until_idle` on the job queue with `sync.conversations` / `sync.customers` / etc. jobs. Each job calls `HelpScoutProvider::list_*`, writes to SQLite, updates `sync_cursors`. Overlap window (`SYNC_OVERLAP_MINUTES=10`). Tests cover cursor resume + checkpoint idempotency.
+- [ ] **M2-T04** Webhook route handler: HMAC verify + persist-first dedup + job enqueue + live Tauri event.
+  - AC: `POST /webhooks/helpscout` in `loopback.rs` calls `webhook::persist_event` → `webhook::verify_signature` → `jobs::enqueue("webhook.process", ...)`. Tauri event `spp://webhook/received` emitted. Tests cover good sig, bad sig, replay dedup.
+- [ ] **M2-T05** Webhook push screen (Sync Health): register/delete + state machine + plain-language explanation.
+  - AC: Leptos page `/sync-health` with webhook state (`not configured` / `registered` / `receiving` / `error`). Tauri commands `webhook_register` / `webhook_delete`. Never claims real-time when it's not.
+- [ ] **M2-T06** Demo mode: `FakeHelpScoutProvider` with simulated data + demo-mode-only tools (A10).
+  - AC: Three demo tools available only in demo mode: simulated webhook event, simulated CSAT rating, simulated incoming customer message. All push through the REAL pipeline (HMAC, dedup, job, sync, live update).
+- [ ] **M2-T07** First-run onboarding completion: wire `first_run_state` to real DB.
+  - AC: Tauri shell boots a SQLite connection at startup; `first_run_state` calls `spp_core::settings::first_run_done` / `mark_first_run_done`. The in-memory stub from M1-T13 is replaced.
+- [ ] **M2-T08** Live events: Tauri event emission on sync write / webhook receive / rating arrive.
+  - AC: `spp://sync/updated`, `spp://webhook/received`, `spp://rating/arrived` events emitted from the Rust core. UI can subscribe and refresh.
+- [ ] **M2-T09** Beacon chat + Docs mirror (basic).
+  - AC: `HelpScoutProvider::list_beacon_chats` + `list_docs` (via Docs API key). Stored in SQLite. Tests with Fake.
+- [ ] **M2-T10** Ratings watcher (CSAT): lightweight 30s poll.
+  - AC: Separate lightweight poller that fetches ratings every 30s (configurable). `spp://rating/arrived` event on new rating.
+- [ ] **M2-T11** M2 milestone close: all M2 tasks ticked, CI green, tag `milestone-2-done`, STOP.
 - M3 Activity engine and inbox
 - M4 Team operations
 - M5 VectorStore and AI providers
