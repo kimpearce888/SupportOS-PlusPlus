@@ -15,10 +15,13 @@ pub fn LayoutShell() -> impl IntoView {
         <div class="spp-shell">
             <header class="spp-topbar">
                 <h1 class="spp-topbar__title">"SupportOS++"</h1>
-                <span class="spp-topbar__version">"v0.1.0 — M1"</span>
+                <span class="spp-topbar__version">"v0.1.0 — M2"</span>
                 <nav class="spp-nav">
                     <A href="/" class="spp-nav__link" active_class="spp-nav__link--active">
                         "Dashboard"
+                    </A>
+                    <A href="/sync-health" class="spp-nav__link" active_class="spp-nav__link--active">
+                        "Sync Health"
                     </A>
                     <A href="/settings" class="spp-nav__link" active_class="spp-nav__link--active">
                         "Settings"
