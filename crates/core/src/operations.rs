@@ -276,9 +276,14 @@ fn tile_sql(
             let sql = "SELECT COUNT(*) FROM sync_runs WHERE status = 'failed'";
             Some((sql, vec![]))
         }
+        OperationsTileKey::AutomationApprovals => {
+            // Wired in M4-T10: counts pending automation approvals.
+            // This tile is NOT mailbox-scoped — approvals are global.
+            let sql = "SELECT COUNT(*) FROM automation_approvals WHERE status = 'pending'";
+            Some((sql, vec![]))
+        }
         // Stubbed tiles — their dependencies ship in later milestones.
-        OperationsTileKey::AutomationApprovals
-        | OperationsTileKey::SlaAtRisk
+        OperationsTileKey::SlaAtRisk
         | OperationsTileKey::SlaBreached
         | OperationsTileKey::RepeatedIssue
         | OperationsTileKey::KnownIssue
@@ -294,14 +299,13 @@ fn tile_sql(
 #[must_use]
 pub fn tile_milestone(tile: OperationsTileKey) -> Option<u8> {
     match tile {
-        OperationsTileKey::AutomationApprovals => Some(4), // M4-T10 (this milestone)
-        OperationsTileKey::AiEscalation => Some(6),        // M6 (AI features)
+        OperationsTileKey::AiEscalation => Some(6), // M6 (AI features)
         OperationsTileKey::SlaAtRisk
         | OperationsTileKey::SlaBreached
         | OperationsTileKey::RepeatedIssue
         | OperationsTileKey::KnownIssue
         | OperationsTileKey::IssueSpike => Some(7), // M7 (Intelligence)
-        OperationsTileKey::CampaignActivity => Some(9),    // M9 (Outreach)
+        OperationsTileKey::CampaignActivity => Some(9), // M9 (Outreach)
         // Real tiles have no pending milestone.
         OperationsTileKey::Unassigned
         | OperationsTileKey::NeedsFirstResponse
@@ -310,7 +314,8 @@ pub fn tile_milestone(tile: OperationsTileKey) -> Option<u8> {
         | OperationsTileKey::Urgent
         | OperationsTileKey::HighEffort
         | OperationsTileKey::FailedJobs
-        | OperationsTileKey::SyncProblems => None,
+        | OperationsTileKey::SyncProblems
+        | OperationsTileKey::AutomationApprovals => None,
     }
 }
 
@@ -516,6 +521,11 @@ mod tests {
         apply_m003(&conn).unwrap();
         apply_m004(&conn).unwrap();
         crate::jobs::ensure_jobs_table(&conn).unwrap();
+        // M005 (notifications) + M006 (side_threads) + M007 (automation) —
+        // needed so the automation_approvals tile query can run.
+        crate::notifications::apply_m005(&conn).unwrap();
+        crate::side_threads::apply_m006(&conn).unwrap();
+        crate::automation::apply_m007(&conn).unwrap();
         conn
     }
 
@@ -765,13 +775,50 @@ mod tests {
         assert_eq!(count.count(), Some(1));
     }
 
+    #[test]
+    fn count_automation_approvals_uses_automation_approvals_table() {
+        let conn = fresh_db();
+        // Empty → 0.
+        let count = count_tile(&conn, OperationsTileKey::AutomationApprovals, None).unwrap();
+        assert_eq!(count.count(), Some(0));
+
+        // Insert a pending approval → 1.
+        // We need a rule first (FK constraint), then an approval.
+        let rule_id = crate::automation::create_rule(
+            &conn,
+            &crate::automation::AutomationRule {
+                id: None,
+                name: "Test rule".into(),
+                trigger: crate::automation::Trigger::SlaRisk,
+                action: crate::automation::Action::Assign {
+                    assignee_remote_id: 42,
+                },
+                enabled: true,
+                created_at: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_approvals (rule_id, conversation_id, proposed_action_json, status)
+             VALUES (?1, 1001, '{}', 'pending')",
+            rusqlite::params![rule_id],
+        )
+        .unwrap();
+        let count = count_tile(&conn, OperationsTileKey::AutomationApprovals, None).unwrap();
+        assert_eq!(count.count(), Some(1), "pending approval counts as 1");
+
+        // mailbox_id is ignored (approvals are global).
+        let count = count_tile(&conn, OperationsTileKey::AutomationApprovals, Some(101)).unwrap();
+        assert_eq!(count.count(), Some(1));
+    }
+
     // ---- Stubbed tile tests --------------------------------------------------
 
     #[test]
     fn stubbed_tiles_return_not_available_with_correct_milestone() {
         let conn = fresh_db();
+        // AutomationApprovals is now wired (M4-T10) — removed from this list.
         let stubbed: &[(OperationsTileKey, u8)] = &[
-            (OperationsTileKey::AutomationApprovals, 4),
             (OperationsTileKey::AiEscalation, 6),
             (OperationsTileKey::SlaAtRisk, 7),
             (OperationsTileKey::SlaBreached, 7),
@@ -803,6 +850,7 @@ mod tests {
             OperationsTileKey::HighEffort,
             OperationsTileKey::FailedJobs,
             OperationsTileKey::SyncProblems,
+            OperationsTileKey::AutomationApprovals,
         ];
         for tile in real_tiles {
             assert!(
@@ -839,11 +887,18 @@ mod tests {
         // Unassigned is real and counts 1.
         let unassigned = snapshot.get(OperationsTileKey::Unassigned).unwrap();
         assert_eq!(unassigned.count(), Some(1));
-        // AutomationApprovals is stubbed.
+        // AutomationApprovals is real (wired in M4-T10) and counts 0 (no pending).
         let automation = snapshot
             .get(OperationsTileKey::AutomationApprovals)
             .unwrap();
-        assert!(automation.is_not_available());
+        assert_eq!(
+            automation.count(),
+            Some(0),
+            "AutomationApprovals is real and counts 0"
+        );
+        // SlaBreached is still stubbed (ships in M7).
+        let sla_breached = snapshot.get(OperationsTileKey::SlaBreached).unwrap();
+        assert!(sla_breached.is_not_available());
     }
 
     #[test]

@@ -28,6 +28,7 @@
 pub use spp_catalog;
 
 pub mod activity;
+pub mod automation;
 pub mod config;
 pub mod db;
 pub mod demo;

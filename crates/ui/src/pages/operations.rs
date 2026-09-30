@@ -144,7 +144,7 @@ pub fn tile_description(tile: OperationsTileKey) -> &'static str {
             "Conversations clustered around a spiking issue. (Ships in M7.)"
         }
         OperationsTileKey::AutomationApprovals => {
-            "Pending automation approvals awaiting review. (Ships in M4-T10.)"
+            "Pending automation approvals awaiting review."
         }
         OperationsTileKey::FailedJobs => "Background jobs that exhausted their retry budget.",
         OperationsTileKey::SyncProblems => "Help Scout sync runs that ended in failure.",
