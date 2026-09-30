@@ -436,3 +436,91 @@ body {
   font-weight: 600;
   margin: 0 0 var(--spp-space-4) 0;
 }
+
+/* ─── Command palette (M3-T07) ────────────────────────────────────────── */
+.spp-command-palette-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--spp-bg-overlay);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 15vh;
+  z-index: 1100;
+}
+
+.spp-command-palette {
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-lg);
+  box-shadow: var(--spp-shadow-lg);
+  width: 100%;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.spp-command-palette__input {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+  padding: var(--spp-space-3) var(--spp-space-4);
+  border-bottom: 1px solid var(--spp-border);
+}
+
+.spp-command-palette__icon {
+  color: var(--spp-fg-muted);
+  font-size: var(--spp-text-md);
+}
+
+.spp-command-palette__field {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--spp-fg);
+  font-family: var(--spp-font-sans);
+  font-size: var(--spp-text-base);
+}
+
+.spp-command-palette__field::placeholder {
+  color: var(--spp-fg-subtle);
+}
+
+.spp-command-palette__results {
+  max-height: 400px;
+  overflow-y: auto;
+  padding: var(--spp-space-2);
+}
+
+.spp-command-palette__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-1);
+}
+
+.spp-command-palette__item {
+  display: flex;
+  flex-direction: column;
+  padding: var(--spp-space-2) var(--spp-space-3);
+  border-radius: var(--spp-radius-md);
+  cursor: pointer;
+  transition: background var(--spp-duration-fast) var(--spp-ease);
+}
+
+.spp-command-palette__item:hover,
+.spp-command-palette__item--selected {
+  background: var(--spp-bg);
+}
+
+.spp-command-palette__item-label {
+  font-size: var(--spp-text-base);
+  font-weight: 500;
+  color: var(--spp-fg);
+}
+
+.spp-command-palette__item-desc {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+}

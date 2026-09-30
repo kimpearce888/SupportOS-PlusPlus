@@ -33,12 +33,8 @@ pub fn mount() {
 }
 
 fn app_view() -> impl IntoView {
-    // The first-run onboarding overlay. The actual `first_run_done` flag is
-    // read from the DB via the Tauri IPC command `first_run_state`; for M1
-    // we wire it as a signal that starts as `false` (the DB default) and is
-    // set to `true` when the user picks either action. M2 will replace the
-    // initial value with a real Tauri IPC call.
     let first_run_done = create_rw_signal(false);
+    let palette_open = create_rw_signal(false);
 
     view! {
         <Router>
@@ -60,6 +56,10 @@ fn app_view() -> impl IntoView {
                 )
             />
         </Show>
+        <components::CommandPalette
+            open=palette_open
+            on_close=move || palette_open.set(false)
+        />
     }
 }
 
