@@ -39,6 +39,7 @@ pub mod oauth;
 pub mod oauth_state;
 pub mod runner;
 pub mod settings;
+pub mod sync;
 pub mod webhook;
 
 pub use error::{Error, Result};
