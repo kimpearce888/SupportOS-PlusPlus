@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M6 — AI features (AI Center, analysis, attributes, Copilot, verified drafts, coaching, customer memory, translation, QA, suggestions) |
-| Current task ID | M6-T04 (next up) — M6-T02+T03 done (AI analysis + attributes) |
-| Last completed task | M6-T03 (AI attributes — M010 + 14-key catalog + evidence + thread_ref; M6-T02 AI analysis with caching in same commit; 18 new tests) |
-| Last commit hash | (about to be) M6-T02+T03: AI analysis + attributes |
-| Last updated | Session 30 — M6-T02+T03 done (3 of 11 M6 tasks complete) |
+| Current milestone | M6 — AI features (CLOSED — pending owner sign-off to proceed to M7) |
+| Current task ID | (none — M6 milestone complete; awaiting owner "continue" to start M7) |
+| Last completed task | M6-T11 (M6 milestone close — all 11 tasks ticked, tag `milestone-6-done` pushed) |
+| Last commit hash | (about to be) M6-T11: M6 milestone close — tag milestone-6-done |
+| Last updated | Session 30 — M6 closed (11 of 11 tasks done; 726 tests passing) |
 
 ## Next 3 tasks
 
-1. **M6-T04**: Copilot — read-only tool allowlist (22 tools, bounded: max 5 rounds, max 8 calls, 4000 chars).
-2. **M6-T05**: Verified drafts — AI-drafted replies requiring human approval (auto-send OFF).
-3. **M6-T07**: Customer memory — per-customer notes/preferences (AI-derived).
+1. **Owner sign-off**: confirm M6 milestone is acceptable; say "continue" to proceed to M7.
+2. **M7 — Intelligence**: write the M7 task list, then start M7-T01.
+3. **(After M7)**: M8 — Reports and quality.
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M6 tasks T02–T11).
+1. Read `AGENTS.md` → this file → `TASKS.md` (M7 task list will be written at the start of the next session, per spec: "Write the full task list for a milestone before starting it").
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M6/M6-T02. Last commit: <hash>. Next: AI analysis.`
+3. Announce `Resuming at M7/M7-T01. Last commit: <hash>. Next: M7 task list + Intelligence.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)
