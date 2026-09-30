@@ -50,7 +50,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Verify Tauri config meets A0 (no system deps needed)
-        run: cargo run -p supportos-plusplus-xtask -- verify-config
+        run: cargo run -p supportos-plusplus-xtask --bin xtask -- verify-config
 
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
