@@ -29,6 +29,7 @@ pub mod error;
 pub mod jobs;
 pub mod logging;
 pub mod loopback;
+pub mod migrations;
 pub mod settings;
 
 pub use error::{Error, Result};

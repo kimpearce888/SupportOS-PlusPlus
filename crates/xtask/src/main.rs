@@ -15,6 +15,7 @@ use std::process::Command;
 use clap::{Parser, Subcommand};
 
 mod discover;
+mod verify_config;
 
 #[derive(Parser)]
 #[command(name = "xtask", version, about = "SupportOS++ developer entry point", long_about = None)]
@@ -47,6 +48,13 @@ enum Cmd {
         #[arg(long)]
         out: Option<String>,
     },
+    /// (M1-T02) Verify the Tauri 2 config meets spec amendment A0 (naming + bundle targets).
+    /// Pure JSON check — does not require GTK/WebKit2GTK system libs.
+    VerifyConfig {
+        /// Path to tauri.conf.json. Defaults to crates/app/src-tauri/tauri.conf.json.
+        #[arg(long)]
+        config: Option<String>,
+    },
     /// (M1-T14) Black-box audit binary (placeholder).
     Audit {
         /// Path to a packaged app to audit.
@@ -65,6 +73,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Lint => run_lint(),
         Cmd::Package => run_package(),
         Cmd::Discover { reference, out } => run_discover(&reference, out.as_deref()),
+        Cmd::VerifyConfig { config } => run_verify_config(config.as_deref()),
         Cmd::Audit { app } => run_audit(&app),
     }
 }
@@ -197,4 +206,37 @@ fn run_audit(app: &str) -> anyhow::Result<()> {
     eprintln!("audit: stub (M1-T14). App to audit: {app}");
     eprintln!("Output will be a JSON findings list once implemented.");
     Ok(())
+}
+
+fn run_verify_config(config: Option<&str>) -> anyhow::Result<()> {
+    let path = match config {
+        Some(p) => std::path::PathBuf::from(p),
+        None => workspace_root()
+            .join("crates")
+            .join("app")
+            .join("src-tauri")
+            .join("tauri.conf.json"),
+    };
+    println!("VerifyConfig: checking {}", path.display());
+    let violations = verify_config::check(&path)?;
+    if violations.is_empty() {
+        println!("VerifyConfig: PASS — tauri.conf.json meets spec amendment A0.");
+        println!("  productName:        \"SupportOS++\"");
+        println!("  identifier:          \"com.supportos.plusplus\"");
+        println!("  window[0].title:     \"SupportOS++\"");
+        println!(
+            "  bundle.targets:      all 6 formats present ({})",
+            verify_config::REQUIRED_BUNDLE_TARGETS.join(", ")
+        );
+        Ok(())
+    } else {
+        eprintln!(
+            "VerifyConfig: FAIL — {} violation(s) found:",
+            violations.len()
+        );
+        for v in &violations {
+            eprintln!("  - {v}");
+        }
+        std::process::exit(1);
+    }
 }

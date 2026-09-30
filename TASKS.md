@@ -32,14 +32,16 @@
   - AC: `cargo xtask discover --reference /path/to/supportos` regenerates parity counts; output diffs to zero against session-1 manual pass. **✅ verified session 2 — 10/10 canonical counts match.**
 - [ ] **M1-T02** Tauri 2 shell that launches on all 3 OSes with product name `SupportOS++`, bundle id `com.supportos.plusplus`.
   - AC: `cargo xtask dev` opens a window titled "SupportOS++" on Linux; same on Win/mac in CI.
-- [ ] **M1-T03** SQLite connection (rusqlite, bundled, WAL+FTS5), first migration, runner.
-  - AC: migrations table exists; `application_settings` table exists; idempotent re-run.
+  - **Session 3 partial**: added `cargo xtask verify-config` (D-016) that statically verifies the Tauri config meets A0 (productName, identifier, window title, all 6 bundle targets). 7 unit tests including one that asserts the real `tauri.conf.json` in the repo. CI runs this step on every push before clippy. The actual `cargo xtask dev` launch verification still needs GTK/WebKit2GTK system libs (BLOCKED locally; CI verifies).
+- [x] **M1-T03** SQLite connection (rusqlite, bundled, WAL+FTS5), first migration, runner.
+  - AC: migrations table exists; `application_settings` table exists; idempotent re-run. **✅ verified session 3** — `crates/core/src/migrations.rs` (Migration 1 "initial_schema" creates `application_settings` + `secrets` + `app_state`); `db::open_with_migrations` convenience helper; 5 new migration tests + 2 new `open_with_migrations` tests, all green.
 - [ ] **M1-T04** Settings store (typed, secrets redacted on read, only `application_settings` row + key/value table).
   - AC: read/write round-trip; secret values never appear in Tauri IPC responses.
+  - **Session 3 partial**: added typed helpers `get_bool`/`set_bool`/`get_i64`/`set_i64`/`get_json`/`set_json` (D-017) + `first_run_done`/`mark_first_run_done` for M1-T13 prep. 7 new tests, all green. Tauri IPC layer wiring still pending.
 - [ ] **M1-T05** Job queue (enqueue, claim, execute, retry with backoff, dead-letter). Tested end-to-end (per KNOWN PITFALLS).
   - AC: a fake job enqueues, is claimed by the runner, executes, succeeds (or retries then dead-letters) — covered by an integration test.
-- [ ] **M1-T06** Error type (`thiserror`), structured logging (`tracing`), config loader. Foundation crate exposes them.
-  - AC: every crate uses the shared `Error`/`Result`; logs are JSON in prod, pretty in dev.
+- [x] **M1-T06** Error type (`thiserror`), structured logging (`tracing`), config loader. Foundation crate exposes them.
+  - AC: every crate uses the shared `Error`/`Result`; logs are JSON in prod, pretty in dev. **✅ verified session 3** — `crates/core/src/{error,logging,config}.rs` already in place since session 1; session 3 confirmed AC: every crate uses the shared `Error`/`Result`; `logging::init()` emits JSON in release, pretty in dev; `config::AppConfig` is the typed config with redacted `HelpScoutConfig` view.
 - [ ] **M1-T07** Common UI components (loading / empty / error states), layout shell, theming tokens.
   - AC: every view in the (empty) shell renders a loading state, an empty state, and an error state.
 - [ ] **M1-T08** Leptos routing scaffold + first route (`/`) with the empty dashboard placeholder.

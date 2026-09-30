@@ -9,24 +9,24 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M1 — Foundation |
-| Current task ID | M1-T02 (next up) — M1-T01 ✅ done this session |
-| Last completed task | M1-T01 — `cargo xtask discover` (A7) implemented; 10/10 canonical counts match spec; writes `docs/original-notes/inventory.json` |
-| Last commit hash | `e54cb3b` (e54cb3b6188e61d307b8784731922ab38800c82c) — M1-T01 (xtask discover) pushed to `main` |
-| Last updated | Session 2 |
+| Current task ID | M1-T07 (next up) — M1-T02 partial ✅, M1-T03 ✅, M1-T04 partial ✅, M1-T06 ✅ done this session |
+| Last completed task | M1-T03 (SQLite first migration + runner) + M1-T06 (foundation: error/logging/config) + M1-T02 partial (Tauri config A0 verification) + M1-T04 partial (typed settings store with bool/i64/JSON + first-run flag) |
+| Last commit hash | _(set after push — see `git log`)_ |
+| Last updated | Session 3 |
 
 ## Next 3 tasks
 
-1. **M1-T02**: Tauri 2 shell that launches on Win/macOS/Linux with the `SupportOS++` product name and `com.supportos.plusplus` bundle id. **BLOCKED locally** (no sudo → can't install GTK/WebKit2GTK); CI on ubuntu-22.04 will verify. Code is already in place from session 1; this task is primarily about installing the system deps and running `cargo xtask dev` to confirm the window opens.
-2. **M1-T03**: SQLite first migration + runner (foundation already in `crates/core/src/db.rs`; M1-T03 will add the first *app* migration that creates the `application_settings` + `secrets` tables the `settings.rs` module already expects).
-3. **M1-T04**: Settings store — already partially done; M1-T04 is to wire it into the Tauri IPC layer with redaction-on-read.
+1. **M1-T07**: Common UI components (loading / empty / error states), layout shell, theming tokens. Pure Leptos work; doesn't strictly need the Tauri shell to be linked locally — can be developed against `trunk serve` standalone.
+2. **M1-T08**: Leptos routing scaffold + first route (`/`) with the empty dashboard placeholder.
+3. **M1-T05**: Job queue — already at IMPLEMENTED status with the julianday fix; M1-T05 just needs the final "execute" handler shape (a small trait + a registration mechanism) to close out.
 
 ## Parity counts by status (honest, A3)
 
 | Status | Count |
 |---|---|
-| DISCOVERED | 8 canonical counts + 13 surface-area rows + per-milestone high-level rows (now reproducible via `cargo xtask discover`) |
-| SPECIFIED | 7 (M1 capabilities still pending: Tauri shell launch, Leptos UI scaffold, theming, CI matrix, installers, Qdrant spike, demo-mode boot) |
-| IMPLEMENTED | 4 (xtask discover, SQLite foundation, job queue, settings store) |
+| DISCOVERED | 8 canonical counts + 13 surface-area rows + per-milestone high-level rows (reproducible via `cargo xtask discover`) |
+| SPECIFIED | 5 (Tauri shell launch verification on CI, Leptos UI scaffold, theming, installers, Qdrant spike) |
+| IMPLEMENTED | 6 (xtask discover, SQLite foundation + first migration + runner, job queue, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification) |
 | TESTED | 0 (foundation tested at unit level; no milestone complete yet) |
 | PACKAGED | 0 |
 | VERIFIED | 0 |
@@ -44,16 +44,19 @@
 
 Session 1 (recorded above): D-001 through D-005.
 
-Session 2:
-- **D-013**: All timestamp comparisons in SQL go through `julianday()` (never lexical). Enforced by code review + clippy; documented in `crates/core/src/jobs.rs::claim_next`. Fixes a real flaky-test bug from session 1.
-- **D-014**: `cargo xtask discover` writes a machine-readable `docs/original-notes/inventory.json` and exits non-zero if any canonical count differs from the spec. Makes reference drift detectable in CI.
+Session 2: D-013 (julianday), D-014 (inventory.json).
 
-(See `docs/DECISIONS.md` for the full list D-001..D-014.)
+Session 3:
+- **D-015**: Migrations are a single source-of-truth `&[Migration]` const array in `crates/core/src/migrations.rs`. Each migration is forward-only, versioned, applied in order, never edited after release. New migrations append at the end with the next version number.
+- **D-016**: `cargo xtask verify-config` statically parses `tauri.conf.json` and asserts the spec amendment A0 mandates (`productName = "SupportOS++"`, `identifier = "com.supportos.plusplus"`, `window[0].title = "SupportOS++"`, all 6 bundle targets present). Runs in CI on every push, before clippy, without needing GTK/WebKit2GTK system deps.
+- **D-017**: Typed settings store helpers (`get_bool`, `set_bool`, `get_i64`, `set_i64`, `get_json`, `set_json`) wrap the string-only `application_settings` table so callers get type-safe reads/writes with proper `Error::Config` validation on parse failure.
+
+(See `docs/DECISIONS.md` for the full list D-001..D-017.)
 
 ## Resume protocol for next session
 
 1. Read `AGENTS.md` → this file → `TASKS.md`.
 2. `git status` + `git log --oneline -20` + `cargo xtask lint && cargo xtask test` (skipping the Tauri shell crate if GTK deps aren't installed locally; CI verifies the full workspace).
 3. Confirm `tauri-cli` and `trunk` are installed (install if missing: `cargo install tauri-cli --version '^2.0' --locked --no-default-features && cargo install trunk --locked`).
-4. Announce `Resuming at M1/M1-T02. Last commit: <hash>. Next: Tauri 2 shell that launches.`
+4. Announce `Resuming at M1/M1-T07. Last commit: <hash>. Next: common UI components + Leptos routing scaffold.`
 5. Continue from the first unchecked task in `TASKS.md`.

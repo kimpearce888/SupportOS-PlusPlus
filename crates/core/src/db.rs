@@ -26,6 +26,17 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open a connection and run all pending application migrations.
+///
+/// Convenience wrapper for the common boot path: open + ensure_migrations_table +
+/// migrations::run_all. Idempotent — safe to call on every boot.
+pub fn open_with_migrations(path: &Path) -> Result<Connection> {
+    let mut conn = open(path)?;
+    ensure_migrations_table(&conn)?;
+    crate::migrations::run_all(&mut conn)?;
+    Ok(conn)
+}
+
 /// Run the migrations table bootstrap (migration 000).
 ///
 /// Creates `_migrations` if it does not exist; idempotent.
@@ -138,5 +149,56 @@ mod tests {
         assert!(bad.is_err(), "expected migration 2 to fail");
         // Latest version stays at 1, the bad migration is not recorded.
         assert_eq!(latest_version(&conn).unwrap(), 1);
+    }
+
+    #[test]
+    fn open_with_migrations_creates_application_settings_and_secrets() {
+        let f = NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let conn = open_with_migrations(&f).unwrap();
+        // application_settings table exists.
+        let _: i64 = conn
+            .query_row("SELECT COUNT(*) FROM application_settings", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // secrets table exists.
+        let _: i64 = conn
+            .query_row("SELECT COUNT(*) FROM secrets", [], |r| r.get(0))
+            .unwrap();
+        // app_state single-row bootstrap exists with first_run_done = 0.
+        let first_run: i64 = conn
+            .query_row(
+                "SELECT first_run_done FROM app_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_run, 0);
+        // Latest version equals the highest version in MIGRATIONS.
+        assert_eq!(
+            latest_version(&conn).unwrap(),
+            crate::migrations::latest_version()
+        );
+    }
+
+    #[test]
+    fn open_with_migrations_is_idempotent_on_reopen() {
+        let f = NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        // First open applies all migrations.
+        let conn1 = open_with_migrations(&f).unwrap();
+        let v1 = latest_version(&conn1).unwrap();
+        drop(conn1);
+        // Second open is a no-op for migrations.
+        let conn2 = open_with_migrations(&f).unwrap();
+        let v2 = latest_version(&conn2).unwrap();
+        assert_eq!(v1, v2);
     }
 }

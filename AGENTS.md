@@ -52,12 +52,13 @@ Independent Rust/Tauri 2 desktop reimplementation of the existing `supportos` TS
 ## Build / test / lint commands
 
 ```bash
-cargo xtask dev        # run the app in dev mode (Tauri + Leptos trunk)
-cargo xtask test        # run all unit + integration tests across the workspace
-cargo xtask lint        # rustfmt --check + clippy -D warnings
-cargo xtask package     # build installers for the host OS
-cargo xtask discover    # regenerate docs/original-notes/* from a local reference checkout
-cargo xtask audit       # black-box audit binary (port of reference audit-phase1)
+cargo xtask dev             # run the app in dev mode (Tauri + Leptos trunk)
+cargo xtask test             # run all unit + integration tests across the workspace
+cargo xtask lint             # rustfmt --check + clippy -D warnings
+cargo xtask package          # build installers for the host OS
+cargo xtask discover         # regenerate docs/original-notes/* from a local reference checkout
+cargo xtask verify-config    # verify tauri.conf.json meets spec amendment A0 (no system deps needed)
+cargo xtask audit            # black-box audit binary (port of reference audit-phase1)
 ```
 
 Bootstrap scripts: `./bootstrap.sh` (macOS/Linux) and `./bootstrap.ps1` (Windows) install prerequisites silently, then build and launch. Safe to re-run.

@@ -130,3 +130,34 @@
   3. An exit code that is non-zero if any of the 10 canonical counts differs from the spec, so CI catches reference drift.
 - Why: makes reference drift detectable in CI without requiring a human to read the matrix; the JSON is the audit trail.
 - AC for M1-T01 (per `TASKS.md`): "output diffs to zero against session-1 manual pass" — verified: 10/10 canonical counts match the session-1 manual pass and the spec.
+
+## D-015 — Migrations live as a single `&[Migration]` const array
+
+- Date: Session 3
+- Status: ADOPTED
+- Context: A12 mandates "Database changes only through forward migrations; keep configuration and constants in one place".
+- Decision: All application migrations live in `crates/core/src/migrations.rs` as `pub const MIGRATIONS: &[Migration]`. Each `Migration` has `version`, `label`, `sql`. Versions are contiguous starting at 1. A migration is never edited after release; new ones append at the end with the next version number. `migrations::run_all` is idempotent — migrations already in `_migrations` are skipped.
+- Why: one source of truth for the schema; trivially auditable (`git log crates/core/src/migrations.rs`); the version-contiguity test catches accidental re-ordering.
+- Verification: 5 new unit tests in `migrations::tests` cover version contiguity, fresh-DB apply, idempotency, find-by-version, latest_version.
+
+## D-016 — `cargo xtask verify-config` statically asserts A0 in CI
+
+- Date: Session 3
+- Status: ADOPTED
+- Context: A0 mandates `productName = "SupportOS++"`, `identifier = "com.supportos.plusplus"`, and all 6 installer targets. The local dev sandbox can't link the Tauri shell (no GTK/WebKit2GTK), so we needed a way to verify A0 without running the app.
+- Decision: New xtask subcommand `verify-config` parses `crates/app/src-tauri/tauri.conf.json` with `serde` and asserts every A0 mandate. Returns a violations list; exits 1 on any violation. Runs in CI on every push, before clippy, on every OS (no system deps needed).
+- Why: catches accidental A0 regressions (e.g. someone renames the product or drops a bundle target) before the more expensive clippy + build steps; works on every OS without GUI libs.
+- Verification: 7 unit tests cover the spec-compliant case + 5 violation cases (wrong product, wrong bundle id, wrong window title, missing bundle target, empty windows list) + 1 integration test that asserts the real `tauri.conf.json` in the repo passes.
+
+## D-017 — Typed settings store helpers (bool / i64 / JSON) on top of the string-only table
+
+- Date: Session 3
+- Status: ADOPTED
+- Context: A12 mandates "type system makes wrong states impossible". The `application_settings` table is `TEXT` key/value, so callers reading typed values had to parse strings themselves, with no validation.
+- Decision: Add typed helpers in `crates/core/src/settings.rs`:
+  - `get_bool(conn, key, default)` / `set_bool(conn, key, value)` — stored as `"true"`/`"false"` strings; invalid values produce `Error::Config` with a clear message.
+  - `get_i64(conn, key, default)` / `set_i64(conn, key, value)` — stored as decimal strings; same error pattern.
+  - `get_json<T>(conn, key)` / `set_json<T>(conn, key, value)` — for typed config structs.
+  - `first_run_done(conn)` / `mark_first_run_done(conn)` — single-row `app_state` table from migration 1.
+- Why: every caller gets type safety + a single error path. No `unwrap`/`expect` in callers; parse failures are typed `Error::Config` with the key name in the message.
+- Verification: 7 new tests covering round-trips, defaults, invalid-value errors, JSON round-trip, and the first-run flag lifecycle.
