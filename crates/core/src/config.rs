@@ -101,19 +101,21 @@ pub fn default_data_dir() -> PathBuf {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("supportos-plusplus");
-        }
+        std::env::var("APPDATA")
+            .map(|appdata| PathBuf::from(appdata).join("supportos-plusplus"))
+            .unwrap_or_else(|_| PathBuf::from(".").join("data"))
     }
 
     #[cfg(target_os = "macos")]
     {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("supportos-plusplus");
-        }
+        std::env::var("HOME")
+            .map(|home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("supportos-plusplus")
+            })
+            .unwrap_or_else(|_| PathBuf::from(".").join("data"))
     }
 
     #[cfg(target_os = "linux")]
