@@ -101,8 +101,8 @@
 >
 > Task IDs follow `M3-T##`. Each is sized 30–90 min.
 
-- [ ] **M3-T01** Activity engine: events + derived timestamps + M003 migration.
-  - AC: `activity_events` table + `ActivityEngine` that derives `response_state`, `first_response_at`, `closed_at` etc. from conversation changes. Uses `julianday()` for all timestamp comparisons (KNOWN PITFALLS). Tests cover event derivation + dedup.
+- [x] **M3-T01** Activity engine: events + derived timestamps + M003 migration.
+  - AC: `activity_events` table + `ActivityEngine` that derives `response_state`, `first_response_at`, `closed_at` etc. from conversation changes. Uses `julianday()` for all timestamp comparisons (KNOWN PITFALLS). Tests cover event derivation + dedup. **✅ verified session 19** — `crates/core/src/activity.rs`: M003 migration (activity_events table + 6 derived columns on conversations), `record_event()` (idempotent via dedup_key), `derive_response_state()` (4 states via julianday ordering), `update_derived_columns()` (rebuilds all timestamps). 11 new tests.
 - [ ] **M3-T02** Response states: the 4-state enum (needs_first_response / customer_waiting / agent_waiting / closed) + SQL fragment (single source of truth for both tiles and filters).
   - AC: `ResponseState` enum from the catalog drives both the Operations Center tile counts AND the inbox filter list. Tests verify the SQL fragment produces the same count as the filter list.
 - [ ] **M3-T03** Saved inbox views: 22 condition kinds + AND/OR groups + compiled-to-parameterized-SQL at open time.
