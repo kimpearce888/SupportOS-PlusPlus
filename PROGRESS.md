@@ -9,22 +9,22 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M5 — VectorStore and AI providers (VectorStore abstraction + Qdrant Edge adapter, LocalAIProvider, embeddings, hybrid search, vector backup/migration/recovery) |
-| Current task ID | M5-T01 (next up) — M4 closed (tag `milestone-4-done`), M5 task list written |
-| Last completed task | M4-T12 (M4 milestone close — all 12 tasks ticked, tag `milestone-4-done` pushed) |
-| Last commit hash | `24d3c41` — fmt normalization; M4 milestone closed at `8055e23` with tag `milestone-4-done` |
-| Last updated | Session 29 — M5 started (owner said "continue") |
+| Current task ID | M5-T02 (next up) — M5-T01 done (VectorStore trait + In-memory adapter) |
+| Last completed task | M5-T01 (VectorStore trait + InMemoryVectorStore Fake adapter — 9-method sync trait, adapter-agnostic snapshot format, 37 new tests) |
+| Last commit hash | (about to be) M5-T01: VectorStore trait + In-memory adapter |
+| Last updated | Session 29 — M5-T01 done (1 of 11 M5 tasks complete) |
 
 ## Next 3 tasks
 
-1. **M5-T01**: VectorStore trait + In-memory adapter (Fake) — the abstraction boundary per A4, testable without qdrant-edge.
-2. **M5-T02**: Qdrant Edge adapter — pin exact version; x64 smoke test (arm64 remains BLOCKED from M1-T11).
-3. **M5-T03**: LocalAIProvider trait + Fake provider (deterministic test data).
+1. **M5-T02**: Qdrant Edge adapter — pin exact version; x64 smoke test (arm64 remains BLOCKED from M1-T11).
+2. **M5-T03**: LocalAIProvider trait + Fake provider (deterministic test data).
+3. **M5-T04**: LM Studio adapter (OpenAI-compatible HTTP at 127.0.0.1:1234/v1).
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (M5 task list will be written at the start of the next session, per spec: "Write the full task list for a milestone before starting it").
+1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M5 tasks T02–T11).
 2. `git status` + `git log --oneline -10` + `cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M5/M5-T01. Last commit: <hash>. Next: M5 task list + VectorStore abstraction.`
+3. Announce `Resuming at M5/M5-T02. Last commit: <hash>. Next: Qdrant Edge adapter (x64 smoke test).`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)

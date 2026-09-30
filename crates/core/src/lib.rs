@@ -56,6 +56,7 @@ pub mod side_threads;
 pub mod sync;
 pub mod ticket_ops;
 pub mod ticket_states;
+pub mod vectorstore;
 pub mod webhook;
 pub mod webhook_handler;
 pub mod workload;
