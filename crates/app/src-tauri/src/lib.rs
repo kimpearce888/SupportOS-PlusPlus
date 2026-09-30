@@ -160,7 +160,7 @@ fn catalog_counts() -> serde_json::Value {
 ///   dismissed the overlay without enabling demo mode).
 #[tauri::command]
 fn first_run_state(
-    db_state: tauri::State<DbState>,
+    db_state: tauri::State<'_, DbState>,
     demo_mode: Option<bool>,
 ) -> Result<bool, String> {
     let conn = db_state.conn.lock().map_err(|e| e.to_string())?;
