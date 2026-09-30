@@ -29,6 +29,7 @@ axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true
+regex.workspace = true
 async-trait = "0.1"
 # Re-export the catalog crate so callers don't need a separate dep.
 supportos-plusplus-catalog = { workspace = true }

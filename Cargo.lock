@@ -4521,6 +4521,7 @@ dependencies = [
  "chrono",
  "hyper",
  "rand",
+ "regex",
  "rusqlite",
  "scrypt",
  "serde",

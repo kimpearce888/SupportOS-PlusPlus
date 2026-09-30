@@ -37,6 +37,7 @@ pub mod helpscout;
 pub mod jobs;
 pub mod logging;
 pub mod loopback;
+pub mod mentions;
 pub mod migrations;
 pub mod notification_prefs;
 pub mod notification_sweep;
