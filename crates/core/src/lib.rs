@@ -31,6 +31,7 @@ pub mod config;
 pub mod db;
 pub mod demo;
 pub mod error;
+pub mod events;
 pub mod helpscout;
 pub mod jobs;
 pub mod logging;
