@@ -38,8 +38,8 @@
 - [ ] **M1-T04** Settings store (typed, secrets redacted on read, only `application_settings` row + key/value table).
   - AC: read/write round-trip; secret values never appear in Tauri IPC responses.
   - **Session 3 partial**: added typed helpers `get_bool`/`set_bool`/`get_i64`/`set_i64`/`get_json`/`set_json` (D-017) + `first_run_done`/`mark_first_run_done` for M1-T13 prep. 7 new tests, all green. Tauri IPC layer wiring still pending.
-- [ ] **M1-T05** Job queue (enqueue, claim, execute, retry with backoff, dead-letter). Tested end-to-end (per KNOWN PITFALLS).
-  - AC: a fake job enqueues, is claimed by the runner, executes, succeeds (or retries then dead-letters) — covered by an integration test.
+- [x] **M1-T05** Job queue (enqueue, claim, execute, retry with backoff, dead-letter). Tested end-to-end (per KNOWN PITFALLS).
+  - AC: a fake job enqueues, is claimed by the runner, executes, succeeds (or retries then dead-letters) — covered by an integration test. **✅ verified session 5** — `crates/core/src/runner.rs`: `JobHandler` trait (Send+Sync) + `JobRegistry` (Clone, Arc<HashMap>) + `Runner` (with `max_iterations` safety bound) + `RunSummary`. 10 new tests covering: end-to-end enqueue→claim→execute→success, empty queue, payload pass-through, unknown-kind failure with clear message, always-fail dead-lettering, fail-then-succeed retry path, summary Display, registry len/is_empty, outcome constructors, Send+Sync of `Arc<dyn JobHandler>`. Stable across 5 consecutive runs.
 - [x] **M1-T06** Error type (`thiserror`), structured logging (`tracing`), config loader. Foundation crate exposes them.
   - AC: every crate uses the shared `Error`/`Result`; logs are JSON in prod, pretty in dev. **✅ verified session 3** — `crates/core/src/{error,logging,config}.rs` already in place since session 1; session 3 confirmed AC: every crate uses the shared `Error`/`Result`; `logging::init()` emits JSON in release, pretty in dev; `config::AppConfig` is the typed config with redacted `HelpScoutConfig` view.
 - [x] **M1-T07** Common UI components (loading / empty / error states), layout shell, theming tokens.
@@ -56,8 +56,8 @@
   - AC: webhook HMAC tests pass (good sig, bad sig, replay); OAuth state single-use test passes.
 - [ ] **M1-T13** First-run onboarding stub (no credentials required; 2-minute demo mode offer).
   - AC: app launches with no DB and no credentials; offers demo mode; does not crash.
-- [ ] **M1-T14** `cargo xtask audit` black-box audit binary (port of `scripts/audit-phase1.mjs`).
-  - AC: runs against a packaged app, reports a JSON findings list.
+- [x] **M1-T14** `cargo xtask audit` black-box audit binary (port of `scripts/audit-phase1.mjs`).
+  - AC: runs against a packaged app, reports a JSON findings list. **✅ verified session 5** — `crates/xtask/src/bin/audit.rs`: separate binary sharing `spp_xtask` lib with the `xtask` binary (D-022). Two M1 checks: `path_exists` (critical if missing, info otherwise) + `config_a0` (reuses `spp_xtask::verify_config` — one source of truth). JSON output (default) or text. `cargo xtask audit --app PATH` shells out to the audit binary. 8 new audit tests. Smoke test against the workspace's real `tauri.conf.json` produces 2 info findings (path exists + A0 verified).
 - [ ] **M1-T15** M1 milestone close: every M1 task ticked, CI green on all 3 OSes, tag `milestone-1-done`, report parity counts + deviations + BLOCKED, STOP, wait for owner sign-off.
   - AC: tag pushed; `docs/PARITY-MATRIX.md` updated; `PROGRESS.md` shows M1 closed.
 

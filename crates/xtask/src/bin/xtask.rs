@@ -13,9 +13,7 @@
 use std::process::Command;
 
 use clap::{Parser, Subcommand};
-
-mod discover;
-mod verify_config;
+use spp_xtask::{discover, verify_config};
 
 #[derive(Parser)]
 #[command(name = "xtask", version, about = "SupportOS++ developer entry point", long_about = None)]
@@ -202,9 +200,20 @@ fn run_discover(reference: &str, out: Option<&str>) -> anyhow::Result<()> {
 }
 
 fn run_audit(app: &str) -> anyhow::Result<()> {
-    // M1-T14: port the reference's scripts/audit-phase1.mjs to a Rust binary.
-    eprintln!("audit: stub (M1-T14). App to audit: {app}");
-    eprintln!("Output will be a JSON findings list once implemented.");
+    // The audit binary lives in the same crate; re-run it as a child process.
+    // Using the build artefact avoids re-compilation.
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("could not locate current exe: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("exe has no parent dir"))?;
+    let audit_path = dir.join("audit");
+    if !audit_path.exists() {
+        eprintln!("audit: binary not built; run `cargo build -p supportos-plusplus-xtask --bin audit` first");
+        std::process::exit(1);
+    }
+    let status = Command::new(&audit_path).arg("--app").arg(app).status()?;
+    anyhow::ensure!(status.success(), "audit binary exited with non-zero status");
     Ok(())
 }
 

@@ -9,24 +9,24 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M1 — Foundation |
-| Current task ID | M1-T05 (next up) — M1-T07 ✅, M1-T08 ✅ done this session; new `catalog` crate (D-018) extracted |
-| Last completed task | M1-T07 (common UI components: StateView, LoadingState, EmptyState, ErrorState, Button, theming tokens) + M1-T08 (Leptos Router scaffold with /, /settings, /*any not-found) + extracted `supportos-plusplus-catalog` crate as the WASM-safe single source of truth (D-018) |
-| Last commit hash | `a4261e8` (a4261e8) — M1-T07/M1-T08 done, catalog crate extracted pushed to `main` |
-| Last updated | Session 4 |
+| Current task ID | M1-T13 (next up) — M1-T05 ✅, M1-T14 ✅ done this session |
+| Last completed task | M1-T05 (job queue closed out with JobHandler trait + JobRegistry + Runner + end-to-end integration tests) + M1-T14 (cargo xtask audit binary with checks::path_exists + checks::config_a0) |
+| Last commit hash | _(set after push)_ |
+| Last updated | Session 5 |
 
 ## Next 3 tasks
 
-1. **M1-T05**: Job queue — already at IMPLEMENTED status with the julianday fix (D-013); M1-T05 closes it out by adding a `JobHandler` trait + a small registry + an end-to-end integration test that exercises the full claim → execute → complete cycle. Pure Rust in `crates/core`.
-2. **M1-T13**: First-run onboarding stub — the foundation is in place (`app_state.first_run_done` flag from M001, `settings::first_run_done()`/`mark_first_run_done()` helpers). M1-T13 wires it into the Tauri shell's setup hook + a UI overlay.
-3. **M1-T14**: `cargo xtask audit` — port the reference's `scripts/audit-phase1.mjs` to a Rust binary that runs against a packaged app and reports a JSON findings list. Independent of GUI libs.
+1. **M1-T13**: First-run onboarding stub — the foundation is in place (`app_state.first_run_done` flag from M001, `settings::first_run_done()`/`mark_first_run_done()` helpers, `<StateView>` component pattern). M1-T13 wires them together: Tauri shell setup hook reads `first_run_done`; if false, the UI shows a 2-minute demo-mode offer overlay. Pure-Rust work — no new external deps.
+2. **M1-T09**: CI matrix runs on Win/macOS/Linux with `rustfmt --check`, `clippy -D warnings`, `cargo test`, `cargo build --release`, `trunk build`, headless demo-mode boot. The CI workflow file is already in place; M1-T09 is about confirming a green run on `main` and adding any missing pieces.
+3. **M1-T15**: M1 milestone close — every M1 task ticked, CI green on all 3 OSes, tag `milestone-1-done`, report parity counts + deviations + BLOCKED, STOP, wait for owner sign-off.
 
 ## Parity counts by status (honest, A3)
 
 | Status | Count |
 |---|---|
 | DISCOVERED | 8 canonical counts + 13 surface-area rows + per-milestone high-level rows (reproducible via `cargo xtask discover`) |
-| SPECIFIED | 4 (Tauri shell launch verification on CI, installers, Qdrant spike, demo-mode boot) |
-| IMPLEMENTED | 9 (xtask discover, SQLite foundation + first migration + runner, job queue, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification, catalog crate (WASM-safe, single source of truth), common UI components + theming tokens, Leptos Router scaffold with 3 routes) |
+| SPECIFIED | 3 (Tauri shell launch verification on CI, installers, Qdrant spike) |
+| IMPLEMENTED | 11 (xtask discover, SQLite foundation + first migration + runner, job queue with JobHandler/JobRegistry/Runner, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification, catalog crate (WASM-safe, single source of truth), common UI components + theming tokens, Leptos Router scaffold with 3 routes, xtask audit binary with checks catalog) |
 | TESTED | 0 (foundation tested at unit level; no milestone complete yet) |
 | PACKAGED | 0 |
 | VERIFIED | 0 |
@@ -42,21 +42,21 @@
 
 ## Decisions this session
 
-Session 1 (recorded above): D-001 through D-005.
+Session 1: D-001 through D-005.
 Session 2: D-013 (julianday), D-014 (inventory.json).
 Session 3: D-015 (migrations const array), D-016 (verify-config xtask), D-017 (typed settings helpers).
+Session 4: D-018 (catalog crate extraction), D-019 (ViewState enum + StateView), D-020 (stable Rust, no Leptos nightly).
 
-Session 4:
-- **D-018**: Extracted `supportos-plusplus-catalog` crate — WASM-safe (no I/O deps) — as the single source of truth for closed vocabularies. The UI crate depends on it directly (not on `core`, which has tokio/rusqlite/etc. that don't compile to WASM). `core` re-exports the catalog so native callers can keep writing `spp_core::catalog::*`.
-- **D-019**: `ViewState` enum + `<StateView>` component — the canonical implementation of the KNOWN PITFALLS rule ("every view has loading, empty, and error states"). Wrong states are impossible by construction; no caller can render an error without a message or a loading state with results.
-- **D-020**: Leptos 0.6 with stable Rust (no `nightly` feature). Removed `nightly` feature flag from the Leptos dep — the `server_fn_macro` crate requires nightly when that feature is on, which broke CI. CSR-only + stable Rust is enough for our use case.
+Session 5:
+- **D-021**: `JobHandler` trait + `JobRegistry` + `Runner` close out the job queue per KNOWN PITFALLS. The trait is `Send + Sync` so the registry can be shared across Tokio workers; the registry is `Clone` (backed by `Arc<HashMap>`); the runner has a `max_iterations` bound so a runaway enqueue source can't livelock a single `run_until_idle` call. End-to-end tests cover enqueue → claim → execute → complete, retry-then-succeed, and always-fail → dead-letter.
+- **D-022**: `cargo xtask audit` is a separate binary (`crates/xtask/src/bin/audit.rs`) sharing a `spp_xtask` lib with the `xtask` binary. Reuses the workspace's `verify_config` module for the `config_a0` check (one source of truth per A12). The reference's 1100-line `audit-phase1.mjs` will be ported check-by-check as the matching milestone lands (M2 sync, M3 saved-view injection, M9 campaigns).
 
-(See `docs/DECISIONS.md` for the full list D-001..D-020.)
+(See `docs/DECISIONS.md` for the full list D-001..D-022.)
 
 ## Resume protocol for next session
 
 1. Read `AGENTS.md` → this file → `TASKS.md`.
 2. `git status` + `git log --oneline -20` + `cargo xtask lint && cargo xtask test` (skipping the Tauri shell crate if GTK deps aren't installed locally; CI verifies the full workspace).
 3. Confirm `tauri-cli` and `trunk` are installed (install if missing: `cargo install tauri-cli --version '^2.0' --locked --no-default-features && cargo install trunk --locked`).
-4. Announce `Resuming at M1/M1-T05. Last commit: <hash>. Next: close out job queue with JobHandler trait + integration test.`
+4. Announce `Resuming at M1/M1-T13. Last commit: <hash>. Next: first-run onboarding stub (foundation already in place: app_state.first_run_done + settings::first_run_done + StateView component).`
 5. Continue from the first unchecked task in `TASKS.md`.

@@ -188,3 +188,31 @@
 - Decision: Use Leptos 0.6 with the `csr` feature only, on stable Rust. CSR (client-side rendering) is enough for our use case; we don't need server functions (the Tauri shell is the backend). Removed the `nightly` feature from `crates/ui/Cargo.toml`.
 - Why: aligns with the `rust-toolchain.toml` (`channel = "stable"`); unblocks WASM CI; no functional loss.
 - Verification: UI crate now compiles on stable Rust for both native and `wasm32-unknown-unknown` targets; 12 UI unit tests pass.
+
+## D-021 — Job queue: JobHandler trait + JobRegistry + Runner (closes M1-T05)
+
+- Date: Session 5
+- Status: ADOPTED
+- Context: KNOWN PITFALLS mandates "Job claim loops must be tested end to end (enqueue, claim, execute), not by calling components directly." Sessions 1–4 built the storage layer (`enqueue`/`claim_next`/`complete`/`fail`) but not the execute layer. M1-T05 was the only remaining M1 task explicitly requiring end-to-end testing.
+- Decision: New `crates/core/src/runner.rs` module:
+  - `JobHandler` trait: `fn handle(&self, payload: &str) -> HandlerOutcome`. `Send + Sync` so the registry can be shared across Tokio workers.
+  - `JobRegistry`: `Clone`, backed by `Arc<HashMap<String, Arc<dyn JobHandler>>>`. Immutable `register` returns a new registry. `get` returns `Option<Arc<dyn JobHandler>>` for unknown kinds (the runner then fails with a clear message — never silently skips).
+  - `Runner`: owns `&mut Connection` + `&JobRegistry`. `run_until_idle(max_iterations)` runs the claim loop until either no more jobs are available or `max_iterations` is reached (the safety bound prevents livelock from a runaway enqueue source).
+  - `HandlerOutcome` enum: `Success` or `Failure { message }`. Wrong combinations impossible — the runner maps these to `jobs::complete` or `jobs::fail`.
+  - `RunSummary`: processed/succeeded/failed/dead-lettered counts. `Display` impl for human-readable logs.
+- Why: closes the spec mandate; the trait abstraction means M2 sync handlers, M5 embedding handlers, etc. each register one kind with one line of code.
+- Verification: 10 new tests including end-to-end enqueue→claim→execute→success, payload pass-through verification, unknown-kind failure with clear message, always-fail→dead-letter, fail-then-succeed retry path. 5 consecutive runs all stable.
+
+## D-022 — `cargo xtask audit` is a separate binary sharing `spp_xtask` lib
+
+- Date: Session 5
+- Status: ADOPTED
+- Context: M1-T14 requires porting the reference's `audit-phase1.mjs` (1100+ lines of HTTP probing). The full port lands check-by-check per milestone; M1 needed the scaffold + at least one real check.
+- Decision: `crates/xtask` becomes a lib + 2 binaries:
+  - `src/lib.rs` (new): exposes `discover` + `verify_config` modules.
+  - `src/bin/xtask.rs`: the developer entry point (dev/test/lint/package/discover/verify-config/audit). Unchanged behavior; `cargo xtask audit --app PATH` shells out to the `audit` binary.
+  - `src/bin/audit.rs` (new): the black-box audit binary. Takes `--app PATH`, runs all available checks, outputs JSON (default) or text.
+  - `src/bin/checks/`: each check is its own module. M1 ships `path_exists` (critical if missing, info otherwise) + `config_a0` (reuses `spp_xtask::verify_config` — one source of truth per A12).
+- Why: avoids code duplication between the two binaries; the `Check` struct + `ALL` const make adding new checks trivial (one entry per milestone); the JSON output shape matches the reference so the owner's existing audit tooling is reusable.
+- Verification: 8 new audit tests; smoke test against the workspace's real `tauri.conf.json` produces 2 info findings.
+

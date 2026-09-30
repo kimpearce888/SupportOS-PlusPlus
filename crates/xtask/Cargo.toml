@@ -7,9 +7,17 @@ authors.workspace = true
 repository.workspace = true
 description = "SupportOS++ developer entry point: dev/test/lint/package/discover/audit."
 
+[lib]
+name = "spp_xtask"
+path = "src/lib.rs"
+
 [[bin]]
 name = "xtask"
-path = "src/main.rs"
+path = "src/bin/xtask.rs"
+
+[[bin]]
+name = "audit"
+path = "src/bin/audit.rs"
 
 [dependencies]
 anyhow = "1.0"
