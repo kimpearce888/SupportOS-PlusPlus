@@ -156,7 +156,51 @@
   - AC: Leptos page with two sections: (1) rules list (CRUD: name, trigger, action, enabled toggle); (2) approval queue (pending items with approve/reject actions). Loading/empty/error states for both sections. Router: added `/automation` route + nav link. CSS: rule cards + approval-queue table. **✅ verified session 28** — `crates/ui/src/pages/automation.rs`: `AutomationPage` component with 2 sections (Approval queue + Rules list). `AutomationRuleView` + `AutomationApprovalView` + `TriggerView` + `ActionView` mirror the core types with `'static` lifetimes so Leptos signals can hold them. `TriggerView::label()` produces human-readable strings ("Status: active → closed", "Tag added: vip", "SLA at risk"). `ActionView::label()` truncates long note bodies with ellipsis at 32 chars. `ActionView::requires_approval()` mirrors the core `Action::requires_approval()` for the UI badge display. `ApprovalQueue` + `ApprovalRow` render pending items with warning-colored left border + approve (success-green) / reject (critical-red) buttons (only shown when `requires_approval`). `RulesList` + `RuleCard` render each rule as a card with name + enabled toggle (role="switch" + aria-checked) + trigger/action rows + "requires approval" badge when applicable. Empty state via `<EmptyState>` for both sections (KNOWN PITFALLS). Router: added `/automation` route + "Automation" nav link. CSS: rule cards with toggle styling matching the Notifications preferences pattern, approval rows with warning left border, responsive reflow on mobile. 20 new tests covering TriggerView labels (4 variants incl. wildcard) + ActionView labels (6 variants incl. truncation) + ActionView::requires_approval (6 cases) + empty rules/approvals state + AutomationRuleView/AutomationApprovalView construction.
 - [x] **M4-T12** M4 milestone close: all tasks ticked, CI green, tag `milestone-4-done`, STOP.
   - AC: tag pushed; all M4 tasks ticked; `docs/PARITY-MATRIX.md` updated with M4 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts (not a completion claim). **✅ verified session 28** — All 11 M4 implementation tasks (T01–T11) done + committed. `docs/PARITY-MATRIX.md` updated with full M4 section (12 capability rows). `docs/FINAL-PARITY-AUDIT.md` updated with M4 milestone close report (honest status — 9/16 tiles real, Tauri IPC wiring deferred, team_workload needs caller-resolved membership, team mentions broadcast pending Tauri shell fanout, automation actions route through ticket_ops::execute in caller). Tag `milestone-4-done` pushed after this commit. **STOP — waiting for owner to say 'continue' to proceed to M5.**
-- M5 VectorStore and AI providers
+
+## Milestone 5 — VectorStore and AI providers
+
+> Per spec M5: "VectorStore abstraction and Qdrant Edge adapter (full contract),
+> LocalAIProvider (LM Studio, Ollama, generic), embeddings, hybrid search,
+> vector backup, migration and recovery."
+>
+> Per spec A4 (Qdrant Edge — decision is final, do not reopen):
+> - Use the `qdrant-edge` Rust crate, embedded and in-process, behind the
+>   SupportOS++ VectorStore abstraction; only the adapter module may import it.
+> - Pin the EXACT version; record in `docs/architecture/VECTORSTORE.md` +
+>   `docs/architecture/VECTORSTORE-EVALUATION.md`.
+> - M1-T11 (arm64 spike) is still BLOCKED — M5 proceeds x64-only for the
+>   Qdrant adapter; the trait + In-memory adapter work on all platforms.
+> - SQLite stays authoritative; vectors are derived and rebuildable from
+>   source text. No Qdrant URL or API-key settings in the UI.
+>
+> Per spec A6: backup uses AES-256-GCM + scrypt (`.sosync` format).
+> Per KNOWN PITFALLS: re-embed only when content hash changes; cap failed
+> embedding retries.
+>
+> Task IDs follow `M5-T##`. Each is sized 30–90 min. Tick only after tests pass + commit + push + matrix update.
+
+- [ ] **M5-T01** VectorStore trait + In-memory adapter (Fake).
+  - AC: `VectorStore` trait in `crates/core/src/vectorstore.rs` with the full contract: `upsert` (point + dense vector + optional sparse vector + payload), `search_dense` (top-k with optional filter), `search_sparse` (top-k with optional filter), `delete`, `count`, `create_collection` (with dim), `drop_collection`, `snapshot` (to bytes), `restore` (from bytes). An `InMemoryVectorStore` impl (Fake — for tests + demo mode) backed by a `HashMap`. Per A4: the trait is the single source of truth; only the Qdrant adapter (M5-T02) may import `qdrant-edge`. Tests cover CRUD, dense + sparse search ranking, filter application, count, snapshot round-trip.
+- [ ] **M5-T02** Qdrant Edge adapter (x64 smoke test).
+  - AC: `crates/core/src/vectorstore_qdrant.rs` — the ONLY module that imports `qdrant-edge`. Pin the exact version in `Cargo.toml` + record in `docs/architecture/VECTORSTORE.md`. x64 smoke test: build, persist to app data dir, reopen, dense + sparse + filters work. If the crate fails to build on x64 or the arm64 smoke test is needed, STOP + report (arm64 remains BLOCKED from M1-T11). Per A4: "If the crate fails on a required platform, STOP and report; do not swap engines." The trait + In-memory adapter (M5-T01) remain functional regardless.
+- [ ] **M5-T03** LocalAIProvider trait + Fake provider.
+  - AC: `LocalAiProvider` trait in `crates/core/src/ai_provider.rs` with two methods: `chat(model, messages) -> ChatResponse` and `embed(model, text) -> EmbedResponse`. `ChatResponse` includes content + model + token usage + finish reason; `EmbedResponse` includes vector + dim. A `FakeAiProvider` impl (deterministic — for tests + demo mode) that returns canned responses keyed by input hash. Per spec: AI is advisory; "Unknown" is a legitimate answer; never fabricate. Tests cover chat + embed round-trip + Fake determinism.
+- [ ] **M5-T04** LM Studio adapter (OpenAI-compatible HTTP).
+  - AC: `LmStudioProvider` in `crates/core/src/ai_provider.rs` (or a sub-module) that calls `http://127.0.0.1:1234/v1/chat/completions` + `/v1/embeddings`. Uses `reqwest` (added to workspace deps). Auto-detect availability; list models via `/v1/models`. Two endpoints: chat completions + embeddings. Per spec A5: "LM Studio and Ollama are optional, never bundled: auto-detect, list models, select, test. The app works fully without them." Tests use a mock HTTP server (or the Fake provider for the trait-level tests).
+- [ ] **M5-T05** Ollama adapter (native API).
+  - AC: `OllamaProvider` that calls `http://127.0.0.1:11434/api/chat` + `/api/embeddings`. Auto-detect availability; list models via `/api/tags`. Same trait as LM Studio. Tests with mock HTTP.
+- [ ] **M5-T06** Generic OpenAI-compatible adapter.
+  - AC: `GenericAiProvider` for any user-configured OpenAI-compatible endpoint (base URL + optional API key, stored as a redacted secret). The user enters the endpoint in Settings; the adapter calls `{base_url}/v1/chat/completions` + `/v1/embeddings`.
+- [ ] **M5-T07** Embeddings pipeline — content-hash-gated re-embedding + retry cap.
+  - AC: M008 migration creates `ai_runs` table (id, input_hash TEXT, prompt_version TEXT, model TEXT, response_json TEXT, created_at). `embed_with_cache(provider, model, text, prompt_version)` checks the cache first (by `hash(text) + prompt_version + model`); only re-embeds when the content hash changes. Failed embedding retries capped (e.g., max 3). Per KNOWN PITFALLS: "Re-embed only when the content hash changes; cap failed embedding retries." Tests cover cache hit, cache miss, retry-then-succeed, retry-cap-reached.
+- [ ] **M5-T08** Hybrid search — dense + sparse + filters; merge + rank.
+  - AC: `hybrid_search(conn, vectorstore, query_text, query_vector, filter, top_k)` that runs dense search (VectorStore) + sparse search (FTS5 from M3-T06) in parallel, merges + re-ranks by a weighted score (e.g., RRF — Reciprocal Rank Fusion). Filters apply to both. Tests cover dense-only, sparse-only, hybrid, filter application, top-k bound.
+- [ ] **M5-T09** Vector backup + migration + recovery (`.sosync` format).
+  - AC: `.sosync` file format (AES-256-GCM + scrypt per A6) that includes the VectorStore snapshot (from M5-T01's `snapshot()`) + the SQLite DB dump. `backup(path, password)` + `restore(path, password)`. Verify-first import (check integrity before applying); safety backup before restore; atomic swap. Per A6: "authenticated header, verify-first import, safety backup, atomic swap." Tests cover backup → restore round-trip, wrong-password rejection, corrupt-file rejection.
+- [ ] **M5-T10** VectorStore contract tests (spec section 92).
+  - AC: A test suite that exercises the full VectorStore contract against BOTH the In-memory adapter (M5-T01) and the Qdrant adapter (M5-T02, x64-only). Capability matrix: dense/sparse/named vectors, payload filters + indexes, exact search, snapshots + restore, count/scroll/facet. Missing capabilities documented in `docs/architecture/VECTORSTORE.md`; BLOCKED + reported if any required capability is missing from the pinned qdrant-edge version.
+- [ ] **M5-T11** M5 milestone close: all tasks ticked, CI green, tag `milestone-5-done`, STOP.
+  - AC: tag pushed; all M5 tasks ticked; `docs/PARITY-MATRIX.md` updated with M5 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts (not a completion claim). **STOP — waiting for owner to say 'continue' to proceed to M6.**
 - M6 AI features
 - M7 Intelligence
 - M8 Reports and quality

@@ -8,17 +8,17 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M4 — Team operations (CLOSED — pending owner sign-off to proceed to M5) |
-| Current task ID | (none — M4 milestone complete; awaiting owner "continue" to start M5) |
+| Current milestone | M5 — VectorStore and AI providers (VectorStore abstraction + Qdrant Edge adapter, LocalAIProvider, embeddings, hybrid search, vector backup/migration/recovery) |
+| Current task ID | M5-T01 (next up) — M4 closed (tag `milestone-4-done`), M5 task list written |
 | Last completed task | M4-T12 (M4 milestone close — all 12 tasks ticked, tag `milestone-4-done` pushed) |
-| Last commit hash | (about to be) M4-T12: M4 milestone close — tag milestone-4-done |
-| Last updated | Session 28 — M4 closed (12 of 12 tasks done; 487 tests passing) |
+| Last commit hash | `24d3c41` — fmt normalization; M4 milestone closed at `8055e23` with tag `milestone-4-done` |
+| Last updated | Session 29 — M5 started (owner said "continue") |
 
 ## Next 3 tasks
 
-1. **Owner sign-off**: confirm M4 milestone is acceptable; say "continue" to proceed to M5.
-2. **M5 — VectorStore and AI providers**: write the M5 task list, then start M5-T01.
-3. **(After M5)**: M6 — AI features.
+1. **M5-T01**: VectorStore trait + In-memory adapter (Fake) — the abstraction boundary per A4, testable without qdrant-edge.
+2. **M5-T02**: Qdrant Edge adapter — pin exact version; x64 smoke test (arm64 remains BLOCKED from M1-T11).
+3. **M5-T03**: LocalAIProvider trait + Fake provider (deterministic test data).
 
 ## Resume protocol for next session
 
