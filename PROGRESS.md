@@ -8,17 +8,21 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M1 — Foundation |
-| Current task ID | M1-T15 (next up) — M1-T09 ✅ done this session (CI green on all 3 OSes) |
-| Last completed task | M1-T09 (CI matrix green on Win/macOS/Linux + WASM + Tauri build; headless demo-mode boot smoke test added) |
-| Last commit hash | `d27f413` — first GREEN CI run on main |
-| Last updated | Session 7 |
+| Current milestone | M1 — Foundation (CLOSED — pending owner sign-off) |
+| Current task ID | M2 prep — M1 milestone close ✅ done (session 8) |
+| Last completed task | M1-T15 (milestone close: FINAL-PARITY-AUDIT.md written, tag milestone-1-done pushed, STOP for owner sign-off) |
+| Last commit hash | _(set after push — see `git log`)_ |
+| Last updated | Session 8 |
 
 ## Next 3 tasks
 
-1. **M1-T15**: M1 milestone close — every M1 task ticked, CI green on all 3 OSes (✅ done), tag `milestone-1-done`, report parity counts + deviations + BLOCKED, STOP, wait for owner sign-off. The remaining tasks (T02 launch, T04 settings IPC, T10 installers, T11 Qdrant spike) are either partial or require owner credentials/certificates.
-2. **M2 prep**: Once the owner signs off on M1, write the M2 task list (Help Scout mirror: provider trait, OAuth, sync, webhook, demo mode, first-run onboarding).
-3. **M1-T11 (Qdrant Edge spike)**: BLOCKED — requires per-platform smoke tests on Win x64, macOS arm64+x64, Linux x64+arm64. Needs the owner's CI matrix to include arm64 runners OR cross-compilation setup.
+**M1 is CLOSED. Waiting for owner to say "continue" to proceed to M2.**
+
+Per spec CHECKPOINT RULES: "At the end of each milestone: all its tasks ticked, CI green on all OSes, tag milestone-N-done, then STOP. Report parity counts by status, deviations awaiting my approval, BLOCKED items, and what the next session covers. Wait for me to say 'continue'."
+
+1. **Owner action**: Review `docs/FINAL-PARITY-AUDIT.md` (honest M1 close report). Decide on BLOCKED items (T10 installer signing certs, T11 arm64 CI runners).
+2. **Owner action**: Run `docs/MANUAL-VERIFICATION.md` on a clean machine to promote rows from PACKAGED to VERIFIED.
+3. **Next session (after owner says "continue")**: Write the M2 task list (Help Scout mirror) and begin M2-T01.
 
 ## Parity counts by status (honest, A3)
 

@@ -48,6 +48,13 @@ The master spec / reference README makes count claims. We re-derived every one o
 
 Each milestone groups dozens of capabilities. Detailed per-capability rows live in the per-milestone files under `docs/original-notes/`. Statuses below reflect the SupportOS++ side only.
 
+### Milestone 1 — Foundation (CLOSED — pending owner sign-off)
+
+> **M1 milestone close report**: see `docs/FINAL-PARITY-AUDIT.md`.
+> CI green on `main` (commit `d27f413`): all 8 jobs pass on Win/macOS/Linux + WASM + Tauri build.
+> 12 of 15 tasks done; 2 partial (T02, T04); 2 BLOCKED (T10, T11).
+> Tag `milestone-1-done` pushed. Waiting for owner to say "continue" to proceed to M2.
+
 ### Milestone 1 — Foundation
 | Capability | Status |
 |---|---|
