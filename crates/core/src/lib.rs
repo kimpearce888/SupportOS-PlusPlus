@@ -63,6 +63,7 @@ pub mod sync;
 pub mod ticket_ops;
 pub mod ticket_states;
 pub mod vectorstore;
+pub mod vectorstore_contract;
 pub mod webhook;
 pub mod webhook_handler;
 pub mod workload;
