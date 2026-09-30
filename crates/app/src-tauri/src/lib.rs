@@ -13,7 +13,7 @@
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
 
-use supportos_plusplus_core as spp_core;
+use spp_core;
 
 /// Entry point called by `main.rs`.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
