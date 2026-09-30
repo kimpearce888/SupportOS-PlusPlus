@@ -39,6 +39,7 @@ pub mod embeddings;
 pub mod error;
 pub mod events;
 pub mod helpscout;
+pub mod hybrid_search;
 pub mod jobs;
 pub mod logging;
 pub mod loopback;
