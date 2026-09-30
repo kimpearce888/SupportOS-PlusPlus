@@ -11,7 +11,7 @@
 | Current milestone | M1 — Foundation |
 | Current task ID | M1-T05 (next up) — M1-T07 ✅, M1-T08 ✅ done this session; new `catalog` crate (D-018) extracted |
 | Last completed task | M1-T07 (common UI components: StateView, LoadingState, EmptyState, ErrorState, Button, theming tokens) + M1-T08 (Leptos Router scaffold with /, /settings, /*any not-found) + extracted `supportos-plusplus-catalog` crate as the WASM-safe single source of truth (D-018) |
-| Last commit hash | _(set after push)_ |
+| Last commit hash | `a4261e8` (a4261e8) — M1-T07/M1-T08 done, catalog crate extracted pushed to `main` |
 | Last updated | Session 4 |
 
 ## Next 3 tasks
