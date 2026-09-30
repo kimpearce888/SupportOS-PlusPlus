@@ -11,7 +11,7 @@
 | Current milestone | M1 — Foundation (CLOSED — pending owner sign-off) |
 | Current task ID | M2 prep — M1 milestone close ✅ done (session 8) |
 | Last completed task | M1-T15 (milestone close: FINAL-PARITY-AUDIT.md written, tag milestone-1-done pushed, STOP for owner sign-off) |
-| Last commit hash | _(set after push — see `git log`)_ |
+| Last commit hash | `5a8a0f5` — M1 milestone close pushed to `main`; tag `milestone-1-done` pushed |
 | Last updated | Session 8 |
 
 ## Next 3 tasks
