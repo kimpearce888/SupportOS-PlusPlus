@@ -33,8 +33,10 @@ fn headless_demo_mode_boot_smoke() {
     //    so the test never touches the user's real data.
     let tmpdir = tempfile::TempDir::new().expect("failed to create tempdir");
     std::env::set_var("SPP_DATA_DIR", tmpdir.path());
-    let mut app_config = spp_core::config::AppConfig::default();
-    app_config.demo_mode = true;
+    let app_config = spp_core::config::AppConfig {
+        demo_mode: true,
+        ..spp_core::config::AppConfig::default()
+    };
     assert!(
         app_config.demo_mode,
         "demo_mode must be settable on AppConfig"
