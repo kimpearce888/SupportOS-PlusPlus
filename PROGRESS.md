@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M7 — Intelligence (client interaction intelligence, Issue Radar, known issues and clusters, incidents and impact, SLA, knowledge, Docs, freshness and gaps) |
-| Current task ID | M7-T01 (next up) — M6 closed (tag `milestone-6-done`), M7 task list written |
-| Last completed task | M6-T11 (M6 milestone close — all 11 tasks ticked, tag `milestone-6-done` pushed) |
-| Last commit hash | `c0d4d1e` — M6-T05 through M6-T11: Verified drafts + coaching + memory + translation + QA + suggestions + M6 milestone close |
-| Last updated | Session 31 — M7 started (owner said "continue") |
+| Current milestone | M7 — Intelligence (CLOSED — pending owner sign-off to proceed to M8) |
+| Current task ID | (none — M7 milestone complete; awaiting owner "continue" to start M8) |
+| Last completed task | M7-T08 (M7 milestone close — all 7 tasks done, tag `milestone-7-done` pushed) |
+| Last commit hash | (about to be) M7-T08: M7 milestone close — tag milestone-7-done |
+| Last updated | Session 31 — M7 closed (7 of 7 tasks done; 781 tests passing) |
 
 ## Next 3 tasks
 
-1. **M7-T01**: Client interaction intelligence — deterministic signals + recency weighting.
-2. **M7-T02**: Known issues — CRUD + status + links.
-3. **M7-T03**: Issue clusters — vector similarity + lexical overlap; wires Operations Center tiles.
+1. **Owner sign-off**: confirm M7 milestone is acceptable; say "continue" to proceed to M8.
+2. **M8 — Reports and quality**: write the M8 task list, then start M8-T01.
+3. **(After M8)**: M9 — Outreach.
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M7 tasks T01–T08).
+1. Read `AGENTS.md` → this file → `TASKS.md` (M8 task list will be written at the start of the next session, per spec: "Write the full task list for a milestone before starting it").
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M7/M7-T01. Last commit: <hash>. Next: Client interaction intelligence.`
+3. Announce `Resuming at M8/M8-T01. Last commit: <hash>. Next: M8 task list + Reports and quality.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)
