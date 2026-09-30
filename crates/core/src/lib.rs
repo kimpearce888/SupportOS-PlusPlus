@@ -43,6 +43,7 @@ pub mod oauth_state;
 pub mod response_state_sql;
 pub mod runner;
 pub mod saved_views;
+pub mod search;
 pub mod settings;
 pub mod sync;
 pub mod ticket_ops;
