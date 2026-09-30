@@ -611,3 +611,135 @@ body {
     display: none;
   }
 }
+
+/* ─── Operations Center page (M4-T02) ──────────────────────────────────── */
+.spp-page--operations {
+  padding: var(--spp-space-6);
+}
+
+.spp-page__subtitle {
+  color: var(--spp-fg-muted);
+  font-size: var(--spp-text-base);
+  margin: 0 0 var(--spp-space-6);
+  line-height: var(--spp-text-line-normal);
+}
+
+.spp-operations-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-6);
+}
+
+.spp-operations-section {
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-lg);
+  padding: var(--spp-space-4) var(--spp-space-6) var(--spp-space-6);
+}
+
+.spp-operations-section__title {
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+  color: var(--spp-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 0 0 var(--spp-space-4);
+}
+
+.spp-operations-section__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--spp-space-3);
+}
+
+/* A single tile card. Uses severity color coding (info / warning / critical)
+   via the left border. The badge sits on the right. */
+.spp-tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-2);
+  padding: var(--spp-space-4);
+  background: var(--spp-bg);
+  border: 1px solid var(--spp-border);
+  border-left: 4px solid var(--spp-border);
+  border-radius: var(--spp-radius-md);
+  min-height: 84px;
+  position: relative;
+}
+
+.spp-tile--info {
+  border-left-color: var(--spp-info);
+}
+
+.spp-tile--warning {
+  border-left-color: var(--spp-warning);
+}
+
+.spp-tile--critical {
+  border-left-color: var(--spp-critical);
+}
+
+.spp-tile__label {
+  font-size: var(--spp-text-sm);
+  font-weight: 500;
+  color: var(--spp-fg);
+  line-height: var(--spp-text-line-tight);
+}
+
+.spp-tile__badge--info,
+.spp-tile__badge--warning,
+.spp-tile__badge--critical,
+.spp-tile__badge--muted {
+  font-size: var(--spp-text-xl);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.spp-tile__badge--info {
+  color: var(--spp-info);
+}
+
+.spp-tile__badge--warning {
+  color: var(--spp-warning);
+}
+
+.spp-tile__badge--critical {
+  color: var(--spp-critical);
+}
+
+.spp-tile__badge--muted {
+  color: var(--spp-fg-subtle);
+  font-size: var(--spp-text-md);
+}
+
+.spp-tile__not-available {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-subtle);
+  font-style: italic;
+}
+
+.spp-tile__link {
+  font-size: var(--spp-text-sm);
+  color: var(--spp-accent);
+  text-decoration: none;
+  margin-top: auto;
+  align-self: flex-start;
+}
+
+.spp-tile__link:hover {
+  color: var(--spp-accent-hover);
+  text-decoration: underline;
+}
+
+.spp-tile__link--active {
+  color: var(--spp-accent-pressed);
+  font-weight: 500;
+}
+
+@media (max-width: 600px) {
+  .spp-operations-section__grid {
+    grid-template-columns: 1fr;
+  }
+}
+

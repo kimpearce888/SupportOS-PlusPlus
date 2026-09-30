@@ -9,16 +9,16 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M4 — Team operations (Operations Center, workload + capacity, Notification Center, mentions, side threads, automation) |
-| Current task ID | M4-T02 (next up) — M4-T01 done (Operations Center tile SQL fragments + snapshot aggregator) |
-| Last completed task | M4-T01 (Operations Center: 16 tile SQL fragments + `OperationsSnapshot` aggregator; 8 real + 8 stubbed) |
-| Last commit hash | (about to be) M4-T01: 16 Operations Center tile SQL fragments + snapshot aggregator |
-| Last updated | Session 27 — M4-T01 done |
+| Current task ID | M4-T03 (next up) — M4-T02 done (Operations Center UI page) |
+| Last completed task | M4-T02 (Operations Center UI page `/operations` — 16-tile grid + nav + CSS + 11 tests) |
+| Last commit hash | (about to be) M4-T02: Operations Center UI page + nav + CSS |
+| Last updated | Session 27 — M4-T02 done |
 
 ## Next 3 tasks
 
-1. **M4-T02**: Operations Center UI page (`/operations`) — 16-tile grid + links to filtered inbox.
-2. **M4-T03**: Workload + capacity metrics (per-agent + incoming-vs-closing rate).
-3. **M4-T04**: Notification Center — M005 migration + `record_notification` (15 types) + first-sync-settled guardrail.
+1. **M4-T03**: Workload + capacity metrics (per-agent + incoming-vs-closing rate).
+2. **M4-T04**: Notification Center — M005 migration + `record_notification` (15 types) + first-sync-settled guardrail.
+3. **M4-T05**: Notification per-type preferences + retention pruning.
 
 ## Parity counts by status (honest, A3)
 
