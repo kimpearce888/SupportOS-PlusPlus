@@ -13,7 +13,9 @@
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
 
-use spp_core;
+// The core crate's [lib] name is "spp_core" (see crates/core/Cargo.toml),
+// which is the extern crate name. Rust 2021 makes `extern crate` implicit,
+// so no `use` statement is needed — `spp_core::...` just works.
 
 /// Entry point called by `main.rs`.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
