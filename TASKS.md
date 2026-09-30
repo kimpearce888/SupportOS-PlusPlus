@@ -121,7 +121,41 @@
   - AC: Test that creates 2,000 conversations + measures query performance. EXPLAIN QUERY PLAN on key queries. Documented bounds. **✅ verified session 26** — `crates/core/src/perf_guards.rs`: `populate_synthetic_dataset()` creates 2,000 conversations + 100 customers with FTS5 indexing. `benchmark_query()` measures elapsed ms. 3 performance tests: count_by_response_state, filter_by_status_active, fts5_search_on_2000_conversations. All bounded at MAX_QUERY_MS (500ms). 6 new tests.
 - [x] **M3-T10** M3 milestone close: all tasks ticked, CI green, tag `milestone-3-done`, STOP.
   - AC: tag pushed; all M3 tasks ticked. **✅ verified session 26** — All 9 M3 tasks (T01–T09) done + committed. Tag `milestone-3-done` pushed. **STOP — waiting for owner to say 'continue' to proceed to M4.**
-- M4 Team operations
+## Milestone 4 — Team operations
+
+> Per spec M4: "Team operations: Operations Center, workload and capacity, Notification Center,
+> mentions, side threads, automation."
+>
+> Catalog foundations already in place (since session 4): `OperationsTileKey` × 16, `NotificationType` × 15.
+> M3-T02's `response_state_sql.rs` (single stored column) established the single-source-of-truth pattern
+> for tile counts vs. filter counts (v1.7.0 invariant). M4 applies the same pattern to all 16 tiles.
+>
+> Task IDs follow `M4-T##`. Each is sized 30–90 min. Tick only after tests pass + commit + push + matrix update.
+
+- [ ] **M4-T01** Operations Center: 16 tile SQL fragments + snapshot aggregator (single source of truth).
+  - AC: A `tile_sql` module with one parameterized SQL fragment per tile (driven by `OperationsTileKey::ALL` from the catalog — single source of truth). The 4 response-state tiles reuse `RESPONSE_STATE_SQL` from M3-T02. 9 tiles are real (their dependencies exist by end of M3): `unassigned`, `needs_first_response`, `customer_waiting`, `waiting_over_threshold`, `urgent`, `high_effort`, `automation_approvals` (stub pending M4-T09), `failed_jobs`, `sync_problems`. 7 tiles are stubbed `not_available` (their dependencies ship in later milestones): `sla_at_risk`, `sla_breached`, `sla_*` (M7), `repeated_issue`, `known_issue`, `issue_spike` (M7), `ai_escalation` (M6), `campaign_activity` (M9). The v1.7.0 invariant test (tile count == filter count) covers the 9 real tiles. `OperationsSnapshot` struct aggregates all 16 counts in one call. Tests cover: per-tile count, snapshot aggregator, invariant, mailbox scoping, stub tiles return `TileCount::NotAvailable`.
+- [ ] **M4-T02** Operations Center UI page (`/operations`).
+  - AC: Leptos page with the 16-tile grid (severity-grouped: info / warning / critical), each tile links to the filtered inbox (`/inbox?view=<tile>&scope=<mailbox>` if applicable). Stubbed tiles display a "Not yet available" badge with a tooltip naming the milestone that wires them (M6/M7/M9). Loading/empty/error states per tile. Router: added `/operations` route + nav link. CSS: grid layout with severity color coding (reuses `Severity` enum from M1-T07 theming tokens).
+- [ ] **M4-T03** Workload + capacity metrics.
+  - AC: `WorkloadMetrics` aggregator (per-agent: assigned/active/resolved-today counts; per-team rollup). `CapacityMetrics` aggregator (incoming vs. closing rate over a rolling 7d window, computed from `activity_events` via `julianday()` per KNOWN PITFALLS). Tests cover empty dataset, single-agent workload, team rollup, 7d incoming-vs-closing rate.
+- [ ] **M4-T04** Notification Center — M005 migration + `record_notification` (15 types from catalog).
+  - AC: M005 migration creates `notifications` table (id, type TEXT, severity TEXT, target_user_id, conversation_id, payload JSON, read_at, created_at; index on (target_user_id, read_at)). `record_notification()` validates the type against `NotificationType::ALL` (catalog-driven; rejects unknown types). Severity copied from `NotificationType::severity()`. Tests cover all 15 types round-trip, unknown-type rejection, unread/list queries, mark-as-read.
+- [ ] **M4-T05** Notification sweep engine — first-sync-settled guardrail (v1.7.x CHANGELOG bug fix).
+  - AC: `NotificationSweep` that scans for triggering conditions (e.g., customer replied → `CustomerReplied`, ticket assigned → `TicketAssigned`) and calls `record_notification`. The guardrail: the sweep does NOT run until the first sync has settled (per CHANGELOG v1.7.x bug fix: "Notification sweep fired too early on first run, spamming the user. Fix: cursors must not init until the first sync settles."). Tests cover: sweep is a no-op before first sync settles, sweep produces correct notifications after settle, sweep is idempotent (re-running with no new events produces no new notifications).
+- [ ] **M4-T06** Notification per-type preferences + retention pruning.
+  - AC: Per-user, per-type opt-in/out via the existing typed settings store (`get_bool`/`set_bool` keyed by `notifications.<type>.enabled`; default value = `NotificationType::default_enabled()`). The sweep respects preferences (skips recording if user has opted out for that type). Retention pruning: a `notification.prune` job (enqueued via `jobs::enqueue`) that deletes notifications older than the configurable TTL (default 30d, scoped per-user). Tests cover preference read/write, sweep respects preference, prune job deletes only old + unread-read-keep rules.
+- [ ] **M4-T07** Notification Center UI page (`/notifications`).
+  - AC: Leptos page with the notification list grouped by severity (critical / warning / info), per-type preferences UI (15 toggle rows driven by `NotificationType::ALL`), mark-as-read action, retention TTL setting. Loading/empty/error states. Router: added `/notifications` route + nav link. CSS: severity-grouped list with per-type icons.
+- [ ] **M4-T08** Mentions — text scan + emit Mentioned/TeamMentioned notification.
+  - AC: `scan_for_mentions()` parses a message body for `@username` and `@team:teamname` patterns (regex bounded; no ReDoS via `regex` crate's bounded NFA). On match: calls `record_notification` with `Mentioned` or `TeamMentioned` type. Tests cover single mention, multiple mentions, team mention, no mentions, mention of nonexistent user (no notification — fail-safe), text without `@` (no scan cost). Performance: 1,000-message scan completes in < 50ms (perf guard).
+- [ ] **M4-T09** Side threads — M006 migration + CRUD + list.
+  - AC: M006 migration creates `side_threads` (id, conversation_id, created_at, created_by_user_id) and `side_thread_messages` (id, thread_id, body, author_user_id, created_at, mentions_json). `create_side_thread()`, `add_side_thread_message()`, `list_side_threads_for_conversation()`, `list_messages()`. Side threads are separate from the customer-visible conversation thread (per spec: "side threads"). Tests cover CRUD, conversation→threads list, thread→messages list, ordering by `julianday(created_at)`.
+- [ ] **M4-T10** Automation engine — rules + trigger/action + approval queue.
+  - AC: M007 migration creates `automation_rules` (id, name, trigger JSON, action JSON, enabled, created_at) and `automation_approvals` (id, rule_id, conversation_id, proposed_action JSON, status, decided_by_user_id, decided_at). `AutomationRule` with a closed `Trigger` enum (e.g., `StatusChanged`, `TagAdded`, `SlaRisk`) and `Action` enum (e.g., `Assign`, `AddTag`, `SendNote`). Actions that modify conversation state go through `ticket_ops::execute()` (M3-T05 write-protection pipeline — single source of truth). High-impact actions require approval (recorded in `automation_approvals`). The `AutomationApprovals` Operations Center tile (M4-T01 stub) is wired here to count `WHERE status = 'pending'`. Tests cover rule CRUD, trigger match, action execute, approval queue, approval flow.
+- [ ] **M4-T11** Automation UI page (`/automation`).
+  - AC: Leptos page with two sections: (1) rules list (CRUD: name, trigger, action, enabled toggle); (2) approval queue (pending items with approve/reject actions). Loading/empty/error states for both sections. Router: added `/automation` route + nav link. CSS: rule cards + approval-queue table.
+- [ ] **M4-T12** M4 milestone close: all tasks ticked, CI green, tag `milestone-4-done`, STOP.
+  - AC: tag pushed; all M4 tasks ticked; `docs/PARITY-MATRIX.md` updated with M4 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts (not a completion claim). **STOP — waiting for owner to say 'continue' to proceed to M5.**
 - M5 VectorStore and AI providers
 - M6 AI features
 - M7 Intelligence

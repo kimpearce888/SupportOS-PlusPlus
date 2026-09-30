@@ -8,17 +8,17 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M3 — Activity engine and inbox |
-| Current task ID | M3-T01 (next up) — M2 closed, M3 task list written |
-| Last completed task | M2-T11 (M2 milestone close: tag milestone-2-done pushed) |
-| Last commit hash | `8e4a85f` — M2 milestone close pushed to `main`; tag `milestone-2-done` pushed |
-| Last updated | Session 19 — M3 started (owner said "continue") |
+| Current milestone | M4 — Team operations (Operations Center, workload + capacity, Notification Center, mentions, side threads, automation) |
+| Current task ID | M4-T01 (next up) — M3 closed, M4 task list written |
+| Last completed task | M3-T10 (M3 milestone close: tag `milestone-3-done` pushed) |
+| Last commit hash | `a3c4689` — M3-T08 + M3-T09 + M3-T10: inbox page UI + performance guards + M3 milestone close |
+| Last updated | Session 27 — M4 started (owner said "continue") |
 
 ## Next 3 tasks
 
-1. **M3-T01**: Activity engine — events + derived timestamps + M003 migration.
-2. **M3-T02**: Response states — 4-state enum + SQL fragment (single source of truth for tiles + filters).
-3. **M3-T03**: Saved inbox views — 22 condition kinds + AND/OR groups + compiled-to-parameterized-SQL.
+1. **M4-T01**: Operations Center — 16 tile SQL fragments + snapshot aggregator (single source of truth, reuse `response_state_sql.rs` pattern).
+2. **M4-T02**: Operations Center UI page (`/operations`) — 16-tile grid + links to filtered inbox.
+3. **M4-T03**: Workload + capacity metrics (per-agent + incoming-vs-closing rate).
 
 ## Parity counts by status (honest, A3)
 
@@ -57,7 +57,7 @@ Session 6:
 ## Resume protocol for next session
 
 1. Read `AGENTS.md` → this file → `TASKS.md`.
-2. `git status` + `git log --oneline -20` + `cargo xtask lint && cargo xtask test` (skipping the Tauri shell crate if GTK deps aren't installed locally; CI verifies the full workspace).
+2. `git status` + `git log --oneline -20` + `cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skipping the Tauri shell crate if GTK deps aren't installed locally; CI verifies the full workspace).
 3. Confirm `tauri-cli` and `trunk` are installed (install if missing: `cargo install tauri-cli --version '^2.0' --locked --no-default-features && cargo install trunk --locked`).
-4. Announce `Resuming at M1/M1-T13. Last commit: <hash>. Next: first-run onboarding stub (foundation already in place: app_state.first_run_done + settings::first_run_done + StateView component).`
+4. Announce `Resuming at M4/<task>. Last commit: <hash>. Next: <task>.`
 5. Continue from the first unchecked task in `TASKS.md`.
