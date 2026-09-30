@@ -9,16 +9,16 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M6 — AI features (AI Center, analysis, attributes, Copilot, verified drafts, coaching, customer memory, translation, QA, suggestions) |
-| Current task ID | M6-T02 (next up) — M6-T01 done (AI Center + Copilot catalog) |
-| Last completed task | M6-T01 (AI Center — M009 migration + ProviderKind + AiStatus + model selection + Copilot tool allowlist 22 tools; 25 new tests across catalog + core) |
-| Last commit hash | (about to be) M6-T01: AI Center + Copilot catalog |
-| Last updated | Session 30 — M6-T01 done (1 of 11 M6 tasks complete) |
+| Current task ID | M6-T04 (next up) — M6-T02+T03 done (AI analysis + attributes) |
+| Last completed task | M6-T03 (AI attributes — M010 + 14-key catalog + evidence + thread_ref; M6-T02 AI analysis with caching in same commit; 18 new tests) |
+| Last commit hash | (about to be) M6-T02+T03: AI analysis + attributes |
+| Last updated | Session 30 — M6-T02+T03 done (3 of 11 M6 tasks complete) |
 
 ## Next 3 tasks
 
-1. **M6-T02**: AI analysis — conversation analysis via LocalAiProvider; advisory only; "Unknown" is legitimate.
-2. **M6-T03**: AI attributes — 14-key catalog + evidence excerpt + thread reference.
-3. **M6-T04**: Copilot — read-only tool allowlist (22 tools, bounded: max 5 rounds, max 8 calls, 4000 chars).
+1. **M6-T04**: Copilot — read-only tool allowlist (22 tools, bounded: max 5 rounds, max 8 calls, 4000 chars).
+2. **M6-T05**: Verified drafts — AI-drafted replies requiring human approval (auto-send OFF).
+3. **M6-T07**: Customer memory — per-customer notes/preferences (AI-derived).
 
 ## Resume protocol for next session
 
