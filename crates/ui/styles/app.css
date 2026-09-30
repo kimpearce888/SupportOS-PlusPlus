@@ -743,3 +743,236 @@ body {
   }
 }
 
+/* ─── Notifications Center page (M4-T07) ───────────────────────────────── */
+.spp-page--notifications {
+  padding: var(--spp-space-6);
+}
+
+.spp-notifications-list,
+.spp-notifications-prefs,
+.spp-notifications-retention {
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-lg);
+  padding: var(--spp-space-4) var(--spp-space-6) var(--spp-space-6);
+  margin-bottom: var(--spp-space-5);
+}
+
+.spp-notifications-list__title,
+.spp-notifications-prefs__title,
+.spp-notifications-retention__title {
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+  color: var(--spp-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 0 0 var(--spp-space-4);
+}
+
+.spp-notifications-prefs__help,
+.spp-notifications-retention__help {
+  font-size: var(--spp-text-sm);
+  color: var(--spp-fg-muted);
+  line-height: var(--spp-text-line-normal);
+  margin: 0 0 var(--spp-space-4);
+}
+
+/* Severity-grouped notification list */
+.spp-notifications-severity-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-5);
+}
+
+.spp-notifications-severity-group__title {
+  font-size: var(--spp-text-base);
+  font-weight: 600;
+  color: var(--spp-fg);
+  margin: 0 0 var(--spp-space-2);
+}
+
+.spp-notifications-severity-group__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-2);
+}
+
+/* A single notification row. Severity class suffix is appended (--info /
+   --warning / --critical) so the left border color matches the tile badge. */
+.spp-notification-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto auto;
+  align-items: center;
+  gap: var(--spp-space-3);
+  padding: var(--spp-space-3) var(--spp-space-4);
+  background: var(--spp-bg);
+  border: 1px solid var(--spp-border);
+  border-left: 3px solid var(--spp-border);
+  border-radius: var(--spp-radius-md);
+}
+
+.spp-notification-row--info {
+  border-left-color: var(--spp-info);
+}
+
+.spp-notification-row--warning {
+  border-left-color: var(--spp-warning);
+}
+
+.spp-notification-row--critical {
+  border-left-color: var(--spp-critical);
+}
+
+.spp-notification-row__label {
+  font-size: var(--spp-text-base);
+  color: var(--spp-fg);
+  font-weight: 500;
+}
+
+.spp-notification-row__time {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-subtle);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.spp-notification-row__read-badge {
+  font-size: var(--spp-text-xs);
+  padding: 2px var(--spp-space-2);
+  border-radius: var(--spp-radius-full);
+  font-weight: 500;
+}
+
+.spp-notification-row__read-badge--unread {
+  background: var(--spp-accent);
+  color: var(--spp-bg);
+}
+
+.spp-notification-row__read-badge--read {
+  background: var(--spp-border-subtle);
+  color: var(--spp-fg-muted);
+}
+
+.spp-notification-row__mark-read {
+  font-size: var(--spp-text-sm);
+  color: var(--spp-accent);
+  background: transparent;
+  border: 1px solid var(--spp-accent);
+  border-radius: var(--spp-radius-sm);
+  padding: var(--spp-space-1) var(--spp-space-2);
+  cursor: pointer;
+}
+
+.spp-notification-row__mark-read:hover {
+  background: var(--spp-accent);
+  color: var(--spp-bg);
+}
+
+/* Per-type preferences list */
+.spp-preferences-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-2);
+}
+
+.spp-preferences-list__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spp-space-3);
+  padding: var(--spp-space-3) var(--spp-space-4);
+  background: var(--spp-bg);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-md);
+}
+
+.spp-preferences-list__label {
+  font-size: var(--spp-text-base);
+  color: var(--spp-fg);
+}
+
+.spp-preferences-list__toggle {
+  font-size: var(--spp-text-sm);
+  font-weight: 500;
+  padding: var(--spp-space-1) var(--spp-space-3);
+  border-radius: var(--spp-radius-full);
+  cursor: pointer;
+  border: 1px solid var(--spp-border);
+  background: var(--spp-border-subtle);
+  color: var(--spp-fg-muted);
+  min-width: 48px;
+}
+
+.spp-preferences-list__toggle[aria-checked="true"] {
+  background: var(--spp-success);
+  color: var(--spp-bg);
+  border-color: var(--spp-success);
+}
+
+.spp-preferences-list__toggle:hover {
+  opacity: 0.9;
+}
+
+/* Retention TTL setting */
+.spp-notifications-retention__row {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-3);
+}
+
+.spp-notifications-retention__label {
+  font-size: var(--spp-text-base);
+  color: var(--spp-fg);
+  font-weight: 500;
+}
+
+.spp-notifications-retention__input {
+  width: 80px;
+  padding: var(--spp-space-2) var(--spp-space-3);
+  background: var(--spp-bg);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-md);
+  color: var(--spp-fg);
+  font-size: var(--spp-text-base);
+  font-variant-numeric: tabular-nums;
+}
+
+.spp-notifications-retention__input:focus {
+  outline: none;
+  border-color: var(--spp-accent);
+}
+
+.spp-notifications-retention__hint {
+  font-size: var(--spp-text-sm);
+  color: var(--spp-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 600px) {
+  .spp-notification-row {
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      "label badge"
+      "time mark-read";
+  }
+  .spp-notification-row__label {
+    grid-area: label;
+  }
+  .spp-notification-row__time {
+    grid-area: time;
+  }
+  .spp-notification-row__read-badge {
+    grid-area: badge;
+  }
+  .spp-notification-row__mark-read {
+    grid-area: mark-read;
+  }
+}
+
+

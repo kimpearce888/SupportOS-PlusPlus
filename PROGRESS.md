@@ -9,22 +9,22 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M4 — Team operations (Operations Center, workload + capacity, Notification Center, mentions, side threads, automation) |
-| Current task ID | M4-T07 (next up) — M4-T06 done (Notification per-type preferences + retention pruning) |
-| Last completed task | M4-T06 (Per-user per-type preferences via typed settings store; retention pruning via `notification.prune` job; 30d default TTL; julianday comparison) |
-| Last commit hash | (about to be) M4-T06: Notification preferences + retention pruning |
-| Last updated | Session 27 — M4-T06 done (6 of 12 M4 tasks complete) |
+| Current task ID | M4-T08 (next up) — M4-T07 done (Notification Center UI page) |
+| Last completed task | M4-T07 (Notifications UI page `/notifications` — severity-grouped list + 15 per-type preferences + retention TTL; 12 new tests) |
+| Last commit hash | (about to be) M4-T07: Notification Center UI page |
+| Last updated | Session 28 — M4-T07 done (7 of 12 M4 tasks complete) |
 
 ## Next 3 tasks
 
-1. **M4-T07**: Notification Center UI page (`/notifications`).
-2. **M4-T08**: Mentions — text scan + emit Mentioned/TeamMentioned notification.
-3. **M4-T09**: Side threads — M006 migration + CRUD + list.
+1. **M4-T08**: Mentions — text scan + emit Mentioned/TeamMentioned notification (regex bounded, perf guard).
+2. **M4-T09**: Side threads — M006 migration + CRUD + list.
+3. **M4-T10**: Automation engine — rules + trigger/action + approval queue (wires the AutomationApprovals tile).
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M4 tasks T07–T12).
+1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M4 tasks T08–T12).
 2. `git status` + `git log --oneline -10` + `cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M4/M4-T07. Last commit: <hash>. Next: Notification Center UI page.`
+3. Announce `Resuming at M4/M4-T08. Last commit: <hash>. Next: Mentions — text scan + emit Mentioned/TeamMentioned notification.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)
