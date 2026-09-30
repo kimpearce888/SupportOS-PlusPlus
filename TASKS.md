@@ -71,8 +71,8 @@
 >
 > Task IDs follow `M2-T##`. Each is sized 30–90 min.
 
-- [ ] **M2-T01** `HelpScoutProvider` trait + `FakeHelpScoutProvider` + M002 migration (sync tables).
-  - AC: trait defined with list_conversations/get_conversation/list_customers/etc.; Fake returns deterministic demo data; M002 creates `sync_cursors`, `sync_checkpoints`, `sync_runs`, `oauth_tokens`, `conversations`, `customers`, `mailboxes`, `users`, `teams` tables. Tests pass.
+- [x] **M2-T01** `HelpScoutProvider` trait + `FakeHelpScoutProvider` + M002 migration (sync tables).
+  - AC: trait defined with list_conversations/get_conversation/list_customers/etc.; Fake returns deterministic demo data; M002 creates `sync_cursors`, `sync_checkpoints`, `sync_runs`, `oauth_tokens`, `conversations`, `customers`, `mailboxes`, `users`, `teams` tables. Tests pass. **✅ verified session 9** — `crates/core/src/helpscout.rs`: `HelpScoutProvider` async trait + 7 DTOs + `FakeHelpScoutProvider` with `FakeWorld::demo()` (deterministic: 2 mailboxes, 3 agents, 2 teams, 5 tags, 10 conversations, 8 customers). M002 `sync_tables` migration creates all sync tables with indexes. 12 new tests.
 - [ ] **M2-T02** OAuth flow: loopback listener `/oauth/callback` handler + token exchange + persist token.
   - AC: `oauth_state::issue_state` → redirect to Help Scout → callback → `consume_state` → token exchange → store in `secrets` table. `RealHelpScoutProvider` uses the stored token. Tests cover the full flow with Fake.
 - [ ] **M2-T03** Incremental sync: cursors + checkpoints + rate-limited queue + 5-minute cycle.
