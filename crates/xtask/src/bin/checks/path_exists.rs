@@ -36,7 +36,9 @@ mod tests {
     #[test]
     fn records_info_when_path_exists() {
         let mut r = AuditReport::new("/tmp");
-        run(&mut r, Path::new("/tmp"));
+        // Use a path that exists on every OS: the system temp dir.
+        let temp = std::env::temp_dir();
+        run(&mut r, &temp);
         assert_eq!(r.findings.len(), 1);
         assert_eq!(r.findings[0].severity, "info");
         assert_eq!(r.findings[0].check, "path_exists");
