@@ -15,7 +15,9 @@
 //! GUI launch is verified separately by `cargo xtask package` + the manual
 //! verification checklist in `docs/MANUAL-VERIFICATION.md`.
 
-use supportos_plusplus_core as spp_core;
+// The core crate's [lib] name is "spp_core" (see crates/core/Cargo.toml),
+// which is the extern crate name. Rust 2021 makes `extern crate` implicit,
+// so no `use` statement is needed — `spp_core::...` just works.
 
 /// Boot the foundation in demo mode against a throwaway DB and verify the
 /// boot-critical invariants. This is the "headless demo-mode boot" the spec

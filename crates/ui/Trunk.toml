@@ -1,20 +1,15 @@
 # Trunk build configuration for SupportOS++.
 # https://trunkrs.dev/configuration.html
 #
-# M1: we disable wasm-opt because the version trunk ships (v123 / binaryen
-# 123) fails on the WASM output from Rust 1.98 with "memory.copy operations
-# require bulk memory operations". The wasm-opt pass is an optimization;
-# skipping it produces a larger (but correct) WASM bundle. M2 will revisit
-# once binaryen/wasm-opt catches up.
+# M1: wasm-opt is disabled via `data-no-opt` on the <link rel="rust"> tag in
+# index.html because trunk's bundled wasm-opt (v123 AND v116) fails on the
+# WASM output from Rust 1.98 with "memory.copy operations require bulk memory
+# operations". The `data-no-opt` attribute skips the wasm-opt pass entirely,
+# producing a larger (but correct) WASM bundle. M2 will revisit once
+# binaryen/wasm-opt catches up with Rust 1.98's output.
 
 [build]
 # The public URL of the dist dir (Tauri serves from the local file system,
 # so this is just a placeholder; Tauri's beforeBuildCommand + frontendDist
 # handle the actual serving).
 public_url = "./"
-
-[tools]
-# Pin wasm-opt to a version that handles bulk-memory ops. Trunk's default
-# (version_123) is the one that fails; we use an older known-good version.
-# If this version also fails, set `wasm-opt = false` in the [[hooks]] below.
-wasm_opt = "version_116"
