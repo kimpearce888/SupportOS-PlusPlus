@@ -9,16 +9,16 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M4 — Team operations (Operations Center, workload + capacity, Notification Center, mentions, side threads, automation) |
-| Current task ID | M4-T04 (next up) — M4-T03 done (Workload + capacity metrics) |
-| Last completed task | M4-T03 (Workload + capacity metrics — per-agent + per-team + 7d incoming/closing rate) |
-| Last commit hash | (about to be) M4-T03: Workload + capacity metrics |
-| Last updated | Session 27 — M4-T03 done |
+| Current task ID | M4-T05 (next up) — M4-T04 done (Notification Center data layer) |
+| Last completed task | M4-T04 (Notification Center: M005 migration + record_notification + list/mark-as-read API; 15 types from catalog) |
+| Last commit hash | (about to be) M4-T04: Notification Center data layer |
+| Last updated | Session 27 — M4-T04 done |
 
 ## Next 3 tasks
 
-1. **M4-T04**: Notification Center — M005 migration + `record_notification` (15 types) + first-sync-settled guardrail.
-2. **M4-T05**: Notification per-type preferences + retention pruning.
-3. **M4-T06**: Notification Center UI page (`/notifications`).
+1. **M4-T05**: Notification sweep engine — first-sync-settled guardrail (v1.7.x CHANGELOG bug fix).
+2. **M4-T06**: Notification per-type preferences + retention pruning.
+3. **M4-T07**: Notification Center UI page (`/notifications`).
 
 ## Parity counts by status (honest, A3)
 
