@@ -70,6 +70,8 @@ Each milestone groups dozens of capabilities. Detailed per-capability rows live 
 | `xtask discover` (A7) replaces manual pass | ✅ DONE (10/10 canonical counts match; writes `docs/original-notes/inventory.json`) |
 | `xtask verify-config` (A0 in CI) | ✅ DONE (D-016) — 7 unit tests, runs on every CI push |
 | `xtask audit` (M1-T14, port of `audit-phase1.mjs`) | ✅ DONE (D-022) — separate binary sharing `spp_xtask` lib; M1 checks: `path_exists` + `config_a0`. 8 audit tests; JSON output; `cargo xtask audit --app PATH` shells out |
+| Loopback listener HMAC + OAuth state + dedup (M1-T12) | ✅ DONE (D-023) — `crates/core/src/{webhook,oauth_state}.rs`: timing-safe HMAC-SHA1 (FIPS 180-1 verified) + `subtle::ConstantTimeEq`; persist-first dedup via `webhook_events` SQLite table; single-use OAuth state via `oauth_states` table. 25 new tests |
+| First-run onboarding overlay (M1-T13) | ✅ DONE (D-024) — `<OnboardingOverlay>` Leptos component + `first_run_state` Tauri IPC command. 5 UI tests + 3 Tauri IPC tests |
 | Closed-vocabulary catalog crate (WASM-safe) | ✅ DONE (D-018) — `crates/catalog` extracted as WASM-safe single source of truth; UI + core share it |
 | Common UI components + state pattern | ✅ DONE (M1-T07) — `ViewState` enum + `<StateView>`, `<LoadingState>`, `<EmptyState>`, `<ErrorState>`, `<Button>` (D-019) |
 | Leptos Router scaffold | ✅ DONE (M1-T08) — 3 routes (`/`, `/settings`, `/*any`) + `LayoutShell` |

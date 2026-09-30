@@ -9,15 +9,15 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M1 — Foundation |
-| Current task ID | M1-T13 (next up) — M1-T05 ✅, M1-T14 ✅ done this session |
-| Last completed task | M1-T05 (job queue closed out with JobHandler trait + JobRegistry + Runner + end-to-end integration tests) + M1-T14 (cargo xtask audit binary with checks::path_exists + checks::config_a0) |
-| Last commit hash | `f570511` (f570511c61946570c1c079e4b8fc8a039e5ec04c) — M1-T05/M1-T14 done pushed to `main` |
-| Last updated | Session 5 |
+| Current task ID | M1-T09 (next up) — M1-T12 ✅, M1-T13 ✅ done this session |
+| Last completed task | M1-T12 (loopback listener: timing-safe HMAC-SHA1 + single-use OAuth state + persist-first dedup) + M1-T13 (first-run onboarding overlay UI + first_run_state Tauri IPC command) |
+| Last commit hash | _(set after push)_ |
+| Last updated | Session 6 |
 
 ## Next 3 tasks
 
-1. **M1-T13**: First-run onboarding stub — the foundation is in place (`app_state.first_run_done` flag from M001, `settings::first_run_done()`/`mark_first_run_done()` helpers, `<StateView>` component pattern). M1-T13 wires them together: Tauri shell setup hook reads `first_run_done`; if false, the UI shows a 2-minute demo-mode offer overlay. Pure-Rust work — no new external deps.
-2. **M1-T09**: CI matrix runs on Win/macOS/Linux with `rustfmt --check`, `clippy -D warnings`, `cargo test`, `cargo build --release`, `trunk build`, headless demo-mode boot. The CI workflow file is already in place; M1-T09 is about confirming a green run on `main` and adding any missing pieces.
+1. **M1-T09**: CI matrix runs on Win/macOS/Linux with `rustfmt --check`, `clippy -D warnings`, `cargo test`, `cargo build --release`, `trunk build`, headless demo-mode boot. The CI workflow file is already in place; M1-T09 is about confirming a green run on `main` (CI runs on every push). The remaining piece is the headless demo-mode boot smoke test — a small Rust test that boots the Tauri shell in demo mode and verifies it doesn't crash within 5 seconds.
+2. **M1-T02 close**: The actual `cargo xtask dev` launch verification still needs GTK/WebKit2GTK system libs locally. The CI workflow installs them. M1-T02 closes when CI is green on `main`.
 3. **M1-T15**: M1 milestone close — every M1 task ticked, CI green on all 3 OSes, tag `milestone-1-done`, report parity counts + deviations + BLOCKED, STOP, wait for owner sign-off.
 
 ## Parity counts by status (honest, A3)
@@ -25,8 +25,8 @@
 | Status | Count |
 |---|---|
 | DISCOVERED | 8 canonical counts + 13 surface-area rows + per-milestone high-level rows (reproducible via `cargo xtask discover`) |
-| SPECIFIED | 3 (Tauri shell launch verification on CI, installers, Qdrant spike) |
-| IMPLEMENTED | 11 (xtask discover, SQLite foundation + first migration + runner, job queue with JobHandler/JobRegistry/Runner, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification, catalog crate (WASM-safe, single source of truth), common UI components + theming tokens, Leptos Router scaffold with 3 routes, xtask audit binary with checks catalog) |
+| SPECIFIED | 2 (Tauri shell launch verification on CI, Qdrant spike) |
+| IMPLEMENTED | 13 (xtask discover, SQLite foundation + first migration + runner, job queue with JobHandler/JobRegistry/Runner, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification, catalog crate (WASM-safe, single source of truth), common UI components + theming tokens, Leptos Router scaffold with 3 routes, xtask audit binary with checks catalog, loopback HMAC-SHA1 + OAuth state + persist-first dedup, first-run onboarding overlay + first_run_state IPC) |
 | TESTED | 0 (foundation tested at unit level; no milestone complete yet) |
 | PACKAGED | 0 |
 | VERIFIED | 0 |
@@ -46,12 +46,13 @@ Session 1: D-001 through D-005.
 Session 2: D-013 (julianday), D-014 (inventory.json).
 Session 3: D-015 (migrations const array), D-016 (verify-config xtask), D-017 (typed settings helpers).
 Session 4: D-018 (catalog crate extraction), D-019 (ViewState enum + StateView), D-020 (stable Rust, no Leptos nightly).
+Session 5: D-021 (JobHandler + JobRegistry + Runner), D-022 (xtask lib + 2 binaries).
 
-Session 5:
-- **D-021**: `JobHandler` trait + `JobRegistry` + `Runner` close out the job queue per KNOWN PITFALLS. The trait is `Send + Sync` so the registry can be shared across Tokio workers; the registry is `Clone` (backed by `Arc<HashMap>`); the runner has a `max_iterations` bound so a runaway enqueue source can't livelock a single `run_until_idle` call. End-to-end tests cover enqueue → claim → execute → complete, retry-then-succeed, and always-fail → dead-letter.
-- **D-022**: `cargo xtask audit` is a separate binary (`crates/xtask/src/bin/audit.rs`) sharing a `spp_xtask` lib with the `xtask` binary. Reuses the workspace's `verify_config` module for the `config_a0` check (one source of truth per A12). The reference's 1100-line `audit-phase1.mjs` will be ported check-by-check as the matching milestone lands (M2 sync, M3 saved-view injection, M9 campaigns).
+Session 6:
+- **D-023**: Loopback listener cryptographic primitives — HMAC-SHA1 implemented inline (no extra dep), verified with FIPS 180-1 known vectors. Timing-safe comparison via `subtle::ConstantTimeEq`. Persist-first + dedup via a `webhook_events` SQLite table (id PRIMARY KEY, INSERT OR IGNORE for dedup). Single-use OAuth state via `oauth_states` table with `consumed_at` column. 25 new tests covering HMAC determinism, signature verification (good/bad/replay), persist-first dedup, OAuth state single-use violation, redirect_uri lookup.
+- **D-024**: First-run onboarding overlay — `<OnboardingOverlay>` Leptos component with two actions: "Try the 2-minute demo mode" (calls `first_run_state(Some(true))` Tauri IPC) and "I'll set up later" (calls `first_run_state(Some(false))`). The Tauri IPC command `first_run_state(demo_mode: Option<bool>) -> Result<bool, String>` reads/writes the flag; M1 uses an in-memory stub (process-global Mutex) because the Tauri shell doesn't yet boot a SQLite connection at startup (M2 will swap in the real `spp_core::settings::first_run_done` / `mark_first_run_done`). The overlay uses `Arc<dyn Fn>` props so it can live in Leptos signals. 5 new UI tests + 3 new Tauri IPC tests.
 
-(See `docs/DECISIONS.md` for the full list D-001..D-022.)
+(See `docs/DECISIONS.md` for the full list D-001..D-024.)
 
 ## Resume protocol for next session
 

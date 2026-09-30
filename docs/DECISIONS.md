@@ -216,3 +216,26 @@
 - Why: avoids code duplication between the two binaries; the `Check` struct + `ALL` const make adding new checks trivial (one entry per milestone); the JSON output shape matches the reference so the owner's existing audit tooling is reusable.
 - Verification: 8 new audit tests; smoke test against the workspace's real `tauri.conf.json` produces 2 info findings.
 
+
+## D-023 — Loopback listener cryptographic primitives (closes M1-T12)
+
+- Date: Session 6
+- Status: ADOPTED
+- Context: A2 mandates "timing-safe HMAC-SHA1 webhook verification, persist-first with deduplication, single-use OAuth state". The existing `loopback.rs` had the axum Router skeleton but no actual verification logic.
+- Decision: Two new pure-Rust modules in `crates/core`:
+  - `webhook.rs`: HMAC-SHA1 implemented inline (no extra dep). Verified with the 3 FIPS 180-1 known vectors (empty, "abc", multi-block input). Timing-safe comparison via `subtle::ConstantTimeEq` (rejects length-mismatched signatures without leaking the expected length). Persist-first + dedup via a `webhook_events` SQLite table with `id TEXT PRIMARY KEY` and `INSERT OR IGNORE` — duplicate event IDs return false, signaling the caller to skip processing.
+  - `oauth_state.rs`: Single-use OAuth state via `oauth_states` table with `state TEXT PRIMARY KEY`, `consumed_at TEXT` (NULL until consumed). `consume_state` checks `EXISTS(state=? AND consumed_at IS NULL)` and atomically marks consumed; a second call with the same state returns `Error::OauthStateInvalid`. Includes a TTL sweeper (`sweep_consumed`) for M2 to call periodically.
+- Why: All three primitives are pure logic + tiny SQLite tables — no axum/Tokio needed for testing. The route handler in `loopback.rs` (which IS async) stays minimal and just calls these. Each primitive is independently testable.
+- Verification: 25 new tests (11 HMAC + 5 persist-event + 9 OAuth state). Includes the canonical good-signature/bad-signature/replay tests mandated by the spec AC.
+
+## D-024 — First-run onboarding overlay + first_run_state Tauri IPC (closes M1-T13)
+
+- Date: Session 6
+- Status: ADOPTED
+- Context: Spec mandates "First run offers the 2-minute demo mode with no credentials". The foundation was already in place: `app_state.first_run_done` column (migration 1), `settings::first_run_done()` / `mark_first_run_done()` helpers (D-017). M1-T13 wires them into the UI + Tauri shell.
+- Decision:
+  - `crates/ui/src/components/onboarding.rs`: `<OnboardingOverlay>` component with two `<Button>` actions. Props are `Arc<dyn Fn() + Send + Sync>` (clonable, can live in Leptos signals). The overlay renders inside a `<Show>` controlled by a `first_run_done` signal; both buttons flip the signal to `true` (hiding the overlay) and call back to the parent.
+  - `crates/ui/src/lib.rs::app_view`: Wires the overlay into the app root alongside the router. The signal starts as `false` (matches the DB default for `first_run_done`); M2 will replace the initial value with a real Tauri IPC call to `first_run_state(None)`.
+  - `crates/app/src-tauri/src/lib.rs`: New Tauri IPC command `first_run_state(demo_mode: Option<bool>) -> Result<bool, String>`. With no args: returns the current flag. With `Some(_)`: marks first-run done. M1 uses an in-memory stub (process-global `Mutex<bool>`) because the Tauri shell doesn't yet boot a SQLite connection at startup — M2 will swap in the real `spp_core::settings::first_run_done` / `mark_first_run_done` / `set_bool("demo_mode", demo_mode.unwrap())`.
+- Why: Stable IPC shape lets the UI call the command today; the swap from in-memory to SQLite is a one-line change in M2. The two-button overlay matches the spec's "2-minute demo mode offer" without committing to a specific demo data source (which lands in M2 with the Fake Help Scout provider).
+- Verification: 5 new UI tests (props construction, first_run_done round-trip, cloneability, debug repr, callback state sharing) + 3 new Tauri IPC tests (read initial, accept demo, dismiss).

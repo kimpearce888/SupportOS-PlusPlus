@@ -273,3 +273,52 @@ body {
   font-size: var(--spp-text-xl);
   color: var(--spp-fg-subtle);
 }
+
+/* ─── First-run onboarding overlay (M1-T13) ──────────────────────────── */
+.spp-onboarding-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--spp-bg-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.spp-onboarding-card {
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-lg);
+  box-shadow: var(--spp-shadow-lg);
+  padding: var(--spp-space-8);
+  max-width: 520px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-4);
+}
+
+.spp-onboarding-card__title {
+  font-size: var(--spp-text-xl);
+  font-weight: 600;
+  margin: 0;
+}
+
+.spp-onboarding-card__body {
+  font-size: var(--spp-text-base);
+  color: var(--spp-fg-muted);
+  margin: 0;
+  line-height: var(--spp-text-line-normal);
+}
+
+.spp-onboarding-card__actions {
+  display: flex;
+  gap: var(--spp-space-3);
+  flex-wrap: wrap;
+}
+
+.spp-onboarding-card__legal {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-subtle);
+  margin: var(--spp-space-2) 0 0 0;
+  line-height: var(--spp-text-line-normal);
+}
