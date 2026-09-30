@@ -11,7 +11,7 @@
 | Current milestone | M1 — Foundation |
 | Current task ID | M1-T09 (next up) — M1-T12 ✅, M1-T13 ✅ done this session |
 | Last completed task | M1-T12 (loopback listener: timing-safe HMAC-SHA1 + single-use OAuth state + persist-first dedup) + M1-T13 (first-run onboarding overlay UI + first_run_state Tauri IPC command) |
-| Last commit hash | _(set after push)_ |
+| Last commit hash | `86af418` (86af418ddf6b2784a1f7b8452ab1937b51d58c75) — M1-T12/M1-T13 done pushed to `main` |
 | Last updated | Session 6 |
 
 ## Next 3 tasks
