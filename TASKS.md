@@ -301,7 +301,44 @@
   - AC: M019 migration creates `knowledge_doc_freshness` table (doc_id, last_synced_at, content_hash, stale_at) + `knowledge_gaps` (id, query_text, hit_count, last_seen_at). `check_freshness(conn) -> Vec<FreshnessStatus>` identifies docs that haven't been synced recently or whose content hash changed. `record_gap(conn, query_text)` records when a search returns no results (knowledge gap). Per the reference notes: `knowledge/` module handles "Knowledge docs mirror + freshness + gaps." Tests cover freshness check, gap recording, stale detection.
 - [x] **M7-T08** M7 milestone close: all tasks ticked, CI green, tag `milestone-7-done`, STOP.
   - AC: tag pushed; all M7 tasks ticked; `docs/PARITY-MATRIX.md` updated with M7 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts. Wires 5 more Operations Center tiles (sla_at_risk, sla_breached, repeated_issue, known_issue, issue_spike) — total 14 of 16 tiles real; 2 remaining (ai_escalation=M6 already done, campaign_activity=M9). **STOP — waiting for owner to say 'continue' to proceed to M8.**
-- M8 Reports and quality
+
+## Milestone 8 — Reports and quality
+
+> Per spec M8: "Reports and quality: dashboards, report builder, post-resolution QA,
+> effectiveness, friction, support health, customer timeline, support graph."
+>
+> Per the reference notes changelog:
+> - v2.2.x: Custom report builder (21 metrics × 14 dimensions) with previous-period
+>   comparison; metrics ship their own definition + limitations in the response.
+> - v2.0.x: Support graph (12 node kinds).
+> - v1.4.x: SLA reports.
+>
+> Catalog foundations already in place (since session 4):
+> - `ReportMetricKey` × 21 (the catalog enum — single source of truth).
+> - `ReportDimensionKey` × 14 (the catalog enum — single source of truth).
+> - `GraphNodeKind` × 12 (the support graph node kinds).
+>
+> The activity engine (M3-T01), response states (M3-T02), SLA tracking (M7-T06),
+> and post-resolution QA (M6-T09) are all available as data sources.
+>
+> Task IDs follow `M8-T##`. Each is sized 30–90 min.
+
+- [ ] **M8-T01** Dashboards — summary metrics + KPI tiles.
+  - AC: `Dashboard` module with `get_dashboard_metrics(conn, mailbox_id, date_range) -> DashboardMetrics` that computes: total conversations, new conversations, closed conversations, avg first response time, avg resolution time, SLA breach count, active conversations, customer waiting count. Per the reference notes: `analytics/` module handles "Aggregations backing the dashboard." All timestamp comparisons use `julianday()` per KNOWN PITFALLS. Tests cover empty dataset, single conversation, multi-mailbox filtering, date range.
+- [ ] **M8-T02** Report builder — 21 metrics × 14 dimensions + previous-period comparison.
+  - AC: `ReportBuilder` module: `build_report(conn, metric, dimension, date_range, prev_period) -> ReportResult`. The 21 metrics come from `ReportMetricKey::ALL` (catalog — single source of truth); the 14 dimensions from `ReportDimensionKey::ALL`. Per the reference notes: "Custom report builder (21 metrics × 14 dimensions) with previous-period comparison; metrics ship their own definition + limitations in the response." Each metric returns its definition + limitations (per the reference changelog). Tests cover a sample of metrics × dimensions, previous-period comparison, empty dataset.
+- [ ] **M8-T03** Post-resolution QA effectiveness — wire QA results (M6-T09) to reports.
+  - AC: `EffectivenessReport` module that aggregates `post_resolution_qa` (M6-T09) results: avg QA score, distribution of scores, trend over time. Per the reference notes: `quality.ts` handles "QA / friction / effectiveness." Tests cover aggregation, empty dataset, trend.
+- [ ] **M8-T04** Friction — customer effort scoring + high-friction rate.
+  - AC: M020 migration creates `friction_scores` table (conversation_id, effort_score REAL, factors_json, created_at). `compute_friction(conn, conversation_id) -> FrictionScore` that derives effort from: number of back-and-forth messages, time to resolution, reopen count, escalation. Per the reference notes: `quality.ts` handles "friction." The `HighFrictionRate` report metric (from `ReportMetricKey::ALL`) is computed here. Tests cover friction computation, high-friction threshold, empty dataset.
+- [ ] **M8-T05** Support health — aggregate health score.
+  - AC: `SupportHealth` module: `compute_health(conn, date_range) -> HealthScore` that combines SLA performance + friction + response times + resolution rates into a single 0–100 health score. Per the reference notes: "support health" is an aggregate metric. The health score is advisory — per spec: "AI is always advisory." Tests cover health computation, edge cases (no data → score 0 or "Unknown"), component weighting.
+- [ ] **M8-T06** Customer timeline — chronological activity feed per customer.
+  - AC: M021 migration creates `customer_timeline` table (id, customer_id, event_type, event_data_json, occurred_at). `record_timeline_event(conn, customer_id, event_type, data)` stores an event. `get_timeline(conn, customer_id, limit) -> Vec<TimelineEvent>` returns the feed ordered by `julianday(occurred_at)` per KNOWN PITFALLS. Per the reference notes: `timeline/` module handles "Customer timeline." Tests cover event recording, timeline retrieval, ordering, empty case.
+- [ ] **M8-T07** Support graph — 12-node-kind graph with neighbor traversal.
+  - AC: M022 migration creates `graph_nodes` (id, kind TEXT, entity_id, label, properties_json) + `graph_edges` (id, source_id, target_id, edge_type). `GraphNodeKind::ALL` (12 kinds from the catalog — single source of truth) drives node validation. `add_node`, `add_edge`, `get_neighbors(node_id)` — returns adjacent nodes. Per the reference notes: `graph/` module handles "Support graph (12 node kinds)." Per the reference changelog: v2.0.x "support graph (12 node kinds)." Tests cover node CRUD, edge CRUD, neighbor traversal, kind validation.
+- [ ] **M8-T08** M8 milestone close: all tasks ticked, CI green, tag `milestone-8-done`, STOP.
+  - AC: tag pushed; all M8 tasks ticked; `docs/PARITY-MATRIX.md` updated with M8 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts. **STOP — waiting for owner to say 'continue' to proceed to M9.**
 - M9 Outreach
 - M10 Data tools
 - M11 Conformance and hardening

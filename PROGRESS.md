@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M7 — Intelligence (CLOSED — pending owner sign-off to proceed to M8) |
-| Current task ID | (none — M7 milestone complete; awaiting owner "continue" to start M8) |
+| Current milestone | M8 — Reports and quality (dashboards, report builder, post-resolution QA, effectiveness, friction, support health, customer timeline, support graph) |
+| Current task ID | M8-T01 (next up) — M7 closed (tag `milestone-7-done`), M8 task list written |
 | Last completed task | M7-T08 (M7 milestone close — all 7 tasks done, tag `milestone-7-done` pushed) |
-| Last commit hash | (about to be) M7-T08: M7 milestone close — tag milestone-7-done |
-| Last updated | Session 31 — M7 closed (7 of 7 tasks done; 781 tests passing) |
+| Last commit hash | `8edef65` — M7-T08: M7 milestone close — tag milestone-7-done |
+| Last updated | Session 32 — M8 started (owner said "continue") |
 
 ## Next 3 tasks
 
-1. **Owner sign-off**: confirm M7 milestone is acceptable; say "continue" to proceed to M8.
-2. **M8 — Reports and quality**: write the M8 task list, then start M8-T01.
-3. **(After M8)**: M9 — Outreach.
+1. **M8-T01**: Dashboards — summary metrics + KPI tiles.
+2. **M8-T02**: Report builder — 21 metrics × 14 dimensions + previous-period comparison.
+3. **M8-T04**: Friction — customer effort scoring + high-friction rate.
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (M8 task list will be written at the start of the next session, per spec: "Write the full task list for a milestone before starting it").
+1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M8 tasks T01–T08).
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M8/M8-T01. Last commit: <hash>. Next: M8 task list + Reports and quality.`
+3. Announce `Resuming at M8/M8-T01. Last commit: <hash>. Next: Dashboards.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)
