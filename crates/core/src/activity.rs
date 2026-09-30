@@ -136,7 +136,6 @@ pub fn record_event(conn: &Connection, event: &ActivityEvent) -> Result<bool> {
 ///
 /// This function reads the conversation + its events and computes the state.
 /// It does NOT write — the caller must call `update_response_state` to persist.
-#[must_use]
 pub fn derive_response_state(
     conn: &Connection,
     conversation_remote_id: i64,
@@ -169,7 +168,7 @@ pub fn derive_response_state(
 
     match last_event {
         None => Ok(ResponseState::NeedsFirstResponse),
-        Some((event_type, actor_type)) => {
+        Some((_event_type, actor_type)) => {
             if actor_type == "customer" {
                 Ok(ResponseState::CustomerWaiting)
             } else if actor_type == "agent" {
