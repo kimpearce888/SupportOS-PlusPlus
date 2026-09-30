@@ -40,6 +40,7 @@ pub mod loopback;
 pub mod migrations;
 pub mod oauth;
 pub mod oauth_state;
+pub mod perf_guards;
 pub mod response_state_sql;
 pub mod runner;
 pub mod saved_views;

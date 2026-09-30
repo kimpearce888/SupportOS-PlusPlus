@@ -41,6 +41,7 @@ fn app_view() -> impl IntoView {
             <Routes>
                 <Route path="/" view=layout::LayoutShell>
                     <Route path="/" view=pages::DashboardPage />
+                    <Route path="/inbox" view=pages::InboxPage />
                     <Route path="/settings" view=pages::SettingsPage />
                     <Route path="/sync-health" view=pages::SyncHealthPage />
                     <Route path="/*any" view=not_found_from_params />

@@ -524,3 +524,90 @@ body {
   font-size: var(--spp-text-xs);
   color: var(--spp-fg-muted);
 }
+
+/* ─── Inbox page (M3-T08) ────────────────────────────────────────────── */
+.spp-inbox {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.spp-inbox__list {
+  width: 320px;
+  min-width: 240px;
+  max-width: 400px;
+  border-right: 1px solid var(--spp-border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.spp-inbox__list-header {
+  padding: var(--spp-space-3) var(--spp-space-4);
+  border-bottom: 1px solid var(--spp-border);
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+}
+
+.spp-inbox__title {
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+  margin: 0;
+}
+
+.spp-inbox__count {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+}
+
+.spp-inbox__list-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spp-space-2);
+}
+
+.spp-inbox__detail {
+  flex: 1;
+  min-width: 0;
+  padding: var(--spp-space-4);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.spp-inbox__detail-content {
+  flex: 1;
+}
+
+.spp-inbox__context {
+  width: 280px;
+  min-width: 200px;
+  max-width: 360px;
+  border-left: 1px solid var(--spp-border);
+  padding: var(--spp-space-4);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.spp-inbox__context-content {
+  flex: 1;
+}
+
+@media (max-width: 900px) {
+  .spp-inbox {
+    flex-direction: column;
+  }
+  .spp-inbox__list {
+    width: 100%;
+    max-width: none;
+    max-height: 200px;
+    border-right: none;
+    border-bottom: 1px solid var(--spp-border);
+  }
+  .spp-inbox__context {
+    display: none;
+  }
+}
