@@ -38,6 +38,7 @@ pub mod jobs;
 pub mod logging;
 pub mod loopback;
 pub mod migrations;
+pub mod notification_sweep;
 pub mod notifications;
 pub mod oauth;
 pub mod oauth_state;

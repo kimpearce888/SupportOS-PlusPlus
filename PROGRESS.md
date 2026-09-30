@@ -9,16 +9,16 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M4 — Team operations (Operations Center, workload + capacity, Notification Center, mentions, side threads, automation) |
-| Current task ID | M4-T05 (next up) — M4-T04 done (Notification Center data layer) |
-| Last completed task | M4-T04 (Notification Center: M005 migration + record_notification + list/mark-as-read API; 15 types from catalog) |
-| Last commit hash | (about to be) M4-T04: Notification Center data layer |
-| Last updated | Session 27 — M4-T04 done |
+| Current task ID | M4-T06 (next up) — M4-T05 done (Notification sweep engine + first-sync-settled guardrail) |
+| Last completed task | M4-T05 (Notification sweep engine — v1.7.x CHANGELOG bug fix's structural guardrail; cursor never inits until first sync settles; historical events never trigger notifications) |
+| Last commit hash | (about to be) M4-T05: Notification sweep engine + first-sync-settled guardrail |
+| Last updated | Session 27 — M4-T05 done |
 
 ## Next 3 tasks
 
-1. **M4-T05**: Notification sweep engine — first-sync-settled guardrail (v1.7.x CHANGELOG bug fix).
-2. **M4-T06**: Notification per-type preferences + retention pruning.
-3. **M4-T07**: Notification Center UI page (`/notifications`).
+1. **M4-T06**: Notification per-type preferences + retention pruning.
+2. **M4-T07**: Notification Center UI page (`/notifications`).
+3. **M4-T08**: Mentions — text scan + emit Mentioned/TeamMentioned notification.
 
 ## Parity counts by status (honest, A3)
 
