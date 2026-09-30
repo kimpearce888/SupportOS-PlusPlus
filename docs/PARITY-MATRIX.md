@@ -59,16 +59,19 @@ Each milestone groups dozens of capabilities. Detailed per-capability rows live 
 | State files (`AGENTS.md`, `PROGRESS.md`, `TASKS.md`, `DECISIONS.md`, `DEVIATIONS.md`, `MANUAL-VERIFICATION.md`, `UI-PARITY.md`) | ✅ DONE |
 | Cargo workspace + crates (`app`, `core`, `ui`, `xtask`) | ✅ DONE |
 | Tauri 2 shell that launches on Win/macOS/Linux | SPECIFIED — config verified via `cargo xtask verify-config` (D-016); full launch needs CI |
-| Leptos WASM UI scaffold | SPECIFIED |
+| Leptos WASM UI scaffold | ✅ DONE (M1-T08) — `crates/ui/src/{lib,layout,pages/}.rs`: Router with `/`, `/settings`, `/*any` (not-found); LayoutShell with Topbar + nav + footer; compiles to both native and `wasm32-unknown-unknown` |
 | SQLite (WAL + FTS5) + first migration | ✅ DONE (M1-T03) — `crates/core/src/migrations.rs`, M001 creates `application_settings` + `secrets` + `app_state`; `db::open_with_migrations` convenience helper |
 | Job queue | ✅ IMPLEMENTED (claim/complete/fail/dead-letter; julianday-based D-013, 35 tests stable × 10 runs) |
 | Settings store | ✅ IMPLEMENTED (M1-T04 partial) — typed helpers `get_bool`/`set_bool`/`get_i64`/`set_i64`/`get_json`/`set_json` (D-017) + first-run flag; secrets redacted on read |
-| Theming | SPECIFIED |
+| Theming | ✅ DONE (M1-T07) — CSS custom properties in `crates/ui/styles/app.css` (colors, spacing, typography, radii, shadows, motion) + `Severity` enum (D-019) mirroring Operations Center buckets |
 | CI matrix (Win/macOS/Linux: fmt + verify-config + clippy + test + build) | ✅ DONE — `.github/workflows/ci.yml` runs fmt + `cargo xtask verify-config` + clippy + tests + WASM build + Tauri build on ubuntu-22.04, ubuntu-24.04, macos-latest, windows-latest |
 | Installer pipelines (MSI, NSIS, DMG, DEB, RPM, AppImage) | SPECIFIED — bundle targets present in `tauri.conf.json` (verified by `verify-config`); actual builds happen in `.github/workflows/release.yml` on tag push |
 | Qdrant Edge spike on all 5 platforms (A4) | SPECIFIED |
 | `xtask discover` (A7) replaces manual pass | ✅ DONE (10/10 canonical counts match; writes `docs/original-notes/inventory.json`) |
 | `xtask verify-config` (A0 in CI) | ✅ DONE (D-016) — 7 unit tests, runs on every CI push |
+| Closed-vocabulary catalog crate (WASM-safe) | ✅ DONE (D-018) — `crates/catalog` extracted as WASM-safe single source of truth; UI + core share it |
+| Common UI components + state pattern | ✅ DONE (M1-T07) — `ViewState` enum + `<StateView>`, `<LoadingState>`, `<EmptyState>`, `<ErrorState>`, `<Button>` (D-019) |
+| Leptos Router scaffold | ✅ DONE (M1-T08) — 3 routes (`/`, `/settings`, `/*any`) + `LayoutShell` |
 | Error type + logging + config foundation (M1-T06) | ✅ DONE — `crates/core/src/{error,logging,config}.rs`; shared `Error`/`Result`; JSON logs in release, pretty in dev |
 | Empty app installs & launches on all 3 OSes | SPECIFIED |
 

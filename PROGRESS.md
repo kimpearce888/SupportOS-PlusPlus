@@ -9,24 +9,24 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M1 — Foundation |
-| Current task ID | M1-T07 (next up) — M1-T02 partial ✅, M1-T03 ✅, M1-T04 partial ✅, M1-T06 ✅ done this session |
-| Last completed task | M1-T03 (SQLite first migration + runner) + M1-T06 (foundation: error/logging/config) + M1-T02 partial (Tauri config A0 verification) + M1-T04 partial (typed settings store with bool/i64/JSON + first-run flag) |
-| Last commit hash | `c3b8c48` (c3b8c48880f56d0b6c4b9dbca2b5c464eb014c46) — M1-T03/M1-T06 done, M1-T02/M1-T04 partial pushed to `main` |
-| Last updated | Session 3 |
+| Current task ID | M1-T05 (next up) — M1-T07 ✅, M1-T08 ✅ done this session; new `catalog` crate (D-018) extracted |
+| Last completed task | M1-T07 (common UI components: StateView, LoadingState, EmptyState, ErrorState, Button, theming tokens) + M1-T08 (Leptos Router scaffold with /, /settings, /*any not-found) + extracted `supportos-plusplus-catalog` crate as the WASM-safe single source of truth (D-018) |
+| Last commit hash | _(set after push)_ |
+| Last updated | Session 4 |
 
 ## Next 3 tasks
 
-1. **M1-T07**: Common UI components (loading / empty / error states), layout shell, theming tokens. Pure Leptos work; doesn't strictly need the Tauri shell to be linked locally — can be developed against `trunk serve` standalone.
-2. **M1-T08**: Leptos routing scaffold + first route (`/`) with the empty dashboard placeholder.
-3. **M1-T05**: Job queue — already at IMPLEMENTED status with the julianday fix; M1-T05 just needs the final "execute" handler shape (a small trait + a registration mechanism) to close out.
+1. **M1-T05**: Job queue — already at IMPLEMENTED status with the julianday fix (D-013); M1-T05 closes it out by adding a `JobHandler` trait + a small registry + an end-to-end integration test that exercises the full claim → execute → complete cycle. Pure Rust in `crates/core`.
+2. **M1-T13**: First-run onboarding stub — the foundation is in place (`app_state.first_run_done` flag from M001, `settings::first_run_done()`/`mark_first_run_done()` helpers). M1-T13 wires it into the Tauri shell's setup hook + a UI overlay.
+3. **M1-T14**: `cargo xtask audit` — port the reference's `scripts/audit-phase1.mjs` to a Rust binary that runs against a packaged app and reports a JSON findings list. Independent of GUI libs.
 
 ## Parity counts by status (honest, A3)
 
 | Status | Count |
 |---|---|
 | DISCOVERED | 8 canonical counts + 13 surface-area rows + per-milestone high-level rows (reproducible via `cargo xtask discover`) |
-| SPECIFIED | 5 (Tauri shell launch verification on CI, Leptos UI scaffold, theming, installers, Qdrant spike) |
-| IMPLEMENTED | 6 (xtask discover, SQLite foundation + first migration + runner, job queue, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification) |
+| SPECIFIED | 4 (Tauri shell launch verification on CI, installers, Qdrant spike, demo-mode boot) |
+| IMPLEMENTED | 9 (xtask discover, SQLite foundation + first migration + runner, job queue, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification, catalog crate (WASM-safe, single source of truth), common UI components + theming tokens, Leptos Router scaffold with 3 routes) |
 | TESTED | 0 (foundation tested at unit level; no milestone complete yet) |
 | PACKAGED | 0 |
 | VERIFIED | 0 |
@@ -43,20 +43,20 @@
 ## Decisions this session
 
 Session 1 (recorded above): D-001 through D-005.
-
 Session 2: D-013 (julianday), D-014 (inventory.json).
+Session 3: D-015 (migrations const array), D-016 (verify-config xtask), D-017 (typed settings helpers).
 
-Session 3:
-- **D-015**: Migrations are a single source-of-truth `&[Migration]` const array in `crates/core/src/migrations.rs`. Each migration is forward-only, versioned, applied in order, never edited after release. New migrations append at the end with the next version number.
-- **D-016**: `cargo xtask verify-config` statically parses `tauri.conf.json` and asserts the spec amendment A0 mandates (`productName = "SupportOS++"`, `identifier = "com.supportos.plusplus"`, `window[0].title = "SupportOS++"`, all 6 bundle targets present). Runs in CI on every push, before clippy, without needing GTK/WebKit2GTK system deps.
-- **D-017**: Typed settings store helpers (`get_bool`, `set_bool`, `get_i64`, `set_i64`, `get_json`, `set_json`) wrap the string-only `application_settings` table so callers get type-safe reads/writes with proper `Error::Config` validation on parse failure.
+Session 4:
+- **D-018**: Extracted `supportos-plusplus-catalog` crate — WASM-safe (no I/O deps) — as the single source of truth for closed vocabularies. The UI crate depends on it directly (not on `core`, which has tokio/rusqlite/etc. that don't compile to WASM). `core` re-exports the catalog so native callers can keep writing `spp_core::catalog::*`.
+- **D-019**: `ViewState` enum + `<StateView>` component — the canonical implementation of the KNOWN PITFALLS rule ("every view has loading, empty, and error states"). Wrong states are impossible by construction; no caller can render an error without a message or a loading state with results.
+- **D-020**: Leptos 0.6 with stable Rust (no `nightly` feature). Removed `nightly` feature flag from the Leptos dep — the `server_fn_macro` crate requires nightly when that feature is on, which broke CI. CSR-only + stable Rust is enough for our use case.
 
-(See `docs/DECISIONS.md` for the full list D-001..D-017.)
+(See `docs/DECISIONS.md` for the full list D-001..D-020.)
 
 ## Resume protocol for next session
 
 1. Read `AGENTS.md` → this file → `TASKS.md`.
 2. `git status` + `git log --oneline -20` + `cargo xtask lint && cargo xtask test` (skipping the Tauri shell crate if GTK deps aren't installed locally; CI verifies the full workspace).
 3. Confirm `tauri-cli` and `trunk` are installed (install if missing: `cargo install tauri-cli --version '^2.0' --locked --no-default-features && cargo install trunk --locked`).
-4. Announce `Resuming at M1/M1-T07. Last commit: <hash>. Next: common UI components + Leptos routing scaffold.`
+4. Announce `Resuming at M1/M1-T05. Last commit: <hash>. Next: close out job queue with JobHandler trait + integration test.`
 5. Continue from the first unchecked task in `TASKS.md`.

@@ -2,6 +2,12 @@
 //!
 //! CSR-only build. Bundled by `trunk` into `dist/` and served by Tauri.
 //! No hand-written JS/TS anywhere (spec hard rule).
+//!
+//! # Routes
+//!
+//! - `/` — Dashboard page (placeholder for M1; real KPI tiles land in M3).
+//! - `/settings` — Settings page (placeholder; real settings land in M2+).
+//! - `*` — Not-found page (per KNOWN PITFALLS: every route renders a state).
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
@@ -9,43 +15,63 @@
 #![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
 
 use leptos::*;
+use leptos_router::*;
 
-/// Mount the app at the given DOM element id (default `#app`).
+pub mod components;
+pub mod layout;
+pub mod pages;
+
+// Re-export the catalog so the UI has type-safe access to closed
+// vocabularies (one source of truth per spec A12). The catalog crate is
+// WASM-safe (no I/O deps).
+pub use spp_catalog as catalog;
+
+/// Mount the app at the `<div id="app">` element. Called by `index.html`.
 pub fn mount() {
     console_error_panic_hook::set_once();
-    mount_to_body(view_fn);
+    mount_to_body(app_view);
 }
 
-fn view_fn() -> impl IntoView {
-    let count = create_rw_signal(0i32);
+fn app_view() -> impl IntoView {
     view! {
-        <div class="spp-shell">
-            <header class="spp-topbar">
-                <h1 class="spp-title">"SupportOS++"</h1>
-                <span class="spp-version">"v0.1.0 — M1 foundation"</span>
-            </header>
-            <main class="spp-main">
-                <section class="spp-empty">
-                    <p>"M1 foundation scaffold. The Help Scout mirror lands in M2."</p>
-                    <button
-                        class="spp-button"
-                        on:click=move |_| count.update(|c| *c += 1)
-                    >
-                        "Counter: " {count}
-                    </button>
-                </section>
-            </main>
-            <footer class="spp-footer">
-                <p>"Help Scout is a trademark of Help Scout, Inc. "
-                    "SupportOS++ is an independent, open-source integration and is not affiliated with or endorsed by Help Scout."
-                </p>
-            </footer>
-        </div>
+        <Router>
+            <Routes>
+                <Route path="/" view=layout::LayoutShell>
+                    <Route path="/" view=pages::DashboardPage />
+                    <Route path="/settings" view=pages::SettingsPage />
+                    <Route path="/*any" view=not_found_from_params />
+                </Route>
+            </Routes>
+        </Router>
     }
 }
 
-// Re-export core types so the UI never depends on the Tauri shell crate directly.
-pub use spp_core::catalog;
+/// Renders the not-found page, extracting the unmatched path from the router
+/// params. Per KNOWN PITFALLS: every route renders a state.
+fn not_found_from_params() -> impl IntoView {
+    let params = use_params_map();
+    let path = move || {
+        params.with(|p| {
+            let any = p.get("any").cloned().unwrap_or_default();
+            if any.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{any}")
+            }
+        })
+    };
+    view! { <pages::NotFoundPage path=path /> }
+}
 
-/// Re-export the core crate's public API under the `spp_core` alias.
-extern crate spp_core as _core;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_reachable_from_ui() {
+        // Smoke check: the catalog enum is reachable from the UI crate.
+        // This catches accidental `pub use` removals.
+        use catalog::OperationsTileKey;
+        assert_eq!(OperationsTileKey::ALL.len(), 16);
+    }
+}

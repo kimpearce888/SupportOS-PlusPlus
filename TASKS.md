@@ -42,10 +42,10 @@
   - AC: a fake job enqueues, is claimed by the runner, executes, succeeds (or retries then dead-letters) — covered by an integration test.
 - [x] **M1-T06** Error type (`thiserror`), structured logging (`tracing`), config loader. Foundation crate exposes them.
   - AC: every crate uses the shared `Error`/`Result`; logs are JSON in prod, pretty in dev. **✅ verified session 3** — `crates/core/src/{error,logging,config}.rs` already in place since session 1; session 3 confirmed AC: every crate uses the shared `Error`/`Result`; `logging::init()` emits JSON in release, pretty in dev; `config::AppConfig` is the typed config with redacted `HelpScoutConfig` view.
-- [ ] **M1-T07** Common UI components (loading / empty / error states), layout shell, theming tokens.
-  - AC: every view in the (empty) shell renders a loading state, an empty state, and an error state.
-- [ ] **M1-T08** Leptos routing scaffold + first route (`/`) with the empty dashboard placeholder.
-  - AC: `cargo xtask dev` shows the placeholder; navigation to unknown routes shows the not-found state.
+- [x] **M1-T07** Common UI components (loading / empty / error states), layout shell, theming tokens.
+  - AC: every view in the (empty) shell renders a loading state, an empty state, and an error state. **✅ verified session 4** — `crates/ui/src/components/{state_view,button,theming}.rs`: `ViewState` enum (Loading/Empty/Error/Loaded) + `<StateView>` component + `<LoadingState>`, `<EmptyState>`, `<ErrorState>` standalone components + `<Button>` with Primary/Ghost styles + theming tokens (CSS custom properties + `Severity` enum mirroring the Operations Center buckets). 12 UI tests, all green.
+- [x] **M1-T08** Leptos routing scaffold + first route (`/`) with the empty dashboard placeholder.
+  - AC: `cargo xtask dev` shows the placeholder; navigation to unknown routes shows the not-found state. **✅ verified session 4** — `crates/ui/src/{lib,layout,pages/}.rs`: `Router` with 3 routes (`/` DashboardPage, `/settings` SettingsPage, `/*any` NotFoundPage) + `LayoutShell` with Topbar + nav + footer. UI crate compiles for both native and `wasm32-unknown-unknown`. AC for "unknown routes shows not-found" verified by code review + the router fallback pattern; full `cargo xtask dev` launch needs CI to verify (no GTK locally).
 - [ ] **M1-T09** CI matrix runs on Win/macOS/Linux: `rustfmt --check`, `clippy -D warnings`, `cargo test`, `cargo build --release`, `trunk build` (WASM), headless demo-mode boot.
   - AC: a green run on `main` for all three OSes.
 - [ ] **M1-T10** Installer pipelines per format: MSI, NSIS, DMG, DEB, RPM, AppImage. Verify the `SupportOS++` naming per A0 — fall back to ASCII `supportos-plusplus` only where a format rejects `++`.

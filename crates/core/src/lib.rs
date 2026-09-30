@@ -7,11 +7,14 @@
 //! - job queue
 //! - settings store (secrets redacted on read)
 //! - the loopback HTTP listener (A2) for webhook + OAuth
-//! - the closed-vocabulary catalog (D-008)
 //! - traits for `VectorStore`, `LocalAiProvider`, `HelpScoutProvider`
 //!
+//! The closed-vocabulary catalog lives in the `supportos-plusplus-catalog`
+//! crate (WASM-safe, no I/O deps) so the UI and core can share a single
+//! source of truth.
+//!
 //! The Tauri shell (`crates/app`) calls into this crate via Tauri commands.
-//! The Leptos UI (`crates/ui`) depends on this crate for shared types only.
+//! The Leptos UI (`crates/ui`) depends on the catalog crate directly.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
@@ -22,7 +25,8 @@
     missing_docs
 )]
 
-pub mod catalog;
+pub use spp_catalog;
+
 pub mod config;
 pub mod db;
 pub mod error;
@@ -33,3 +37,9 @@ pub mod migrations;
 pub mod settings;
 
 pub use error::{Error, Result};
+
+/// Convenience re-export so callers can write `spp_core::catalog::Foo` exactly
+/// as before the catalog was extracted into its own crate.
+pub mod catalog {
+    pub use spp_catalog::*;
+}

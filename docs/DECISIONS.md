@@ -161,3 +161,30 @@
   - `first_run_done(conn)` / `mark_first_run_done(conn)` — single-row `app_state` table from migration 1.
 - Why: every caller gets type safety + a single error path. No `unwrap`/`expect` in callers; parse failures are typed `Error::Config` with the key name in the message.
 - Verification: 7 new tests covering round-trips, defaults, invalid-value errors, JSON round-trip, and the first-run flag lifecycle.
+
+## D-018 — Extract `supportos-plusplus-catalog` as a WASM-safe crate
+
+- Date: Session 4
+- Status: ADOPTED
+- Context: The UI crate (`crates/ui`) needs the catalog enums (closed vocabularies) so the UI has type-safe access. The original `crates/core` has `tokio`, `rusqlite`, `axum`, `aes-gcm`, etc. — none of which compile to `wasm32-unknown-unknown`. The UI couldn't share the same source of truth.
+- Decision: Extract `crates/catalog` as a tiny crate with only `serde` as a dependency (no I/O). It compiles to both native and WASM. The UI depends on the catalog crate directly. The core crate re-exports the catalog via `pub mod catalog { pub use spp_catalog::*; }` so existing `spp_core::catalog::*` call sites keep working.
+- Why: one source of truth per spec A12; type-safe in both UI and core; the WASM build of the UI crate now succeeds (`cargo check -p supportos-plusplus-ui --target wasm32-unknown-unknown` is green); CI can verify the WASM build on every push.
+- Verification: 15 catalog unit tests (moved from the core crate); all green. UI crate compiles for both native and WASM targets.
+
+## D-019 — `ViewState` enum + `<StateView>` component
+
+- Date: Session 4
+- Status: ADOPTED
+- Context: KNOWN PITFALLS in `docs/MASTER-SPEC.md` mandates "every view has loading, empty, and error states". The previous dashboard view had none.
+- Decision: A single `ViewState` enum with four variants — `Loading`, `Empty { message }`, `Error { message, retry }`, `Loaded` — makes wrong states impossible by construction (an error with no message is unrepresentable). The `<StateView state=... children=...>` component renders the right placeholder for the current state. A `<Button>` with Primary/Ghost styles completes the common-component set.
+- Why: one source of truth for the three states; type system enforces the spec rule; every future view inherits the pattern for free.
+- Verification: 5 unit tests for `ViewState` constructors + clone + debug-repr + retry-callback execution.
+
+## D-020 — Leptos 0.6 with stable Rust (no `nightly` feature)
+
+- Date: Session 4
+- Status: ADOPTED
+- Context: Session 1 set the Leptos dep with the `nightly` feature. Session 4 found that `server_fn_macro` (a transitive dep) requires nightly when that feature is on — the WASM CI build was impossible.
+- Decision: Use Leptos 0.6 with the `csr` feature only, on stable Rust. CSR (client-side rendering) is enough for our use case; we don't need server functions (the Tauri shell is the backend). Removed the `nightly` feature from `crates/ui/Cargo.toml`.
+- Why: aligns with the `rust-toolchain.toml` (`channel = "stable"`); unblocks WASM CI; no functional loss.
+- Verification: UI crate now compiles on stable Rust for both native and `wasm32-unknown-unknown` targets; 12 UI unit tests pass.

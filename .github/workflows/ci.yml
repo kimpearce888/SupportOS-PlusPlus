@@ -59,7 +59,7 @@ jobs:
         run: cargo test --workspace --all-targets
 
   build-wasm:
-    name: trunk build (WASM)
+    name: trunk build (WASM) + cargo check on wasm32
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -77,6 +77,8 @@ jobs:
             ~/.cargo/git
             target
           key: wasm-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+      - name: cargo check UI crate on wasm32 target
+        run: cargo check -p supportos-plusplus-ui --target wasm32-unknown-unknown
       - name: Build WASM UI
         run: |
           cd crates/ui

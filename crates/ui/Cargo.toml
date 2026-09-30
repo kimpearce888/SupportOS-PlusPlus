@@ -11,10 +11,11 @@ description = "SupportOS++ Leptos/WASM UI."
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-leptos = { version = "0.6", features = ["csr", "nightly"] }
+leptos = { version = "0.6", features = ["csr"] }
+leptos_router = { version = "0.6", features = ["csr"] }
 serde.workspace = true
 serde_json.workspace = true
-supportos-plusplus-core = { workspace = true }
+supportos-plusplus-catalog = { workspace = true }
 console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2"
 

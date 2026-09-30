@@ -8,6 +8,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/catalog",
     "crates/core",
     "crates/ui",
     "crates/xtask",
@@ -58,6 +59,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 hyper = "1"
 
 # Internal crates (paths)
+supportos-plusplus-catalog = { path = "crates/catalog" }
 supportos-plusplus-core = { path = "crates/core" }
 supportos-plusplus-ui = { path = "crates/ui" }
 
