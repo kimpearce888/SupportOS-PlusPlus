@@ -52,6 +52,7 @@ pub mod ticket_ops;
 pub mod ticket_states;
 pub mod webhook;
 pub mod webhook_handler;
+pub mod workload;
 
 pub use error::{Error, Result};
 
