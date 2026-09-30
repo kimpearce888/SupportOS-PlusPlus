@@ -29,6 +29,9 @@ pub fn LayoutShell() -> impl IntoView {
                     <A href="/notifications" class="spp-nav__link" active_class="spp-nav__link--active">
                         "Notifications"
                     </A>
+                    <A href="/automation" class="spp-nav__link" active_class="spp-nav__link--active">
+                        "Automation"
+                    </A>
                     <A href="/sync-health" class="spp-nav__link" active_class="spp-nav__link--active">
                         "Sync Health"
                     </A>

@@ -9,22 +9,22 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M4 — Team operations (Operations Center, workload + capacity, Notification Center, mentions, side threads, automation) |
-| Current task ID | M4-T11 (next up) — M4-T10 done (Automation engine + AutomationApprovals tile wired) |
-| Last completed task | M4-T10 (Automation engine — M007 + rules/trigger/action/approval queue; AutomationApprovals Operations Center tile changed from NotAvailable stub → real count of pending approvals; 41 new automation tests + 1 new operations test) |
-| Last commit hash | (about to be) M4-T10: Automation engine + AutomationApprovals tile wired |
-| Last updated | Session 28 — M4-T10 done (10 of 12 M4 tasks complete) |
+| Current task ID | M4-T12 (next up) — M4-T11 done (Automation UI page) |
+| Last completed task | M4-T11 (Automation UI page `/automation` — approval queue + rules list; 20 new tests) |
+| Last commit hash | (about to be) M4-T11: Automation UI page + nav + CSS |
+| Last updated | Session 28 — M4-T11 done (11 of 12 M4 tasks complete) |
 
 ## Next 3 tasks
 
-1. **M4-T11**: Automation UI page (`/automation`).
-2. **M4-T12**: M4 milestone close — all tasks ticked, CI green, tag `milestone-4-done`, STOP.
-3. **M5**: VectorStore and AI providers (after owner sign-off).
+1. **M4-T12**: M4 milestone close — all tasks ticked, CI green, tag `milestone-4-done`, STOP.
+2. **M5**: VectorStore and AI providers (after owner sign-off).
+3. **M6**: AI features (after M5).
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M4 tasks T11–T12).
+1. Read `AGENTS.md` → this file → `TASKS.md` (M4-T12 milestone close is the only unchecked M4 task; after that, M5 begins).
 2. `git status` + `git log --oneline -10` + `cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M4/M4-T11. Last commit: <hash>. Next: Automation UI page (/automation).`
+3. Announce `Resuming at M4/M4-T12. Last commit: <hash>. Next: M4 milestone close + tag milestone-4-done.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)

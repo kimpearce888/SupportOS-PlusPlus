@@ -43,6 +43,7 @@ fn app_view() -> impl IntoView {
                     <Route path="/" view=pages::DashboardPage />
                     <Route path="/operations" view=pages::OperationsPage />
                     <Route path="/notifications" view=pages::NotificationsPage />
+                    <Route path="/automation" view=pages::AutomationPage />
                     <Route path="/inbox" view=pages::InboxPage />
                     <Route path="/settings" view=pages::SettingsPage />
                     <Route path="/sync-health" view=pages::SyncHealthPage />

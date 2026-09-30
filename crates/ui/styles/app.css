@@ -975,4 +975,200 @@ body {
   }
 }
 
+/* ─── Automation page (M4-T11) ─────────────────────────────────────────── */
+.spp-page--automation {
+  padding: var(--spp-space-6);
+}
+
+.spp-automation-approvals,
+.spp-automation-rules {
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-lg);
+  padding: var(--spp-space-4) var(--spp-space-6) var(--spp-space-6);
+  margin-bottom: var(--spp-space-5);
+}
+
+.spp-automation-approvals__title,
+.spp-automation-rules__title {
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+  color: var(--spp-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 0 0 var(--spp-space-4);
+}
+
+/* Approval queue — vertical list of approval rows */
+.spp-automation-queue {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-3);
+}
+
+.spp-approval-row {
+  background: var(--spp-bg);
+  border: 1px solid var(--spp-border);
+  border-left: 3px solid var(--spp-warning);
+  border-radius: var(--spp-radius-md);
+  padding: var(--spp-space-3) var(--spp-space-4);
+}
+
+.spp-approval-row__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spp-space-3);
+  margin-bottom: var(--spp-space-2);
+}
+
+.spp-approval-row__action {
+  font-size: var(--spp-text-base);
+  color: var(--spp-fg);
+  font-weight: 500;
+  flex: 1;
+}
+
+.spp-approval-row__conv {
+  font-size: var(--spp-text-sm);
+  color: var(--spp-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.spp-approval-row__time {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.spp-approval-row__actions {
+  display: flex;
+  gap: var(--spp-space-2);
+  justify-content: flex-end;
+}
+
+.spp-approval-row__approve {
+  font-size: var(--spp-text-sm);
+  color: var(--spp-bg);
+  background: var(--spp-success);
+  border: 1px solid var(--spp-success);
+  border-radius: var(--spp-radius-sm);
+  padding: var(--spp-space-1) var(--spp-space-3);
+  cursor: pointer;
+}
+
+.spp-approval-row__approve:hover {
+  opacity: 0.9;
+}
+
+.spp-approval-row__reject {
+  font-size: var(--spp-text-sm);
+  color: var(--spp-critical);
+  background: transparent;
+  border: 1px solid var(--spp-critical);
+  border-radius: var(--spp-radius-sm);
+  padding: var(--spp-space-1) var(--spp-space-3);
+  cursor: pointer;
+}
+
+.spp-approval-row__reject:hover {
+  background: var(--spp-critical);
+  color: var(--spp-bg);
+}
+
+/* Rules list — vertical list of rule cards */
+.spp-rules-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-3);
+}
+
+.spp-rule-card {
+  background: var(--spp-bg);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-md);
+  padding: var(--spp-space-4);
+}
+
+.spp-rule-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spp-space-3);
+  margin-bottom: var(--spp-space-3);
+}
+
+.spp-rule-card__name {
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+  color: var(--spp-fg);
+}
+
+.spp-rule-card__toggle {
+  font-size: var(--spp-text-sm);
+  font-weight: 500;
+  padding: var(--spp-space-1) var(--spp-space-3);
+  border-radius: var(--spp-radius-full);
+  cursor: pointer;
+  border: 1px solid var(--spp-border);
+  background: var(--spp-border-subtle);
+  color: var(--spp-fg-muted);
+  min-width: 80px;
+}
+
+.spp-rule-card__toggle[aria-checked="true"] {
+  background: var(--spp-success);
+  color: var(--spp-bg);
+  border-color: var(--spp-success);
+}
+
+.spp-rule-card__toggle:hover {
+  opacity: 0.9;
+}
+
+.spp-rule-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-2);
+}
+
+.spp-rule-card__row {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+  font-size: var(--spp-text-sm);
+}
+
+.spp-rule-card__label {
+  color: var(--spp-fg-muted);
+  font-weight: 500;
+  min-width: 80px;
+}
+
+.spp-rule-card__value {
+  color: var(--spp-fg);
+}
+
+.spp-rule-card__badge {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-warning);
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-warning);
+  border-radius: var(--spp-radius-full);
+  padding: 2px var(--spp-space-2);
+  margin-left: var(--spp-space-2);
+}
+
+@media (max-width: 600px) {
+  .spp-approval-row__header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .spp-rule-card__header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+
 
