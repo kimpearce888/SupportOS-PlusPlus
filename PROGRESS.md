@@ -11,8 +11,8 @@
 | Current milestone | M1 — Foundation |
 | Current task ID | M1-T01 |
 | Last completed task | Session-1 setup (repo, master spec, discovery, state files, workspace skeleton) |
-| Last commit hash | _(set after first push — see `git log`)_ |
-| Last updated | Session 1 |
+| Last commit hash | `d181718` (d181718d79ea55892dab2319743671c93dc8b13b) — Session 1 foundation pushed to `main` |
+| Last updated | Session 1 — pushed |
 
 ## Next 3 tasks
 
