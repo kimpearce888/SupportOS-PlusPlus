@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M6 — AI features (CLOSED — pending owner sign-off to proceed to M7) |
-| Current task ID | (none — M6 milestone complete; awaiting owner "continue" to start M7) |
+| Current milestone | M7 — Intelligence (client interaction intelligence, Issue Radar, known issues and clusters, incidents and impact, SLA, knowledge, Docs, freshness and gaps) |
+| Current task ID | M7-T01 (next up) — M6 closed (tag `milestone-6-done`), M7 task list written |
 | Last completed task | M6-T11 (M6 milestone close — all 11 tasks ticked, tag `milestone-6-done` pushed) |
-| Last commit hash | (about to be) M6-T11: M6 milestone close — tag milestone-6-done |
-| Last updated | Session 30 — M6 closed (11 of 11 tasks done; 726 tests passing) |
+| Last commit hash | `c0d4d1e` — M6-T05 through M6-T11: Verified drafts + coaching + memory + translation + QA + suggestions + M6 milestone close |
+| Last updated | Session 31 — M7 started (owner said "continue") |
 
 ## Next 3 tasks
 
-1. **Owner sign-off**: confirm M6 milestone is acceptable; say "continue" to proceed to M7.
-2. **M7 — Intelligence**: write the M7 task list, then start M7-T01.
-3. **(After M7)**: M8 — Reports and quality.
+1. **M7-T01**: Client interaction intelligence — deterministic signals + recency weighting.
+2. **M7-T02**: Known issues — CRUD + status + links.
+3. **M7-T03**: Issue clusters — vector similarity + lexical overlap; wires Operations Center tiles.
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (M7 task list will be written at the start of the next session, per spec: "Write the full task list for a milestone before starting it").
+1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M7 tasks T01–T08).
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M7/M7-T01. Last commit: <hash>. Next: M7 task list + Intelligence.`
+3. Announce `Resuming at M7/M7-T01. Last commit: <hash>. Next: Client interaction intelligence.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)

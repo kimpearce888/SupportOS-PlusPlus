@@ -248,7 +248,59 @@
   - AC: `SuggestionEngine::generate(provider, model, conversation) -> Vec<Suggestion>`. Per spec: AI is advisory. Tests cover suggestion construction, provider-unavailable → empty, bounds (max 5). **✅ verified session 30** — `crates/core/src/ai_features.rs`: Suggestion struct. parse_suggestions pure function (valid JSON + malformed → empty + capped at MAX_SUGGESTIONS=5).
 - [x] **M6-T11** M6 milestone close: all tasks ticked, CI green, tag `milestone-6-done`, STOP.
   - AC: tag pushed; all M6 tasks ticked; `docs/PARITY-MATRIX.md` updated with M6 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts (not a completion claim). **✅ verified session 30** — All 10 M6 implementation tasks (T01–T10) done + committed. Tag `milestone-6-done` pushed after this commit. 726 tests passing (20 catalog + 616 core + 64 ui + 18 xtask + 8 audit). **STOP — waiting for owner to say 'continue' to proceed to M7.**
-- M7 Intelligence
+
+## Milestone 7 — Intelligence
+
+> Per spec M7: "Intelligence: client interaction intelligence, Issue Radar, known
+> issues and clusters, incidents and impact, SLA, knowledge, Docs, freshness
+> and gaps."
+>
+> Per the reference notes:
+> - Interaction engine: per-customer signals (response style, question count,
+>   technical familiarity, frustration cues, escalation intent). Deterministic
+>   by default (zero AI).
+> - Evidence: every AI-derived attribute carries evidence excerpt + thread ref.
+>   Preference requires ≥3 observations. Recency half-life: 90 days. Change
+>   significance threshold: 0.34.
+> - Issue Radar / known issues / clusters:
+>   - Known issue: a customer-facing problem with a name, status, and links.
+>   - Issue cluster: a cluster of similar conversations (vector similarity +
+>     lexical overlap).
+>   - Issue spike: cluster with abnormal recent growth → surfaces in Notification
+>     Center (already wired in M4-T04).
+>   - Incident: a known issue promoted to incident status (5 statuses, 4
+>     severities, 3 sources — catalog already in place since session 4).
+>
+> Catalog foundations already in place:
+> - `IncidentStatus` × 5, `IncidentSeverity` × 4, `IncidentSource` × 3
+>   (in `crates/catalog/src/workspace.rs`).
+> - `GraphNodeKind` × 12 (includes KnownIssue, IssueCluster, Incident — M8 graph).
+> - `AiAttributeKey` × 14 (includes KnownIssue, IssueCluster — M6-T03).
+> - Operations Center tiles: `sla_at_risk`, `sla_breached`, `repeated_issue`,
+>   `known_issue`, `issue_spike` are currently stubbed `NotAvailable { milestone: 7 }`
+>   (from M4-T01). M7 wires them to real counts.
+>
+> The VectorStore (M5-T01), embeddings pipeline (M5-T07), and hybrid search
+> (M5-T08) are all available for issue clustering.
+>
+> Task IDs follow `M7-T##`. Each is sized 30–90 min.
+
+- [ ] **M7-T01** Client interaction intelligence — deterministic signals + recency.
+  - AC: M014 migration creates `interaction_signals` table (customer_id, signal_key TEXT, signal_value TEXT, observed_at, source_conversation_id). `InteractionEngine` that derives per-customer signals from conversation messages: response_style, question_count, technical_familiarity, frustration_cues, escalation_intent. Deterministic by default (zero AI — observable from message metadata). Per the reference notes: recency weighting half-life = 90 days (`INTERACTION_RECENCY_HALF_LIFE_DAYS`); preference requires ≥3 observations; change significance threshold = 0.34. Tests cover signal derivation, recency weighting, observation count, change detection.
+- [ ] **M7-T02** Known issues — CRUD + status + links.
+  - AC: M015 migration creates `known_issues` table (id, name, status TEXT, description, created_at, updated_at) + `known_issue_links` (id, known_issue_id, conversation_id, link_type). `KnownIssue` struct. `create_known_issue`, `update_status`, `add_link`, `list_known_issues`, `get_known_issue`. Per the reference notes: "a customer-facing problem with a name, status, and links." Status is a closed vocabulary (e.g., 'active', 'investigating', 'resolved'). Tests cover CRUD, link management, status transitions, list filtering.
+- [ ] **M7-T03** Issue clusters — vector similarity + lexical overlap; wires Operations Center tiles.
+  - AC: M016 migration creates `issue_clusters` table (id, name, conversation_count, first_seen_at, last_seen_at, status) + `issue_cluster_members` (cluster_id, conversation_id). `cluster_conversations(vectorstore, conn, threshold)` groups conversations by vector similarity (M5-T01 search_dense) + lexical overlap (M3-T06 FTS5). Per the reference notes: "a cluster of similar conversations (vector similarity + lexical overlap)." Wires the `repeated_issue`, `known_issue`, and `issue_spike` Operations Center tiles (currently stubbed from M4-T01) to real counts. Tests cover clustering, tile wiring, empty dataset, threshold sensitivity.
+- [ ] **M7-T04** Issue Radar — aggregate view of active issues + spikes.
+  - AC: `IssueRadar` module: `get_radar_snapshot(conn) -> RadarSnapshot` that aggregates active known issues + issue clusters + issue spikes. An issue spike is a cluster with abnormal recent growth (compared to its historical baseline). Per the reference notes: "cluster with abnormal recent growth — surfaces in Notification Center." The `IssueSpike` Operations Center tile (M4-T01 stub) is wired here to count spikes. Tests cover snapshot, spike detection, empty dataset.
+- [ ] **M7-T05** Incidents — promote known issue to incident.
+  - AC: M017 migration creates `incidents` table (id, known_issue_id, status TEXT, severity TEXT, source TEXT, description, created_at, updated_at, resolved_at). `Incident` struct. `promote_to_incident(conn, known_issue_id, severity, source)`, `update_incident_status(conn, id, status)`, `list_incidents(conn, filter)`. The `IncidentStatus` × 5, `IncidentSeverity` × 4, `IncidentSource` × 3 enums from the catalog drive validation (single source of truth). Per the reference notes: "a known issue that has been promoted to incident status." Tests cover promotion, status transitions, severity/source validation, list filtering.
+- [ ] **M7-T06** SLA — risk detection + breach tracking; wires SlaAtRisk + SlaBreached tiles.
+  - AC: M018 migration creates `sla_configs` table (mailbox_id, first_response_hours, resolution_hours) + `sla_breaches` (conversation_id, breach_type TEXT, breached_at). `check_sla(conn, conversation_id) -> SlaStatus` that checks first-response time + resolution time against the configured SLA. The `SlaAtRisk` + `SlaBreached` Operations Center tiles (M4-T01 stubs) are wired here to count at-risk + breached conversations. Per the reference notes: SLA is a local SupportOS++ concept layered over Help Scout data. Tests cover SLA check (at-risk vs breached vs ok), config per mailbox, tile wiring.
+- [ ] **M7-T07** Knowledge docs — freshness tracking + gaps.
+  - AC: M019 migration creates `knowledge_doc_freshness` table (doc_id, last_synced_at, content_hash, stale_at) + `knowledge_gaps` (id, query_text, hit_count, last_seen_at). `check_freshness(conn) -> Vec<FreshnessStatus>` identifies docs that haven't been synced recently or whose content hash changed. `record_gap(conn, query_text)` records when a search returns no results (knowledge gap). Per the reference notes: `knowledge/` module handles "Knowledge docs mirror + freshness + gaps." Tests cover freshness check, gap recording, stale detection.
+- [ ] **M7-T08** M7 milestone close: all tasks ticked, CI green, tag `milestone-7-done`, STOP.
+  - AC: tag pushed; all M7 tasks ticked; `docs/PARITY-MATRIX.md` updated with M7 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts. Wires 5 more Operations Center tiles (sla_at_risk, sla_breached, repeated_issue, known_issue, issue_spike) — total 14 of 16 tiles real; 2 remaining (ai_escalation=M6 already done, campaign_activity=M9). **STOP — waiting for owner to say 'continue' to proceed to M8.**
 - M8 Reports and quality
 - M9 Outreach
 - M10 Data tools
