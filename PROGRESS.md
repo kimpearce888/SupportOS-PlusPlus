@@ -9,15 +9,15 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M5 — VectorStore and AI providers (VectorStore abstraction + Qdrant Edge adapter, LocalAIProvider, embeddings, hybrid search, vector backup/migration/recovery) |
-| Current task ID | M5-T04 (next up) — M5-T03 done (LocalAIProvider trait + Fake/Noop providers) |
-| Last completed task | M5-T03 (LocalAIProvider async trait + FakeAiProvider + NoopAiProvider — 4 methods, 25 new tests) |
-| Last commit hash | (about to be) M5-T03: LocalAIProvider trait + Fake provider |
-| Last updated | Session 29 — M5-T03 done (2 of 11 M5 tasks done; 1 BLOCKED) |
+| Current task ID | M5-T05 (next up) — M5-T04 done (LM Studio adapter) |
+| Last completed task | M5-T04 (LM Studio adapter — OpenAiCompatibleClient + LmStudioProvider; pure request/response logic separated from HTTP I/O; 22 new tests) |
+| Last commit hash | (about to be) M5-T04: LM Studio adapter (OpenAI-compatible HTTP) |
+| Last updated | Session 29 — M5-T04 done (3 of 11 M5 tasks done; 1 BLOCKED) |
 
 ## Next 3 tasks
 
-1. **M5-T04**: LM Studio adapter (OpenAI-compatible HTTP at 127.0.0.1:1234/v1).
-2. **M5-T05**: Ollama adapter (native API at 127.0.0.1:11434).
+1. **M5-T05**: Ollama adapter (native API at 127.0.0.1:11434).
+2. **M5-T06**: Generic OpenAI-compatible adapter (user-configured endpoint; reuses OpenAiCompatibleClient from M5-T04).
 3. **M5-T07**: Embeddings pipeline — content-hash-gated re-embedding + retry cap.
 
 ## Resume protocol for next session

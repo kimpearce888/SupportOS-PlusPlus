@@ -62,6 +62,9 @@ hyper = "1"
 # look-around support which we need for the negative-lookbehind in mentions)
 regex = "1"
 
+# HTTP client (for LocalAIProvider adapters — LM Studio, Ollama, Generic)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Internal crates (paths)
 supportos-plusplus-catalog = { path = "crates/catalog" }
 supportos-plusplus-core = { path = "crates/core" }
