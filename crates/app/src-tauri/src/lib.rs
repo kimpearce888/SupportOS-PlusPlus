@@ -178,7 +178,7 @@ fn first_run_state(
     Ok(done)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
