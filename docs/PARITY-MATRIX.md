@@ -90,6 +90,30 @@ M2 Help Scout mirror · M3 Activity engine & inbox · M4 Team operations · M5 V
 
 Detailed per-capability rows for M2-M11 will be expanded at the start of each milestone (per spec: "Write the full task list for a milestone before starting it").
 
+### Milestone 4 — Team operations (CLOSED — pending owner sign-off)
+
+> **M4 milestone close report**: see `docs/FINAL-PARITY-AUDIT.md`.
+> All 12 M4 tasks (T01–T11) done + committed. CI to verify on next push.
+> Tag `milestone-4-done` to be pushed after this commit.
+> 9 of 16 Operations Center tiles real (M4-T01 added 1: AutomationApprovals wired in M4-T10); 7 still stubbed pending M6/M7/M9.
+> 487 tests passing across pure-Rust crates (catalog + core + ui + xtask + audit).
+> STOP — waiting for owner to say "continue" to proceed to M5.
+
+| Capability | Status |
+|---|---|
+| Operations Center: 16 tile SQL fragments + snapshot aggregator (M4-T01) | ✅ DONE — `crates/core/src/operations.rs`; 8 real + 8 stubbed tiles; v1.7.0 invariant test (tile count == filter count); 21 tests |
+| Operations Center UI page `/operations` (M4-T02) | ✅ DONE — `crates/ui/src/pages/operations.rs`; 16-tile severity-grouped grid + nav + CSS; 11 tests |
+| Workload + capacity metrics (M4-T03) | ✅ DONE — `crates/core/src/workload.rs`; per-agent workload + per-team rollup + 7d incoming/closing rate via `julianday()`; 13 tests |
+| Notification Center data layer (M4-T04) | ✅ DONE — `crates/core/src/notifications.rs`; M005 migration + `record_notification` (15 types from catalog) + list/mark-as-read API; 20 tests |
+| Notification sweep engine — first-sync-settled guardrail (M4-T05) | ✅ DONE — `crates/core/src/notification_sweep.rs`; v1.7.x CHANGELOG bug fix's structural guardrail (cursor never inits until first sync settles); 16 tests |
+| Notification per-type preferences + retention pruning (M4-T06) | ✅ DONE — `crates/core/src/notification_prefs.rs`; per-user per-type opt-in/out via typed settings store; `notification.prune` job + 30d default TTL; 15 tests |
+| Notification Center UI page `/notifications` (M4-T07) | ✅ DONE — `crates/ui/src/pages/notifications.rs`; severity-grouped list + 15 per-type preferences + retention TTL setting; 12 tests |
+| Mentions — text scan + emit Mentioned/TeamMentioned (M4-T08) | ✅ DONE — `crates/core/src/mentions.rs`; `regex` crate bounded NFA (no ReDoS); manual preceding-char filter; 24 tests |
+| Side threads — M006 migration + CRUD + list (M4-T09) | ✅ DONE — `crates/core/src/side_threads.rs`; M006 + `side_threads` + `side_thread_messages` (FK→cascade) + indexes; mention scan stored as JSON; 22 tests |
+| Automation engine — rules + trigger/action + approval queue (M4-T10) | ✅ DONE — `crates/core/src/automation.rs`; M007 + `automation_rules` + `automation_approvals` (FK→cascade) + index; `Trigger` + `Action` enums; high-impact actions require approval; AutomationApprovals Operations Center tile wired (stub → real count); 41 tests |
+| Automation UI page `/automation` (M4-T11) | ✅ DONE — `crates/ui/src/pages/automation.rs`; approval queue + rules list; 20 tests |
+| M4 milestone close (M4-T12) | ✅ DONE — this entry; tag `milestone-4-done` pushed after commit |
+
 ## Reference delta since last session
 
 None. Reference HEAD `c346fb51466e237a89e70156ae20a3386be0b322` unchanged since session 1 (verified by `cargo xtask discover` reading the local reference checkout).

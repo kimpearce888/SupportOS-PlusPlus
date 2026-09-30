@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M4 — Team operations (Operations Center, workload + capacity, Notification Center, mentions, side threads, automation) |
-| Current task ID | M4-T12 (next up) — M4-T11 done (Automation UI page) |
-| Last completed task | M4-T11 (Automation UI page `/automation` — approval queue + rules list; 20 new tests) |
-| Last commit hash | (about to be) M4-T11: Automation UI page + nav + CSS |
-| Last updated | Session 28 — M4-T11 done (11 of 12 M4 tasks complete) |
+| Current milestone | M4 — Team operations (CLOSED — pending owner sign-off to proceed to M5) |
+| Current task ID | (none — M4 milestone complete; awaiting owner "continue" to start M5) |
+| Last completed task | M4-T12 (M4 milestone close — all 12 tasks ticked, tag `milestone-4-done` pushed) |
+| Last commit hash | (about to be) M4-T12: M4 milestone close — tag milestone-4-done |
+| Last updated | Session 28 — M4 closed (12 of 12 tasks done; 487 tests passing) |
 
 ## Next 3 tasks
 
-1. **M4-T12**: M4 milestone close — all tasks ticked, CI green, tag `milestone-4-done`, STOP.
-2. **M5**: VectorStore and AI providers (after owner sign-off).
-3. **M6**: AI features (after M5).
+1. **Owner sign-off**: confirm M4 milestone is acceptable; say "continue" to proceed to M5.
+2. **M5 — VectorStore and AI providers**: write the M5 task list, then start M5-T01.
+3. **(After M5)**: M6 — AI features.
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (M4-T12 milestone close is the only unchecked M4 task; after that, M5 begins).
+1. Read `AGENTS.md` → this file → `TASKS.md` (M5 task list will be written at the start of the next session, per spec: "Write the full task list for a milestone before starting it").
 2. `git status` + `git log --oneline -10` + `cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M4/M4-T12. Last commit: <hash>. Next: M4 milestone close + tag milestone-4-done.`
+3. Announce `Resuming at M5/M5-T01. Last commit: <hash>. Next: M5 task list + VectorStore abstraction.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)

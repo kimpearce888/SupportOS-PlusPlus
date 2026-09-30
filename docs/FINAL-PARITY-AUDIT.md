@@ -85,3 +85,60 @@ The M2 task list will be written at the start of the next session (per spec: "Wr
 Per spec CHECKPOINT RULES: "At the end of each milestone: all its tasks ticked, CI green on all OSes, tag milestone-N-done, then STOP. Report parity counts by status, deviations awaiting my approval, BLOCKED items, and what the next session covers. Wait for me to say 'continue'."
 
 **Waiting for owner to say "continue" to proceed to M2.**
+
+---
+
+## Milestone 4 — Team operations
+
+> Per spec amendment A3: "an honest report, not a completion claim."
+
+**Status: M4 CLOSED (pending owner sign-off to proceed to M5).**
+
+### What's done
+
+All 11 of the M4 implementation tasks (T01–T11) are done + committed. The 12th task (T12) is this milestone close.
+
+- **Operations Center**: 16 tile SQL fragments + snapshot aggregator (M4-T01). 9 tiles are real (8 from M3 deps + `AutomationApprovals` wired in M4-T10). 7 tiles are stubbed `TileCount::NotAvailable { milestone }` pending their data sources shipping in M6 (`ai_escalation`), M7 (`sla_at_risk`, `sla_breached`, `repeated_issue`, `known_issue`, `issue_spike`), and M9 (`campaign_activity`).
+- **Operations Center UI page** `/operations` (M4-T02): 16-tile severity-grouped grid with "Not yet available" badges on stubbed tiles.
+- **Workload + capacity metrics** (M4-T03): per-agent assigned/active/resolved-today counts; per-team rollup; 7-day rolling incoming-vs-closing rate computed via `julianday()` per KNOWN PITFALLS.
+- **Notification Center data layer** (M4-T04): M005 migration + `record_notification` (15 types from the catalog) + list/mark-as-read API. Catalog-driven type validation by construction.
+- **Notification sweep engine** (M4-T05): the v1.7.x CHANGELOG bug fix's structural guardrail — the cursor never initializes until the first sync settles, so historical events don't trigger notification spam. Once initialized, only NEW events trigger notifications.
+- **Per-type preferences + retention pruning** (M4-T06): per-user, per-type opt-in/out via the typed settings store; `notification.prune` job; 30-day default TTL (clamps to 1 day minimum).
+- **Notification Center UI page** `/notifications` (M4-T07): severity-grouped list + 15 per-type preference toggles + retention TTL input.
+- **Mentions** (M4-T08): `scan_for_mentions` using the `regex` crate's bounded NFA (no backtracking, no ReDoS surface). Manual preceding-char filter for email-style `@` exclusion (the regex crate doesn't support look-behind). `emit_mention_notifications` resolves user mentions via `users.mention` + team mentions via `teams.name`; self-mentions suppressed; unresolved mentions are fail-safe.
+- **Side threads** (M4-T09): M006 migration + `side_threads` + `side_thread_messages` (FK→cascade) + indexes. `add_side_thread_message` scans the body via M4-T08's mention scanner and stores parsed mentions as JSON in `mentions_json` for replay-without-rescan. Side threads are agent-only — never shown to customers.
+- **Automation engine** (M4-T10): M007 migration + `automation_rules` + `automation_approvals` (FK→cascade) + index. `Trigger` enum (StatusChanged/TagAdded/SlaRisk) + `Action` enum (Assign/AddTag/SendNote/ChangeStatus/SetPriority). High-impact actions (Assign, ChangeStatus, SetPriority(urgent)) require approval; low-impact actions execute directly. **Wired the `AutomationApprovals` Operations Center tile (M4-T01 stub → real count of pending approvals)**.
+- **Automation UI page** `/automation` (M4-T11): approval queue with approve/reject buttons + rules list with enabled toggles.
+
+### Test count
+
+487 tests passing across pure-Rust crates (catalog: 15, core: 382, ui: 64, xtask: 18, audit: 8). Up from 257 at the start of M4 — 230 new tests added across the 11 tasks. The Tauri shell crate is not built locally (no GTK/WebKit2GTK system libs in the dev sandbox — same as M1/M2/M3); CI verifies the full workspace including the Tauri release build on Win/macOS/Linux.
+
+### Honest status (not a completion claim)
+
+- **Tauri shell not yet linked to the new M4 modules.** The Operations Center UI, Notification Center UI, and Automation UI pages render with local signals (empty data) so they're testable without the IPC layer. The actual `operations_snapshot`, `notifications_list_unread`, `automation_list_rules`, etc. Tauri IPC commands are deferred to a future wiring task. The Rust core is fully functional — the Tauri shell just doesn't call into it yet.
+- **Per-agent workload `team_workload` requires the caller to resolve team membership** — the `teams` SQLite table doesn't persist membership (it comes from Help Scout sync as `HsTeam.member_user_ids`). The function takes `member_remote_ids: &[i64]` as a parameter; the caller resolves team → members via `HelpScoutProvider::list_teams`.
+- **Team mentions emit a broadcast notification** (target_user_id = NULL tagged with `team_remote_id` in the payload). The Tauri shell wiring in a future task will fan it out to actual members once team membership is loaded.
+- **Automation actions don't yet call `ticket_ops::execute()`** — the Tauri shell wiring is responsible for executing the proposed action after approval. The core `automation.rs` records the decision; the action execution is separate (separation of concerns).
+- **9 of 16 Operations Center tiles are real.** The 7 stubbed tiles will become real when their dependencies ship in M6 (AI escalation), M7 (SLA, known issues, issue spike), and M9 (campaign activity).
+- **The M4 work is at IMPLEMENTED + TESTED status**, not VERIFIED — VERIFIED requires a packaged app + black-box audit, which is part of M11 (Conformance and hardening).
+
+### BLOCKED items
+
+None new for M4. The M1 BLOCKED items (T10 installer signing, T11 Qdrant arm64 spike) remain — they're tracked in M1's section of this file.
+
+### What the next session covers (M5 — VectorStore and AI providers)
+
+Per spec M5: "VectorStore abstraction and Qdrant Edge adapter (full contract), LocalAIProvider (LM Studio, Ollama, generic), embeddings, hybrid search, vector backup, migration and recovery."
+
+The M5 task list will be written at the start of the next session (per spec: "Write the full task list for a milestone before starting it"). Key M5 work:
+- VectorStore trait + Qdrant Edge adapter (M1-T11 BLOCKED on arm64 — M5 may proceed x64-only if owner approves)
+- LocalAIProvider trait (LM Studio, Ollama, generic HTTP)
+- Embeddings model + hybrid search (dense + sparse + filters)
+- Vector backup + migration + recovery (per spec A6)
+
+### STOP (M4)
+
+Per spec CHECKPOINT RULES: "At the end of each milestone: all its tasks ticked, CI green on all OSes, tag milestone-N-done, then STOP. Report parity counts by status, deviations awaiting my approval, BLOCKED items, and what the next session covers. Wait for me to say 'continue'."
+
+**Waiting for owner to say "continue" to proceed to M5.**
