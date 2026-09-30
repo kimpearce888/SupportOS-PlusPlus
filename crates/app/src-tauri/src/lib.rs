@@ -166,7 +166,10 @@ mod tests {
     fn first_run_state_accepts_demo_mode_true() {
         let r = first_run_state(Some(true));
         assert!(r.is_ok(), "first_run_state(Some(true)) must succeed");
-        assert!(r.unwrap(), "after setting demo_mode, first_run_done must be true");
+        assert!(
+            r.unwrap(),
+            "after setting demo_mode, first_run_done must be true"
+        );
     }
 
     #[test]

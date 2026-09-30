@@ -28,6 +28,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 # This feature is set by tauri-build when building a real Tauri app.
 custom-protocol = ["tauri/custom-protocol"]
