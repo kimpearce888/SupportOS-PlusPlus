@@ -9,16 +9,23 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M4 — Team operations (Operations Center, workload + capacity, Notification Center, mentions, side threads, automation) |
-| Current task ID | M4-T06 (next up) — M4-T05 done (Notification sweep engine + first-sync-settled guardrail) |
-| Last completed task | M4-T05 (Notification sweep engine — v1.7.x CHANGELOG bug fix's structural guardrail; cursor never inits until first sync settles; historical events never trigger notifications) |
-| Last commit hash | (about to be) M4-T05: Notification sweep engine + first-sync-settled guardrail |
-| Last updated | Session 27 — M4-T05 done |
+| Current task ID | M4-T07 (next up) — M4-T06 done (Notification per-type preferences + retention pruning) |
+| Last completed task | M4-T06 (Per-user per-type preferences via typed settings store; retention pruning via `notification.prune` job; 30d default TTL; julianday comparison) |
+| Last commit hash | (about to be) M4-T06: Notification preferences + retention pruning |
+| Last updated | Session 27 — M4-T06 done (6 of 12 M4 tasks complete) |
 
 ## Next 3 tasks
 
-1. **M4-T06**: Notification per-type preferences + retention pruning.
-2. **M4-T07**: Notification Center UI page (`/notifications`).
-3. **M4-T08**: Mentions — text scan + emit Mentioned/TeamMentioned notification.
+1. **M4-T07**: Notification Center UI page (`/notifications`).
+2. **M4-T08**: Mentions — text scan + emit Mentioned/TeamMentioned notification.
+3. **M4-T09**: Side threads — M006 migration + CRUD + list.
+
+## Resume protocol for next session
+
+1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M4 tasks T07–T12).
+2. `git status` + `git log --oneline -10` + `cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
+3. Announce `Resuming at M4/M4-T07. Last commit: <hash>. Next: Notification Center UI page.`
+4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)
 
