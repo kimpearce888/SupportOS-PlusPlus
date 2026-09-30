@@ -35,6 +35,7 @@ pub mod automation;
 pub mod config;
 pub mod db;
 pub mod demo;
+pub mod embeddings;
 pub mod error;
 pub mod events;
 pub mod helpscout;

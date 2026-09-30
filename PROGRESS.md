@@ -9,16 +9,16 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M5 — VectorStore and AI providers (VectorStore abstraction + Qdrant Edge adapter, LocalAIProvider, embeddings, hybrid search, vector backup/migration/recovery) |
-| Current task ID | M5-T07 (next up) — M5-T05+T06 done (Ollama + Generic adapters) |
-| Last completed task | M5-T06 (Generic OpenAI-compatible adapter — reuses OpenAiCompatibleClient from M5-T04; M5-T05 Ollama native API adapter in the same commit) |
-| Last commit hash | (about to be) M5-T05+T06: Ollama + Generic AI provider adapters |
-| Last updated | Session 29 — M5-T05+T06 done (5 of 11 M5 tasks done; 1 BLOCKED) |
+| Current task ID | M5-T08 (next up) — M5-T07 done (Embeddings pipeline) |
+| Last completed task | M5-T07 (Embeddings pipeline — M008 ai_runs cache + content-hash-gated re-embedding + retry cap; 17 new tests) |
+| Last commit hash | (about to be) M5-T07: Embeddings pipeline |
+| Last updated | Session 29 — M5-T07 done (6 of 11 M5 tasks done; 1 BLOCKED) |
 
 ## Next 3 tasks
 
-1. **M5-T07**: Embeddings pipeline — content-hash-gated re-embedding + retry cap; ai_runs cache table (M008 migration).
-2. **M5-T08**: Hybrid search — dense (vector) + sparse (FTS5 from M3-T06) + filters; merge + rank.
-3. **M5-T09**: Vector backup + migration + recovery — .sosync format (AES-256-GCM, scrypt per A6).
+1. **M5-T08**: Hybrid search — dense (vector) + sparse (FTS5 from M3-T06) + filters; merge + rank (RRF).
+2. **M5-T09**: Vector backup + migration + recovery — .sosync format (AES-256-GCM, scrypt per A6).
+3. **M5-T10**: VectorStore contract tests (spec section 92) — In-memory locally; Qdrant in CI.
 
 ## Resume protocol for next session
 
