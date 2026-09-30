@@ -1,0 +1,75 @@
+# SupportOS++ — Cargo workspace
+
+# The workspace members are split so that:
+#   - `crates/core` has no UI and no Tauri deps; it's the pure-Rust business core (DB, sync, AI, VectorStore).
+#   - `crates/ui` is the Leptos/WASM frontend; it depends on `core` types only.
+#   - `crates/app` is the Tauri 2 shell; it depends on `core` for the backend and serves the WASM bundle.
+#   - `crates/xtask` is the developer entry point (dev/test/lint/package/discover/audit).
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/ui",
+    "crates/xtask",
+    "crates/app/src-tauri",
+]
+# `crates/app/src-tauri` is a workspace member so `cargo check --workspace` builds it too.
+# It declares a `[[bin]] name = "supportos-plusplus"` so the desktop binary is just `cargo build -p supportos-plusplus-app`.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["kimpearce888"]
+repository = "https://github.com/kimpearce888/SupportOS-PlusPlus"
+homepage = "https://github.com/kimpearce888/SupportOS-PlusPlus"
+
+[workspace.dependencies]
+# Error + logging
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1.0"
+
+# Serde
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "blob", "limits"] }
+
+# Crypto (for backup/restore, A6)
+aes-gcm = "0.10"
+scrypt = "0.11"
+rand = "0.8"
+subtle = "2.5"
+
+# HTTP (loopback listener only, D-002)
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "tower-log", "macros"] }
+tower = { version = "0.5", features = ["limit", "timeout"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = "1"
+
+# Internal crates (paths)
+supportos-plusplus-core = { path = "crates/core" }
+supportos-plusplus-ui = { path = "crates/ui" }
+
+# Profile: optimize for fast startup + small binary in release.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+# Faster dev builds.
+[profile.dev]
+opt-level = 0
+debug = 1

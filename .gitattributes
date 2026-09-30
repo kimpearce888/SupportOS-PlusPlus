@@ -1,0 +1,15 @@
+# Auto-detect text files and normalize line endings.
+* text=auto eol=lf
+
+# Binary files — never diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.mp4 binary
+*.sosync binary
+
+# Generated files — hide in diffs
+Cargo.lock -diff

@@ -1,0 +1,32 @@
+# Build artifacts
+/target
+/dist
+/crates/ui/dist
+
+# Tauri
+/crates/app/src-tauri/target
+/crates/app/src-tauri/gen
+
+# Data + secrets (never commit)
+/data
+*.sosync
+*.supportos
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Reference repo checkout (NEVER inside this repo, but just in case)
+/reference
+/supportos
+
+# Crash dumps
+*.dmp

@@ -1,0 +1,33 @@
+[package]
+name = "supportos-plusplus-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SupportOS++ — Tauri 2 desktop shell."
+
+[lib]
+name = "supportos_plusplus_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "supportos-plusplus"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+supportos-plusplus-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+# This feature is set by tauri-build when building a real Tauri app.
+custom-protocol = ["tauri/custom-protocol"]
