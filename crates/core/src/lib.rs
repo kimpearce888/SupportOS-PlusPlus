@@ -46,6 +46,7 @@ pub mod events;
 pub mod helpscout;
 pub mod hybrid_search;
 pub mod intelligence;
+pub mod intelligence_features;
 pub mod jobs;
 pub mod logging;
 pub mod loopback;

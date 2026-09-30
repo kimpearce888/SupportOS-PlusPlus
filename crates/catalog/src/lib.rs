@@ -36,3 +36,7 @@ pub use graph::GraphNodeKind;
 pub use notifications::NotificationType;
 pub use operations::OperationsTileKey;
 pub use reporting::{ReportDimensionKey, ReportMetricKey};
+pub use workspace::{
+    ConnectorAuthMode, ConnectorKind, CustomFieldType, IncidentSeverity, IncidentSource,
+    IncidentStatus,
+};
