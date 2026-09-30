@@ -32,6 +32,7 @@ pub mod ai_lm_studio;
 pub mod ai_ollama_generic;
 pub mod ai_provider;
 pub mod automation;
+pub mod backup;
 pub mod config;
 pub mod db;
 pub mod demo;

@@ -9,16 +9,16 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M5 — VectorStore and AI providers (VectorStore abstraction + Qdrant Edge adapter, LocalAIProvider, embeddings, hybrid search, vector backup/migration/recovery) |
-| Current task ID | M5-T09 (next up) — M5-T08 done (Hybrid search) |
-| Last completed task | M5-T08 (Hybrid search — dense (VectorStore) + sparse (FTS5) + RRF fusion; 13 new tests) |
-| Last commit hash | (about to be) M5-T08: Hybrid search — dense + sparse + RRF |
-| Last updated | Session 29 — M5-T08 done (7 of 11 M5 tasks done; 1 BLOCKED) |
+| Current task ID | M5-T10 (next up) — M5-T09 done (Vector backup) |
+| Last completed task | M5-T09 (Vector backup — .sosync format AES-256-GCM + scrypt; backup/restore + atomic swap + verify-first; 14 new tests) |
+| Last commit hash | (about to be) M5-T09: Vector backup + migration + recovery |
+| Last updated | Session 29 — M5-T09 done (8 of 11 M5 tasks done; 1 BLOCKED) |
 
 ## Next 3 tasks
 
-1. **M5-T09**: Vector backup + migration + recovery — .sosync format (AES-256-GCM, scrypt per A6).
-2. **M5-T10**: VectorStore contract tests (spec section 92) — In-memory locally; Qdrant in CI.
-3. **M5-T11**: M5 milestone close — tag milestone-5-done, STOP.
+1. **M5-T10**: VectorStore contract tests (spec section 92) — In-memory locally; Qdrant in CI.
+2. **M5-T11**: M5 milestone close — tag milestone-5-done, STOP.
+3. **M6**: AI features (after owner sign-off).
 
 ## Resume protocol for next session
 
