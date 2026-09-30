@@ -11,7 +11,7 @@
 | Current milestone | M1 — Foundation |
 | Current task ID | M1-T02 (next up) — M1-T01 ✅ done this session |
 | Last completed task | M1-T01 — `cargo xtask discover` (A7) implemented; 10/10 canonical counts match spec; writes `docs/original-notes/inventory.json` |
-| Last commit hash | _(set after push — see `git log`)_ |
+| Last commit hash | `e54cb3b` (e54cb3b6188e61d307b8784731922ab38800c82c) — M1-T01 (xtask discover) pushed to `main` |
 | Last updated | Session 2 |
 
 ## Next 3 tasks
