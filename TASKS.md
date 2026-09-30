@@ -93,7 +93,33 @@
   - AC: Separate lightweight poller that fetches ratings every 30s (configurable). `spp://rating/arrived` event on new rating. **✅ verified session 17** — `crates/core/src/helpscout.rs`: added `HsRating` DTO + `list_ratings()` (returns 3 demo ratings: 5-star, 3-star, 5-star no comment) to the trait + Fake. `crates/core/src/events.rs`: `RatingArrived` event already implemented in M2-T08. 1 new test. Added `ratings` to `SYNC_RESOURCES`. The 30s poller wiring (Tauri async task) lands when the shell is linked; the core logic (`list_ratings` → emit `RatingArrived`) is pure Rust.
 - [x] **M2-T11** M2 milestone close: all M2 tasks ticked, CI green, tag `milestone-2-done`, STOP.
   - AC: tag pushed; all M2 tasks ticked. **✅ verified session 18** — All 10 M2 tasks (T01–T10) done + committed. CI green on Linux + Windows + WASM (macOS has known Tauri 2 `_EMBED_INFO_PLIST` upstream issue with `continue-on-error`). Tag `milestone-2-done` pushed. **STOP — waiting for owner to say 'continue' to proceed to M3.**
-- M3 Activity engine and inbox
+## Milestone 3 — Activity engine and inbox
+
+> Per spec M3: "events, derived timestamps, response states, filters, saved views,
+> priority, ticket states, ticket operations, write-protection pipeline, lexical
+> universal search, command palette."
+>
+> Task IDs follow `M3-T##`. Each is sized 30–90 min.
+
+- [ ] **M3-T01** Activity engine: events + derived timestamps + M003 migration.
+  - AC: `activity_events` table + `ActivityEngine` that derives `response_state`, `first_response_at`, `closed_at` etc. from conversation changes. Uses `julianday()` for all timestamp comparisons (KNOWN PITFALLS). Tests cover event derivation + dedup.
+- [ ] **M3-T02** Response states: the 4-state enum (needs_first_response / customer_waiting / agent_waiting / closed) + SQL fragment (single source of truth for both tiles and filters).
+  - AC: `ResponseState` enum from the catalog drives both the Operations Center tile counts AND the inbox filter list. Tests verify the SQL fragment produces the same count as the filter list.
+- [ ] **M3-T03** Saved inbox views: 22 condition kinds + AND/OR groups + compiled-to-parameterized-SQL at open time.
+  - AC: `SavedView` with condition tree (max depth + node count capped), compiled to parameterized SQL. Injection-shaped values tested. LIKE wildcards escaped. FTS5 queries quoted safely.
+- [ ] **M3-T04** Priority + ticket states: local priority layer + per-transition history.
+  - AC: `TicketPriority` enum (urgent/high/normal/low) + `TicketState` with per-transition history + lifecycle metrics. Layered over Help Scout status, never replacing it.
+- [ ] **M3-T05** Ticket operations: write-protection pipeline.
+  - AC: `TicketOperation` enum (assign, change_status, add_note, etc.) with write-protection (reads have no side effects; writes only via explicit commands). Status write + closed_at in one transaction (KNOWN PITFALLS).
+- [ ] **M3-T06** Lexical universal search (FTS5): search conversations + customers + docs.
+  - AC: FTS5 index on conversations/customers/docs text. Query length capped. LIKE wildcards escaped. Results bounded. Tests with injection-shaped values.
+- [ ] **M3-T07** Command palette (Cmd/Ctrl+K): quick search + actions.
+  - AC: Leptos component with keyboard shortcut, debounce, results list, keyboard nav. Every view has loading/empty/error states.
+- [ ] **M3-T08** Inbox page UI: 3-pane layout (conversation list + detail + context).
+  - AC: Leptos page `/inbox` with list pane (filtered by saved view), detail pane (conversation threads), context pane (customer info + AI attributes). Loading/empty/error states for each pane.
+- [ ] **M3-T09** Performance guards: synthetic 2,000-conversation dataset + EXPLAIN QUERY PLAN.
+  - AC: Test that creates 2,000 conversations + measures query performance. EXPLAIN QUERY PLAN on key queries. Documented bounds.
+- [ ] **M3-T10** M3 milestone close: all tasks ticked, CI green, tag `milestone-3-done`, STOP.
 - M4 Team operations
 - M5 VectorStore and AI providers
 - M6 AI features

@@ -8,17 +8,17 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M2 — Help Scout mirror |
-| Current task ID | M2-T01 (next up) — M1 closed, M2 task list written |
-| Last completed task | M1-T15 (M1 milestone close: tag milestone-1-done pushed, STOP for owner sign-off) |
-| Last commit hash | `7d971d0` — M1 milestone close pushed to `main`; tag `milestone-1-done` pushed |
-| Last updated | Session 9 — M2 started (owner said "continue") |
+| Current milestone | M3 — Activity engine and inbox |
+| Current task ID | M3-T01 (next up) — M2 closed, M3 task list written |
+| Last completed task | M2-T11 (M2 milestone close: tag milestone-2-done pushed) |
+| Last commit hash | `8e4a85f` — M2 milestone close pushed to `main`; tag `milestone-2-done` pushed |
+| Last updated | Session 19 — M3 started (owner said "continue") |
 
 ## Next 3 tasks
 
-1. **M2-T01**: `HelpScoutProvider` trait + `FakeHelpScoutProvider` + M002 migration (sync tables). Pure Rust in `crates/core`; defines the provider boundary per A12.
-2. **M2-T02**: OAuth flow wiring (loopback listener `/oauth/callback` → `oauth_state::consume_state` → token exchange → persist in `secrets` table).
-3. **M2-T03**: Incremental sync with cursors + checkpoints + rate-limited queue + 5-minute cycle.
+1. **M3-T01**: Activity engine — events + derived timestamps + M003 migration.
+2. **M3-T02**: Response states — 4-state enum + SQL fragment (single source of truth for tiles + filters).
+3. **M3-T03**: Saved inbox views — 22 condition kinds + AND/OR groups + compiled-to-parameterized-SQL.
 
 ## Parity counts by status (honest, A3)
 
