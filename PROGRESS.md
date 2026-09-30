@@ -9,16 +9,16 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M5 — VectorStore and AI providers (VectorStore abstraction + Qdrant Edge adapter, LocalAIProvider, embeddings, hybrid search, vector backup/migration/recovery) |
-| Current task ID | M5-T02 (next up) — M5-T01 done (VectorStore trait + In-memory adapter) |
+| Current task ID | M5-T03 (next up) — M5-T02 BLOCKED (qdrant-edge build exceeds dev sandbox disk space; CI must verify) |
 | Last completed task | M5-T01 (VectorStore trait + InMemoryVectorStore Fake adapter — 9-method sync trait, adapter-agnostic snapshot format, 37 new tests) |
-| Last commit hash | (about to be) M5-T01: VectorStore trait + In-memory adapter |
-| Last updated | Session 29 — M5-T01 done (1 of 11 M5 tasks complete) |
+| Last commit hash | (about to be) M5-T02 BLOCKED: qdrant-edge pinned + docs/architecture/VECTORSTORE.md + VECTORSTORE-EVALUATION.md |
+| Last updated | Session 29 — M5-T02 BLOCKED (1 of 11 M5 tasks done; 1 BLOCKED) |
 
 ## Next 3 tasks
 
-1. **M5-T02**: Qdrant Edge adapter — pin exact version; x64 smoke test (arm64 remains BLOCKED from M1-T11).
-2. **M5-T03**: LocalAIProvider trait + Fake provider (deterministic test data).
-3. **M5-T04**: LM Studio adapter (OpenAI-compatible HTTP at 127.0.0.1:1234/v1).
+1. **M5-T03**: LocalAIProvider trait + Fake provider (deterministic test data) — does NOT need qdrant-edge.
+2. **M5-T04**: LM Studio adapter (OpenAI-compatible HTTP at 127.0.0.1:1234/v1).
+3. **M5-T07**: Embeddings pipeline — content-hash-gated re-embedding + retry cap.
 
 ## Resume protocol for next session
 
