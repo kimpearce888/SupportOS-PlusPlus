@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M5 — VectorStore and AI providers (CLOSED — pending owner sign-off to proceed to M6) |
-| Current task ID | (none — M5 milestone complete; awaiting owner "continue" to start M6) |
+| Current milestone | M6 — AI features (AI Center, analysis, attributes, Copilot, verified drafts, coaching, customer memory, translation, QA, suggestions) |
+| Current task ID | M6-T01 (next up) — M5 closed (tag `milestone-5-done`), M6 task list written |
 | Last completed task | M5-T11 (M5 milestone close — all 11 tasks ticked, tag `milestone-5-done` pushed) |
-| Last commit hash | (about to be) M5-T11: M5 milestone close — tag milestone-5-done |
-| Last updated | Session 29 — M5 closed (10 of 11 tasks done + 1 BLOCKED; 638 tests passing) |
+| Last commit hash | `80b9cd4` — M5-T10 + M5-T11: VectorStore contract tests + M5 milestone close |
+| Last updated | Session 30 — M6 started (owner said "continue") |
 
 ## Next 3 tasks
 
-1. **Owner sign-off**: confirm M5 milestone is acceptable; say "continue" to proceed to M6.
-2. **M6 — AI features**: write the M6 task list, then start M6-T01.
-3. **(After M6)**: M7 — Intelligence.
+1. **M6-T01**: AI Center — model selection + status + Copilot tool allowlist display (A10 transparency).
+2. **M6-T02**: AI analysis — conversation analysis via LocalAiProvider; advisory only; "Unknown" is legitimate.
+3. **M6-T03**: AI attributes — 14-key catalog (intent, product, urgency, etc.) + evidence excerpt + thread reference.
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (M6 task list will be written at the start of the next session, per spec: "Write the full task list for a milestone before starting it").
+1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M6 tasks T01–T11).
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M6/M6-T01. Last commit: <hash>. Next: M6 task list + AI Center.`
+3. Announce `Resuming at M6/M6-T01. Last commit: <hash>. Next: AI Center.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)

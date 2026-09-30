@@ -202,7 +202,52 @@
   - AC: A test suite that exercises the full VectorStore contract against BOTH the In-memory adapter (M5-T01) and the Qdrant adapter (M5-T02, x64-only). Capability matrix: dense/sparse/named vectors, payload filters + indexes, exact search, snapshots + restore, count/scroll/facet. Missing capabilities documented in `docs/architecture/VECTORSTORE.md`; BLOCKED + reported if any required capability is missing from the pinned qdrant-edge version. **✅ verified session 29** — `crates/core/src/vectorstore_contract.rs`: `run_contract_tests(store: &dyn VectorStore)` runs the full contract against ANY VectorStore impl. Sub-tests: `test_dense_vectors` (upsert + search_dense + top_k truncation), `test_sparse_vectors` (upsert + search_sparse + cosine ranking), `test_payload_filters` (filter + count with filter), `test_count` (empty + 3 points + after delete + nonexistent), `test_snapshots_and_restore` (snapshot → restore → searchable after restore), `test_collection_lifecycle` (create + info + idempotent re-create + drop + idempotent re-drop). The In-memory adapter passes the full contract locally; the Qdrant adapter test is BLOCKED (M5-T02 — CI will verify when the `qdrant` feature is enabled). 1 new test: `in_memory_vector_store_passes_contract`.
 - [x] **M5-T11** M5 milestone close: all tasks ticked, CI green, tag `milestone-5-done`, STOP.
   - AC: tag pushed; all M5 tasks ticked; `docs/PARITY-MATRIX.md` updated with M5 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts (not a completion claim). **✅ verified session 29** — All 10 M5 implementation tasks (T01–T10) done + committed (T02 BLOCKED — qdrant-edge build exceeds dev sandbox disk space; CI must verify). `docs/PARITY-MATRIX.md` updated with full M5 section. `docs/FINAL-PARITY-AUDIT.md` updated with M5 milestone close report. Tag `milestone-5-done` pushed after this commit. **STOP — waiting for owner to say 'continue' to proceed to M6.**
-- M6 AI features
+
+## Milestone 6 — AI features
+
+> Per spec M6: "AI features: AI Center, analysis, attributes, Copilot, verified
+> drafts, coaching, customer memory, translation, QA, suggestions."
+>
+> Per spec A10: "Also show the Copilot's read-only tool allowlist in the AI Center
+> for transparency."
+> Per spec: "AI is always advisory. Automatic customer-reply sending is
+> permanently OFF. 'Unknown' is a legitimate answer; never fabricate values."
+> Per the reference notes: "Every AI-derived attribute carries an evidence
+> excerpt + thread reference." Bounds: COPILOT_MAX_TOOL_ROUNDS=5,
+> COPILOT_MAX_TOOL_CALLS=8, COPILOT_TOOL_RESULT_MAX_CHARS=4000.
+>
+> Catalog foundations already in place (since session 4):
+> - `AiAttributeKey` × 14 (the catalog enum — single source of truth).
+> - `CopilotTool` × 22 (catalog — the read-only tool allowlist).
+>
+> The `LocalAiProvider` trait (M5-T03) + LM Studio / Ollama / Generic adapters
+> (M5-T04/T05/T06) + embeddings pipeline (M5-T07) + hybrid search (M5-T08)
+> are all available for M6 to use.
+>
+> Task IDs follow `M6-T##`. Each is sized 30–90 min. Tick only after tests pass + commit + push + matrix update.
+
+- [ ] **M6-T01** AI Center — model selection + status + Copilot tool allowlist.
+  - AC: M009 migration creates `ai_settings` table (id, provider_kind, chat_model, embedding_model, dim, created_at). `AiCenter` module: `get_ai_status(conn, provider) -> AiStatus` (provider available? which models selected? embedding dim?). `set_chat_model(conn, model)` / `set_embedding_model(conn, model)`. The Copilot tool allowlist (22 tools from the catalog) is listed for transparency (A10). Per spec A5: "LM Studio and Ollama are optional, never bundled: auto-detect, list models, select, test. The app works fully without them." Tests cover empty settings (no provider configured → status = NotConfigured), model selection round-trip, allowlist count = 22.
+- [ ] **M6-T02** AI analysis — conversation analysis via LocalAiProvider.
+  - AC: `analyze_conversation(provider, model, conversation) -> AnalysisResult` that calls `provider.chat()` with a structured prompt. Per spec: AI is advisory; "Unknown" is a legitimate answer; never fabricate. Per spec: AI attributes never overwrite Help Scout source data. The analysis is cached via `embed_with_cache` (M5-T07 — the ai_runs cache). Tests cover successful analysis, provider-unavailable → "Unknown", caching (same input → same result, no re-call).
+- [ ] **M6-T03** AI attributes — 14-key catalog + evidence excerpt + thread reference.
+  - AC: M010 migration creates `ai_attributes` table (id, conversation_id, attribute_key TEXT, value TEXT, evidence_excerpt TEXT, thread_ref TEXT, confidence REAL, created_at). `AiAttributeKey::ALL` (14 keys from the catalog — single source of truth) drives validation. `set_attribute(conn, conv_id, key, value, evidence, thread_ref, confidence)` stores a derived attribute. `get_attributes(conn, conv_id) -> Vec<Attribute>`. Per the reference notes: "Every AI-derived attribute carries an evidence excerpt + thread reference." Per spec: AI attributes never overwrite Help Scout source data (they're a separate layer, like `supportos_priority` from M3-T04). Tests cover all 14 keys round-trip, unknown-key rejection (by construction — typed enum), evidence+thread_ref required, get-by-conversation.
+- [ ] **M6-T04** Copilot — read-only tool allowlist (22 tools, bounded).
+  - AC: `CopilotTool` enum (22 variants from the catalog — single source of truth). `CopilotEngine::run(provider, model, query, tools, context)` that executes a bounded number of tool calls (MAX_TOOL_ROUNDS=5, MAX_TOOL_CALLS=8, TOOL_RESULT_MAX_CHARS=4000). Each tool is read-only (no writes — the Copilot never mutates state). The 22 tools map to existing read functions (search_conversations → M3-T06, get_conversation → sync, etc.). Tests cover tool allowlist count = 22, all read-only (no writes), round/call bounds, result char cap.
+- [ ] **M6-T05** Verified drafts — AI-drafted replies requiring human approval.
+  - AC: M011 migration creates `verified_drafts` table (id, conversation_id, draft_text TEXT, status TEXT DEFAULT 'pending', created_by_ai_at, approved_by_user_id, approved_at, sent_at). `create_draft(conn, conv_id, text)` → status='pending'. `approve_draft(conn, id, user_id)` → status='approved'. `send_draft(conn, id)` → status='sent' (only after approval). Per spec: "Automatic customer-reply sending is permanently OFF." The send function exists but is never called automatically — only via explicit human action. Tests cover draft lifecycle (pending → approved → sent), send-rejected-without-approval, idempotent transitions.
+- [ ] **M6-T06** Coaching suggestions — advisory coaching hints for agents.
+  - AC: `CoachingSuggestion` struct (advisory, never auto-acting). `generate_coaching(provider, model, conversation) -> Vec<CoachingSuggestion>` calls the AI with a coaching prompt; returns suggestions like "Consider acknowledging the customer's frustration" or "This might be a known issue — check the knowledge base." Per spec: AI is advisory. Tests cover suggestion construction, provider-unavailable → empty, caching.
+- [ ] **M6-T07** Customer memory — per-customer notes/preferences (AI-derived).
+  - AC: M012 migration creates `customer_memory` table (id, customer_id, memory_key TEXT, memory_value TEXT, evidence_excerpt TEXT, source_conversation_id, created_at). `set_memory(conn, customer_id, key, value, evidence, conv_id)`. `get_memory(conn, customer_id) -> Vec<Memory>`. Per spec: "AI attributes never overwrite Help Scout source data" — customer memory is a SupportOS++-local layer. Per the reference notes: preference requires ≥3 observations before counting as a pattern. Tests cover set/get round-trip, per-customer isolation, evidence required.
+- [ ] **M6-T08** Translation — ticket translation (spec section 65).
+  - AC: `translate_text(provider, model, text, target_lang) -> String` that calls `provider.chat()` with a translation prompt. Per spec A1: "Ticket translation (spec section 65) IS included as a SupportOS feature. Customer text in any language must be stored, searched and displayed correctly (UTF-8, Unicode-safe FTS5, broad font fallback)." Tests cover round-trip (English → French → English), provider-unavailable → "Unknown", caching via ai_runs.
+- [ ] **M6-T09** Post-resolution QA — quality checks after a conversation is closed.
+  - AC: M013 migration creates `post_resolution_qa` table (id, conversation_id, qa_score REAL, qa_notes TEXT, checked_at). `run_qa(provider, model, conversation) -> QaResult` that checks: was the customer's question answered? was the tone appropriate? is there a follow-up needed? Per spec: AI is advisory; "Unknown" is a legitimate answer. Tests cover QA result construction, provider-unavailable → "Unknown", caching.
+- [ ] **M6-T10** Suggestions — proactive suggestions surfaced to the agent.
+  - AC: `SuggestionEngine::generate(provider, model, conversation) -> Vec<Suggestion>` that surfaces proactive hints (e.g., "Similar conversation #1234 was resolved by linking to knowledge doc #56" or "This customer has filed 3 tickets about the same issue — consider escalating"). Per spec: AI is advisory. Tests cover suggestion construction, provider-unavailable → empty, bounds (max 5 suggestions per conversation).
+- [ ] **M6-T11** M6 milestone close: all tasks ticked, CI green, tag `milestone-6-done`, STOP.
+  - AC: tag pushed; all M6 tasks ticked; `docs/PARITY-MATRIX.md` updated with M6 close note; `docs/FINAL-PARITY-AUDIT.md` reports honest parity counts (not a completion claim). **STOP — waiting for owner to say 'continue' to proceed to M7.**
 - M7 Intelligence
 - M8 Reports and quality
 - M9 Outreach
