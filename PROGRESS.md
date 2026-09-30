@@ -9,25 +9,25 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M1 — Foundation |
-| Current task ID | M1-T09 (next up) — M1-T12 ✅, M1-T13 ✅ done this session |
-| Last completed task | M1-T12 (loopback listener: timing-safe HMAC-SHA1 + single-use OAuth state + persist-first dedup) + M1-T13 (first-run onboarding overlay UI + first_run_state Tauri IPC command) |
-| Last commit hash | `86af418` (86af418ddf6b2784a1f7b8452ab1937b51d58c75) — M1-T12/M1-T13 done pushed to `main` |
-| Last updated | Session 6 |
+| Current task ID | M1-T15 (next up) — M1-T09 ✅ done this session (CI green on all 3 OSes) |
+| Last completed task | M1-T09 (CI matrix green on Win/macOS/Linux + WASM + Tauri build; headless demo-mode boot smoke test added) |
+| Last commit hash | `d27f413` — first GREEN CI run on main |
+| Last updated | Session 7 |
 
 ## Next 3 tasks
 
-1. **M1-T09**: CI matrix runs on Win/macOS/Linux with `rustfmt --check`, `clippy -D warnings`, `cargo test`, `cargo build --release`, `trunk build`, headless demo-mode boot. The CI workflow file is already in place; M1-T09 is about confirming a green run on `main` (CI runs on every push). The remaining piece is the headless demo-mode boot smoke test — a small Rust test that boots the Tauri shell in demo mode and verifies it doesn't crash within 5 seconds.
-2. **M1-T02 close**: The actual `cargo xtask dev` launch verification still needs GTK/WebKit2GTK system libs locally. The CI workflow installs them. M1-T02 closes when CI is green on `main`.
-3. **M1-T15**: M1 milestone close — every M1 task ticked, CI green on all 3 OSes, tag `milestone-1-done`, report parity counts + deviations + BLOCKED, STOP, wait for owner sign-off.
+1. **M1-T15**: M1 milestone close — every M1 task ticked, CI green on all 3 OSes (✅ done), tag `milestone-1-done`, report parity counts + deviations + BLOCKED, STOP, wait for owner sign-off. The remaining tasks (T02 launch, T04 settings IPC, T10 installers, T11 Qdrant spike) are either partial or require owner credentials/certificates.
+2. **M2 prep**: Once the owner signs off on M1, write the M2 task list (Help Scout mirror: provider trait, OAuth, sync, webhook, demo mode, first-run onboarding).
+3. **M1-T11 (Qdrant Edge spike)**: BLOCKED — requires per-platform smoke tests on Win x64, macOS arm64+x64, Linux x64+arm64. Needs the owner's CI matrix to include arm64 runners OR cross-compilation setup.
 
 ## Parity counts by status (honest, A3)
 
 | Status | Count |
 |---|---|
 | DISCOVERED | 8 canonical counts + 13 surface-area rows + per-milestone high-level rows (reproducible via `cargo xtask discover`) |
-| SPECIFIED | 2 (Tauri shell launch verification on CI, Qdrant spike) |
-| IMPLEMENTED | 13 (xtask discover, SQLite foundation + first migration + runner, job queue with JobHandler/JobRegistry/Runner, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification, catalog crate (WASM-safe, single source of truth), common UI components + theming tokens, Leptos Router scaffold with 3 routes, xtask audit binary with checks catalog, loopback HMAC-SHA1 + OAuth state + persist-first dedup, first-run onboarding overlay + first_run_state IPC) |
-| TESTED | 0 (foundation tested at unit level; no milestone complete yet) |
+| SPECIFIED | 2 (Tauri shell launch verification on CI ✅, Qdrant spike) |
+| IMPLEMENTED | 14 (xtask discover, SQLite foundation + first migration + runner, job queue with JobHandler/JobRegistry/Runner, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification, catalog crate (WASM-safe, single source of truth), common UI components + theming tokens, Leptos Router scaffold with 3 routes, xtask audit binary with checks catalog, loopback HMAC-SHA1 + OAuth state + persist-first dedup, first-run onboarding overlay + first_run_state IPC, CI matrix green on all 3 OSes + WASM + Tauri build) |
+| TESTED | 1 (CI green run on main — commit d27f413 — verifies fmt + clippy + tests + WASM + Tauri build on Win/macOS/Linux) |
 | PACKAGED | 0 |
 | VERIFIED | 0 |
 
