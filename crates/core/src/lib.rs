@@ -51,6 +51,7 @@ pub mod runner;
 pub mod saved_views;
 pub mod search;
 pub mod settings;
+pub mod side_threads;
 pub mod sync;
 pub mod ticket_ops;
 pub mod ticket_states;
