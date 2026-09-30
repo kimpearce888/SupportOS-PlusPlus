@@ -41,6 +41,7 @@ pub mod runner;
 pub mod settings;
 pub mod sync;
 pub mod webhook;
+pub mod webhook_handler;
 
 pub use error::{Error, Result};
 
