@@ -29,6 +29,7 @@ pub use spp_catalog;
 
 pub mod activity;
 pub mod ai_lm_studio;
+pub mod ai_ollama_generic;
 pub mod ai_provider;
 pub mod automation;
 pub mod config;
