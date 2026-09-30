@@ -69,21 +69,25 @@ pub fn enqueue(conn: &Connection, kind: &str, payload: &str) -> Result<i64> {
 
 /// Claim the next available job for `worker_id` (recorded in `claimed_at`).
 /// Returns `None` if no job is available.
+///
+/// KNOWN PITFALL: never compare ISO-8601 timestamps lexically against SQLite
+/// `datetime('now')` strings — SQLite's `%f` gives 3 fractional digits while
+/// chrono's `%f` gives 9, so lexical comparisons silently break.
+/// We compare via `julianday()` (a numeric unix-epoch-like float) instead.
 pub fn claim_next(conn: &mut Connection) -> Result<Option<ClaimedJob>> {
     let tx = conn.transaction()?;
-    // Atomic claim: select the oldest pending job whose available_at is now or earlier,
-    // mark it claimed, and bump attempts.
-    let now = format!("{}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%fZ"));
+    // Atomic claim: select the oldest pending job whose available_at is now or earlier.
+    // Compare via julianday() to avoid lexical timestamp comparison bugs.
     let row: Option<(i64, String, String, i64, i64)> = tx
         .prepare(
             "SELECT id, kind, payload, attempts, max_attempts
                FROM jobs
               WHERE state = 'pending'
-                AND available_at <= ?1
+                AND julianday(available_at) <= julianday('now')
               ORDER BY available_at ASC
               LIMIT 1;",
         )?
-        .query_row(params![now], |r| {
+        .query_row([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -101,10 +105,10 @@ pub fn claim_next(conn: &mut Connection) -> Result<Option<ClaimedJob>> {
     tx.execute(
         "UPDATE jobs
             SET state = 'claimed',
-                claimed_at = ?1,
-                attempts = ?2
-          WHERE id = ?3",
-        params![now, attempts + 1, id],
+                claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                attempts = ?1
+          WHERE id = ?2",
+        params![attempts + 1, id],
     )?;
     tx.commit()?;
 
@@ -129,10 +133,10 @@ pub struct ClaimedJob {
 
 /// Mark a claimed job as done.
 pub fn complete(conn: &Connection, id: i64) -> Result<()> {
-    let now = format!("{}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%fZ"));
     let rows = conn.execute(
-        "UPDATE jobs SET state = 'done', completed_at = ?1 WHERE id = ?2 AND state = 'claimed'",
-        params![now, id],
+        "UPDATE jobs SET state = 'done', completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ?1 AND state = 'claimed'",
+        params![id],
     )?;
     if rows == 0 {
         return Err(Error::Other(
@@ -245,6 +249,7 @@ mod tests {
         assert_eq!(state, "pending");
 
         // Reset available_at to now so claim_next picks it up (simulating the backoff elapsing).
+        // claim_next compares via julianday() so this is robust regardless of format.
         conn.execute(
             "UPDATE jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
             params![id],

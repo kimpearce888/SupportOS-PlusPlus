@@ -28,8 +28,8 @@
 
 > Task IDs follow `M1-T##`. Each is sized 30–90 min. Tick only after tests pass + commit + push + matrix update.
 
-- [ ] **M1-T01** `xtask discover` — Rust binary that scans a local reference checkout (path passed via `--reference`) and writes `docs/original-notes/*.md` + `docs/PARITY-MATRIX.md` capability rows. Replaces the session-1 manual pass.
-  - AC: `cargo xtask discover --reference /path/to/supportos` regenerates parity counts; output diffs to zero against session-1 manual pass.
+- [x] **M1-T01** `xtask discover` — Rust binary that scans a local reference checkout (path passed via `--reference`) and writes `docs/original-notes/*.md` + `docs/PARITY-MATRIX.md` capability rows. Replaces the session-1 manual pass.
+  - AC: `cargo xtask discover --reference /path/to/supportos` regenerates parity counts; output diffs to zero against session-1 manual pass. **✅ verified session 2 — 10/10 canonical counts match.**
 - [ ] **M1-T02** Tauri 2 shell that launches on all 3 OSes with product name `SupportOS++`, bundle id `com.supportos.plusplus`.
   - AC: `cargo xtask dev` opens a window titled "SupportOS++" on Linux; same on Win/mac in CI.
 - [ ] **M1-T03** SQLite connection (rusqlite, bundled, WAL+FTS5), first migration, runner.

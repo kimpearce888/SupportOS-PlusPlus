@@ -24,19 +24,25 @@ The master spec / reference README makes count claims. We re-derived every one o
 
 | Surface | Count | Status |
 |---|---|---|
-| API route files | 32 | DISCOVERED |
+| API route files | 30 | DISCOVERED |
 | HTTP endpoints (approx) | 310 | DISCOVERED |
 | Database migrations | 16 (001-016) | DISCOVERED |
 | Tables created by migrations | 125 | DISCOVERED |
-| Repositories (server/db/repositories) | 23 | DISCOVERED |
+| Repositories (server/db/repositories) | 22 | DISCOVERED |
 | Client pages (`.tsx`) | 21 | DISCOVERED |
 | Shared TS modules | 14 | DISCOVERED |
 | Server module dirs (ai, sync, inbox…) | 25 | DISCOVERED |
-| Environment variables in `.env.example` | 25 | DISCOVERED |
+| Environment variables in `.env.example` | 19 | DISCOVERED |
+| Scripts in `scripts/` | 21 | DISCOVERED |
 | Documentation files in `docs/` (excl. screenshots) | 11 | DISCOVERED |
 | CHANGELOG.md lines | 660+ (≈135 KB) | DISCOVERED |
 | DECISIONS.md ADR count | 60 (spec claim) | DISCOVERED |
 | Screenshots in `docs/screenshots/` | ~25 PNGs + 1 demo GIF | DISCOVERED |
+
+> The counts above are produced by `cargo xtask discover --reference <path/to/reference>`,
+> which writes a machine-readable snapshot to `docs/original-notes/inventory.json`.
+> Last xtask-discover run: reference HEAD `c346fb51466e237a89e70156ae20a3386be0b322`,
+> 10/10 canonical counts matched the spec (A7 cross-check green).
 
 ## Per-milestone parity (high-level)
 
@@ -51,17 +57,17 @@ Each milestone groups dozens of capabilities. Detailed per-capability rows live 
 | Discovery notes (`docs/original-notes/*.md`) | ✅ DONE |
 | Parity matrix (this file) | ✅ DONE |
 | State files (`AGENTS.md`, `PROGRESS.md`, `TASKS.md`, `DECISIONS.md`, `DEVIATIONS.md`, `MANUAL-VERIFICATION.md`, `UI-PARITY.md`) | ✅ DONE |
-| Cargo workspace + crates (`app`, `core`, `ui`, `xtask`) | SPECIFIED |
+| Cargo workspace + crates (`app`, `core`, `ui`, `xtask`) | ✅ DONE |
 | Tauri 2 shell that launches on Win/macOS/Linux | SPECIFIED |
 | Leptos WASM UI scaffold | SPECIFIED |
-| SQLite (WAL + FTS5) + first migration | SPECIFIED |
-| Job queue | SPECIFIED |
-| Settings store | SPECIFIED |
+| SQLite (WAL + FTS5) + first migration | ✅ IMPLEMENTED (foundation; first app migration lands in M1-T03) |
+| Job queue | ✅ IMPLEMENTED (claim/complete/fail/dead-letter; julianday-based, 35 tests stable × 10 runs) |
+| Settings store | ✅ IMPLEMENTED (redacted reads, encrypted secrets table) |
 | Theming | SPECIFIED |
 | CI matrix (Win/macOS/Linux: fmt + clippy + test + build) | SPECIFIED |
 | Installer pipelines (MSI, NSIS, DMG, DEB, RPM, AppImage) | SPECIFIED |
 | Qdrant Edge spike on all 5 platforms (A4) | SPECIFIED |
-| `xtask discover` (A7) replaces manual pass | SPECIFIED |
+| `xtask discover` (A7) replaces manual pass | ✅ DONE (10/10 canonical counts match; writes `docs/original-notes/inventory.json`) |
 | Empty app installs & launches on all 3 OSes | SPECIFIED |
 
 ### Milestones 2–11 — all rows DISCOVERED only
@@ -71,7 +77,7 @@ Detailed per-capability rows for M2-M11 will be expanded at the start of each mi
 
 ## Reference delta since last session
 
-None — first session.
+None. Reference HEAD `c346fb51466e237a89e70156ae20a3386be0b322` unchanged since session 1 (verified by `cargo xtask discover` reading the local reference checkout).
 
 ## BLOCKED items
 

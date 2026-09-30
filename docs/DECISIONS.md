@@ -109,3 +109,24 @@
 - Context: A5.
 - Decision: Three CI jobs — `windows-latest`, `macos-latest`, `ubuntu-22.04` (and `ubuntu-24.04` for the Linux matrix per INSTALL AND PACKAGING). Each job runs the same matrix: `rustfmt --check`, `clippy -D warnings`, `cargo test`, `cargo build --release`, `trunk build` (WASM), and a headless demo-mode boot smoke test.
 - Why: matches A5 ("fresh CI runners"); avoids cross-compilation complexity for the WASM target.
+
+## D-013 — Compare timestamps via `julianday()`, never lexically (KNOWN PITFALLS enforcement)
+
+- Date: Session 2
+- Status: ADOPTED
+- Context: KNOWN PITFALLS in `docs/MASTER-SPEC.md` explicitly forbids comparing ISO-8601 timestamps against SQLite `datetime('now')` strings lexically. The session-1 jobs crate had a real flaky-test failure (~1 in 5 runs) caused by exactly this: SQLite's `strftime('%fZ','now')` produces 3 fractional digits while chrono's `%f` produces 9, so `"…123Z"` was lexically greater than `"…123456789Z"` and the `available_at <= ?` predicate silently failed.
+- Decision: every SQL predicate that compares two ISO-8601 timestamps in the SupportOS++ codebase MUST use `julianday(col) <= julianday('now')` (or `unixepoch()`), never a direct string comparison. Writes still store ISO-8601 strings (SQLite-friendly, debuggable), but reads compare via the numeric conversion. Documented in `crates/core/src/jobs.rs::claim_next` with the warning inline.
+- Why: removes the format-mismatch class of bugs entirely; aligns with spec mandate.
+- Verification: `cargo test -p supportos-plusplus-core --lib` ran 10× consecutively in session 2; all 10 green. Before the fix, ~1 in 5 runs failed.
+
+## D-014 — `cargo xtask discover` writes machine-readable `inventory.json`
+
+- Date: Session 2
+- Status: ADOPTED
+- Context: A7 requires the discovery xtask to extract inventories and keep `docs/PARITY-MATRIX.md` reproducible.
+- Decision: `cargo xtask discover --reference <path>` produces three outputs:
+  1. `docs/original-notes/inventory.json` — the full inventory (surfaces, canonical counts, vocabulary values).
+  2. A human-readable summary printed to stdout (the canonical-count cross-check table).
+  3. An exit code that is non-zero if any of the 10 canonical counts differs from the spec, so CI catches reference drift.
+- Why: makes reference drift detectable in CI without requiring a human to read the matrix; the JSON is the audit trail.
+- AC for M1-T01 (per `TASKS.md`): "output diffs to zero against session-1 manual pass" — verified: 10/10 canonical counts match the session-1 manual pass and the spec.

@@ -14,6 +14,8 @@ use std::process::Command;
 
 use clap::{Parser, Subcommand};
 
+mod discover;
+
 #[derive(Parser)]
 #[command(name = "xtask", version, about = "SupportOS++ developer entry point", long_about = None)]
 struct Cli {
@@ -40,6 +42,10 @@ enum Cmd {
         /// Path to a local checkout of the reference repo (NEVER inside this repo).
         #[arg(long)]
         reference: String,
+        /// Optional output path for the JSON inventory.
+        /// Defaults to docs/original-notes/inventory.json under the workspace root.
+        #[arg(long)]
+        out: Option<String>,
     },
     /// (M1-T14) Black-box audit binary (placeholder).
     Audit {
@@ -58,7 +64,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Test => run_tests(),
         Cmd::Lint => run_lint(),
         Cmd::Package => run_package(),
-        Cmd::Discover { reference } => run_discover(&reference),
+        Cmd::Discover { reference, out } => run_discover(&reference, out.as_deref()),
         Cmd::Audit { app } => run_audit(&app),
     }
 }
@@ -151,10 +157,38 @@ fn run_package() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_discover(reference: &str) -> anyhow::Result<()> {
-    // M1-T01: replace this stub with a real Rust scan of the reference repo.
-    eprintln!("discover: stub (M1-T01). Reference checkout at: {reference}");
-    eprintln!("Session 1 produced docs/original-notes/* by hand; M1-T01 will automate it.");
+fn run_discover(reference: &str, out: Option<&str>) -> anyhow::Result<()> {
+    let reference_path = std::path::Path::new(reference);
+    let out_path = match out {
+        Some(p) => std::path::PathBuf::from(p),
+        None => workspace_root()
+            .join("docs")
+            .join("original-notes")
+            .join("inventory.json"),
+    };
+
+    println!(
+        "Discover: scanning reference at {}",
+        reference_path.display()
+    );
+    println!("Discover: writing inventory to {}", out_path.display());
+
+    let inventory = discover::run(reference_path, &out_path)?;
+    discover::print_summary(&inventory);
+
+    // Exit non-zero if any canonical count is off, so CI catches reference drift.
+    let mismatches: Vec<_> = inventory
+        .canonical_counts
+        .iter()
+        .filter(|c| !c.matches)
+        .collect();
+    if !mismatches.is_empty() {
+        eprintln!(
+            "discover: {} canonical count(s) differ from spec; see above. See docs/DEVIATIONS.md.",
+            mismatches.len()
+        );
+        std::process::exit(1);
+    }
     Ok(())
 }
 
