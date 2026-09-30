@@ -11,7 +11,7 @@
 | Current milestone | M1 — Foundation |
 | Current task ID | M1-T07 (next up) — M1-T02 partial ✅, M1-T03 ✅, M1-T04 partial ✅, M1-T06 ✅ done this session |
 | Last completed task | M1-T03 (SQLite first migration + runner) + M1-T06 (foundation: error/logging/config) + M1-T02 partial (Tauri config A0 verification) + M1-T04 partial (typed settings store with bool/i64/JSON + first-run flag) |
-| Last commit hash | _(set after push — see `git log`)_ |
+| Last commit hash | `c3b8c48` (c3b8c48880f56d0b6c4b9dbca2b5c464eb014c46) — M1-T03/M1-T06 done, M1-T02/M1-T04 partial pushed to `main` |
 | Last updated | Session 3 |
 
 ## Next 3 tasks
