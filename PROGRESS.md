@@ -9,16 +9,16 @@
 |---|---|
 | Instruction file | `AGENTS.md` |
 | Current milestone | M11 — Conformance and hardening (CLOSED — ALL 11 MILESTONES COMPLETE) |
-| Current task ID | (none — project at IMPLEMENTED + TESTED; awaiting owner VERIFIED status) |
-| Last completed task | M11-T05 (M11 milestone close — final tag `milestone-11-done` pushed) |
-| Last commit hash | (about to be) M11-T05: M11 milestone close — final tag milestone-11-done |
-| Last updated | Session 35 — M11 closed (ALL 11 milestones done; 869 tests passing) |
+| Current task ID | (none — Tauri shell IPC wiring complete; project at IMPLEMENTED + TESTED; awaiting owner PACKAGED + VERIFIED) |
+| Last completed task | Tauri shell IPC wiring — 22 IPC commands connecting all UI pages to the Rust core |
+| Last commit hash | (about to be) Tauri shell IPC wiring — all UI pages connected to Rust core |
+| Last updated | Session 36 — IPC wiring complete (869 tests + Tauri shell updated; CI verifies Tauri build) |
 
 ## Next 3 tasks
 
 1. **Owner action**: Run `docs/MANUAL-VERIFICATION.md` on clean machines to promote rows to VERIFIED.
 2. **Owner action**: Provide signing certificates (M1-T10) + arm64 CI runners (M1-T11) + Qdrant build machine (M5-T02).
-3. **(Future)**: Tauri shell IPC wiring — connect UI pages to Rust core (the only remaining gap before PACKAGED).
+3. **(Done)**: Tauri shell IPC wiring — 22 IPC commands connecting all UI pages to the Rust core.
 
 ## Resume protocol for next session
 
