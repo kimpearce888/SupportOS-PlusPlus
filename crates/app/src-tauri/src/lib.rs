@@ -75,12 +75,11 @@ pub fn run() {
             tracing::warn!("startup self-check found failing subsystems — see report");
         }
     }
-    let _ = self_check_report; // hold for state below
 
     // 4. Launch Tauri with the DB connection in state + all IPC commands.
     let db_state = DbState {
         conn: Mutex::new(conn),
-        self_check_report: self_check_report,
+        self_check_report,
     };
 
     let mut builder = tauri::Builder::default()
@@ -726,8 +725,8 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         // The Qdrant feature is OFF by default; the report must say so.
-        assert_eq!(
-            report.qdrant_feature_enabled, false,
+        assert!(
+            !report.qdrant_feature_enabled,
             "qdrant feature must be off by default"
         );
         let vs = report
