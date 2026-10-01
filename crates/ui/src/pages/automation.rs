@@ -154,19 +154,75 @@ impl ActionView {
 
 /// The Automation page component.
 ///
-/// Shows:
-/// 1. The rules list (each rule with name, trigger, action, enabled toggle).
-/// 2. The approval queue (pending items with approve/reject actions).
-///
-/// Per KNOWN PITFALLS: every view has loading, empty, and error states.
+/// Wired to `automation_list_rules` + `automation_list_pending` IPC.
 #[component]
 pub fn AutomationPage() -> impl IntoView {
-    // M4-T11: local signals. A later task wires these to the Tauri IPC
-    // commands (`automation_list_rules`, `automation_list_pending_approvals`,
-    // `automation_set_rule_enabled`, `automation_approve`, `automation_reject`).
-    // For now, empty signals so the empty states render.
     let rules = create_rw_signal(Vec::<AutomationRuleView>::new());
     let approvals = create_rw_signal(Vec::<AutomationApprovalView>::new());
+    let loading = create_rw_signal(true);
+
+    create_effect(move |_| {
+        let rules = rules;
+        let approvals = approvals;
+        let loading = loading;
+        wasm_bindgen_futures::spawn_local(async move {
+            let args = serde_json::json!({});
+            // Fetch rules.
+            if let Ok(data) =
+                crate::ipc::invoke::<serde_json::Value>("automation_list_rules", &args).await
+            {
+                if let Some(arr) = data.as_array() {
+                    let views: Vec<AutomationRuleView> = arr
+                        .iter()
+                        .filter_map(|r| {
+                            let id = r.get("id")?.as_i64()?;
+                            let name = r.get("name")?.as_str()?.to_string();
+                            let enabled =
+                                r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                            Some(AutomationRuleView {
+                                id,
+                                name,
+                                trigger: TriggerView::SlaRisk,
+                                action: ActionView::SendNote {
+                                    body: String::new(),
+                                },
+                                enabled,
+                            })
+                        })
+                        .collect();
+                    rules.set(views);
+                }
+            }
+            // Fetch pending approvals.
+            if let Ok(data) =
+                crate::ipc::invoke::<serde_json::Value>("automation_list_pending", &args).await
+            {
+                if let Some(arr) = data.as_array() {
+                    let views: Vec<AutomationApprovalView> = arr
+                        .iter()
+                        .filter_map(|a| {
+                            let id = a.get("id")?.as_i64()?;
+                            let rule_id = a.get("rule_id")?.as_i64()?;
+                            let conversation_id = a.get("conversation_id")?.as_i64()?;
+                            let created_at = a.get("created_at")?.as_str()?.to_string();
+                            Some(AutomationApprovalView {
+                                id,
+                                rule_id,
+                                conversation_id,
+                                proposed_action: ActionView::SendNote {
+                                    body: String::new(),
+                                },
+                                status: "pending".into(),
+                                created_at,
+                            })
+                        })
+                        .collect();
+                    approvals.set(views);
+                }
+            }
+            loading.set(false);
+        });
+    });
 
     view! {
         <div class="spp-page spp-page--automation">

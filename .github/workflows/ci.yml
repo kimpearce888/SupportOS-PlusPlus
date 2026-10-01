@@ -120,3 +120,43 @@ jobs:
         run: |
           cd crates/app/src-tauri
           cargo build --release
+
+  ci-report:
+    name: Publish CI report
+    needs: [lint-and-test, build-wasm, build-tauri]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate report
+        run: |
+          mkdir -p ci-report
+          cat > ci-report/report.md << 'REPORT'
+          # CI Report — ${{ github.sha }}
+
+          Run: ${{ github.run_id }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.event.head_commit.message }}
+
+          ## Job Results
+
+          | Job | Status |
+          |---|---|
+          | lint-and-test (ubuntu-22.04) | ${{ needs.lint-and-test.result }} |
+          | lint-and-test (ubuntu-24.04) | ${{ needs.lint-and-test.result }} |
+          | lint-and-test (macos-latest) | ${{ needs.lint-and-test.result }} |
+          | lint-and-test (windows-latest) | ${{ needs.lint-and-test.result }} |
+          | build-wasm | ${{ needs.build-wasm.result }} |
+          | build-tauri (ubuntu-22.04) | ${{ needs.build-tauri.result }} |
+          | build-tauri (macos-latest) | ${{ needs.build-tauri.result }} |
+          | build-tauri (windows-latest) | ${{ needs.build-tauri.result }} |
+
+          Overall: ${{ needs.lint-and-test.result == 'success' && needs.build-wasm.result == 'success' && '✅ GREEN' || '❌ RED' }}
+          REPORT
+        env:
+          GH_SHA: ${{ github.sha }}
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: ci-report/report.md

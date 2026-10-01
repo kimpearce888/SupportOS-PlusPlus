@@ -140,21 +140,64 @@ pub fn notification_description(notif_type: NotificationType) -> &'static str {
 
 /// The Notification Center page component.
 ///
-/// Shows:
-/// 1. The notification list (grouped by severity).
-/// 2. Per-type preferences (15 toggle rows driven by `NotificationType::ALL`).
-/// 3. The retention TTL setting.
-///
-/// Per KNOWN PITFALLS: every view has loading, empty, and error states.
+/// Wired to `notifications_list_unread` + `notifications_unread_count` IPC.
 #[component]
 pub fn NotificationsPage() -> impl IntoView {
-    // M4-T07: local signals. A later task wires these to the Tauri IPC
-    // commands (`notifications_list_unread`, `notifications_set_preference`,
-    // `notifications_mark_as_read`, `notifications_set_retention_ttl`).
-    // For now, an empty list so the empty state renders.
     let notifications = create_rw_signal(Vec::<NotificationView>::new());
     let preferences = create_rw_signal(default_preferences());
     let retention_ttl_days = create_rw_signal(DEFAULT_TTL_DAYS_DISPLAY);
+    let loading = create_rw_signal(true);
+    let error_msg = create_rw_signal(None::<String>);
+
+    // Fetch unread notifications on mount.
+    create_effect(move |_| {
+        let notifications = notifications;
+        let loading = loading;
+        let error_msg = error_msg;
+        wasm_bindgen_futures::spawn_local(async move {
+            let args = serde_json::json!({ "user_id": 1, "limit": 50 });
+            match crate::ipc::invoke::<serde_json::Value>("notifications_list_unread", &args).await
+            {
+                Ok(data) => {
+                    let list = data.as_array().cloned().unwrap_or_default();
+                    let views: Vec<NotificationView> = list
+                        .into_iter()
+                        .filter_map(|n| {
+                            let id = n.get("id")?.as_i64()?;
+                            let type_str = n.get("notification_type")?.as_str()?;
+                            let nt = NotificationType::ALL
+                                .iter()
+                                .find(|t| t.as_str() == type_str)?;
+                            let severity_str = n.get("severity")?.as_str()?;
+                            let sev = match severity_str {
+                                "critical" => Severity::Critical,
+                                "warning" => Severity::Warning,
+                                _ => Severity::Info,
+                            };
+                            let read = n.get("read_at").map(|r| !r.is_null()).unwrap_or(false);
+                            let created_at = n.get("created_at")?.as_str()?.to_string();
+                            Some(NotificationView {
+                                id,
+                                notification_type: *nt,
+                                severity: sev,
+                                target_user_id: n.get("target_user_id").and_then(|v| v.as_i64()),
+                                conversation_id: n.get("conversation_id").and_then(|v| v.as_i64()),
+                                payload: None,
+                                read,
+                                created_at,
+                            })
+                        })
+                        .collect();
+                    notifications.set(views);
+                    loading.set(false);
+                }
+                Err(e) => {
+                    error_msg.set(Some(e));
+                    loading.set(false);
+                }
+            }
+        });
+    });
 
     view! {
         <div class="spp-page spp-page--notifications">

@@ -15,6 +15,8 @@ use std::process::Command;
 use clap::{Parser, Subcommand};
 use spp_xtask::{discover, verify_config};
 
+mod ci_status;
+
 #[derive(Parser)]
 #[command(name = "xtask", version, about = "SupportOS++ developer entry point", long_about = None)]
 struct Cli {
@@ -53,6 +55,12 @@ enum Cmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Check CI status for a branch via the GitHub API.
+    CiStatus {
+        /// Branch name (default: main).
+        #[arg(default_value = "main")]
+        branch: String,
+    },
     /// (M1-T14) Black-box audit binary (placeholder).
     Audit {
         /// Path to a packaged app to audit.
@@ -72,6 +80,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Package => run_package(),
         Cmd::Discover { reference, out } => run_discover(&reference, out.as_deref()),
         Cmd::VerifyConfig { config } => run_verify_config(config.as_deref()),
+        Cmd::CiStatus { branch } => ci_status::run(&branch),
         Cmd::Audit { app } => run_audit(&app),
     }
 }
