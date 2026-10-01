@@ -38,7 +38,9 @@ use qdrant_edge::{
 };
 
 use crate::error::{Error, Result};
-use crate::vectorstore::{CollectionInfo, Filter, Payload, Point, PointId, ScoredPoint, VectorStore};
+use crate::vectorstore::{
+    CollectionInfo, Filter, Payload, Point, PointId, ScoredPoint, VectorStore,
+};
 
 /// A VectorStore backed by `qdrant-edge` — the production adapter (spec A4).
 ///
@@ -75,7 +77,13 @@ impl QdrantEdgeVectorStore {
         // Sanitize the collection name into a filesystem-safe directory name.
         let safe: String = name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.data_dir.join(safe)
     }
@@ -137,7 +145,12 @@ impl VectorStore for QdrantEdgeVectorStore {
     }
 
     fn upsert(&self, collection: &str, point: Point) -> Result<()> {
-        if !self.shards.lock().expect("mutex poisoned").contains_key(collection) {
+        if !self
+            .shards
+            .lock()
+            .expect("mutex poisoned")
+            .contains_key(collection)
+        {
             return Err(Error::Config(format!(
                 "collection '{collection}' does not exist; call create_collection first"
             )));
