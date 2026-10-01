@@ -646,8 +646,7 @@ mod tests {
             params![mailbox_id, user_id, customer_id],
         )
         .unwrap();
-        let conversation_id = conn.last_insert_rowid();
-        conversation_id
+        conn.last_insert_rowid()
     }
 
     #[test]
