@@ -98,7 +98,15 @@ jobs:
 
       - name: Uninstall the DEB + verify removal
         run: |
-          sudo apt-get remove -y supportos-plusplus || sudo apt-get remove -y "supportos++"
+          # Tauri derives the package name from productName ("SupportOS++")
+          # by lowercasing + removing '+'. The result is "support-os".
+          # Use dpkg to find the actual installed package name.
+          PKG=$(dpkg -S /usr/bin/supportos-plusplus 2>/dev/null | cut -d: -f1 || true)
+          if [ -z "$PKG" ]; then
+            PKG="support-os"
+          fi
+          echo "Removing package: $PKG"
+          sudo apt-get remove -y "$PKG"
           if which supportos-plusplus 2>/dev/null; then
             echo "❌ Binary still in PATH after uninstall"
             exit 1
@@ -114,7 +122,8 @@ jobs:
 
       - name: Install Fedora deps
         run: |
-          dnf install -y xorg-x11-server-Xvfb webkit2gtk4.1 libssl3 findutils
+          # Fedora uses 'openssl-libs' (not 'libssl3' which is the Debian name).
+          dnf install -y xorg-x11-server-Xvfb webkit2gtk4.1 openssl-libs findutils
 
       - name: Fetch nightly RPM artifact
         uses: dawidd6/action-download-artifact@v3
@@ -154,7 +163,8 @@ jobs:
 
       - name: Uninstall
         run: |
-          dnf remove -y supportos-plusplus || dnf remove -y "supportos++"
+          # The RPM package name is 'support-os' (derived from productName).
+          dnf remove -y support-os || rpm -e support-os
           if which supportos-plusplus 2>/dev/null; then
             echo "❌ Binary still in PATH after uninstall"
             exit 1
@@ -179,14 +189,19 @@ jobs:
       - name: Silent-install the MSI
         shell: pwsh
         run: |
-          $msi = Get-ChildItem ./artifacts -Filter *.msi | Select-Object -First 1
+          # The MSI is nested in artifacts/target/release/bundle/msi/ — use -Recurse.
+          $msi = Get-ChildItem ./artifacts -Filter *.msi -Recurse | Select-Object -First 1
           Write-Host "Installing $($msi.FullName)"
           Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart" -Wait -NoNewWindow
-          # Verify the binary exists in Program Files.
-          $exe = "C:\Program Files\SupportOS++\supportos-plusplus.exe"
+          # Verify the binary exists in Program Files. Tauri on Windows uses
+          # the productName for the .exe name: 'SupportOS++.exe'.
+          $exe = "C:\Program Files\SupportOS++\SupportOS++.exe"
           if (-not (Test-Path $exe)) {
-            # Try alternate install locations.
-            $exe = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            # Try alternate install locations + ASCII binary name.
+            $exe = Get-ChildItem -Path "C:\Program Files" -Filter "SupportOS++.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $exe) {
+              $exe = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            }
             if (-not $exe) { Write-Host "❌ Installed binary not found"; exit 1 }
           }
           Write-Host "✅ Installed at $exe"
@@ -219,12 +234,13 @@ jobs:
       - name: Uninstall the MSI
         shell: pwsh
         run: |
-          $msi = Get-ChildItem ./artifacts -Filter *.msi | Select-Object -First 1
+          $msi = Get-ChildItem ./artifacts -Filter *.msi -Recurse | Select-Object -First 1
           Start-Process msiexec.exe -ArgumentList "/x `"$($msi.FullName)`" /qn /norestart" -Wait -NoNewWindow
-          # Verify removal.
-          $exe = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($exe) {
-            Write-Host "❌ Binary still exists after uninstall: $($exe.FullName)"
+          # Verify removal — check both productName and ASCII binary names.
+          $exe1 = Get-ChildItem -Path "C:\Program Files" -Filter "SupportOS++.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $exe2 = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe1 -or $exe2) {
+            Write-Host "❌ Binary still exists after uninstall"
             exit 1
           }
           Write-Host "✅ Uninstall succeeded"
@@ -247,14 +263,19 @@ jobs:
       - name: Silent-install the NSIS exe
         shell: pwsh
         run: |
-          $exe = Get-ChildItem ./artifacts -Filter *-setup.exe | Select-Object -First 1
+          # The NSIS exe is nested in artifacts/target/release/bundle/nsis/ — use -Recurse.
+          $exe = Get-ChildItem ./artifacts -Filter *-setup.exe -Recurse | Select-Object -First 1
           Write-Host "Installing $($exe.FullName)"
           # NSIS installers use /S for silent install.
           Start-Process -FilePath $exe.FullName -ArgumentList "/S" -Wait -NoNewWindow
-          # Find the installed binary.
-          $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          # Find the installed binary. Tauri on Windows uses productName for
+          # the .exe name: 'SupportOS++.exe'.
+          $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs" -Filter "SupportOS++.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $installed) {
-            $installed = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            $installed = Get-ChildItem -Path "C:\Program Files" -Filter "SupportOS++.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $installed) {
+            $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           }
           if (-not $installed) { Write-Host "❌ Installed binary not found"; exit 1 }
           Write-Host "✅ Installed at $($installed.FullName)"
