@@ -745,6 +745,27 @@ pub fn count_graph_nodes_by_kind(conn: &Connection, kind: &str) -> Result<u32> {
     Ok(u32::try_from(count).unwrap_or(0))
 }
 
+/// List all graph nodes (most recent first).
+pub fn list_graph_nodes(conn: &Connection, limit: Option<u32>) -> Result<Vec<GraphNode>> {
+    let limit = limit.unwrap_or(100).min(500) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, entity_id, label, properties_json, created_at
+         FROM graph_nodes ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |r| {
+        Ok(GraphNode {
+            id: r.get(0)?,
+            kind: r.get(1)?,
+            entity_id: r.get(2)?,
+            label: r.get(3)?,
+            properties: r.get(4)?,
+            created_at: r.get(5)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

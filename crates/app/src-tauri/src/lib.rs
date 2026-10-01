@@ -159,6 +159,9 @@ pub fn run() {
             universal_search,
             // Backup (M12-P5i)
             backup_export,
+            // Support graph (M12-P5j)
+            graph_nodes_list,
+            graph_neighbors,
         ]);
 
     #[cfg(desktop)]
@@ -1034,6 +1037,37 @@ fn backup_export(db_state: tauri::State<'_, DbState>) -> Result<serde_json::Valu
     let conn = db_state.lock_conn()?;
     let backup = spp_core::data_tools::export_db(&conn).map_err(|e| e.to_string())?;
     serde_json::to_value(&backup).map_err(|e| e.to_string())
+}
+
+// ─── Support graph (M12-P5j) ──────────────────────────────────────────
+
+/// List all graph nodes (most recent first).
+#[tauri::command]
+fn graph_nodes_list(
+    db_state: tauri::State<'_, DbState>,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let nodes = spp_core::reports::list_graph_nodes(&conn, limit).map_err(|e| e.to_string())?;
+    nodes
+        .into_iter()
+        .map(|n| serde_json::to_value(&n).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Get neighbors of a graph node.
+#[tauri::command]
+fn graph_neighbors(
+    db_state: tauri::State<'_, DbState>,
+    node_id: i64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let neighbors =
+        spp_core::reports::get_graph_neighbors(&conn, node_id).map_err(|e| e.to_string())?;
+    neighbors
+        .into_iter()
+        .map(|n| serde_json::to_value(&n).map_err(|e| e.to_string()))
+        .collect()
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
