@@ -139,6 +139,10 @@ pub fn run() {
             customer_conversations,
             customer_timeline,
             customer_search,
+            // Intelligence — Incidents (M12-P5h)
+            incidents_list,
+            // Intelligence — Knowledge gaps (M12-P5h)
+            knowledge_gaps_list,
         ]);
 
     #[cfg(desktop)]
@@ -822,6 +826,53 @@ fn customer_search(
     customers
         .into_iter()
         .map(|c| serde_json::to_value(&c).map_err(|e| e.to_string()))
+        .collect()
+}
+
+// ─── Intelligence — Incidents + Knowledge gaps (M12-P5h) ────────────────
+
+/// List incidents (optionally filtered by status string).
+/// Status strings: "investigating", "identified", "fix_in_progress",
+/// "monitoring", "resolved". None = all statuses.
+#[tauri::command]
+fn incidents_list(
+    db_state: tauri::State<'_, DbState>,
+    status: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    use spp_core::catalog::IncidentStatus;
+    let conn = db_state.lock_conn()?;
+    let status_filter = match status.as_deref() {
+        Some("investigating") => Some(IncidentStatus::Investigating),
+        Some("identified") => Some(IncidentStatus::Identified),
+        Some("fix_in_progress") => Some(IncidentStatus::FixInProgress),
+        Some("monitoring") => Some(IncidentStatus::Monitoring),
+        Some("resolved") => Some(IncidentStatus::Resolved),
+        _ => None,
+    };
+    let incidents = spp_core::intelligence_features::list_incidents(&conn, status_filter)
+        .map_err(|e| e.to_string())?;
+    incidents
+        .into_iter()
+        .map(|i| serde_json::to_value(&i).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// List knowledge gaps (topics with the most missing docs).
+#[tauri::command]
+fn knowledge_gaps_list(
+    db_state: tauri::State<'_, DbState>,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let gaps = spp_core::intelligence_features::list_knowledge_gaps(&conn, limit.unwrap_or(20))
+        .map_err(|e| e.to_string())?;
+    gaps.into_iter()
+        .map(|(topic, count)| {
+            Ok(serde_json::json!({
+                "topic": topic,
+                "gap_count": count,
+            }))
+        })
         .collect()
 }
 
