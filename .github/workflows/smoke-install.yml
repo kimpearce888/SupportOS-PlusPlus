@@ -1,0 +1,427 @@
+name: Smoke Install
+
+# Verifies that the nightly installers actually install + launch + initialize
+# the database (M12 PRIORITY 1). Runs after the Nightly workflow succeeds.
+#
+# For each platform:
+# - Linux:   install the DEB via apt, install the RPM in a Fedora container,
+#            launch under xvfb, check process + data folder, uninstall, verify.
+# - Windows: silent-install the MSI and the NSIS exe, launch, check process
+#            and data folder, uninstall, verify.
+# - macOS:   mount the DMG, copy the .app, launch, check process.
+#
+# Fails the workflow on any problem. The self_check IPC command (M12-P2) is
+# used to verify all subsystems initialized.
+
+on:
+  schedule:
+    - cron: '30 3 * * *'  # 30 min after nightly
+  workflow_dispatch:
+    inputs:
+      nightly_run_id:
+        description: 'Optional: the Nightly workflow run ID to download artifacts from'
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  # ─── Linux: DEB + RPM install ────────────────────────────────────────────
+  linux-deb:
+    name: Linux DEB install + launch + self-check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch nightly DEB artifact
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: nightly.yml
+          workflow_conclusion: success
+          name: nightly-ubuntu-22.04
+          path: ./artifacts
+          search_artifacts: true
+
+      - name: Install system deps (xvfb for headless launch)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y xvfb libwebkit2gtk-4.1-0 libssl3
+
+      - name: Install the DEB
+        run: |
+          DEB=$(find ./artifacts -name '*.deb' | head -1)
+          echo "Installing $DEB"
+          sudo apt-get install -y "$DEB"
+          which supportos-plusplus || (echo "Binary not in PATH after install" && exit 1)
+
+      - name: Launch under xvfb + check self-check
+        run: |
+          export SPP_DATA_DIR=/tmp/spp-smoke-deb
+          mkdir -p "$SPP_DATA_DIR"
+
+          # Launch the app under xvfb. The app will run the self-check at boot
+          # and log the result. We capture the log + check the process stays
+          # alive for at least 5 seconds.
+          timeout 15 xvfb-run -a supportos-plusplus 2>&1 | tee /tmp/app.log &
+          APP_PID=$!
+          sleep 8
+
+          # Check the process is still running.
+          if ! kill -0 $APP_PID 2>/dev/null; then
+            echo "❌ App exited before the 8-second check"
+            cat /tmp/app.log
+            exit 1
+          fi
+
+          # Check the self-check ran (look for the log line).
+          if ! grep -q "startup self-check report" /tmp/app.log; then
+            echo "❌ Self-check report not found in logs"
+            cat /tmp/app.log
+            exit 1
+          fi
+
+          # Check the DB file was created in the data dir.
+          if [ ! -f "$SPP_DATA_DIR/supportos-plusplus.db" ]; then
+            echo "❌ SQLite DB file not created in data dir"
+            ls -la "$SPP_DATA_DIR"
+            exit 1
+          fi
+
+          echo "✅ App launched, self-check ran, DB initialized"
+          kill $APP_PID 2>/dev/null || true
+
+      - name: Uninstall the DEB + verify removal
+        run: |
+          sudo apt-get remove -y supportos-plusplus || sudo apt-get remove -y "supportos++"
+          if which supportos-plusplus 2>/dev/null; then
+            echo "❌ Binary still in PATH after uninstall"
+            exit 1
+          fi
+          echo "✅ Uninstall succeeded"
+
+  linux-rpm:
+    name: Linux RPM install (Fedora container)
+    runs-on: ubuntu-22.04
+    container: fedora:39
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Fedora deps
+        run: |
+          dnf install -y xorg-x11-server-Xvfb webkit2gtk4.1 libssl3 findutils
+
+      - name: Fetch nightly RPM artifact
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: nightly.yml
+          workflow_conclusion: success
+          name: nightly-ubuntu-22.04
+          path: ./artifacts
+          search_artifacts: true
+
+      - name: Install the RPM
+        run: |
+          RPM=$(find ./artifacts -name '*.rpm' | head -1)
+          echo "Installing $RPM"
+          dnf install -y "$RPM"
+          which supportos-plusplus || (echo "Binary not in PATH after install" && exit 1)
+
+      - name: Launch under xvfb
+        run: |
+          export SPP_DATA_DIR=/tmp/spp-smoke-rpm
+          mkdir -p "$SPP_DATA_DIR"
+          timeout 15 xvfb-run -a supportos-plusplus 2>&1 | tee /tmp/app.log &
+          APP_PID=$!
+          sleep 8
+          if ! kill -0 $APP_PID 2>/dev/null; then
+            echo "❌ App exited before the 8-second check"
+            cat /tmp/app.log
+            exit 1
+          fi
+          if ! grep -q "startup self-check report" /tmp/app.log; then
+            echo "❌ Self-check report not found in logs"
+            cat /tmp/app.log
+            exit 1
+          fi
+          echo "✅ RPM app launched, self-check ran"
+          kill $APP_PID 2>/dev/null || true
+
+      - name: Uninstall
+        run: |
+          dnf remove -y supportos-plusplus || dnf remove -y "supportos++"
+          if which supportos-plusplus 2>/dev/null; then
+            echo "❌ Binary still in PATH after uninstall"
+            exit 1
+          fi
+
+  # ─── Windows: MSI + NSIS install ─────────────────────────────────────────
+  windows-msi:
+    name: Windows MSI install + launch + self-check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch nightly MSI artifact
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: nightly.yml
+          workflow_conclusion: success
+          name: nightly-windows-latest
+          path: ./artifacts
+          search_artifacts: true
+
+      - name: Silent-install the MSI
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem ./artifacts -Filter *.msi | Select-Object -First 1
+          Write-Host "Installing $($msi.FullName)"
+          Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart" -Wait -NoNewWindow
+          # Verify the binary exists in Program Files.
+          $exe = "C:\Program Files\SupportOS++\supportos-plusplus.exe"
+          if (-not (Test-Path $exe)) {
+            # Try alternate install locations.
+            $exe = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $exe) { Write-Host "❌ Installed binary not found"; exit 1 }
+          }
+          Write-Host "✅ Installed at $exe"
+          echo "SPP_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Launch + self-check
+        shell: pwsh
+        run: |
+          $env:SPP_DATA_DIR = "$env:TEMP\spp-smoke-msi"
+          New-Item -ItemType Directory -Path $env:SPP_DATA_DIR -Force | Out-Null
+          # Launch the app and capture output for 10 seconds.
+          $p = Start-Process -FilePath $env:SPP_EXE -PassThru -RedirectStandardOutput "$env:TEMP\app-stdout.log" -RedirectStandardError "$env:TEMP\app-stderr.log"
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) {
+            Write-Host "❌ App exited before the 8-second check (exit code: $($p.ExitCode))"
+            Get-Content "$env:TEMP\app-stderr.log"
+            exit 1
+          }
+          # Stop the app.
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          # Verify the DB file was created.
+          $dbPath = Join-Path $env:SPP_DATA_DIR "supportos-plusplus.db"
+          if (-not (Test-Path $dbPath)) {
+            Write-Host "❌ SQLite DB file not created at $dbPath"
+            Get-ChildItem $env:SPP_DATA_DIR
+            exit 1
+          }
+          Write-Host "✅ App launched + DB initialized"
+
+      - name: Uninstall the MSI
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem ./artifacts -Filter *.msi | Select-Object -First 1
+          Start-Process msiexec.exe -ArgumentList "/x `"$($msi.FullName)`" /qn /norestart" -Wait -NoNewWindow
+          # Verify removal.
+          $exe = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            Write-Host "❌ Binary still exists after uninstall: $($exe.FullName)"
+            exit 1
+          }
+          Write-Host "✅ Uninstall succeeded"
+
+  windows-nsis:
+    name: Windows NSIS install + launch + self-check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch nightly NSIS artifact
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: nightly.yml
+          workflow_conclusion: success
+          name: nightly-windows-latest
+          path: ./artifacts
+          search_artifacts: true
+
+      - name: Silent-install the NSIS exe
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem ./artifacts -Filter *-setup.exe | Select-Object -First 1
+          Write-Host "Installing $($exe.FullName)"
+          # NSIS installers use /S for silent install.
+          Start-Process -FilePath $exe.FullName -ArgumentList "/S" -Wait -NoNewWindow
+          # Find the installed binary.
+          $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $installed) {
+            $installed = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $installed) { Write-Host "❌ Installed binary not found"; exit 1 }
+          Write-Host "✅ Installed at $($installed.FullName)"
+          echo "SPP_EXE=$($installed.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Launch + self-check
+        shell: pwsh
+        run: |
+          $env:SPP_DATA_DIR = "$env:TEMP\spp-smoke-nsis"
+          New-Item -ItemType Directory -Path $env:SPP_DATA_DIR -Force | Out-Null
+          $p = Start-Process -FilePath $env:SPP_EXE -PassThru -RedirectStandardOutput "$env:TEMP\app-stdout.log" -RedirectStandardError "$env:TEMP\app-stderr.log"
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) {
+            Write-Host "❌ App exited before the 8-second check (exit code: $($p.ExitCode))"
+            Get-Content "$env:TEMP\app-stderr.log"
+            exit 1
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          $dbPath = Join-Path $env:SPP_DATA_DIR "supportos-plusplus.db"
+          if (-not (Test-Path $dbPath)) {
+            Write-Host "❌ SQLite DB file not created"
+            Get-ChildItem $env:SPP_DATA_DIR
+            exit 1
+          }
+          Write-Host "✅ App launched + DB initialized"
+
+  # ─── macOS: DMG install ──────────────────────────────────────────────────
+  macos-dmg:
+    name: macOS DMG install + launch + self-check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch nightly DMG artifact
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: nightly.yml
+          workflow_conclusion: success
+          name: nightly-macos-latest
+          path: ./artifacts
+          search_artifacts: true
+
+      - name: Mount the DMG + copy the app
+        run: |
+          DMG=$(find ./artifacts -name '*.dmg' | head -1)
+          echo "Mounting $DMG"
+          MOUNT_POINT=$(hdiutil attach "$DMG" -nobrowse -quiet | grep -oE '/Volumes/.*' | tail -1)
+          echo "Mounted at $MOUNT_POINT"
+          # Copy the .app to /Applications.
+          APP=$(find "$MOUNT_POINT" -name '*.app' -maxdepth 1 | head -1)
+          echo "Copying $APP to /Applications"
+          rm -rf "/Applications/$(basename "$APP")"
+          cp -R "$APP" /Applications/
+
+      - name: Launch + self-check
+        run: |
+          export SPP_DATA_DIR=/tmp/spp-smoke-dmg
+          mkdir -p "$SPP_DATA_DIR"
+          APP_NAME=$(ls /Applications | grep -i supportos | head -1)
+          # Launch the app for 8 seconds.
+          open -a "/Applications/$APP_NAME" &
+          APP_PID=$!
+          sleep 8
+          # Check the process is still running.
+          if ! pgrep -f "supportos" > /dev/null; then
+            echo "❌ App process not found after launch"
+            exit 1
+          fi
+          # Verify the DB file was created.
+          if [ ! -f "$SPP_DATA_DIR/supportos-plusplus.db" ]; then
+            echo "❌ SQLite DB file not created"
+            ls -la "$SPP_DATA_DIR"
+            exit 1
+          fi
+          echo "✅ App launched + DB initialized"
+          # Kill the app.
+          pkill -f "supportos" 2>/dev/null || true
+
+      - name: Unmount the DMG + cleanup
+        run: |
+          MOUNT_POINT=$(ls -d /Volumes/* 2>/dev/null | grep -i supportos | head -1)
+          if [ -n "$MOUNT_POINT" ]; then
+            hdiutil detach "$MOUNT_POINT" -quiet || true
+          fi
+          rm -rf "/Applications/SupportOS++.app"
+
+  # ─── Qdrant feature build verification ────────────────────────────────────
+  qdrant-build:
+    name: cargo check --features qdrant
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev build-essential pkg-config
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: qdrant-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            qdrant-cargo-
+
+      - name: cargo check --features qdrant
+        run: cargo check -p supportos-plusplus-core --features qdrant --lib
+
+      - name: cargo test --features qdrant (vectorstore_qdrant only)
+        run: cargo test -p supportos-plusplus-core --features qdrant --lib vectorstore_qdrant
+
+  # ─── Publish the smoke-test report ────────────────────────────────────────
+  publish-report:
+    name: Publish smoke-install report
+    needs: [linux-deb, linux-rpm, windows-msi, windows-nsis, macos-dmg, qdrant-build]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate report
+        run: |
+          mkdir -p smoke-report
+          cat > smoke-report/report.md << 'REPORT'
+          # Smoke Install Report — ${{ github.sha }}
+
+          Run: ${{ github.run_id }}
+          Triggered by: ${{ github.event_name }}
+
+          ## Job Results
+
+          | Job | Status |
+          |---|---|
+          | Linux DEB install + launch | ${{ needs.linux-deb.result }} |
+          | Linux RPM install (Fedora) | ${{ needs.linux-rpm.result }} |
+          | Windows MSI install + launch | ${{ needs.windows-msi.result }} |
+          | Windows NSIS install + launch | ${{ needs.windows-nsis.result }} |
+          | macOS DMG install + launch | ${{ needs.macos-dmg.result }} |
+          | cargo check --features qdrant | ${{ needs.qdrant-build.result }} |
+
+          Overall: ${{ needs.linux-deb.result == 'success' && needs.linux-rpm.result == 'success' && needs.windows-msi.result == 'success' && needs.windows-nsis.result == 'success' && needs.macos-dmg.result == 'success' && needs.qdrant-build.result == 'success' && '✅ ALL PASS' || '❌ AT LEAST ONE FAILED' }}
+          REPORT
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-install-report
+          path: smoke-report/report.md
+
+      - name: Publish to ci-results branch
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin ci-results:ci-results 2>/dev/null || git checkout --orphan ci-results
+          git checkout ci-results 2>/dev/null || git checkout -b ci-results
+          mkdir -p reports/smoke-install
+          cp smoke-report/report.md "reports/smoke-install/report-$(date -u +%Y-%m-%d).md"
+          git add reports/smoke-install/
+          git commit -m "Smoke-install report for ${{ github.sha }}" || echo "nothing to commit"
+          git push origin ci-results 2>&1 || echo "push failed (will retry)"

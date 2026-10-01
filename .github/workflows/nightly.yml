@@ -22,8 +22,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
           - os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
           - os: macos-latest
+            rust_target: aarch64-apple-darwin
+          - os: macos-13
+            rust_target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +36,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown,${{ matrix.rust_target }}
 
       - name: Install Linux system deps
         if: runner.os == 'Linux'
@@ -82,7 +87,6 @@ jobs:
           find . -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \
             -o -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \) -exec $SHA_CMD {} \; > checksums.txt || true
           cat checksums.txt 2>/dev/null || echo "No installer files found"
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -90,12 +94,14 @@ jobs:
           path: |
             target/release/bundle/**/*.deb
             target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.AppImage
             target/release/bundle/**/*.msi
             target/release/bundle/**/*.exe
             target/release/bundle/**/*.dmg
             target/release/bundle/**/checksums.txt
             crates/app/src-tauri/target/release/bundle/**/*.deb
             crates/app/src-tauri/target/release/bundle/**/*.rpm
+            crates/app/src-tauri/target/release/bundle/**/*.AppImage
             crates/app/src-tauri/target/release/bundle/**/*.msi
             crates/app/src-tauri/target/release/bundle/**/*.exe
             crates/app/src-tauri/target/release/bundle/**/*.dmg
@@ -117,12 +123,14 @@ jobs:
           files: |
             target/release/bundle/**/*.deb
             target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.AppImage
             target/release/bundle/**/*.msi
             target/release/bundle/**/*.exe
             target/release/bundle/**/*.dmg
             target/release/bundle/**/checksums.txt
             crates/app/src-tauri/target/release/bundle/**/*.deb
             crates/app/src-tauri/target/release/bundle/**/*.rpm
+            crates/app/src-tauri/target/release/bundle/**/*.AppImage
             crates/app/src-tauri/target/release/bundle/**/*.msi
             crates/app/src-tauri/target/release/bundle/**/*.exe
             crates/app/src-tauri/target/release/bundle/**/*.dmg
