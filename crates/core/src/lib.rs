@@ -59,6 +59,7 @@ pub mod oauth;
 pub mod oauth_state;
 pub mod operations;
 pub mod perf_guards;
+pub mod reports;
 pub mod response_state_sql;
 pub mod runner;
 pub mod saved_views;
