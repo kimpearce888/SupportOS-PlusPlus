@@ -14,6 +14,7 @@ pub mod notifications;
 pub mod operations;
 pub mod reports;
 pub mod settings;
+pub mod support_health;
 pub mod sync_health;
 
 pub use ai_center::AiCenterPage;
@@ -27,4 +28,5 @@ pub use notifications::NotificationsPage;
 pub use operations::OperationsPage;
 pub use reports::ReportsPage;
 pub use settings::SettingsPage;
+pub use support_health::SupportHealthPage;
 pub use sync_health::SyncHealthPage;
