@@ -134,6 +134,11 @@ pub fn run() {
             inbox_assign,
             inbox_list_saved_views,
             inbox_apply_saved_view,
+            // Customers (M12-P5b — customer profile + history + timeline)
+            customer_get,
+            customer_conversations,
+            customer_timeline,
+            customer_search,
         ]);
 
     #[cfg(desktop)]
@@ -752,6 +757,72 @@ fn serialize_operation_result(
             "reason": reason,
         })),
     }
+}
+
+// ─── Customers (M12-P5b) ────────────────────────────────────────────────
+
+/// Get a customer by local id.
+#[tauri::command]
+fn customer_get(
+    db_state: tauri::State<'_, DbState>,
+    customer_id: i64,
+) -> Result<Option<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let customer =
+        spp_core::customers::get_customer(&conn, customer_id).map_err(|e| e.to_string())?;
+    match customer {
+        Some(c) => Ok(Some(serde_json::to_value(&c).map_err(|e| e.to_string())?)),
+        None => Ok(None),
+    }
+}
+
+/// List conversations for a customer (most recent first).
+#[tauri::command]
+fn customer_conversations(
+    db_state: tauri::State<'_, DbState>,
+    customer_id: i64,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let convs = spp_core::customers::list_customer_conversations(&conn, customer_id, limit)
+        .map_err(|e| e.to_string())?;
+    convs
+        .into_iter()
+        .map(|c| serde_json::to_value(&c).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Get the customer timeline — merged view of thread entries across all
+/// conversations for this customer.
+#[tauri::command]
+fn customer_timeline(
+    db_state: tauri::State<'_, DbState>,
+    customer_id: i64,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let entries = spp_core::customers::customer_timeline(&conn, customer_id, limit)
+        .map_err(|e| e.to_string())?;
+    entries
+        .into_iter()
+        .map(|e| serde_json::to_value(&e).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Search customers by name or email.
+#[tauri::command]
+fn customer_search(
+    db_state: tauri::State<'_, DbState>,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let customers =
+        spp_core::customers::search_customers(&conn, &query, limit).map_err(|e| e.to_string())?;
+    customers
+        .into_iter()
+        .map(|c| serde_json::to_value(&c).map_err(|e| e.to_string()))
+        .collect()
 }
 
 #[cfg(all(test, not(target_os = "macos")))]

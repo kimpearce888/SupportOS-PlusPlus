@@ -4,6 +4,7 @@
 //! `/automation`, `/settings`, `/sync-health`, `/inbox`, and a not-found fallback.
 
 pub mod automation;
+pub mod customers;
 pub mod dashboard;
 pub mod inbox;
 pub mod not_found;
@@ -13,6 +14,7 @@ pub mod settings;
 pub mod sync_health;
 
 pub use automation::AutomationPage;
+pub use customers::{CustomerProfilePage, CustomerSearchPage};
 pub use dashboard::DashboardPage;
 pub use inbox::InboxPage;
 pub use not_found::NotFoundPage;
