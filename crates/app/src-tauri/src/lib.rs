@@ -59,11 +59,28 @@ pub fn run() {
             None
         }
     };
-    let _ = loopback_addr;
+    let loopback_addr_str = loopback_addr.map(|a| a.to_string());
+
+    // 3.5 Run the startup self-check (M12 — packaging verification).
+    // The report is logged and made available via the `self_check` IPC command.
+    let self_check_report = spp_core::self_check::run(&conn, loopback_addr_str.clone())
+        .map_err(|e| {
+            tracing::error!(error = %e, "self-check failed to run");
+            e.to_string()
+        })
+        .ok();
+    if let Some(ref report) = self_check_report {
+        tracing::info!(?report, "startup self-check report");
+        if !report.all_ok {
+            tracing::warn!("startup self-check found failing subsystems — see report");
+        }
+    }
+    let _ = self_check_report; // hold for state below
 
     // 4. Launch Tauri with the DB connection in state + all IPC commands.
     let db_state = DbState {
         conn: Mutex::new(conn),
+        self_check_report: self_check_report,
     };
 
     let mut builder = tauri::Builder::default()
@@ -107,6 +124,8 @@ pub fn run() {
             issue_radar_snapshot,
             // Conformance (M11-T01)
             parity_gate_check,
+            // Self-check (M12 — packaging verification)
+            self_check,
         ]);
 
     #[cfg(desktop)]
@@ -155,7 +174,16 @@ fn open_db_with_all_migrations(
 fn launch_without_db() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
-        .invoke_handler(tauri::generate_handler![ping, version, catalog_counts,]);
+        .manage(DbState {
+            conn: Mutex::new(fallback_in_memory_conn()),
+            self_check_report: None,
+        })
+        .invoke_handler(tauri::generate_handler![
+            ping,
+            version,
+            catalog_counts,
+            self_check,
+        ]);
 
     #[cfg(desktop)]
     {
@@ -172,12 +200,29 @@ fn launch_without_db() {
         .expect("error while running SupportOS++");
 }
 
+/// Open an in-memory SQLite connection with the base migrations only.
+/// Used as a fallback when the on-disk DB cannot be opened (disk full,
+/// permissions, etc.). The self_check will report the degraded state.
+fn fallback_in_memory_conn() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap_or_else(|_| {
+        // If even an in-memory connection fails, panic — the app cannot run.
+        panic!("failed to open in-memory SQLite connection");
+    });
+    let _ = spp_core::db::ensure_migrations_table(&conn);
+    let mut conn_mut = conn;
+    let _ = spp_core::migrations::run_all(&mut conn_mut);
+    conn_mut
+}
+
 /// The shared DB state managed by Tauri. IPC commands access this via
 /// `tauri::State<DbState>`.
 pub struct DbState {
     /// The SQLite connection. Wrapped in a Mutex for thread safety (Tauri
     /// IPC commands run on a thread pool).
     pub conn: Mutex<rusqlite::Connection>,
+    /// The startup self-check report (None if self-check failed to run).
+    /// Immutable after boot; read by the `self_check` IPC command.
+    pub self_check_report: Option<spp_core::self_check::SelfCheckReport>,
 }
 
 impl DbState {
@@ -531,6 +576,19 @@ fn parity_gate_check() -> Result<serde_json::Value, String> {
     }
 }
 
+// ─── Self-check (M12 — packaging verification) ──────────────────────────
+
+/// Get the startup self-check report. The check runs once at boot; this
+/// command returns the cached result. Returns `null` if the self-check
+/// failed to run (e.g., the DB connection was unavailable at boot).
+#[tauri::command]
+fn self_check(db_state: tauri::State<'_, DbState>) -> Result<Option<serde_json::Value>, String> {
+    Ok(db_state
+        .self_check_report
+        .as_ref()
+        .and_then(|r| serde_json::to_value(r).ok()))
+}
+
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
@@ -644,5 +702,49 @@ mod tests {
         let _: i64 = conn
             .query_row("SELECT COUNT(*) FROM connectors", [], |r| r.get(0))
             .unwrap();
+    }
+
+    #[test]
+    fn self_check_report_is_honest_on_fresh_db() {
+        use tempfile::NamedTempFile;
+        let f = NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let conn = open_db_with_all_migrations(&f).unwrap();
+        let report = spp_core::self_check::run(&conn, None).unwrap();
+
+        // The self-check must report all subsystems ok on a fresh DB.
+        assert!(
+            report.all_ok,
+            "self-check failed: {:?}",
+            report
+                .subsystems
+                .iter()
+                .filter(|s| !s.ok)
+                .collect::<Vec<_>>()
+        );
+        // The Qdrant feature is OFF by default; the report must say so.
+        assert_eq!(
+            report.qdrant_feature_enabled, false,
+            "qdrant feature must be off by default"
+        );
+        let vs = report
+            .subsystems
+            .iter()
+            .find(|s| s.name == "vector_store")
+            .unwrap();
+        assert!(vs.status.contains("in_memory"));
+        assert!(vs.status.contains("NOT enabled"));
+        // The database check must confirm all 27 migrations applied.
+        let db_check = report
+            .subsystems
+            .iter()
+            .find(|s| s.name == "database")
+            .unwrap();
+        assert!(db_check.ok, "db_check failed: {:?}", db_check);
+        let details = db_check.details.as_ref().unwrap();
+        assert_eq!(details["schema_version"], 27);
     }
 }
