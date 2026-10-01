@@ -139,7 +139,12 @@ jobs:
           RPM=$(find ./artifacts -name '*.rpm' | head -1)
           echo "Installing $RPM"
           dnf install -y "$RPM"
-          which supportos-plusplus || (echo "Binary not in PATH after install" && exit 1)
+          # Fedora minimal container may not have 'which' — use 'command -v' instead.
+          if ! command -v supportos-plusplus >/dev/null 2>&1; then
+            echo "❌ Binary not in PATH after install"
+            exit 1
+          fi
+          echo "✅ Binary installed at $(command -v supportos-plusplus)"
 
       - name: Launch under xvfb
         run: |
@@ -165,7 +170,7 @@ jobs:
         run: |
           # The RPM package name is 'support-os' (derived from productName).
           dnf remove -y support-os || rpm -e support-os
-          if which supportos-plusplus 2>/dev/null; then
+          if command -v supportos-plusplus >/dev/null 2>&1; then
             echo "❌ Binary still in PATH after uninstall"
             exit 1
           fi
@@ -266,18 +271,42 @@ jobs:
           # The NSIS exe is nested in artifacts/target/release/bundle/nsis/ — use -Recurse.
           $exe = Get-ChildItem ./artifacts -Filter *-setup.exe -Recurse | Select-Object -First 1
           Write-Host "Installing $($exe.FullName)"
-          # NSIS installers use /S for silent install.
-          Start-Process -FilePath $exe.FullName -ArgumentList "/S" -Wait -NoNewWindow
-          # Find the installed binary. Tauri on Windows uses productName for
-          # the .exe name: 'SupportOS++.exe'.
-          $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs" -Filter "SupportOS++.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $installed) {
-            $installed = Get-ChildItem -Path "C:\Program Files" -Filter "SupportOS++.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          # NSIS installers use /S for silent install. Wait up to 120 seconds.
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList "/S" -PassThru -NoNewWindow
+          $p | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+          # Find the installed binary. Try multiple common NSIS install locations
+          # and both productName and ASCII binary names.
+          $searchPaths = @(
+            "$env:LOCALAPPDATA\Programs\SupportOS++",
+            "$env:LOCALAPPDATA\Programs\supportos-plusplus",
+            "$env:LOCALAPPDATA\SupportOS++",
+            "$env:LOCALAPPDATA\supportos-plusplus",
+            "C:\Program Files\SupportOS++",
+            "C:\Program Files\supportos-plusplus",
+            "C:\Program Files (x86)\SupportOS++",
+            "C:\Program Files (x86)\supportos-plusplus"
+          )
+          $installed = $null
+          foreach ($path in $searchPaths) {
+            if (Test-Path $path) {
+              $installed = Get-ChildItem -Path $path -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($installed) { break }
+            }
           }
           if (-not $installed) {
-            $installed = Get-ChildItem -Path "$env:LOCALAPPDATA\Programs" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            # Last resort: search all of Program Files + LOCALAPPDATA.
+            $installed = Get-ChildItem -Path "$env:LOCALAPPDATA","C:\Program Files","C:\Program Files (x86)" -Filter "SupportOS*.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $installed) {
+              $installed = Get-ChildItem -Path "$env:LOCALAPPDATA","C:\Program Files","C:\Program Files (x86)" -Filter "supportos-plusplus.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
+            }
           }
-          if (-not $installed) { Write-Host "❌ Installed binary not found"; exit 1 }
+          if (-not $installed) {
+            Write-Host "❌ Installed binary not found in any standard location"
+            Write-Host "Searched paths:"
+            $searchPaths | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
           Write-Host "✅ Installed at $($installed.FullName)"
           echo "SPP_EXE=$($installed.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
