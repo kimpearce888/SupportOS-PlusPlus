@@ -316,10 +316,7 @@ pub fn CustomerSearchPage() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn customer_profile_page_module_loads() {
-        // This test verifies the module compiles. The actual UI rendering is
-        // verified by the wasm test runner in CI.
-        assert!(true);
-    }
+    // The customer profile page's UI rendering is verified by the wasm test
+    // runner in CI. This module exists to ensure the file compiles as a test
+    // target without triggering clippy::assertions_on_constants.
 }
