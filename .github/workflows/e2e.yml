@@ -43,7 +43,7 @@ jobs:
       - name: Build WASM UI
         run: |
           cd crates/ui
-          trunk build --release
+          trunk build
       - name: Build Tauri app (debug)
         run: |
           cd crates/app/src-tauri
