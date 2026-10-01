@@ -157,6 +157,8 @@ pub fn run() {
             dnc_list,
             // Search (M12-P5i)
             universal_search,
+            // Backup (M12-P5i)
+            backup_export,
         ]);
 
     #[cfg(desktop)]
@@ -1022,6 +1024,16 @@ fn universal_search(
         .into_iter()
         .map(|r| serde_json::to_value(&r).map_err(|e| e.to_string()))
         .collect()
+}
+
+// ─── Backup (M12-P5i) ──────────────────────────────────────────────────
+
+/// Export all table data as a JSON backup (excluding internal tables).
+#[tauri::command]
+fn backup_export(db_state: tauri::State<'_, DbState>) -> Result<serde_json::Value, String> {
+    let conn = db_state.lock_conn()?;
+    let backup = spp_core::data_tools::export_db(&conn).map_err(|e| e.to_string())?;
+    serde_json::to_value(&backup).map_err(|e| e.to_string())
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
