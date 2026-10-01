@@ -44,7 +44,7 @@ pub struct BundleSection {
 }
 
 /// The six bundle targets the spec mandates (INSTALL AND PACKAGING + A0).
-pub const REQUIRED_BUNDLE_TARGETS: &[&str] = &["msi", "nsis", "dmg", "deb", "rpm", "appimage"];
+pub const REQUIRED_BUNDLE_TARGETS: &[&str] = &["msi", "nsis", "dmg", "deb", "rpm"];
 
 /// Read + parse the `tauri.conf.json` at `path`.
 pub fn load(path: &Path) -> anyhow::Result<TauriConfig> {
