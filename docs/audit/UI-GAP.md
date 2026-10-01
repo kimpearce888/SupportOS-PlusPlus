@@ -45,12 +45,37 @@ the cargo feature), ai_provider (configured provider kind), loopback_listener
 The report is logged at boot + available via the `self_check` IPC command
 so the UI can display it.
 
-## Summary (updated M12)
+## Summary (updated M12 — session 3)
 
-- **Pages that exist with real IPC**: 4 (Dashboard, Inbox+Detail+Context, Operations, Notifications, Automation, Sync Health) — Dashboard, Inbox, Operations, Notifications, Automation, Sync Health are wired; Settings is the remaining placeholder.
-- **Pages missing**: 14 (Customer profile, AI Center, Reports, Issue Radar, Knowledge docs, Incidents, Side threads, Customer timeline, Support graph, Outreach/campaigns, Custom objects, Connectors, Backup/restore) + the dedicated conversation-detail page is now part of the Inbox.
-- **IPC commands that exist**: 30 (22 prior + 8 new inbox commands + self_check)
-- **IPC commands missing**: ~12 (for the missing pages)
+- **Pages that exist with real IPC**: 12
+  1. Dashboard (`dashboard_metrics`)
+  2. Inbox + Conversation detail + Context pane (8 IPC commands: `inbox_list_conversations`, `inbox_get_conversation`, `inbox_reply`, `inbox_add_note`, `inbox_change_status`, `inbox_assign`, `inbox_list_saved_views`, `inbox_apply_saved_view`)
+  3. Operations Center (`operations_snapshot`)
+  4. Notifications (`notifications_unread_count`, `notifications_list_unread`, `notifications_mark_read`)
+  5. Automation (`automation_list_rules`, `automation_list_pending`, `automation_approve`, `automation_reject`)
+  6. Sync Health (`sync_health_state`)
+  7. Customer profile + search (4 IPC commands: `customer_get`, `customer_conversations`, `customer_timeline`, `customer_search`)
+  8. AI Center (`ai_status`, `ai_set_provider`, `ai_set_chat_model`, `ai_set_embedding_model`, `copilot_allowlist`)
+  9. Reports (`report_build`)
+  10. Issue Radar (`issue_radar_snapshot`)
+  11. Settings (`self_check`, `parity_gate_check`, `first_run_state`)
+  12. Support Health (`support_health`)
+- **Pages missing**: 9 (Knowledge docs, Incidents, Side threads, Customer timeline [standalone], Support graph, Outreach/campaigns, Custom objects, Connectors, Backup/restore, Onboarding wizard, Search, command palette, 404)
+- **IPC commands that exist**: 35+ (22 prior + 8 inbox + 4 customer + self_check + the existing ai/report/issue_radar/support_health commands)
+- **IPC commands missing**: ~10 (for the missing pages)
+
+## Smoke-install verification (M12 PRIORITY 1 — DONE)
+
+All 6 smoke-install jobs PASS on commit 649fc4d2 (run 36875927714):
+- ✅ Linux DEB: install + launch + self-check + DB init + uninstall
+- ✅ Linux RPM (Fedora 39 container): install + launch + self-check + uninstall
+- ✅ Windows MSI: silent install + launch + DB init + uninstall
+- ✅ Windows NSIS: silent install + launch + DB init + uninstall
+- ✅ macOS DMG: mount + copy .app + launch + DB init + unmount
+- ✅ cargo check --features qdrant: the QdrantEdgeVectorStore adapter compiles with the actual published 0.8.0 API
+
+The self-check report at boot confirms all 6 subsystems initialized:
+database (28 migrations), FTS5, vector_store (in_memory; qdrant behind feature flag), ai_provider, loopback_listener, catalog_conformance.
 
 ## What "works" in the Inbox page (M12-P5)
 
