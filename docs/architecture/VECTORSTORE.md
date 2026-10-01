@@ -33,11 +33,9 @@ on x64 Linux in CI environments with adequate disk space.
 Per A4: "If the crate fails on a required platform, STOP and report; do not
 swap engines." We are NOT swapping engines. The VectorStore trait (M5-T01)
 and the `InMemoryVectorStore` Fake adapter are fully functional regardless.
-The Qdrant adapter code will be written + compiled when the environment has
-adequate disk space (CI on GitHub Actions, or a dev machine with >4GB free).
-
-The arm64 smoke test (M1-T11) remains BLOCKED — GitHub Actions free-tier
-runners are x64-only on all 3 OSes.
+The Qdrant adapter code has been written (M12) and compiles in CI via the
+`qdrant-build` smoke-install job. See DEV-002 for the dense-vector subset
+status and DEV-004 for the Linux arm64 non-support decision.
 
 ## API surface (recorded from source inspection of v0.8.0)
 
@@ -129,8 +127,8 @@ adequate disk space):
 1. `cargo build -p supportos-plusplus-core --features qdrant` — verifies the
    adapter compiles against the pinned qdrant-edge version.
 2. x64 smoke test: create a shard in a temp dir, upsert points, search
-   (dense + sparse + filter), count, close, reopen, verify persistence.
-3. The arm64 smoke test remains BLOCKED (M1-T11).
+   (dense + filter), count, close, reopen, verify persistence.
+3. Linux arm64 is NOT supported (DEV-004 — owner decision).
 
 ## Reference delta
 

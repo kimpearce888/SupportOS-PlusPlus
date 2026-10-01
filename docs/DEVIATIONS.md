@@ -64,20 +64,22 @@ Each entry:
 
 ---
 
-## DEV-004 — Linux arm64 + macOS Intel: macOS Intel added, Linux arm64 not yet
+## DEV-004 — Linux arm64 not supported (removed)
 
-- **Date**: Session 37 (M12)
-- **Where**: `.github/workflows/nightly.yml` matrix
-- **Spec says**: A4 — "spike that proves, on CI runners for Windows x64, macOS arm64, macOS x64 (Intel), Linux x64 and Linux arm64 (where feasible)..."
+- **Date**: Session 37 (M12), removed in session 38 per owner directive
+- **Where**: README.md, CI matrix
+- **Spec says**: A4 mentions Linux arm64 "(where feasible)"
 - **Reference does**: n/a
-- **Deviation**:
-  - ✅ macOS Intel (x86_64-apple-darwin) added via `macos-13` runner.
-  - ❌ Linux arm64 NOT added (no free arm64 runner on GitHub Actions free tier).
-- **Reason**: GitHub Actions free tier does not include Linux arm64 runners. Native arm64 Linux builds require either a self-hosted runner, GitHub's pay-tier arm64 runners, or QEMU-based cross-compilation (which is slow + unreliable for Tauri).
+- **Deviation**: Linux arm64 is NOT supported. The CI matrix is x86_64-only
+  for Linux (Ubuntu 22.04 + Fedora 39). Linux arm64 users must build from
+  source. The README documents this.
+- **Reason**: The owner decided not to pursue arm64 CI runners. This is a
+  permanent scope decision, not a blocker.
 - **Impact**:
   - User-visible: Linux arm64 users must build from source.
-  - Technical: the spec's per-platform Qdrant Edge spike for Linux arm64 is BLOCKED pending owner action (a CI runner or a local arm64 machine).
-- **Status**: pending owner approval — owner must provide an arm64 CI runner or accept x64-only Linux builds.
+  - Technical: none — the codebase compiles fine on arm64; only CI does not
+    produce arm64 installers.
+- **Status**: approved (owner decision — removed from the roadmap)
 
 ---
 

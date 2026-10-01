@@ -17,7 +17,7 @@
 ## Next 3 tasks
 
 1. **Owner action**: Run `docs/MANUAL-VERIFICATION.md` on clean machines to promote rows to VERIFIED.
-2. **Owner action**: Provide signing certificates (M1-T10) + arm64 CI runners (M1-T11) + Qdrant build machine (M5-T02).
+2. **Owner action**: Provide signing certificates (M1-T10) + Qdrant build machine (M5-T02).
 3. **(Done)**: Tauri shell IPC wiring — 22 IPC commands connecting all UI pages to the Rust core.
 
 ## Resume protocol for next session
