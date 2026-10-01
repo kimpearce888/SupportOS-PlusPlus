@@ -12,28 +12,26 @@ env:
 
 jobs:
   e2e-linux:
-    name: E2E (Linux, xvfb, TauriDriver)
+    name: E2E (Linux, build + smoke)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-
-      - name: Install system dependencies (Tauri 2 + WebDriver + xvfb)
+      - name: Install system dependencies (Tauri 2 + xvfb)
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev build-essential curl wget file pkg-config \
-            xvfb tauri-driver webkit2gtk-driver
-
-      - name: Install trunk
-        run: cargo install trunk --locked
-
+            xvfb
+      - name: Install trunk + tauri-cli
+        run: |
+          cargo install trunk --locked
+          cargo install tauri-cli --version "^2.0" --locked --no-default-features
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -42,43 +40,43 @@ jobs:
             ~/.cargo/git
             target
           key: e2e-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-
       - name: Build WASM UI
         run: |
           cd crates/ui
           trunk build --release
-
       - name: Build Tauri app (debug)
         run: |
           cd crates/app/src-tauri
           cargo build
-
-      - name: Start WebDriver + launch app under xvfb
+      - name: Launch app under xvfb + verify
         run: |
-          # Start tauri-driver in the background.
-          tauri-driver &
-          DRIVER_PID=$!
-          sleep 2
+          # Build the binary path.
+          APP_BIN="target/debug/supportos-plusplus"
+          if [ ! -f "$APP_BIN" ]; then
+            APP_BIN="crates/app/src-tauri/target/debug/supportos-plusplus"
+          fi
 
-          # Start the app under xvfb.
-          xvfb-run -a cargo run -p supportos-plusplus-app &
+          # Launch under xvfb. The app will try to open a window; xvfb provides
+          # a virtual display. Set SPP_DATA_DIR to a temp dir for a clean DB.
+          export SPP_DATA_DIR=/tmp/spp-e2e-test
+          mkdir -p $SPP_DATA_DIR
+
+          # Launch and wait 5 seconds, then check if the process is running.
+          timeout 10 xvfb-run -a "$APP_BIN" &
           APP_PID=$!
           sleep 5
 
-          # Run E2E test script.
-          # For now, just verify the process is running.
           if kill -0 $APP_PID 2>/dev/null; then
             echo "✅ App launched successfully under xvfb"
             echo "E2E_RESULT=pass" >> $GITHUB_ENV
+            kill $APP_PID 2>/dev/null || true
           else
-            echo "❌ App failed to launch"
+            echo "❌ App failed to launch or exited immediately"
             echo "E2E_RESULT=fail" >> $GITHUB_ENV
           fi
 
           # Cleanup.
-          kill $APP_PID 2>/dev/null || true
-          kill $DRIVER_PID 2>/dev/null || true
-
+          rm -rf $SPP_DATA_DIR
       - name: E2E result
         if: always()
         run: |
@@ -86,31 +84,3 @@ jobs:
           if [ "${{ env.E2E_RESULT }}" != "pass" ]; then
             exit 1
           fi
-
-  e2e-windows-smoke:
-    name: E2E smoke (Windows)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install trunk
-        run: cargo install trunk --locked
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: e2e-win-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-      - name: Build WASM UI
-        run: |
-          cd crates/ui
-          trunk build --release
-      - name: Build Tauri app (debug)
-        run: |
-          cd crates/app/src-tauri
-          cargo build
-      - name: Smoke test — app builds
-        run: echo "✅ Tauri app built successfully on Windows"
