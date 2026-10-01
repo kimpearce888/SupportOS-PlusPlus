@@ -57,7 +57,6 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace --all-targets
-        continue-on-error: ${{ runner.os == 'macOS' }}
 
   build-wasm:
     name: cargo check on wasm32 + trunk build (debug)
@@ -84,21 +83,21 @@ jobs:
         run: |
           cd crates/ui
           trunk build
-        continue-on-error: true
 
   build-tauri:
-    name: cargo build --release (Tauri shell)
+    name: Tauri build + bundle (${{ matrix.os }})
     needs: [lint-and-test, build-wasm]
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - name: Install Linux system deps (Tauri 2)
         if: runner.os == 'Linux'
         run: |
@@ -106,8 +105,10 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev build-essential pkg-config
-      - name: Install trunk
-        run: cargo install trunk --locked
+      - name: Install trunk + tauri-cli
+        run: |
+          cargo install trunk --locked
+          cargo install tauri-cli --version "^2.0" --locked --no-default-features
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -116,10 +117,14 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ matrix.os }}-release-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-      - name: Build Tauri app
+      - name: Build WASM frontend
+        run: |
+          cd crates/ui
+          trunk build
+      - name: Build Tauri app + bundle
         run: |
           cd crates/app/src-tauri
-          cargo build --release
+          cargo tauri build
 
   ci-report:
     name: Publish CI report

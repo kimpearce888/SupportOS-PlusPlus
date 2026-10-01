@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   schedule:
-    # Run at 03:00 UTC every day.
     - cron: '0 3 * * *'
   workflow_dispatch:
 
@@ -12,19 +11,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-release:
-    name: Build installers (${{ matrix.os }})
+  build:
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
           - os: macos-latest
-            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +28,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown,${{ matrix.target }}
+          targets: wasm32-unknown-unknown
 
       - name: Install Linux system deps
         if: runner.os == 'Linux'
@@ -56,44 +52,58 @@ jobs:
             target
           key: nightly-${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
-      - name: Build installers
+      - name: Build WASM frontend
+        run: |
+          cd crates/ui
+          trunk build
+
+      - name: Build Tauri app + bundle installers
         run: |
           cd crates/app/src-tauri
-          cargo tauri build --target ${{ matrix.target }}
-        continue-on-error: ${{ matrix.os == 'macos-latest' }}
+          cargo tauri build
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          cd crates/app/src-tauri/target/release/bundle
+          find . -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \
+            -o -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \) -exec sha256sum {} \; > checksums.txt
+          cat checksums.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: nightly-${{ matrix.os }}
           path: |
-            crates/app/src-tauri/target/${{ matrix.target }}/release/bundle/**
-            crates/app/src-tauri/target/release/bundle/**
+            crates/app/src-tauri/target/release/bundle/**/*.deb
+            crates/app/src-tauri/target/release/bundle/**/*.rpm
+            crates/app/src-tauri/target/release/bundle/**/*.AppImage
+            crates/app/src-tauri/target/release/bundle/**/*.msi
+            crates/app/src-tauri/target/release/bundle/**/*.exe
+            crates/app/src-tauri/target/release/bundle/**/*.dmg
+            crates/app/src-tauri/target/release/bundle/**/checksums.txt
           retention-days: 7
 
-      - name: Create/Update nightly pre-release
-        if: github.ref == 'refs/heads/main' && github.event_name != 'schedule'
+      - name: Upload to nightly pre-release
+        if: github.event_name != 'schedule'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
           name: "Nightly Development Build"
           body: |
-            ⚠️ **Development build, unsigned.**
+            ⚠️ Development build, unsigned.
 
-            Built from the latest `main` branch commit (${{ github.sha }}).
+            Built from commit ${{ github.sha }} on ${{ matrix.os }}.
 
-            **DO NOT use this in production.** This build is for testing only.
-            It may crash, lose data, or behave unexpectedly.
-
-            Install at your own risk. To remove, uninstall like any other app.
+            DO NOT use in production. Testing only.
           prerelease: true
           files: |
-            crates/app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
-            crates/app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
-            crates/app/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
             crates/app/src-tauri/target/release/bundle/**/*.deb
+            crates/app/src-tauri/target/release/bundle/**/*.rpm
+            crates/app/src-tauri/target/release/bundle/**/*.AppImage
             crates/app/src-tauri/target/release/bundle/**/*.msi
+            crates/app/src-tauri/target/release/bundle/**/*.exe
             crates/app/src-tauri/target/release/bundle/**/*.dmg
+            crates/app/src-tauri/target/release/bundle/**/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
