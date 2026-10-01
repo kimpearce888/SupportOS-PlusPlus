@@ -488,18 +488,18 @@ fn report_build(
     serde_json::to_value(&result).map_err(|e| e.to_string())
 }
 
-// ─── Support health (M8-T05) ──────────────────────────────────────────────
+// ─── Support health (M8-T05) — operational facts, NOT a 0-100 score ─────
 
-/// Compute the support health score (0–100).
+/// Get operational health facts (per spec section 58: no aggregate score).
 #[tauri::command]
 fn support_health(
     db_state: tauri::State<'_, DbState>,
     days_back: Option<u32>,
 ) -> Result<serde_json::Value, String> {
     let conn = db_state.lock_conn()?;
-    let health = spp_core::reports::compute_health(&conn, days_back.unwrap_or(7))
+    let facts = spp_core::reports::get_health_facts(&conn, days_back.unwrap_or(7))
         .map_err(|e| e.to_string())?;
-    serde_json::to_value(&health).map_err(|e| e.to_string())
+    serde_json::to_value(&facts).map_err(|e| e.to_string())
 }
 
 // ─── Intelligence — Issue Radar (M7-T04) ─────────────────────────────────

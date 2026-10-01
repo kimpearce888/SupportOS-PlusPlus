@@ -489,77 +489,68 @@ pub fn count_high_friction(conn: &Connection) -> Result<u32> {
     Ok(u32::try_from(count).unwrap_or(0))
 }
 
-// ─── M8-T05: Support health ──────────────────────────────────────────────
+// ─── M8-T05: Support health (operational facts, NOT a 0-100 score) ──────
+//
+// Per spec section 58: no aggregate 0-100 health score.
+// Instead, expose the raw operational facts with definitions + evidence.
+// The UI shows these as labeled metrics, not a single number.
 
-/// A 0–100 health score. Per the reference notes: "support health" is an
-/// aggregate metric. The health score is advisory — per spec: "AI is always advisory."
+/// Operational health facts — individual metrics with definitions.
+/// Per spec section 58: no aggregate score; show operational facts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HealthScore {
-    pub score: f64,
-    pub components: HealthComponents,
+pub struct HealthFacts {
+    /// Total conversations in the period.
+    pub total_conversations: u32,
+    /// SLA breach count (from sla_breaches table).
+    pub sla_breach_count: u32,
+    /// SLA breach rate = sla_breach_count / total_conversations.
+    /// Definition: "Fraction of conversations with at least one SLA breach."
+    pub sla_breach_rate: Option<f64>,
+    /// High-friction conversation count.
+    pub high_friction_count: u32,
+    /// High-friction rate = high_friction / total.
+    /// Definition: "Fraction of conversations with effort_score >= 0.6."
+    pub high_friction_rate: Option<f64>,
+    /// Average first response time in minutes (None if no data).
+    /// Definition: "Mean time from conversation creation to first agent response."
+    pub avg_first_response_minutes: Option<f64>,
+    /// Resolution rate = closed / total.
+    /// Definition: "Fraction of conversations that have been closed."
+    pub resolution_rate: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HealthComponents {
-    pub sla_performance: f64,
-    pub friction_level: f64,
-    pub response_time_score: f64,
-    pub resolution_rate: f64,
-}
-
-/// Compute the support health score. Combines SLA performance, friction,
-/// response times, and resolution rates into a single 0–100 score.
-pub fn compute_health(conn: &Connection, days_back: u32) -> Result<HealthScore> {
+/// Get operational health facts. Per spec section 58: show operational facts
+/// with definitions, NOT a 0-100 aggregate score.
+pub fn get_health_facts(conn: &Connection, days_back: u32) -> Result<HealthFacts> {
     let metrics = get_dashboard_metrics(conn, None, days_back)?;
-
-    // SLA performance: fewer breaches = higher score.
-    let sla_perf = if metrics.total_conversations > 0 {
-        1.0 - (metrics.sla_breach_count as f64 / metrics.total_conversations as f64)
-    } else {
-        1.0
-    };
-
-    // Friction level: fewer high-friction conversations = higher score.
     let high_friction = count_high_friction(conn).unwrap_or(0);
-    let friction = if metrics.total_conversations > 0 {
-        1.0 - (high_friction as f64 / metrics.total_conversations as f64)
+
+    let total = metrics.total_conversations;
+    let sla_breach_rate = if total > 0 {
+        Some(metrics.sla_breach_count as f64 / total as f64)
     } else {
-        1.0
+        None
+    };
+    let high_friction_rate = if total > 0 {
+        Some(high_friction as f64 / total as f64)
+    } else {
+        None
+    };
+    let resolution_rate = if total > 0 {
+        Some(metrics.closed_conversations as f64 / total as f64)
+    } else {
+        None
     };
 
-    // Response time score: faster = higher. 30 min = perfect, 4h = 0.
-    let response_time = metrics
-        .avg_first_response_minutes
-        .map(|mins| {
-            if mins <= 30.0 {
-                1.0
-            } else if mins >= 240.0 {
-                0.0
-            } else {
-                1.0 - (mins - 30.0) / 210.0
-            }
-        })
-        .unwrap_or(1.0); // No data → neutral.
-
-    // Resolution rate: closed / total.
-    let resolution_rate = if metrics.total_conversations > 0 {
-        metrics.closed_conversations as f64 / metrics.total_conversations as f64
-    } else {
-        0.0
-    };
-
-    let components = HealthComponents {
-        sla_performance: sla_perf,
-        friction_level: friction,
-        response_time_score: response_time,
+    Ok(HealthFacts {
+        total_conversations: total,
+        sla_breach_count: metrics.sla_breach_count,
+        sla_breach_rate,
+        high_friction_count: high_friction,
+        high_friction_rate,
+        avg_first_response_minutes: metrics.avg_first_response_minutes,
         resolution_rate,
-    };
-
-    // Weighted average → 0–100.
-    let score =
-        (sla_perf * 0.30 + friction * 0.25 + response_time * 0.25 + resolution_rate * 0.20) * 100.0;
-
-    Ok(HealthScore { score, components })
+    })
 }
 
 // ─── M8-T06: Customer timeline ───────────────────────────────────────────
@@ -981,23 +972,28 @@ mod tests {
         assert_eq!(count_high_friction(&conn).unwrap(), 0);
     }
 
-    // ---- M8-T05: Support health --------------------------------------------
+    // ---- M8-T05: Health facts (operational, not aggregate score) ----------
 
     #[test]
-    fn compute_health_empty_db() {
+    fn health_facts_empty_db() {
         let conn = fresh_db();
-        let health = compute_health(&conn, 7).unwrap();
-        // Empty DB → all components neutral (1.0 except resolution_rate=0).
-        assert!(health.score > 0.0, "health score > 0 even on empty DB");
-        assert!(health.score <= 100.0);
+        let facts = get_health_facts(&conn, 7).unwrap();
+        assert_eq!(facts.total_conversations, 0);
+        assert!(facts.sla_breach_rate.is_none());
+        assert!(facts.resolution_rate.is_none());
     }
 
     #[test]
-    fn compute_health_score_in_range() {
+    fn health_facts_with_data() {
         let conn = fresh_db();
         insert_conversation(&conn, 1001, "closed", 101, 2001);
-        let health = compute_health(&conn, 7).unwrap();
-        assert!(health.score >= 0.0 && health.score <= 100.0);
+        insert_conversation(&conn, 1002, "active", 101, 2002);
+        let facts = get_health_facts(&conn, 7).unwrap();
+        assert_eq!(facts.total_conversations, 2);
+        assert_eq!(facts.sla_breach_count, 0);
+        assert!(facts.sla_breach_rate.is_some());
+        assert!((facts.sla_breach_rate.unwrap() - 0.0).abs() < 1e-6);
+        assert!((facts.resolution_rate.unwrap() - 0.5).abs() < 1e-6);
     }
 
     // ---- M8-T06: Customer timeline -----------------------------------------
@@ -1115,18 +1111,19 @@ mod tests {
     }
 
     #[test]
-    fn health_score_serializes() {
-        let h = HealthScore {
-            score: 75.0,
-            components: HealthComponents {
-                sla_performance: 0.9,
-                friction_level: 0.8,
-                response_time_score: 0.7,
-                resolution_rate: 0.6,
-            },
+    fn health_facts_serializes() {
+        let f = HealthFacts {
+            total_conversations: 10,
+            sla_breach_count: 2,
+            sla_breach_rate: Some(0.2),
+            high_friction_count: 1,
+            high_friction_rate: Some(0.1),
+            avg_first_response_minutes: Some(45.0),
+            resolution_rate: Some(0.8),
         };
-        let s = serde_json::to_string(&h).unwrap();
-        assert!(s.contains("\"score\":75.0"));
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"sla_breach_rate\":0.2"));
+        assert!(s.contains("\"total_conversations\":10"));
     }
 
     #[test]
