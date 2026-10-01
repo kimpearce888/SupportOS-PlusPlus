@@ -38,6 +38,7 @@ pub mod automation;
 pub mod backup;
 pub mod config;
 pub mod copilot;
+pub mod data_tools;
 pub mod db;
 pub mod demo;
 pub mod embeddings;

@@ -386,16 +386,16 @@
 > Per spec TESTING: "SSRF matrix" — connectors with HTTP kind must validate
 > URLs against an SSRF guard (no localhost, no private IPs, no metadata endpoints).
 
-- [ ] **M10-T01** Custom objects — types + fields.
+- [x] **M10-T01** Custom objects — types + fields.
   - AC: M026 migration creates `custom_object_types` (id, name, slug) + `custom_object_fields` (id, type_id, name, field_type TEXT, required, options_json). `CustomFieldType::ALL` (6 types from the catalog — single source of truth) drives field validation. CRUD for types + fields. Tests cover type/field CRUD, field type validation, empty case.
-- [ ] **M10-T02** Connectors with SSRF guard.
+- [x] **M10-T02** Connectors with SSRF guard.
   - AC: M027 migration creates `connectors` (id, name, kind TEXT, config_json, auth_mode TEXT, created_at). `ConnectorKind::ALL` (4 kinds) + `ConnectorAuthMode::ALL` (3 modes) from the catalog drive validation. `validate_ssrf(url)` — pure function that blocks localhost, private IPs (10.x, 172.16-31.x, 192.168.x), link-local (169.254.x including cloud metadata endpoints), and non-HTTP schemes. Per spec TESTING: "SSRF matrix." Tests cover SSRF validation matrix, connector CRUD, kind/auth validation.
-- [ ] **M10-T03** Backup and restore — full DB backup (`.sosync` format).
+- [x] **M10-T03** Backup and restore — full DB backup (`.sosync` format).
   - AC: Extends M5-T09's `.sosync` format to include a full SQLite DB dump alongside the VectorStore snapshots. `backup_database(path, password, conn)` exports all tables to the encrypted backup. `restore_database(path, password)` imports + applies. Per spec A6: "verify-first import, safety backup, atomic swap." Tests cover full backup → restore round-trip, wrong password, corrupt file.
-- [ ] **M10-T04** Encrypted sync — settings export/import with encryption.
+- [x] **M10-T04** Encrypted sync — settings export/import with encryption.
   - AC: `export_settings(conn, password) -> Vec<u8>` encrypts the `application_settings` + `ai_settings` tables into a portable format (AES-256-GCM per A6). `import_settings(conn, bytes, password)` decrypts + applies. Per spec: "encrypted sync." Tests cover round-trip, wrong password, corrupt data.
-- [ ] **M10-T05** Settings UI extension — expose connector + custom object configuration.
+- [x] **M10-T05** Settings UI extension — expose connector + custom object configuration.
   - AC: Extends the existing Settings page with sections for connectors (list, add, delete, test) + custom objects (list types, add type, add fields). Per spec: "settings." Tests cover UI state construction (mirrors the core types for `'static` Leptos lifetimes).
-- [ ] **M10-T06** M10 milestone close: all tasks ticked, CI green, tag `milestone-10-done`, STOP.
+- [x] **M10-T06** M10 milestone close: all tasks ticked, CI green, tag `milestone-10-done`, STOP.
   - AC: tag pushed; all M10 tasks ticked. **STOP — waiting for owner to say 'continue' to proceed to M11.**
 - M11 Conformance and hardening

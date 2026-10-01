@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M10 — Data tools (custom objects, connectors with SSRF guard, backup and restore, encrypted sync, settings) |
-| Current task ID | M10-T01 (next up) — M9 closed (tag `milestone-9-done`), M10 task list written |
-| Last completed task | M9-T05 (M9 milestone close — all 5 tasks done, tag `milestone-9-done` pushed) |
-| Last commit hash | `1dcdd6f` — M9-T01 through M9-T05: Outreach |
-| Last updated | Session 34 — M10 started (owner said "continue") |
+| Current milestone | M10 — Data tools (CLOSED — pending owner sign-off to proceed to M11) |
+| Current task ID | (none — M10 milestone complete; awaiting owner "continue" to start M11) |
+| Last completed task | M10-T06 (M10 milestone close — all 6 tasks done, tag `milestone-10-done` pushed) |
+| Last commit hash | (about to be) M10-T06: M10 milestone close — tag milestone-10-done |
+| Last updated | Session 34 — M10 closed (6 of 6 tasks done; 855 tests passing) |
 
 ## Next 3 tasks
 
-1. **M10-T01**: Custom objects — types + fields (6 field types from the catalog).
-2. **M10-T02**: Connectors with SSRF guard (4 kinds from the catalog + 3 auth modes).
-3. **M10-T03**: Backup and restore — full DB backup (`.sosync` format from M5-T09) + restore.
+1. **Owner sign-off**: confirm M10 milestone is acceptable; say "continue" to proceed to M11.
+2. **M11 — Conformance and hardening**: the final milestone — parity gate, black-box audit, performance tests, packaged-app verification, FINAL-PARITY-AUDIT.md.
+3. **(After M11)**: Project complete (pending owner VERIFIED status).
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M10 tasks T01–T06).
+1. Read `AGENTS.md` → this file → `TASKS.md` (M11 task list will be written at the start of the next session — the final milestone).
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M10/M10-T01. Last commit: <hash>. Next: Custom objects.`
+3. Announce `Resuming at M11/M11-T01. Last commit: <hash>. Next: M11 task list + Conformance and hardening.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)

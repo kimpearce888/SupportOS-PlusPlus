@@ -65,6 +65,9 @@ regex = "1"
 # HTTP client (for LocalAIProvider adapters — LM Studio, Ollama, Generic)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# URL parsing (for SSRF guard in connectors)
+url = "2"
+
 # Internal crates (paths)
 supportos-plusplus-catalog = { path = "crates/catalog" }
 supportos-plusplus-core = { path = "crates/core" }
