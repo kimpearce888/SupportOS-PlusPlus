@@ -66,10 +66,14 @@ jobs:
       - name: Generate SHA-256 checksums
         shell: bash
         run: |
-          cd crates/app/src-tauri/target/release/bundle
-          # Use shasum -a 256 on macOS, sha256sum on Linux/Windows
+          # Tauri outputs to the workspace-level target/ dir.
+          BUNDLE_DIR="target/release/bundle"
+          if [ ! -d "$BUNDLE_DIR" ]; then
+            BUNDLE_DIR="crates/app/src-tauri/target/release/bundle"
+          fi
+          cd "$BUNDLE_DIR" || exit 0
           SHA_CMD="sha256sum"
-          if command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+          if ! command -v sha256sum >/dev/null 2>&1; then
             SHA_CMD="shasum -a 256"
           fi
           find . -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \
@@ -81,13 +85,17 @@ jobs:
         with:
           name: nightly-${{ matrix.os }}
           path: |
+            target/release/bundle/**/*.deb
+            target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*.exe
+            target/release/bundle/**/*.dmg
+            target/release/bundle/**/checksums.txt
             crates/app/src-tauri/target/release/bundle/**/*.deb
             crates/app/src-tauri/target/release/bundle/**/*.rpm
-            crates/app/src-tauri/target/release/bundle/**/*.AppImage
             crates/app/src-tauri/target/release/bundle/**/*.msi
             crates/app/src-tauri/target/release/bundle/**/*.exe
             crates/app/src-tauri/target/release/bundle/**/*.dmg
-            crates/app/src-tauri/target/release/bundle/**/checksums.txt
           retention-days: 7
 
       - name: Upload to nightly pre-release
@@ -104,12 +112,16 @@ jobs:
             DO NOT use in production. Testing only.
           prerelease: true
           files: |
+            target/release/bundle/**/*.deb
+            target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*.exe
+            target/release/bundle/**/*.dmg
+            target/release/bundle/**/checksums.txt
             crates/app/src-tauri/target/release/bundle/**/*.deb
             crates/app/src-tauri/target/release/bundle/**/*.rpm
-            crates/app/src-tauri/target/release/bundle/**/*.AppImage
             crates/app/src-tauri/target/release/bundle/**/*.msi
             crates/app/src-tauri/target/release/bundle/**/*.exe
             crates/app/src-tauri/target/release/bundle/**/*.dmg
-            crates/app/src-tauri/target/release/bundle/**/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
