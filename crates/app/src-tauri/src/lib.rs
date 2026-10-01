@@ -3,7 +3,7 @@
 //! Boot order:
 //!   1. Init logging (JSON in release, pretty in dev).
 //!   2. Load AppConfig (defaults; data_dir from SPP_DATA_DIR or per-OS convention).
-//!   3. Open SQLite with ALL migrations (M001–M027) applied.
+//!   3. Open SQLite with ALL migrations (M001–M028) applied.
 //!   4. Bind the loopback listener (D-002) on a free 127.0.0.1 port.
 //!   5. Start the Tauri app with IPC commands wired to the Rust core.
 //!
@@ -36,7 +36,7 @@ pub fn run() {
     let db_path = app_config.data_dir.join("supportos-plusplus.db");
     let conn = match open_db_with_all_migrations(&db_path) {
         Ok(c) => {
-            tracing::info!(path = %db_path.display(), "SQLite DB opened with all migrations M001–M027");
+            tracing::info!(path = %db_path.display(), "SQLite DB opened with all migrations M001–M028");
             c
         }
         Err(e) => {
@@ -125,6 +125,15 @@ pub fn run() {
             parity_gate_check,
             // Self-check (M12 — packaging verification)
             self_check,
+            // Inbox (M12-P5 — conversation list + detail + reply + note + status + assign)
+            inbox_list_conversations,
+            inbox_get_conversation,
+            inbox_reply,
+            inbox_add_note,
+            inbox_change_status,
+            inbox_assign,
+            inbox_list_saved_views,
+            inbox_apply_saved_view,
         ]);
 
     #[cfg(desktop)]
@@ -140,7 +149,7 @@ pub fn run() {
         .expect("error while running SupportOS++");
 }
 
-/// Open the DB and apply ALL migrations (M001 base + M002 sync tables + M003–M027).
+/// Open the DB and apply ALL migrations (M001 base + M002 sync tables + M003–M028).
 /// This is the single entry point for DB initialization at boot.
 fn open_db_with_all_migrations(
     path: &std::path::Path,
@@ -149,7 +158,7 @@ fn open_db_with_all_migrations(
     db::ensure_migrations_table(&conn)?;
     spp_core::migrations::run_all(&mut conn)?;
 
-    // Apply all incremental migrations (M003–M027).
+    // Apply all incremental migrations (M003–M028).
     spp_core::activity::apply_m003(&conn)?;
     spp_core::ticket_states::apply_m004(&conn)?;
     spp_core::notifications::apply_m005(&conn)?;
@@ -164,8 +173,9 @@ fn open_db_with_all_migrations(
     spp_core::reports::apply_m020_to_m022(&conn)?;
     spp_core::outreach::apply_m023_to_m025(&conn)?;
     spp_core::data_tools::apply_m026_to_m027(&conn)?;
+    spp_core::inbox::apply_m028(&conn)?;
 
-    tracing::info!("All migrations M001–M027 applied successfully");
+    tracing::info!("All migrations M001–M028 applied successfully");
     Ok(conn)
 }
 
@@ -588,6 +598,162 @@ fn self_check(db_state: tauri::State<'_, DbState>) -> Result<Option<serde_json::
         .and_then(|r| serde_json::to_value(r).ok()))
 }
 
+// ─── Inbox (M12-P5) ──────────────────────────────────────────────────────
+
+/// List conversations matching the given filters.
+#[tauri::command]
+fn inbox_list_conversations(
+    db_state: tauri::State<'_, DbState>,
+    filters: spp_core::inbox::InboxFilters,
+) -> Result<serde_json::Value, String> {
+    let conn = db_state.lock_conn()?;
+    let (items, total) =
+        spp_core::inbox::list_conversations(&conn, &filters).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "items": serde_json::to_value(&items).map_err(|e| e.to_string())?,
+        "total": total,
+        "filters": serde_json::to_value(&filters).map_err(|e| e.to_string())?,
+    }))
+}
+
+/// Get a single conversation with its full thread.
+#[tauri::command]
+fn inbox_get_conversation(
+    db_state: tauri::State<'_, DbState>,
+    conversation_id: i64,
+) -> Result<Option<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let detail =
+        spp_core::inbox::get_conversation(&conn, conversation_id).map_err(|e| e.to_string())?;
+    match detail {
+        Some(d) => Ok(Some(serde_json::to_value(&d).map_err(|e| e.to_string())?)),
+        None => Ok(None),
+    }
+}
+
+/// Reply to a conversation. Creates a reply thread entry + activity event.
+#[tauri::command]
+fn inbox_reply(
+    db_state: tauri::State<'_, DbState>,
+    conversation_remote_id: i64,
+    body: String,
+    actor_type: String,
+    actor_id: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let mut conn = db_state.lock_conn()?;
+    let result = spp_core::inbox::reply_to_conversation(
+        &mut conn,
+        conversation_remote_id,
+        body,
+        actor_type,
+        actor_id,
+    )
+    .map_err(|e| e.to_string())?;
+    serialize_operation_result(result)
+}
+
+/// Add an internal note to a conversation.
+#[tauri::command]
+fn inbox_add_note(
+    db_state: tauri::State<'_, DbState>,
+    conversation_remote_id: i64,
+    body: String,
+    actor_type: String,
+    actor_id: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let mut conn = db_state.lock_conn()?;
+    let result = spp_core::inbox::add_note(
+        &mut conn,
+        conversation_remote_id,
+        body,
+        actor_type,
+        actor_id,
+    )
+    .map_err(|e| e.to_string())?;
+    serialize_operation_result(result)
+}
+
+/// Change the conversation status (active/pending/closed).
+#[tauri::command]
+fn inbox_change_status(
+    db_state: tauri::State<'_, DbState>,
+    conversation_remote_id: i64,
+    new_status: String,
+    actor_type: String,
+    actor_id: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let mut conn = db_state.lock_conn()?;
+    let result = spp_core::inbox::change_status(
+        &mut conn,
+        conversation_remote_id,
+        new_status,
+        actor_type,
+        actor_id,
+    )
+    .map_err(|e| e.to_string())?;
+    serialize_operation_result(result)
+}
+
+/// Assign the conversation to a user (or unassign if assignee_local_id is None).
+#[tauri::command]
+fn inbox_assign(
+    db_state: tauri::State<'_, DbState>,
+    conversation_remote_id: i64,
+    assignee_local_id: Option<i64>,
+    actor_type: String,
+    actor_id: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let mut conn = db_state.lock_conn()?;
+    let result = spp_core::inbox::assign(
+        &mut conn,
+        conversation_remote_id,
+        assignee_local_id,
+        actor_type,
+        actor_id,
+    )
+    .map_err(|e| e.to_string())?;
+    serialize_operation_result(result)
+}
+
+/// List all saved inbox views.
+#[tauri::command]
+fn inbox_list_saved_views(
+    db_state: tauri::State<'_, DbState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let views = spp_core::inbox::list_saved_views(&conn).map_err(|e| e.to_string())?;
+    views
+        .into_iter()
+        .map(|v| serde_json::to_value(&v).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Apply a saved view — returns the matching conversation IDs.
+#[tauri::command]
+fn inbox_apply_saved_view(
+    db_state: tauri::State<'_, DbState>,
+    view_id: i64,
+) -> Result<Vec<i64>, String> {
+    let conn = db_state.lock_conn()?;
+    spp_core::inbox::apply_saved_view(&conn, view_id).map_err(|e| e.to_string())
+}
+
+/// Serialize an OperationResult into a JSON value the UI can switch on.
+fn serialize_operation_result(
+    result: spp_core::ticket_ops::OperationResult,
+) -> Result<serde_json::Value, String> {
+    match result {
+        spp_core::ticket_ops::OperationResult::Success { message } => Ok(serde_json::json!({
+            "ok": true,
+            "message": message,
+        })),
+        spp_core::ticket_ops::OperationResult::Rejected { reason } => Ok(serde_json::json!({
+            "ok": false,
+            "reason": reason,
+        })),
+    }
+}
+
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
@@ -701,6 +867,12 @@ mod tests {
         let _: i64 = conn
             .query_row("SELECT COUNT(*) FROM connectors", [], |r| r.get(0))
             .unwrap();
+        // Verify M028 tables exist.
+        let _: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversation_threads", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
     }
 
     #[test]
@@ -712,9 +884,13 @@ mod tests {
             .keep()
             .unwrap();
         let conn = open_db_with_all_migrations(&f).unwrap();
-        let report = spp_core::self_check::run(&conn, None).unwrap();
+        // Pass a mock loopback addr so the loopback_listener check passes.
+        // (In production, the actual bind may fail and the self-check will
+        // honestly report `ok: false` for that subsystem.)
+        let report = spp_core::self_check::run(&conn, Some("127.0.0.1:0".to_string())).unwrap();
 
-        // The self-check must report all subsystems ok on a fresh DB.
+        // The self-check must report all subsystems ok on a fresh DB
+        // (when the loopback listener is bound).
         assert!(
             report.all_ok,
             "self-check failed: {:?}",
@@ -744,6 +920,6 @@ mod tests {
             .unwrap();
         assert!(db_check.ok, "db_check failed: {:?}", db_check);
         let details = db_check.details.as_ref().unwrap();
-        assert_eq!(details["schema_version"], 27);
+        assert_eq!(details["schema_version"], 28);
     }
 }

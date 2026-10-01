@@ -149,6 +149,7 @@ fn check_database(conn: &rusqlite::Connection) -> SubsystemCheck {
         ("campaigns", "M024"),
         ("do_not_contact", "M025"),
         ("connectors", "M027"),
+        ("conversation_threads", "M028"),
     ];
     let mut missing_tables = Vec::new();
     for (table, milestone) in &probe_tables {
@@ -164,13 +165,13 @@ fn check_database(conn: &rusqlite::Connection) -> SubsystemCheck {
         }
     }
 
-    let expected_schema = 27;
+    let expected_schema = 28;
     let ok = schema_version == expected_schema && migrations_max >= 2 && missing_tables.is_empty();
     SubsystemCheck {
         name: "database".to_string(),
         ok,
         status: if ok {
-            "SQLite open; M001+M002 in _migrations; M003–M027 applied (schema_version=27)"
+            "SQLite open; M001+M002 in _migrations; M003–M028 applied (schema_version=28)"
                 .to_string()
         } else if !missing_tables.is_empty() {
             format!("missing tables: {}", missing_tables.join(", "))
@@ -325,6 +326,7 @@ mod tests {
         crate::reports::apply_m020_to_m022(&conn).unwrap();
         crate::outreach::apply_m023_to_m025(&conn).unwrap();
         crate::data_tools::apply_m026_to_m027(&conn).unwrap();
+        crate::inbox::apply_m028(&conn).unwrap();
         conn
     }
 
@@ -409,8 +411,8 @@ mod tests {
             .unwrap();
         assert!(db_check.ok, "db_check failed: {:?}", db_check);
         let details = db_check.details.as_ref().unwrap();
-        assert_eq!(details["schema_version"], 27);
-        assert_eq!(details["expected_schema_version"], 27);
+        assert_eq!(details["schema_version"], 28);
+        assert_eq!(details["expected_schema_version"], 28);
         assert_eq!(details["migrations_max_version"], 2);
     }
 

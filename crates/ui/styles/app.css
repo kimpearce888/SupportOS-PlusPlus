@@ -1172,3 +1172,339 @@ body {
 
 
 
+
+/* ─── Inbox page (M12-P5 — full inbox wiring) ─────────────────────────── */
+
+.spp-inbox__filters {
+  display: flex;
+  gap: 4px;
+  padding: 8px;
+  border-bottom: 1px solid var(--spp-border);
+  flex-wrap: wrap;
+}
+
+.spp-inbox__filter {
+  flex: 1;
+  min-width: 80px;
+  padding: 4px 6px;
+  font-size: 12px;
+  border: 1px solid var(--spp-border);
+  background: var(--spp-surface);
+  color: var(--spp-text);
+  border-radius: 3px;
+}
+
+.spp-inbox__search {
+  flex: 2;
+  min-width: 120px;
+  padding: 4px 6px;
+  font-size: 12px;
+  border: 1px solid var(--spp-border);
+  background: var(--spp-surface);
+  color: var(--spp-text);
+  border-radius: 3px;
+}
+
+.spp-inbox__saved-views {
+  padding: 4px 8px;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  border-bottom: 1px solid var(--spp-border);
+}
+
+.spp-inbox__saved-views label {
+  font-size: 11px;
+  color: var(--spp-text-muted);
+}
+
+.spp-inbox__item {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--spp-border);
+  cursor: pointer;
+}
+
+.spp-inbox__item:hover {
+  background: var(--spp-surface-hover, var(--spp-surface));
+}
+
+.spp-inbox__item.is-selected {
+  background: var(--spp-accent-bg, rgba(0, 0, 0, 0.05));
+  border-left: 3px solid var(--spp-accent);
+}
+
+.spp-inbox__item-checkbox {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.spp-inbox__item-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.spp-inbox__item-subject {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--spp-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.spp-inbox__item-preview {
+  font-size: 12px;
+  color: var(--spp-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin: 2px 0;
+}
+
+.spp-inbox__item-meta {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--spp-text-muted);
+  flex-wrap: wrap;
+}
+
+.spp-inbox__item-status {
+  text-transform: capitalize;
+  font-weight: 600;
+}
+
+.spp-inbox__item-priority {
+  background: var(--spp-surface);
+  padding: 0 4px;
+  border-radius: 2px;
+}
+
+.spp-inbox__item-response-state {
+  font-size: 11px;
+  color: var(--spp-warning, #c47f00);
+  margin-top: 2px;
+}
+
+.spp-inbox__bulk-actions {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  border-top: 1px solid var(--spp-border);
+  background: var(--spp-surface);
+  font-size: 12px;
+  align-items: center;
+}
+
+.spp-inbox__detail-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--spp-border);
+}
+
+.spp-inbox__detail-subject {
+  font-size: 16px;
+  font-weight: 700;
+  margin: 0 0 8px 0;
+}
+
+.spp-inbox__detail-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.spp-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.spp-badge--status {
+  background: var(--spp-surface);
+  color: var(--spp-text);
+}
+
+.spp-badge--priority {
+  background: var(--spp-warning-bg, #fff3cd);
+  color: var(--spp-warning, #856404);
+}
+
+.spp-badge--response-state {
+  background: var(--spp-danger-bg, #f8d7da);
+  color: var(--spp-danger, #721c24);
+}
+
+.spp-inbox__controls {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--spp-border);
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.spp-inbox__controls label {
+  font-size: 12px;
+  color: var(--spp-text-muted);
+  font-weight: 600;
+}
+
+.spp-inbox__control {
+  padding: 4px 6px;
+  font-size: 12px;
+  border: 1px solid var(--spp-border);
+  background: var(--spp-surface);
+  color: var(--spp-text);
+  border-radius: 3px;
+}
+
+.spp-inbox__thread {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+}
+
+.spp-thread-entry {
+  padding: 8px;
+  margin-bottom: 8px;
+  border-radius: 4px;
+  border-left: 3px solid var(--spp-border);
+  background: var(--spp-surface);
+}
+
+.spp-thread-entry--customer {
+  border-left-color: var(--spp-accent);
+}
+
+.spp-thread-entry--reply {
+  border-left-color: var(--spp-success, #28a745);
+}
+
+.spp-thread-entry--note {
+  border-left-color: var(--spp-warning, #ffc107);
+  background: var(--spp-warning-bg, #fff3cd);
+}
+
+.spp-thread-entry--system {
+  border-left-color: var(--spp-text-muted);
+  font-style: italic;
+  font-size: 11px;
+}
+
+.spp-thread-entry__header {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--spp-text-muted);
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.spp-thread-entry__type {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+
+.spp-thread-entry__body {
+  font-size: 13px;
+  color: var(--spp-text);
+  white-space: pre-wrap;
+}
+
+.spp-inbox__composer {
+  border-top: 1px solid var(--spp-border);
+  padding: 8px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.spp-inbox__composer-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.spp-inbox__composer-tab {
+  padding: 4px 12px;
+  font-size: 12px;
+  border: 1px solid var(--spp-border);
+  background: var(--spp-surface);
+  color: var(--spp-text-muted);
+  cursor: pointer;
+  border-radius: 3px 3px 0 0;
+  border-bottom: none;
+}
+
+.spp-inbox__composer-tab.is-active {
+  background: var(--spp-bg, white);
+  color: var(--spp-text);
+  font-weight: 600;
+}
+
+.spp-inbox__composer-body {
+  min-height: 80px;
+  width: 100%;
+  padding: 8px;
+  font-size: 13px;
+  border: 1px solid var(--spp-border);
+  background: var(--spp-surface);
+  color: var(--spp-text);
+  border-radius: 3px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.spp-inbox__composer-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.spp-state--success {
+  background: var(--spp-success-bg, #d4edda);
+  color: var(--spp-success, #155724);
+  padding: 8px 12px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.spp-inbox__context-list {
+  margin: 0;
+  padding: 0 16px;
+}
+
+.spp-inbox__context-list dt {
+  font-size: 11px;
+  color: var(--spp-text-muted);
+  margin-top: 8px;
+  font-weight: 600;
+}
+
+.spp-inbox__context-list dd {
+  margin: 0 0 0 0;
+  font-size: 13px;
+  color: var(--spp-text);
+  word-break: break-word;
+}
+
+.spp-inbox__tags {
+  list-style: none;
+  margin: 0;
+  padding: 0 16px;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.spp-inbox__tag {
+  background: var(--spp-surface);
+  border: 1px solid var(--spp-border);
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+}
