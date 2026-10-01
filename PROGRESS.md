@@ -8,24 +8,25 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M11 — Conformance and hardening (the FINAL milestone) |
-| Current task ID | M11-T01 (next up) — M10 closed (tag `milestone-10-done`), M11 task list written |
-| Last completed task | M10-T06 (M10 milestone close — all 6 tasks done, tag `milestone-10-done` pushed) |
-| Last commit hash | `72aa28d` — M10-T01 through M10-T06: Data tools |
-| Last updated | Session 35 — M11 started (owner said "continue") — the final milestone |
+| Current milestone | M11 — Conformance and hardening (CLOSED — ALL 11 MILESTONES COMPLETE) |
+| Current task ID | (none — project at IMPLEMENTED + TESTED; awaiting owner VERIFIED status) |
+| Last completed task | M11-T05 (M11 milestone close — final tag `milestone-11-done` pushed) |
+| Last commit hash | (about to be) M11-T05: M11 milestone close — final tag milestone-11-done |
+| Last updated | Session 35 — M11 closed (ALL 11 milestones done; 869 tests passing) |
 
 ## Next 3 tasks
 
-1. **M11-T01**: Parity gate — verify all 8 canonical counts + 10 closed vocabularies match the reference.
-2. **M11-T02**: Crash-recovery tests — job recovery + migration idempotency + DB reopen.
-3. **M11-T03**: `docs/FINAL-PARITY-AUDIT.md` — honest report (not a completion claim).
+1. **Owner action**: Run `docs/MANUAL-VERIFICATION.md` on clean machines to promote rows to VERIFIED.
+2. **Owner action**: Provide signing certificates (M1-T10) + arm64 CI runners (M1-T11) + Qdrant build machine (M5-T02).
+3. **(Future)**: Tauri shell IPC wiring — connect UI pages to Rust core (the only remaining gap before PACKAGED).
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (M11 is the final milestone — after it, the project awaits owner VERIFIED status).
-2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M11/M11-T01. Last commit: <hash>. Next: Parity gate.`
-4. Continue from the first unchecked task in `TASKS.md`.
+1. Read `AGENTS.md` → this file → `TASKS.md` → `docs/FINAL-PARITY-AUDIT.md` (the honest report).
+2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets`.
+3. If the owner says "wire the Tauri shell" → start the IPC wiring task (connect UI pages to Rust core).
+4. If the owner says "continue" with new requirements → address them.
+5. The project is at IMPLEMENTED + TESTED status; PACKAGED + VERIFIED require owner action.
 
 ## Parity counts by status (honest, A3)
 

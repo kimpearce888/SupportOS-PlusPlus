@@ -37,6 +37,7 @@ pub mod ai_provider;
 pub mod automation;
 pub mod backup;
 pub mod config;
+pub mod conformance;
 pub mod copilot;
 pub mod data_tools;
 pub mod db;
