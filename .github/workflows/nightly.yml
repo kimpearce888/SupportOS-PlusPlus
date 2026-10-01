@@ -36,7 +36,8 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev build-essential pkg-config
+            librsvg2-dev build-essential pkg-config \
+            dpkg-dev rpm wget
 
       - name: Install trunk + tauri-cli
         run: |
@@ -66,9 +67,14 @@ jobs:
         shell: bash
         run: |
           cd crates/app/src-tauri/target/release/bundle
+          # Use shasum -a 256 on macOS, sha256sum on Linux/Windows
+          SHA_CMD="sha256sum"
+          if command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+            SHA_CMD="shasum -a 256"
+          fi
           find . -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \
-            -o -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \) -exec sha256sum {} \; > checksums.txt
-          cat checksums.txt
+            -o -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \) -exec $SHA_CMD {} \; > checksums.txt || true
+          cat checksums.txt 2>/dev/null || echo "No installer files found"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
