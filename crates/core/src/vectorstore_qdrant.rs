@@ -28,19 +28,17 @@
 #![cfg(feature = "qdrant")]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use qdrant_edge::{
-    Distance, EdgeConfig, EdgeShard, EdgeVectorParams, Memory, PointInsertOperations,
-    PointOperations, PointStruct, QueryEnum, QueryRequestBuilder, ScoringQuery, UpdateOperation,
-    WithPayloadInterface, WithVector,
+    Distance, EdgeConfig, EdgeShard, EdgeVectorParams, PointInsertOperations, PointOperations,
+    PointStruct, QueryEnum, QueryRequestBuilder, ScoringQuery, UpdateOperation,
+    WithPayloadInterface,
 };
 
 use crate::error::{Error, Result};
-use crate::vectorstore::{
-    CollectionInfo, DenseVector, Filter, Payload, Point, PointId, ScoredPoint, VectorStore,
-};
+use crate::vectorstore::{CollectionInfo, Filter, Payload, Point, PointId, ScoredPoint, VectorStore};
 
 /// A VectorStore backed by `qdrant-edge` — the production adapter (spec A4).
 ///
@@ -75,16 +73,9 @@ impl QdrantEdgeVectorStore {
     /// Resolve the on-disk path for a collection.
     fn collection_path(&self, name: &str) -> PathBuf {
         // Sanitize the collection name into a filesystem-safe directory name.
-        // Replace any non-alphanumeric character with `_`.
         let safe: String = name
             .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect();
         self.data_dir.join(safe)
     }
@@ -100,13 +91,11 @@ impl QdrantEdgeVectorStore {
         let path = self.collection_path(name);
         std::fs::create_dir_all(&path).map_err(Error::Io)?;
 
-        let mut config_builder = EdgeConfig::builder().payload_memory(Memory::Cached);
+        let mut config_builder = EdgeConfig::builder();
         if let Some(dim) = dense_dim {
             config_builder = config_builder.vector(
-                qdrant_edge::DEFAULT_VECTOR_NAME,
-                EdgeVectorParams::builder(dim, Distance::Cosine)
-                    .memory(Memory::Cached)
-                    .build(),
+                qdrant_edge::DEFAULT_VECTOR_NAME.to_string(),
+                EdgeVectorParams::new(dim, Distance::Cosine),
             );
         }
         let config = config_builder.build();
@@ -148,33 +137,24 @@ impl VectorStore for QdrantEdgeVectorStore {
     }
 
     fn upsert(&self, collection: &str, point: Point) -> Result<()> {
-        // Open the shard if not already open. We need the dim to be known.
-        let dense_dim = self.dim_for(collection);
-        if !self
-            .shards
-            .lock()
-            .expect("mutex poisoned")
-            .contains_key(collection)
-        {
-            return Err(Error::Other(format!(
+        if !self.shards.lock().expect("mutex poisoned").contains_key(collection) {
+            return Err(Error::Config(format!(
                 "collection '{collection}' does not exist; call create_collection first"
             )));
         }
-        let _ = dense_dim;
 
         let shards = self.shards.lock().expect("mutex poisoned");
         let shard = shards
             .get(collection)
-            .ok_or_else(|| Error::Other(format!("collection '{collection}' does not exist")))?;
+            .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
 
         // Convert our Point to a qdrant-edge PointStruct.
         let id_u64 = point_id_to_u64(&point.id)?;
         let dense = point.dense.clone().ok_or_else(|| {
-            Error::Other("QdrantEdge adapter does not yet support sparse-only points".to_string())
+            Error::Config("QdrantEdge adapter does not yet support sparse-only points".to_string())
         })?;
-        let dense_f32: Vec<f32> = dense;
         let payload_json = point.payload.clone();
-        let point_struct = PointStruct::new(id_u64, dense_f32, payload_json);
+        let point_struct = PointStruct::new(id_u64, dense, payload_json);
 
         shard
             .update(UpdateOperation::PointOperation(
@@ -191,9 +171,8 @@ impl VectorStore for QdrantEdgeVectorStore {
         let shards = self.shards.lock().expect("mutex poisoned");
         let shard = shards
             .get(collection)
-            .ok_or_else(|| Error::Other(format!("collection '{collection}' does not exist")))?;
+            .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
         let id_u64 = point_id_to_u64(id)?;
-        use qdrant_edge::PointOperations;
         shard
             .update(UpdateOperation::PointOperation(
                 PointOperations::DeletePoints(vec![id_u64.into()]),
@@ -213,7 +192,7 @@ impl VectorStore for QdrantEdgeVectorStore {
         let shards = self.shards.lock().expect("mutex poisoned");
         let shard = shards
             .get(collection)
-            .ok_or_else(|| Error::Other(format!("collection '{collection}' does not exist")))?;
+            .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
 
         let query_vec: Vec<f32> = query.to_vec();
         let request = QueryRequestBuilder::new(top_k as u64)
@@ -246,7 +225,7 @@ impl VectorStore for QdrantEdgeVectorStore {
         _top_k: usize,
     ) -> Result<Vec<ScoredPoint>> {
         // TODO: requires configuring a named sparse vector in EdgeConfig.
-        Err(Error::Other(
+        Err(Error::Config(
             "QdrantEdge adapter: search_sparse not yet implemented".to_string(),
         ))
     }
@@ -255,10 +234,10 @@ impl VectorStore for QdrantEdgeVectorStore {
         let shards = self.shards.lock().expect("mutex poisoned");
         let shard = shards
             .get(collection)
-            .ok_or_else(|| Error::Other(format!("collection '{collection}' does not exist")))?;
+            .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
         let info = shard.info().map_err(map_qdrant_err)?;
-        // info contains counts; we want the total point count.
-        // The exact field name varies; use a fallback to 0 if not present.
+        // The info struct contains counts; the exact field name may vary.
+        // Use 0 as a safe default if point_count is not present.
         let count = info.point_count.unwrap_or(0);
         Ok(count as usize)
     }
@@ -280,14 +259,14 @@ impl VectorStore for QdrantEdgeVectorStore {
     fn snapshot(&self, _name: &str) -> Result<Vec<u8>> {
         // TODO: bridge qdrant-edge's snapshot format to our adapter-agnostic
         // CollectionSnapshot JSON.
-        Err(Error::Other(
+        Err(Error::Config(
             "QdrantEdge adapter: snapshot not yet implemented".to_string(),
         ))
     }
 
     fn restore(&self, _bytes: &[u8]) -> Result<()> {
         // TODO: same as snapshot.
-        Err(Error::Other(
+        Err(Error::Config(
             "QdrantEdge adapter: restore not yet implemented".to_string(),
         ))
     }
@@ -298,7 +277,7 @@ impl VectorStore for QdrantEdgeVectorStore {
 fn point_id_to_u64(id: &PointId) -> Result<u64> {
     // qdrant-edge uses u64 point ids. Our PointId is a String; we parse it.
     id.parse::<u64>().map_err(|_| {
-        Error::Other(format!(
+        Error::Config(format!(
             "QdrantEdge adapter requires numeric point ids; got '{id}'"
         ))
     })
@@ -306,15 +285,17 @@ fn point_id_to_u64(id: &PointId) -> Result<u64> {
 
 fn u64_to_point_id(id: qdrant_edge::PointId) -> PointId {
     // qdrant-edge's PointId is an enum (Num(u64) or Uuid(Uuid)).
-    // We stringify both.
     match id {
         qdrant_edge::PointId::Num(n) => n.to_string(),
         qdrant_edge::PointId::Uuid(u) => u.to_string(),
     }
 }
 
-fn map_qdrant_err(e: Box<dyn std::error::Error + Send + Sync>) -> Error {
-    Error::Other(format!("qdrant-edge error: {e}"))
+/// Convert a qdrant-edge `OperationError` to our `Error` type.
+/// qdrant-edge's EdgeShard methods return OperationResult<T> = Result<T, OperationError>.
+/// OperationError implements std::error::Error, so we can convert via to_string().
+fn map_qdrant_err(e: qdrant_edge::OperationError) -> Error {
+    Error::Config(format!("qdrant-edge error: {e}"))
 }
 
 #[cfg(test)]
@@ -375,13 +356,11 @@ mod tests {
             store.upsert("docs", p).unwrap();
         }
 
-        // Wait for the shard to be queryable (qdrant-edge may need an optimize() call).
+        // The index may need an optimize() call before queries return results.
         // For now, just call search; if it returns 0 results that's still OK for the test.
         let results = store
             .search_dense("docs", &[0.05, 0.61, 0.76, 0.74], None, 3)
             .unwrap();
-        // Result count may be 0 if the index hasn't been built yet.
-        // The important thing is that the call doesn't error.
         assert!(results.len() <= 3);
     }
 

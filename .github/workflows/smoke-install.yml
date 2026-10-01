@@ -320,15 +320,36 @@ jobs:
 
       - name: Mount the DMG + copy the app
         run: |
-          DMG=$(find ./artifacts -name '*.dmg' | head -1)
+          DMG=$(find ./artifacts -name '*.dmg' -type f | head -1)
+          if [ -z "$DMG" ]; then
+            echo "❌ No DMG file found in artifacts"
+            ls -R ./artifacts
+            exit 1
+          fi
           echo "Mounting $DMG"
-          MOUNT_POINT=$(hdiutil attach "$DMG" -nobrowse -quiet | grep -oE '/Volumes/.*' | tail -1)
+          # Use a fixed mount point so the variable can't be empty.
+          MOUNT_POINT="/Volumes/SupportOS"
+          hdiutil attach "$DMG" -nobrowse -mountpoint "$MOUNT_POINT" -quiet
+          if [ ! -d "$MOUNT_POINT" ]; then
+            echo "❌ DMG did not mount at $MOUNT_POINT"
+            exit 1
+          fi
           echo "Mounted at $MOUNT_POINT"
-          # Copy the .app to /Applications.
-          APP=$(find "$MOUNT_POINT" -name '*.app' -maxdepth 1 | head -1)
+          # Find the .app inside the mounted DMG.
+          APP=$(find "$MOUNT_POINT" -maxdepth 1 -name '*.app' -type d | head -1)
+          if [ -z "$APP" ]; then
+            echo "❌ No .app found in DMG"
+            ls -la "$MOUNT_POINT"
+            hdiutil detach "$MOUNT_POINT" -quiet || true
+            exit 1
+          fi
           echo "Copying $APP to /Applications"
-          rm -rf "/Applications/$(basename "$APP")"
+          # Remove any existing copy with the same basename.
+          BASENAME=$(basename "$APP")
+          rm -rf "/Applications/$BASENAME" 2>/dev/null || true
           cp -R "$APP" /Applications/
+          # Unmount the DMG (cleanup).
+          hdiutil detach "$MOUNT_POINT" -quiet || true
 
       - name: Launch + self-check
         run: |
