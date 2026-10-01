@@ -146,6 +146,8 @@ pub fn run() {
             // Side threads (M12-P5h)
             side_threads_list,
             side_thread_messages,
+            // Connectors (M12-P5h)
+            connectors_list,
         ]);
 
     #[cfg(desktop)]
@@ -909,6 +911,19 @@ fn side_thread_messages(
     messages
         .into_iter()
         .map(|m| serde_json::to_value(&m).map_err(|e| e.to_string()))
+        .collect()
+}
+
+// ─── Connectors (M12-P5h) ──────────────────────────────────────────────
+
+/// List all configured connectors.
+#[tauri::command]
+fn connectors_list(db_state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let connectors = spp_core::data_tools::list_connectors(&conn).map_err(|e| e.to_string())?;
+    connectors
+        .into_iter()
+        .map(|c| serde_json::to_value(&c).map_err(|e| e.to_string()))
         .collect()
 }
 
