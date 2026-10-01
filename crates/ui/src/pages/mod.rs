@@ -6,6 +6,7 @@
 pub mod ai_center;
 pub mod automation;
 pub mod connectors;
+pub mod custom_objects;
 pub mod customers;
 pub mod dashboard;
 pub mod inbox;
@@ -24,6 +25,7 @@ pub mod sync_health;
 pub use ai_center::AiCenterPage;
 pub use automation::AutomationPage;
 pub use connectors::ConnectorsPage;
+pub use custom_objects::CustomObjectsPage;
 pub use customers::{CustomerProfilePage, CustomerSearchPage};
 pub use dashboard::DashboardPage;
 pub use inbox::InboxPage;

@@ -148,6 +148,9 @@ pub fn run() {
             side_thread_messages,
             // Connectors (M12-P5h)
             connectors_list,
+            // Custom objects (M12-P5h)
+            custom_object_types_list,
+            custom_object_fields_list,
         ]);
 
     #[cfg(desktop)]
@@ -924,6 +927,36 @@ fn connectors_list(db_state: tauri::State<'_, DbState>) -> Result<Vec<serde_json
     connectors
         .into_iter()
         .map(|c| serde_json::to_value(&c).map_err(|e| e.to_string()))
+        .collect()
+}
+
+// ─── Custom objects (M12-P5h) ──────────────────────────────────────────
+
+/// List all custom object types.
+#[tauri::command]
+fn custom_object_types_list(
+    db_state: tauri::State<'_, DbState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let types = spp_core::data_tools::list_object_types(&conn).map_err(|e| e.to_string())?;
+    types
+        .into_iter()
+        .map(|t| serde_json::to_value(&t).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// List fields for a custom object type.
+#[tauri::command]
+fn custom_object_fields_list(
+    db_state: tauri::State<'_, DbState>,
+    type_id: i64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let fields =
+        spp_core::data_tools::list_object_fields(&conn, type_id).map_err(|e| e.to_string())?;
+    fields
+        .into_iter()
+        .map(|f| serde_json::to_value(&f).map_err(|e| e.to_string()))
         .collect()
 }
 
