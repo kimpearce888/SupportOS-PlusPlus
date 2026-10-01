@@ -155,6 +155,8 @@ pub fn run() {
             segments_list,
             campaigns_list,
             dnc_list,
+            // Search (M12-P5i)
+            universal_search,
         ]);
 
     #[cfg(desktop)]
@@ -1001,6 +1003,24 @@ fn dnc_list(db_state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value
                 "added_at": added_at,
             }))
         })
+        .collect()
+}
+
+// ─── Search (M12-P5i) ──────────────────────────────────────────────────
+
+/// Universal search across conversations + customers (FTS5).
+#[tauri::command]
+fn universal_search(
+    db_state: tauri::State<'_, DbState>,
+    query: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    // Ensure FTS5 tables exist (idempotent).
+    let _ = spp_core::search::apply_fts_migration(&conn);
+    let results = spp_core::search::universal_search(&conn, &query).map_err(|e| e.to_string())?;
+    results
+        .into_iter()
+        .map(|r| serde_json::to_value(&r).map_err(|e| e.to_string()))
         .collect()
 }
 
