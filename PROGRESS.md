@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M9 — Outreach (segmentation, saved segments, campaigns, do-not-contact, monitoring) |
-| Current task ID | M9-T01 (next up) — M8 closed (tag `milestone-8-done`), M9 task list written |
-| Last completed task | M8-T08 (M8 milestone close — all 8 tasks done, tag `milestone-8-done` pushed) |
-| Last commit hash | `972bbbc` — M8-T01 through M8-T08: Reports and quality |
-| Last updated | Session 33 — M9 started (owner said "continue") |
+| Current milestone | M9 — Outreach (CLOSED — pending owner sign-off to proceed to M10) |
+| Current task ID | (none — M9 milestone complete; awaiting owner "continue" to start M10) |
+| Last completed task | M9-T05 (M9 milestone close — all 5 tasks done, tag `milestone-9-done` pushed) |
+| Last commit hash | (about to be) M9-T05: M9 milestone close — tag milestone-9-done |
+| Last updated | Session 33 — M9 closed (5 of 5 tasks done; 831 tests passing) |
 
 ## Next 3 tasks
 
-1. **M9-T01**: Segmentation — saved segments (customer groups by criteria).
-2. **M9-T02**: Campaigns — create + send + retry (with livelock prevention per KNOWN PITFALLS).
-3. **M9-T03**: Do-not-contact — suppression list.
+1. **Owner sign-off**: confirm M9 milestone is acceptable; say "continue" to proceed to M10.
+2. **M10 — Data tools**: write the M10 task list, then start M10-T01.
+3. **(After M10)**: M11 — Conformance and hardening.
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (especially the unchecked M9 tasks T01–T06).
+1. Read `AGENTS.md` → this file → `TASKS.md` (M10 task list will be written at the start of the next session, per spec: "Write the full task list for a milestone before starting it").
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M9/M9-T01. Last commit: <hash>. Next: Segmentation.`
+3. Announce `Resuming at M10/M10-T01. Last commit: <hash>. Next: M10 task list + Data tools.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)

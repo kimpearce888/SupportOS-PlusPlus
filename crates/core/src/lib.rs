@@ -58,6 +58,7 @@ pub mod notifications;
 pub mod oauth;
 pub mod oauth_state;
 pub mod operations;
+pub mod outreach;
 pub mod perf_guards;
 pub mod reports;
 pub mod response_state_sql;

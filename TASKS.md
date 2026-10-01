@@ -354,15 +354,15 @@
 > This milestone also wires the last remaining Operations Center tile:
 > `campaign_activity` (currently stubbed `NotAvailable { milestone: 9 }` from M4-T01).
 
-- [ ] **M9-T01** Segmentation — saved segments.
+- [x] **M9-T01** Segmentation — saved segments.
   - AC: M023 migration creates `saved_segments` table (id, name, criteria_json, created_at). `SavedSegment` struct. `create_segment`, `list_segments`, `get_segment`, `delete_segment`. Per the reference: `segmentation/` = "Saved segments." Tests cover CRUD, criteria JSON round-trip, empty case.
-- [ ] **M9-T02** Campaigns — create + send + retry (livelock prevention).
+- [x] **M9-T02** Campaigns — create + send + retry (livelock prevention).
   - AC: M024 migration creates `campaigns` (id, name, segment_id, status, message_template, created_at) + `campaign_recipients` (campaign_id, customer_id, status, attempts, last_error). `Campaign` + `CampaignRecipient` structs. `create_campaign`, `start_campaign`, `retry_failed_recipients`. Per KNOWN PITFALLS: "Campaign recipients that exhaust retries must fail, never livelock; 'retry failed' resets the attempt budget." The `CampaignActivity` Operations Center tile (M4-T01 stub) is wired here. Tests cover campaign lifecycle, recipient retry, max attempts, livelock prevention.
-- [ ] **M9-T03** Do-not-contact — suppression list.
+- [x] **M9-T03** Do-not-contact — suppression list.
   - AC: M025 migration creates `do_not_contact` table (customer_id, reason, created_at). `add_to_dnc`, `remove_from_dnc`, `is_on_dnc`, `list_dnc`. Campaign recipient selection must exclude DNC entries. Tests cover add/remove/check, campaign exclusion, empty case.
-- [ ] **M9-T04** Campaign monitoring — delivery stats + reply tracking.
+- [x] **M9-T04** Campaign monitoring — delivery stats + reply tracking.
   - AC: `get_campaign_stats(conn, campaign_id) -> CampaignStats` (sent, delivered, replied, failed). `CampaignReplyRate` report metric (from `ReportMetricKey::ALL`) computed here. Per the reference: `outreach/` includes monitoring. Tests cover stats, reply rate, empty campaign.
-- [ ] **M9-T05** M9 milestone close: all tasks ticked, CI green, tag `milestone-9-done`, STOP.
+- [x] **M9-T05** M9 milestone close: all tasks ticked, CI green, tag `milestone-9-done`, STOP.
   - AC: tag pushed; all M9 tasks ticked. Wires the last Operations Center tile (`campaign_activity`) — total 16 of 16 tiles real. **STOP — waiting for owner to say 'continue' to proceed to M10.**
 - M10 Data tools
 - M11 Conformance and hardening
