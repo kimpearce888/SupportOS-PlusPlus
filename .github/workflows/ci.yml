@@ -55,8 +55,13 @@ jobs:
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Tests (exclude Tauri shell on macOS due to upstream _EMBED_INFO_PLIST duplicate symbol)
+        run: cargo test --workspace --all-targets --exclude supportos-plusplus-app
+        if: runner.os == 'macOS'
+
       - name: Tests
         run: cargo test --workspace --all-targets
+        if: runner.os != 'macOS'
 
   build-wasm:
     name: cargo check on wasm32 + trunk build (debug)
