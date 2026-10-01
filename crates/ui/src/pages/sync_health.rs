@@ -71,11 +71,40 @@ impl WebhookPushState {
 /// - A note about incremental polling being the baseline.
 #[component]
 pub fn SyncHealthPage() -> impl IntoView {
-    // M2: the state is a local signal. M2-T07 will wire it to the real
-    // `webhook_state` Tauri IPC command. For now, it starts as NotConfigured.
+    // Wired to the `sync_health_state` Tauri IPC command on mount.
     let state = create_rw_signal(WebhookPushState::NotConfigured);
     let webhook_url = create_rw_signal(String::new());
     let last_event = create_rw_signal(None::<String>);
+    let loading = create_rw_signal(true);
+
+    create_effect(move |_| {
+        let state = state;
+        let loading = loading;
+        wasm_bindgen_futures::spawn_local(async move {
+            let args = serde_json::json!({});
+            match crate::ipc::invoke::<serde_json::Value>("sync_health_state", &args).await {
+                Ok(data) => {
+                    let push_state = data
+                        .get("webhook_push_state")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("not_configured");
+                    let new_state = match push_state {
+                        "receiving" => WebhookPushState::Receiving,
+                        "registered" => WebhookPushState::Registered,
+                        "error" => WebhookPushState::Error,
+                        _ => WebhookPushState::NotConfigured,
+                    };
+                    state.set(new_state);
+                    loading.set(false);
+                }
+                Err(_) => {
+                    // If IPC fails (e.g. in browser without Tauri), show NotConfigured.
+                    state.set(WebhookPushState::NotConfigured);
+                    loading.set(false);
+                }
+            }
+        });
+    });
 
     let on_register = move || {
         // M2: invoke `webhook_register` Tauri command.

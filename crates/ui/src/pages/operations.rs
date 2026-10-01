@@ -188,12 +188,69 @@ pub fn tile_inbox_link(tile: OperationsTileKey, mailbox_id: Option<i64>) -> Opti
 /// Shows the 16-tile grid (severity-grouped: critical / warning / info) plus
 /// loading/empty/error states. Each tile links to its filtered inbox view
 /// (if applicable) or shows a "Not yet available" badge (for stubbed tiles).
+///
+/// Wired to the `operations_snapshot` Tauri IPC command on mount.
 #[component]
 pub fn OperationsPage() -> impl IntoView {
-    // M4-T02: local signal. A later task wires this to the `operations_snapshot`
-    // Tauri IPC command (which calls spp_core::operations::build_snapshot).
-    // For now, an empty snapshot so the empty state renders.
     let snapshot = create_rw_signal(OperationsSnapshotView::default());
+    let loading = create_rw_signal(true);
+    let error_msg = create_rw_signal(None::<String>);
+
+    // Fetch the operations snapshot on mount.
+    create_effect(move |_| {
+        let snapshot = snapshot;
+        let loading = loading;
+        let error_msg = error_msg;
+        wasm_bindgen_futures::spawn_local(async move {
+            let args = serde_json::json!({ "mailbox_id": null });
+            match crate::ipc::invoke::<serde_json::Value>("operations_snapshot", &args).await {
+                Ok(data) => {
+                    let tiles = data
+                        .get("tiles")
+                        .and_then(|t| t.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|entry| {
+                                    let id = entry.get("0")?.as_str()?;
+                                    let count_obj = entry.get("1")?;
+                                    let kind = count_obj.get("kind")?.as_str()?;
+                                    if kind == "available" {
+                                        let count = count_obj.get("count")?.as_u64()? as u32;
+                                        Some((id.to_string(), TileCountView::Available { count }))
+                                    } else {
+                                        let milestone = count_obj.get("milestone")?.as_u64()? as u8;
+                                        Some((
+                                            id.to_string(),
+                                            TileCountView::NotAvailable { milestone },
+                                        ))
+                                    }
+                                })
+                                .filter_map(|(id_str, count)| {
+                                    // Match the string back to the enum variant.
+                                    for tile in OperationsTileKey::ALL {
+                                        if tile.as_str() == id_str {
+                                            return Some((tile, count));
+                                        }
+                                    }
+                                    None
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    snapshot.set(OperationsSnapshotView {
+                        tiles,
+                        mailbox_id: None,
+                        built_at: String::new(),
+                    });
+                    loading.set(false);
+                }
+                Err(e) => {
+                    error_msg.set(Some(e));
+                    loading.set(false);
+                }
+            }
+        });
+    });
 
     view! {
         <div class="spp-page spp-page--operations">
@@ -203,15 +260,34 @@ pub fn OperationsPage() -> impl IntoView {
                 "Click a tile to filter the inbox."
             </p>
 
+            <Show when=move || loading.get() fallback=|| ()>
+                <div class="spp-state">
+                    <span class="spp-spinner" aria-label="Loading"></span>
+                    <p class="spp-state__body">"Loading operations data…"</p>
+                </div>
+            </Show>
+
+            <Show when=move || error_msg.get().is_some() fallback=|| ()>
+                <div class="spp-state spp-state--error">
+                    <span class="spp-state__icon" aria-hidden="true">"⚠"</span>
+                    <p class="spp-state__body">{move || error_msg.get().unwrap_or_default()}</p>
+                </div>
+            </Show>
+
             <Show
-                when=move || !snapshot.get().tiles.is_empty()
-                fallback=move || {
-                    view! {
-                        <EmptyState message="No operations data yet. Run a sync or try demo mode to populate tiles." />
-                    }
-                }
+                when=move || !loading.get() && error_msg.get().is_none()
+                fallback=|| ()
             >
-                <OperationsTileGrid snapshot=snapshot.get() />
+                <Show
+                    when=move || !snapshot.get().tiles.is_empty()
+                    fallback=move || {
+                        view! {
+                            <EmptyState message="No operations data yet. Run a sync or try demo mode to populate tiles." />
+                        }
+                    }
+                >
+                    <OperationsTileGrid snapshot=snapshot.get() />
+                </Show>
             </Show>
         </div>
     }

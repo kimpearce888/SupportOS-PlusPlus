@@ -18,6 +18,7 @@ use leptos::*;
 use leptos_router::*;
 
 pub mod components;
+pub mod ipc;
 pub mod layout;
 pub mod pages;
 
