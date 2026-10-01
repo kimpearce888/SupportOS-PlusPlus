@@ -151,6 +151,10 @@ pub fn run() {
             // Custom objects (M12-P5h)
             custom_object_types_list,
             custom_object_fields_list,
+            // Outreach (M12-P5i)
+            segments_list,
+            campaigns_list,
+            dnc_list,
         ]);
 
     #[cfg(desktop)]
@@ -957,6 +961,46 @@ fn custom_object_fields_list(
     fields
         .into_iter()
         .map(|f| serde_json::to_value(&f).map_err(|e| e.to_string()))
+        .collect()
+}
+
+// ─── Outreach (M12-P5i) ───────────────────────────────────────────────
+
+/// List all saved segments.
+#[tauri::command]
+fn segments_list(db_state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let segments = spp_core::outreach::list_segments(&conn).map_err(|e| e.to_string())?;
+    segments
+        .into_iter()
+        .map(|s| serde_json::to_value(&s).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// List all campaigns.
+#[tauri::command]
+fn campaigns_list(db_state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let campaigns = spp_core::outreach::list_campaigns(&conn).map_err(|e| e.to_string())?;
+    campaigns
+        .into_iter()
+        .map(|c| serde_json::to_value(&c).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// List customers on the do-not-contact list.
+#[tauri::command]
+fn dnc_list(db_state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let dnc = spp_core::outreach::list_dnc(&conn).map_err(|e| e.to_string())?;
+    dnc.into_iter()
+        .map(|(customer_id, reason, added_at)| {
+            Ok(serde_json::json!({
+                "customer_id": customer_id,
+                "reason": reason,
+                "added_at": added_at,
+            }))
+        })
         .collect()
 }
 

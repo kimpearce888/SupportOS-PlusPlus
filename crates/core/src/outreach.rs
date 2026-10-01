@@ -252,6 +252,28 @@ pub fn count_active_campaigns(conn: &Connection) -> Result<u32> {
     Ok(u32::try_from(count).unwrap_or(0))
 }
 
+/// List all campaigns (most recent first).
+pub fn list_campaigns(conn: &Connection) -> Result<Vec<Campaign>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, segment_id, status, message_template, created_at, started_at, completed_at
+         FROM campaigns ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Campaign {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            segment_id: r.get(2)?,
+            status: r.get(3)?,
+            message_template: r.get(4)?,
+            created_at: r.get(5)?,
+            started_at: r.get(6)?,
+            completed_at: r.get(7)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.into())
+}
+
 // ─── M9-T03: Do-not-contact ──────────────────────────────────────────────
 
 pub fn add_to_dnc(conn: &Connection, customer_id: i64, reason: &str) -> Result<()> {
