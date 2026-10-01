@@ -75,6 +75,8 @@ pub mod ticket_ops;
 pub mod ticket_states;
 pub mod vectorstore;
 pub mod vectorstore_contract;
+#[cfg(feature = "qdrant")]
+pub mod vectorstore_qdrant;
 pub mod webhook;
 pub mod webhook_handler;
 pub mod workload;
