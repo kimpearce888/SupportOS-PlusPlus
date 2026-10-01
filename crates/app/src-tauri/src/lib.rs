@@ -143,6 +143,9 @@ pub fn run() {
             incidents_list,
             // Intelligence — Knowledge gaps (M12-P5h)
             knowledge_gaps_list,
+            // Side threads (M12-P5h)
+            side_threads_list,
+            side_thread_messages,
         ]);
 
     #[cfg(desktop)]
@@ -873,6 +876,39 @@ fn knowledge_gaps_list(
                 "gap_count": count,
             }))
         })
+        .collect()
+}
+
+// ─── Side threads (M12-P5h) ─────────────────────────────────────────────
+
+/// List side threads for a conversation.
+#[tauri::command]
+fn side_threads_list(
+    db_state: tauri::State<'_, DbState>,
+    conversation_id: i64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let threads =
+        spp_core::side_threads::list_side_threads_for_conversation(&conn, conversation_id)
+            .map_err(|e| e.to_string())?;
+    threads
+        .into_iter()
+        .map(|t| serde_json::to_value(&t).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// List messages in a side thread.
+#[tauri::command]
+fn side_thread_messages(
+    db_state: tauri::State<'_, DbState>,
+    thread_id: i64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.lock_conn()?;
+    let messages = spp_core::side_threads::list_side_thread_messages(&conn, thread_id)
+        .map_err(|e| e.to_string())?;
+    messages
+        .into_iter()
+        .map(|m| serde_json::to_value(&m).map_err(|e| e.to_string()))
         .collect()
 }
 

@@ -16,6 +16,7 @@ pub mod notifications;
 pub mod operations;
 pub mod reports;
 pub mod settings;
+pub mod side_threads;
 pub mod support_health;
 pub mod sync_health;
 
@@ -32,5 +33,6 @@ pub use notifications::NotificationsPage;
 pub use operations::OperationsPage;
 pub use reports::ReportsPage;
 pub use settings::SettingsPage;
+pub use side_threads::SideThreadsPage;
 pub use support_health::SupportHealthPage;
 pub use sync_health::SyncHealthPage;
