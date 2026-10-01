@@ -12,10 +12,10 @@ The reference has 21 client-side `.tsx` pages. SupportOS++ currently has 7 pages
 
 | # | Reference page | SupportOS++ status | Core module exists? | IPC command exists? |
 |---|---|---|---|---|
-| 1 | Dashboard | ✅ EXISTS (placeholder, no KPI data wired) | ✅ `reports::get_dashboard_metrics` | ✅ `dashboard_metrics` |
-| 2 | Inbox (3-pane) | ✅ EXISTS (empty state only, no conversation list wired) | ✅ `search::universal_search` | ❌ MISSING: `inbox_list_conversations` |
-| 3 | Conversation detail | ❌ MISSING (no detail pane with threads) | ✅ `sync` (conversations table) | ❌ MISSING: `conversation_get` |
-| 4 | Customer profile | ❌ MISSING | ✅ `customers` table | ❌ MISSING: `customer_get` |
+| 1 | Dashboard | ✅ EXISTS (wired to `dashboard_metrics` IPC) | ✅ `reports::get_dashboard_metrics` | ✅ `dashboard_metrics` |
+| 2 | Inbox (3-pane) | ✅ EXISTS (full wiring — M12-P5: list + filters + saved views + thread + composer + reply + note + status + assign + bulk actions + context pane) | ✅ `inbox::list_conversations`, `inbox::get_conversation`, `inbox::reply_to_conversation`, `inbox::add_note`, `inbox::change_status`, `inbox::assign` | ✅ `inbox_list_conversations`, `inbox_get_conversation`, `inbox_reply`, `inbox_add_note`, `inbox_change_status`, `inbox_assign`, `inbox_list_saved_views`, `inbox_apply_saved_view` |
+| 3 | Conversation detail | ✅ EXISTS (merged into Inbox page as the detail pane — M12-P5) | ✅ `inbox::get_conversation` | ✅ `inbox_get_conversation` |
+| 4 | Customer profile | ❌ MISSING (the inbox context pane shows customer name/email; a dedicated customer-profile page is still needed) | ✅ `customers` table | ❌ MISSING: `customer_get` |
 | 5 | Operations Center | ✅ EXISTS (16 tiles, wired to `operations_snapshot`) | ✅ `operations` | ✅ `operations_snapshot` |
 | 6 | Notification Center | ✅ EXISTS (list + prefs + TTL) | ✅ `notifications` | ✅ `notifications_unread_count`, `notifications_list_unread`, `notifications_mark_read` |
 | 7 | Automation | ✅ EXISTS (rules + approval queue) | ✅ `automation` | ✅ `automation_list_rules`, `automation_list_pending`, `automation_approve`, `automation_reject` |
@@ -34,39 +34,46 @@ The reference has 21 client-side `.tsx` pages. SupportOS++ currently has 7 pages
 | 20 | Connectors | ❌ MISSING (no UI page for connector CRUD) | ✅ `data_tools` | ❌ MISSING: `connectors_list`, `connector_create` |
 | 21 | Backup/restore | ❌ MISSING (no UI page for backup/restore) | ✅ `backup` + `data_tools` | ❌ MISSING: `backup_create`, `restore_apply` |
 
-## Summary
+## Self-check (M12-P2)
 
-- **Pages that exist**: 7 (Dashboard, Inbox [partial], Operations, Notifications, Automation, Settings, Sync Health)
-- **Pages missing**: 14 (Conversation detail, Customer profile, AI Center, Reports, Issue Radar, Knowledge docs, Incidents, Side threads, Customer timeline, Support graph, Outreach/campaigns, Custom objects, Connectors, Backup/restore)
-- **IPC commands that exist**: 22
-- **IPC commands missing**: ~20 (for the missing pages)
+A new `self_check` IPC command runs at boot and reports the status of 6
+subsystems: database (with all 28 migrations applied), FTS5 (probe creates +
+drops a temp table), vector_store (in_memory or qdrant_edge depending on
+the cargo feature), ai_provider (configured provider kind), loopback_listener
+(bound address), catalog_conformance (165 variants match the reference).
 
-## What "works" vs "doesn't work" in existing pages
+The report is logged at boot + available via the `self_check` IPC command
+so the UI can display it.
 
-### Dashboard (`/`)
-- **Works**: Page renders, empty state shows.
-- **Doesn't work**: No IPC call to `dashboard_metrics` — the page has no data. The KPI numbers are hardcoded to 0 or empty.
+## Summary (updated M12)
 
-### Inbox (`/inbox`)
-- **Works**: 3-pane layout renders, empty states show.
-- **Doesn't work**: No IPC call to load conversations. The list pane is always empty. No conversation selection → detail → context flow.
+- **Pages that exist with real IPC**: 4 (Dashboard, Inbox+Detail+Context, Operations, Notifications, Automation, Sync Health) — Dashboard, Inbox, Operations, Notifications, Automation, Sync Health are wired; Settings is the remaining placeholder.
+- **Pages missing**: 14 (Customer profile, AI Center, Reports, Issue Radar, Knowledge docs, Incidents, Side threads, Customer timeline, Support graph, Outreach/campaigns, Custom objects, Connectors, Backup/restore) + the dedicated conversation-detail page is now part of the Inbox.
+- **IPC commands that exist**: 30 (22 prior + 8 new inbox commands + self_check)
+- **IPC commands missing**: ~12 (for the missing pages)
 
-### Operations (`/operations`)
-- **Works**: 16-tile grid renders with severity grouping. Tile labels + descriptions correct.
-- **Doesn't work**: No IPC call to `operations_snapshot`. All tiles show 0 or "Not yet available" hardcoded. The snapshot data is a local signal initialized to empty.
+## What "works" in the Inbox page (M12-P5)
 
-### Notifications (`/notifications`)
-- **Works**: 3 sections render (list + preferences + retention). Preference toggles work locally.
-- **Doesn't work**: No IPC call to `notifications_list_unread` or `notifications_unread_count`. The list is always empty. Preference changes are local only (not saved to DB).
+- ✅ Loads conversations from `inbox_list_conversations` on mount + on filter change.
+- ✅ Filter dropdowns: status, priority, search box.
+- ✅ Saved views selector.
+- ✅ Conversation click loads detail from `inbox_get_conversation`.
+- ✅ Reply composer calls `inbox_reply` (validates non-empty body).
+- ✅ Note composer calls `inbox_add_note`.
+- ✅ Status dropdown calls `inbox_change_status`.
+- ✅ Assignee picker calls `inbox_assign`.
+- ✅ Bulk-select + close-all calls `inbox_change_status` for each.
+- ✅ Context pane shows customer name/email + mailbox + assignee + timestamps.
+- ✅ Loading, empty, and error states on every async fetch.
+- ✅ Composer success/error feedback.
 
-### Automation (`/automation`)
-- **Works**: 2 sections render (approval queue + rules list). Empty states show.
-- **Doesn't work**: No IPC call to `automation_list_pending` or `automation_list_rules`. Both lists are always empty.
+## TODO for the Inbox page
 
-### Settings (`/settings`)
-- **Works**: Page renders.
-- **Doesn't work**: No AI Center controls, no connector management, no custom object management. Placeholder only.
-
-### Sync Health (`/sync-health`)
-- **Works**: Webhook push state UI renders, explanation text shows.
-- **Doesn't work**: No IPC call to `sync_health_state`. State is hardcoded to "Not configured".
+- Tags: the backend doesn't yet expose `inbox_add_tag` / `inbox_remove_tag`
+  IPC commands (the conversations_tags join table is not yet defined).
+- Snooze: not yet implemented (would require a new `snooze_until` column on
+  conversations + a `inbox_snooze` IPC command).
+- Mailbox filter dropdown: currently only status + priority + search;
+  mailbox filter needs the `mailbox_list` IPC command (TODO).
+- Customer/AI context pane: shows customer info; AI attributes + history
+  panes need `customer_timeline` + `get_ai_attributes` IPC commands (TODO).
