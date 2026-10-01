@@ -33,14 +33,12 @@ use std::sync::Mutex;
 
 use qdrant_edge::{
     Distance, EdgeConfig, EdgeShard, EdgeVectorParams, PointInsertOperations, PointOperations,
-    PointStruct, QueryEnum, QueryRequestBuilder, ScoringQuery, UpdateOperation,
-    WithPayloadInterface,
+    PointStructPersisted as PointStruct, QueryEnum, QueryRequestBuilder, ScoringQuery,
+    UpdateOperation, VectorStructPersisted, WithPayloadInterface,
 };
 
 use crate::error::{Error, Result};
-use crate::vectorstore::{
-    CollectionInfo, Filter, Payload, Point, PointId, ScoredPoint, VectorStore,
-};
+use crate::vectorstore::{CollectionInfo, Filter, Point, PointId, ScoredPoint, VectorStore};
 
 /// A VectorStore backed by `qdrant-edge` — the production adapter (spec A4).
 ///
@@ -103,7 +101,7 @@ impl QdrantEdgeVectorStore {
         if let Some(dim) = dense_dim {
             config_builder = config_builder.vector(
                 qdrant_edge::DEFAULT_VECTOR_NAME.to_string(),
-                EdgeVectorParams::new(dim, Distance::Cosine),
+                EdgeVectorParams::builder(dim, Distance::Cosine).build(),
             );
         }
         let config = config_builder.build();
@@ -167,12 +165,16 @@ impl VectorStore for QdrantEdgeVectorStore {
             Error::Config("QdrantEdge adapter does not yet support sparse-only points".to_string())
         })?;
         let payload_json = point.payload.clone();
-        let point_struct = PointStruct::new(id_u64, dense, payload_json);
+        let point_struct = PointStruct {
+            id: id_u64.into(),
+            vector: VectorStructPersisted::Single(dense),
+            payload: value_to_qdrant_payload(payload_json),
+        };
 
         shard
             .update(UpdateOperation::PointOperation(
                 PointOperations::UpsertPoints(PointInsertOperations::PointsList(vec![
-                    point_struct.into(),
+                    point_struct,
                 ])),
             ))
             .map_err(map_qdrant_err)?;
@@ -188,7 +190,9 @@ impl VectorStore for QdrantEdgeVectorStore {
         let id_u64 = point_id_to_u64(id)?;
         shard
             .update(UpdateOperation::PointOperation(
-                PointOperations::DeletePoints(vec![id_u64.into()]),
+                PointOperations::DeletePoints {
+                    ids: vec![id_u64.into()],
+                },
             ))
             .map_err(map_qdrant_err)?;
         Ok(())
@@ -208,7 +212,7 @@ impl VectorStore for QdrantEdgeVectorStore {
             .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
 
         let query_vec: Vec<f32> = query.to_vec();
-        let request = QueryRequestBuilder::new(top_k as u64)
+        let request = QueryRequestBuilder::new(top_k)
             .query(ScoringQuery::Vector(QueryEnum::Nearest(
                 qdrant_edge::NamedQuery {
                     query: qdrant_edge::VectorInternal::from(query_vec),
@@ -224,7 +228,7 @@ impl VectorStore for QdrantEdgeVectorStore {
             .map(|r| ScoredPoint {
                 id: u64_to_point_id(r.id),
                 score: r.score,
-                payload: r.payload.unwrap_or_else(|| serde_json::Value::Null),
+                payload: qdrant_payload_to_value(r.payload),
             })
             .collect();
         Ok(scored)
@@ -251,8 +255,8 @@ impl VectorStore for QdrantEdgeVectorStore {
         let info = shard.info().map_err(map_qdrant_err)?;
         // The info struct contains counts; the exact field name may vary.
         // Use 0 as a safe default if point_count is not present.
-        let count = info.point_count.unwrap_or(0);
-        Ok(count as usize)
+        let count = info.points_count;
+        Ok(count)
     }
 
     fn collection_info(&self, name: &str) -> Result<Option<CollectionInfo>> {
@@ -265,7 +269,7 @@ impl VectorStore for QdrantEdgeVectorStore {
         Ok(Some(CollectionInfo {
             name: name.to_string(),
             dense_dim: self.dim_for(name),
-            point_count: info.point_count.unwrap_or(0) as usize,
+            point_count: info.points_count,
         }))
     }
 
@@ -297,10 +301,32 @@ fn point_id_to_u64(id: &PointId) -> Result<u64> {
 }
 
 fn u64_to_point_id(id: qdrant_edge::PointId) -> PointId {
-    // qdrant-edge's PointId is an enum (Num(u64) or Uuid(Uuid)).
+    // qdrant-edge's PointId is aliased to ExtendedPointId (enum: NumId(u64) | Uuid(Uuid)).
     match id {
-        qdrant_edge::PointId::Num(n) => n.to_string(),
+        qdrant_edge::PointId::NumId(n) => n.to_string(),
         qdrant_edge::PointId::Uuid(u) => u.to_string(),
+    }
+}
+
+/// Convert a serde_json::Value to a qdrant-edge Payload (wraps Map<String, Value>).
+fn value_to_qdrant_payload(value: serde_json::Value) -> Option<qdrant_edge::Payload> {
+    match value {
+        serde_json::Value::Object(map) => Some(qdrant_edge::Payload(map)),
+        serde_json::Value::Null => None,
+        // Non-object payloads: wrap in a single-key map under "value".
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("value".to_string(), other);
+            Some(qdrant_edge::Payload(map))
+        }
+    }
+}
+
+/// Convert a qdrant-edge Payload back to a serde_json::Value.
+fn qdrant_payload_to_value(payload: Option<qdrant_edge::Payload>) -> serde_json::Value {
+    match payload {
+        Some(p) => serde_json::Value::Object(p.0),
+        None => serde_json::Value::Null,
     }
 }
 
