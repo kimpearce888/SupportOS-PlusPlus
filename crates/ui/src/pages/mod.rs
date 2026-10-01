@@ -11,6 +11,7 @@ pub mod inbox;
 pub mod not_found;
 pub mod notifications;
 pub mod operations;
+pub mod reports;
 pub mod settings;
 pub mod sync_health;
 
@@ -22,5 +23,6 @@ pub use inbox::InboxPage;
 pub use not_found::NotFoundPage;
 pub use notifications::NotificationsPage;
 pub use operations::OperationsPage;
+pub use reports::ReportsPage;
 pub use settings::SettingsPage;
 pub use sync_health::SyncHealthPage;
