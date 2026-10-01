@@ -398,4 +398,26 @@
   - AC: Extends the existing Settings page with sections for connectors (list, add, delete, test) + custom objects (list types, add type, add fields). Per spec: "settings." Tests cover UI state construction (mirrors the core types for `'static` Leptos lifetimes).
 - [x] **M10-T06** M10 milestone close: all tasks ticked, CI green, tag `milestone-10-done`, STOP.
   - AC: tag pushed; all M10 tasks ticked. **STOP — waiting for owner to say 'continue' to proceed to M11.**
-- M11 Conformance and hardening
+
+## Milestone 11 — Conformance and hardening (THE FINAL MILESTONE)
+
+> Per spec M11: "Conformance and hardening: parity gate, reference-delta check,
+> black-box audit, performance and crash-recovery tests, packaged-app
+> verification, Linux matrix, UI-PARITY walkthrough, MANUAL-VERIFICATION
+> handoff, docs/FINAL-PARITY-AUDIT.md (an honest report, not a completion claim)."
+>
+> Per spec A3: "You may NOT declare the project complete or '100% parity'; report
+> counts per status and list every gap."
+> Per spec TESTING: "crash recovery, performance guards. Port the idea of the
+> reference's black-box audit as a Rust binary."
+
+- [ ] **M11-T01** Parity gate — verify all canonical counts + closed vocabularies.
+  - AC: A test suite (`crates/core/src/conformance.rs`) that verifies all 8 canonical counts (16 tiles, 15 notification types, 22 condition kinds, 14 activity fields, 15 date modes, 21 report metrics, 14 report dimensions, 14 AI attribute keys, 12 graph node kinds, 22 Copilot tools) match the reference's `inventory.json`. Also verifies that all catalog enums (`ALL` arrays) have the correct count. Tests cover: every `ALL` const array length matches the spec count; every `as_str()` matches the inventory vocabulary list.
+- [ ] **M11-T02** Crash-recovery tests — job recovery + migration idempotency + DB reopen.
+  - AC: Tests that verify: (1) a job in 'claimed' state at crash time is recoverable (re-claimed on restart); (2) all migrations M001–M027 are idempotent (re-running doesn't error); (3) a DB closed mid-write reopens cleanly (WAL recovery); (4) the notification sweep cursor survives a restart. Per spec TESTING: "crash recovery." Tests cover each scenario.
+- [ ] **M11-T03** Performance guards — EXPLAIN QUERY PLAN on key queries + synthetic dataset.
+  - AC: Extends M3-T09's `perf_guards.rs` with EXPLAIN QUERY PLAN on the new M4–M10 queries (Operations Center tiles, notifications list, SLA breach count, campaign stats, graph neighbors, dashboard metrics). All bounded at MAX_QUERY_MS=500ms. Tests verify query plans use indexes (not full table scans).
+- [ ] **M11-T04** `docs/FINAL-PARITY-AUDIT.md` — honest report.
+  - AC: The final honest parity audit. Reports: total test count, IMPLEMENTED vs TESTED vs PACKAGED vs VERIFIED counts per capability area, BLOCKED items (M1-T10 installer signing, M1-T11 Qdrant arm64, M5-T02 Qdrant adapter), honest gaps (Tauri shell IPC wiring pending, UI pages render with local signals not wired to core). Per spec A3: "an honest report, not a completion claim." The project is NOT declared complete.
+- [ ] **M11-T05** M11 milestone close — final tag.
+  - AC: tag `milestone-11-done` pushed. All 11 milestones complete. The project is at IMPLEMENTED + TESTED status; PACKAGED + VERIFIED require owner action (manual verification on clean machines per `docs/MANUAL-VERIFICATION.md`). **STOP — waiting for owner to run the manual verification checklist and promote rows to VERIFIED.**

@@ -8,23 +8,23 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M10 — Data tools (CLOSED — pending owner sign-off to proceed to M11) |
-| Current task ID | (none — M10 milestone complete; awaiting owner "continue" to start M11) |
+| Current milestone | M11 — Conformance and hardening (the FINAL milestone) |
+| Current task ID | M11-T01 (next up) — M10 closed (tag `milestone-10-done`), M11 task list written |
 | Last completed task | M10-T06 (M10 milestone close — all 6 tasks done, tag `milestone-10-done` pushed) |
-| Last commit hash | (about to be) M10-T06: M10 milestone close — tag milestone-10-done |
-| Last updated | Session 34 — M10 closed (6 of 6 tasks done; 855 tests passing) |
+| Last commit hash | `72aa28d` — M10-T01 through M10-T06: Data tools |
+| Last updated | Session 35 — M11 started (owner said "continue") — the final milestone |
 
 ## Next 3 tasks
 
-1. **Owner sign-off**: confirm M10 milestone is acceptable; say "continue" to proceed to M11.
-2. **M11 — Conformance and hardening**: the final milestone — parity gate, black-box audit, performance tests, packaged-app verification, FINAL-PARITY-AUDIT.md.
-3. **(After M11)**: Project complete (pending owner VERIFIED status).
+1. **M11-T01**: Parity gate — verify all 8 canonical counts + 10 closed vocabularies match the reference.
+2. **M11-T02**: Crash-recovery tests — job recovery + migration idempotency + DB reopen.
+3. **M11-T03**: `docs/FINAL-PARITY-AUDIT.md` — honest report (not a completion claim).
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` (M11 task list will be written at the start of the next session — the final milestone).
+1. Read `AGENTS.md` → this file → `TASKS.md` (M11 is the final milestone — after it, the project awaits owner VERIFIED status).
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skip the Tauri shell crate locally; CI verifies the full workspace).
-3. Announce `Resuming at M11/M11-T01. Last commit: <hash>. Next: M11 task list + Conformance and hardening.`
+3. Announce `Resuming at M11/M11-T01. Last commit: <hash>. Next: Parity gate.`
 4. Continue from the first unchecked task in `TASKS.md`.
 
 ## Parity counts by status (honest, A3)
