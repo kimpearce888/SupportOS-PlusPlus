@@ -114,7 +114,7 @@ jobs:
       - name: Install trunk + tauri-cli
         run: |
           cargo install trunk --locked
-          cargo install tauri-cli --version "^2.0" --locked --no-default-features
+          cargo install tauri-cli --version "^2.0" --locked
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
