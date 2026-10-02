@@ -40,6 +40,7 @@ tokio-stream = { workspace = true }
 crc32fast = { workspace = true }
 # Re-export the catalog crate so callers don't need a separate dep.
 supportos-plusplus-catalog = { workspace = true }
+ammonia = "4.2.0"
 
 [dev-dependencies]
 tempfile = "3"

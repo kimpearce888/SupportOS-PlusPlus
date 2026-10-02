@@ -59,7 +59,22 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> impl Int
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::inbox::get_conversation(&conn, id) {
         Ok(Some(detail)) => match serde_json::to_value(&detail) {
-            Ok(v) => (StatusCode::OK, Json(v)),
+            Ok(mut v) => {
+                // Sanitize untrusted thread HTML before it leaves the server
+                // (reference routes/conversations.ts:180 — sanitizeThreadHtml
+                // on body_html). The port's thread body carries the same
+                // untrusted email HTML.
+                if let Some(threads) = v["thread"].as_array_mut() {
+                    for t in threads {
+                        if let Some(body) = t.get("body").and_then(|b| b.as_str()) {
+                            t["body"] = serde_json::Value::String(
+                                crate::security::sanitize_thread_html(body),
+                            );
+                        }
+                    }
+                }
+                (StatusCode::OK, Json(v))
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(

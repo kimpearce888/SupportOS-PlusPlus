@@ -172,65 +172,11 @@ pub struct Connector {
 ///
 /// Pure function — testable without a DB.
 pub fn validate_ssrf(url: &str) -> Result<()> {
-    // Parse the URL.
-    let parsed = url::Url::parse(url)
-        .map_err(|e| Error::Config(format!("SSRF guard: invalid URL '{url}': {e}")))?;
-
-    // Only allow http and https schemes.
-    match parsed.scheme() {
-        "http" | "https" => {}
-        scheme => {
-            return Err(Error::Config(format!(
-                "SSRF guard: scheme '{scheme}' not allowed (only http/https)"
-            )));
-        }
-    }
-
-    // Check the host.
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| Error::Config(format!("SSRF guard: URL '{url}' has no host")))?;
-
-    // Block localhost.
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-        return Err(Error::Config(format!(
-            "SSRF guard: localhost blocked: '{host}'"
-        )));
-    }
-
-    // Check for private IP ranges.
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if ip.is_loopback() {
-            return Err(Error::Config(format!(
-                "SSRF guard: loopback IP blocked: '{host}'"
-            )));
-        }
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                if v4.is_private() || v4.is_link_local() {
-                    return Err(Error::Config(format!(
-                        "SSRF guard: private/link-local IP blocked: '{host}'"
-                    )));
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                if v6.is_loopback() || v6.is_unicast_link_local() {
-                    return Err(Error::Config(format!(
-                        "SSRF guard: loopback/link-local IPv6 blocked: '{host}'"
-                    )));
-                }
-            }
-        }
-    }
-
-    // Check for 169.254.x.x (cloud metadata — AWS/GCP/Azure).
-    if host.starts_with("169.254.") {
-        return Err(Error::Config(format!(
-            "SSRF guard: cloud metadata IP blocked: '{host}'"
-        )));
-    }
-
-    Ok(())
+    // Full reference parity: URL shape + literal ranges (CGNAT, benchmarking,
+    // multicast, IPv4-mapped IPv6, numeric encodings) + hostname checks +
+    // DNS resolution where EVERY resolved address must be public.
+    // Fail-closed.
+    crate::security::validate_ssrf_full(url)
 }
 
 pub fn create_connector(
@@ -578,12 +524,13 @@ mod tests {
 
     #[test]
     fn ssrf_allows_https_url() {
-        assert!(validate_ssrf("https://api.example.com/data").is_ok());
+        // Literal public IP (deterministic — no DNS dependency in CI sandboxes).
+        assert!(validate_ssrf("https://93.184.216.34/data").is_ok());
     }
 
     #[test]
     fn ssrf_allows_http_url() {
-        assert!(validate_ssrf("http://api.example.com/data").is_ok());
+        assert!(validate_ssrf("http://93.184.216.34/data").is_ok());
     }
 
     #[test]
