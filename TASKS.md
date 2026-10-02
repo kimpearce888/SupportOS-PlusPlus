@@ -6,10 +6,13 @@
 
 ## Queue (priority order)
 
-- [ ] T1 Webhook correctness: fix 500 column drift; base64 HMAC; dedup key;
-      wire `process_webhook` pipeline + boot drain + prune (F-019..F-026)
-- [ ] T2 Real HTTP status codes on error paths (F-006)
-- [ ] T3 Body limit 20 MB + CORS [::1] origin (F-003, F-005)
+- [x] T1 Webhook correctness — base64 HMAC + dedup + pipeline landed (Session A);
+      re-verified live 5/5 scenarios incl. prune (Session B). Boot drain still
+      pending app-boot wiring (T9).
+- [x] T2 Real HTTP status codes on error paths (F-006) — Session A;
+      Session B re-verified 404/422/200/429 live.
+- [x] T3 Body limit 20 MB + CORS [::1] origin (F-003, F-005) — Session A;
+      Session B added the 512 MB upload override (F-035).
 - [ ] T4 SSE: named events, 7-type catalog, `: ping` text, 25-stream cap,
       UI client URL + subscribers (F-014..F-018)
 - [ ] T5 Dashboard/analytics SQL column drift + computed reports (F-084, F-088)
@@ -19,7 +22,9 @@
       pipeline) (F-010..F-013)
 - [ ] T9 Sync engine wiring: real provider, OAuth, registration, rate
       limiter/queue, status (F-027..F-034)
-- [ ] T10 .sosync byte-compatible format (F-041)
+- [x] T10 .sosync byte-compatible format (F-041) — reference format
+      implemented; crypto interop verified BOTH directions by execution
+      (Session B). Data-level interop limited by schema coverage (F-037).
 - [ ] T11 HTML sanitizer + SSRF DNS-resolution parity + AI redaction (F-044..F-046)
 - [ ] T12 Remove EXTRA AI providers (Ollama/Generic) (F-051)
 - [ ] T13 AI endpoints wiring (analyze/draft/similar/rewrite/verify/

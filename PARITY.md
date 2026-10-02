@@ -30,30 +30,30 @@
 - REFERENCE_HEAD = `c346fb51466e237a89e70156ae20a3386be0b322` (branch `main`, clean tree)
 - PORT_HEAD = `ac808722f849f593dd2ba0e01eb316a2b570816c` (branch `main`, clean tree)
 
-## Verified inventory (recalculated from source)
+## Verified inventory (recalculated from source; Session-B corrections in **bold**)
 
 | Metric | Reference (verified) | Port (verified) |
 |---|---|---|
-| HTTP routes registered | **310** (32 route files) | **205** (175 distinct paths) + 33 handlers written but unregistered |
-| Route handlers that are canned/stub | 0 | **58** |
-| DB migrations | 16, all recorded in `schema_migrations` | 2 recorded in `_migrations` + 26 boot-time idempotent batches (M003–M028) |
-| Tables | 124 ordinary + 8 FTS5 = 132 | ~47 + 2 FTS5 |
+| HTTP routes registered | **311** (32 route files; corrected from 310 — the multiline `POST /api/sync/encrypted/upload` registration was missed by the original single-line grep) | **257** (Session B: +33 Session-A WIP registrations, +12 new settings/audit/backups/sosync routes, +4 mirror readouts, +5 OAuth, +1 upload) — 55 still missing |
+| Route handlers that are canned/stub | 0 | 58 at Session-A baseline (sync initial/incremental/reconcile/cancel + queue + webhook register/unregister still canned; recount pending) |
+| DB migrations | 16, all recorded in `schema_migrations` | 2 recorded in `_migrations` + 26 boot-time idempotent batches (M003–M028); **Session B: `schema_migrations` 1..16 reference-equivalent record now seeded at boot (used by `migrations_applied` + .sosync schema guard)** |
+| Tables | 124 ordinary + 8 FTS5 = 132 | **66 + 2 FTS5 on a fresh DB** (Session-A's "85 tables" observation was a stale-DB artifact; Session B added `mailbox_business_hours`, `audit_log`, `application_errors`, `encrypted_sync_log`, `inbox_fields(+options)`, `saved_replies`, `workflows`, `user_statuses`, `webhook_configs`, `schema_migrations`) |
 | FTS5 tables | fts_conversations, fts_threads, fts_knowledge, fts_known_issues, fts_saved_replies, fts_ai_analyses, docs_fts, fts_custom_objects | conversations_fts, customers_fts |
 | SSE event types | 7 (`hello`, `ratings`, `sync`, `conversation`, `campaign`, `notification`, `error`) | 3 (`SyncUpdated`, `WebhookReceived`, `RatingArrived`), no `event:` field |
 | Notification kinds | 16 | 15 (catalog) — sweep emits only 2 |
 | Operations tiles | 16 computed | 9 SQL + 7 `NotAvailable` |
 | Views condition kinds | 22 (max depth 10, ≤50 nodes) | 22 (max depth **5**, ≤50 nodes) |
 | AI tools | 22 read-only | 22 (same list) |
-| AI providers | LM Studio + Disabled | LM Studio + **Ollama + Generic (EXTRA)** + Fake |
+| AI providers | LM Studio + Disabled | LM Studio + Fake (EXTRA providers removed in Session A) |
 | Vector store | Local Qdrant REST client, graceful FTS5 fallback | Qdrant Edge adapter behind off-by-default `qdrant` feature; **nothing wired in production** |
-| Tests | 672 (169 unit / 296 integration / 207 e2e) | 941 cargo tests (812 core / 20 catalog / 72 ui / 26 xtask / 11 app) |
+| Tests | 672 (169 unit / 296 integration / 207 e2e) | **916 cargo tests** (Session B: 794 core / 21 catalog / 71 ui / 26 xtask + 4 bins; app crate blocked in sandbox — no GTK/webkit dev libs; 1 ignored cross-compat test needs the JS harness) |
 | UI routes | 26 (25 pages + 404) | **8** (7 pages + 404); 17 page components exist but unwired |
 | Keyboard shortcuts | 5 global + ~11 local | 0 global + ~3 local |
 | Demo endpoints | 4 | 4 (2 diverge from reference semantics) |
-| Webhook signature | HMAC-SHA1 → **base64** | HMAC-SHA1 → **hex** |
-| Tauri bundle targets | msi, nsis, dmg, appimage (reference) | deb, **rpm**, appimage (rpm out of scope) |
+| Webhook signature | HMAC-SHA1 → **base64** | base64 (Session A fix; **re-verified live in Session B: 5/5 scenarios — 401 invalid/missing sig with secret set, 200 dedup, 400 malformed**) |
+| Tauri bundle targets | msi, nsis, dmg, appimage (reference) | deb, appimage (Session A cleanup; rpm/msi/nsis/dmg removed) |
 | Rate limit | 300 mutations/60 s, socket-keyed, 429 | same (verify by execution) |
-| Body limit | 20 MB | **none** |
+| Body limit | 20 MB | 20 MB (`DefaultBodyLimit`); **512 MB per-route override on `/api/sync/encrypted/upload` (Session B)** |
 
 ## Master F-ID checklist
 
@@ -171,11 +171,18 @@ port evidence · required fix.
 - **F-028 · [Sync] Real Help Scout REST provider** — MISSING
   Only `FakeHelpScoutProvider` exists (`helpscout.rs`). Fix: implement
   `RealHelpScoutProvider` (api.helpscout.net, OAuth bearer).
-- **F-029 · [Sync] OAuth flow** — BROKEN
-  `exchange_code()` stub (fake token for "test_code"); loopback callback
-  returns `{"ok":true,"todo":"M2"}`. Ref: `/oauth/callback` returns HTML
-  with single-use CSRF state (`routes/sync.ts:332-382`). Fix: real token
-  exchange + HTML callback.
+- **F-029 · [Sync] OAuth flow routes** — MATCH for the route surface
+  (Session B). `/api/oauth/authorize-url` (demo shape; 16-byte hex state
+  stored as JSON), `/api/oauth/status` (demo + real shapes),
+  `/api/oauth/client-credentials` (400 unconfigured, 401 on exchange
+  failure, token stored + audited), `/api/oauth/disconnect`
+  (`{ok,message}` + audit), `/oauth/callback` — HTML pages byte-identical
+  to the reference in all three failure modes (demo, error param,
+  missing/state-mismatch) + success page; single-use CSRF state verified
+  (deleted on read, mismatch refuses exchange). Live-diffed 6/6. NOTE:
+  the real-provider token exchange path cannot be end-to-end verified in
+  the sandbox (no external network to api.helpscout.net); the demo-mode
+  branches and failure paths ARE execution-verified.
 - **F-030 · [Sync] Webhook registration/unregistration with HS API** — BROKEN
   (canned). Fix: call HS webhook API.
 - **F-031 · [Sync] API rate limiter + queue** — MISSING
@@ -189,9 +196,12 @@ port evidence · required fix.
   mismatched state vocabulary (always zeros). Fix: match semantics + fix
   `jobs.state` vocabulary query (`pending/claimed/done/dead`).
 - **F-034 · [Sync] Sync status shape** — DIFFERENT (hard-coded). Fix: real.
-- **F-035 · [Sync] Encrypted sync upload/download (.sosync over HTTP)** — MISSING
-  Ref: 512 MB octet-stream upload w/ `SOSYNC` magic check vs 20 MB JSON
-  limit (`routes/sync.ts:238-262`). Fix: implement both routes.
+- **F-035 · [Sync] Encrypted sync upload (.sosync over HTTP)** — MATCH
+  (Session B). `POST /api/sync/encrypted/upload` with per-route 512 MB
+  `DefaultBodyLimit` (global stays 20 MB), 422 on short body, 422 on
+  non-`SOSYNC` magic with the exact reference message, saved as
+  `uploaded-{ms}.sosync` in the bundles dir, `{ok, path, message}` response.
+  Live-diffed vs the reference (422 + 200 + file-written all match).
 
 ### F. Database / persistence
 
@@ -215,13 +225,23 @@ port evidence · required fix.
 - **F-040 · [DB] Retention/cleanup** — PARTIAL
   Ref prunes webhook_events/application_errors/audit_log/ai_runs/
   notifications. Port: notifications only (365 d). Fix: add prunes.
-- **F-041 · [DB] .sosync backup format interop** — DIFFERENT (BLOCKER for
-  compatibility) Ref: magic `SOSYNC` (6 B) + UInt32BE header length +
-  JSON header, scrypt **N=32768**, r=8, p=1, AES-256-GCM over `VACUUM INTO`
-  snapshot, 16-byte tag, two-phase import, 5-bundle retention,
-  `encrypted_sync_log`. Port: magic `SOSYNC1`, scrypt **N=2^17**, different
-  layout (`backup.rs`). Fix: byte-compatible format; verify BOTH directions
-  by execution.
+- **F-041 · [DB] .sosync backup format interop** — MATCH for the crypto
+  layer / wire format (Session B, 2026-10-02). The port's
+  `encrypted_sync.rs` now produces/consumes the reference byte format
+  exactly: magic `SOSYNC` (6 B) + UInt32BE header length + JSON header,
+  scrypt **N=32768**, r=8, p=1, AES-256-GCM over a `VACUUM INTO` snapshot,
+  16-byte tag appended, two-phase verify/import, integrity + schema guards,
+  safety backup, atomic swap, 5-bundle retention, `encrypted_sync_log`
+  ledger. **Cross-app decryption verified BOTH directions by execution**:
+  reference-created bundle → port `verify_bundle` OK (5 conversations,
+  2 customers, schema 16); port-created bundle → Node reference code
+  decrypts + counts match; wrong passphrase → reference-exact message;
+  flipped tag byte → rejected. Routes `/api/sync/encrypted(+/export/
+  verify/import)` live-diff 5/5 vs the reference. REMAINING (recorded, not
+  hidden): full data interop is limited by port schema coverage (F-037) —
+  a reference snapshot restores into the port only as far as the schemas
+  align; the port's own `backup.rs` (vector-store-only, `SOSYNC1`) remains
+  for the vector snapshot path and is not used by the sync routes.
 - **F-042 · [DB] Attachments** — MISSING (storage + routes + body limit).
 - **F-043 · [DB] Seed data** — MISSING on demo enable (see F-010).
 
@@ -461,7 +481,15 @@ port evidence · required fix.
   on interval change, strict-partial patch semantics, internal keys
   unwritable, `automatic_reply_sending` forced false. Fix per ref.
 - **F-141 · [Conf] LM Studio settings + test** — PARTIAL (test stub).
-- **F-142 · [Conf] Business hours per mailbox** — PARTIAL (round-trip only).
+- **F-142 · [Conf] Business hours per mailbox** — MATCH (Session B,
+  2026-10-02). GET returns the exact reference `mailboxes` shape
+  (configured flag, safe-parsed days, nullable targets); PUT reproduces the
+  full validation chain (422 envelope on bad mailboxId, 404 unknown
+  mailbox, 422 schema message, 422 unknown IANA timezone via chrono-tz),
+  writes `mailbox_business_hours` (reference DDL) + audit entry + exact
+  success message; DELETE validates + clears + exact message. Live-diffed
+  against the reference (validation matrix 6/6, GET shape SAME). Fixes the
+  Session-A panic (`no such column: config_json`).
 - **F-143 · [Conf] Data directories + demo mode env** — PARTIAL (Rust-native
   substitution acceptable; document as intentional difference).
 
@@ -528,6 +556,55 @@ theme + IPC), F-140+ (settings API), packaging verification F-148/F-149.
 
 Every fixed F-ID above carries its execution evidence (curl commands +
 responses in the session log). See PROGRESS.md for resume state.
+
+Session-B progress (2026-10-02/03, reference c346fb5, port 53bdeaa → 3fce745
+→ 360e3c4 → head): fresh from-scratch execution audit + repair round.
+
+Verification performed (commands + live servers ref :3471 / port :3470):
+- Route inventory corrected: reference = **311** routes (multiline
+  registrations included); port = 257 registered, 55 missing
+  (scripts/route_gap.py).
+- Webhook HMAC re-verified by execution: 5/5 scenarios (valid 200, invalid
+  401 exact body, missing 401, duplicate 200 dedup flag, malformed 400
+  Fastify envelope).
+- Live API differential over 86 endpoints (scripts/diff_api.sh) + a
+  focused 18-check differential on newly implemented routes
+  (scripts/diff_new_routes.py): all SAME for status + shape.
+- `/health/detailed` now byte-shape-matches the reference (9 top-level keys,
+  indexed object, SyncState vocabulary, curated LM Studio error,
+  migrations_applied=16). Remaining deltas are runtime-state only (path,
+  size, sync LIVE vs NEW — the sync engine is still unwired).
+- .sosync cross-app compatibility verified BOTH directions by execution
+  (Node reference crypto code ↔ Rust port): encrypt/decrypt/count/tag-tamper
+  all match; wrong passphrase → reference-exact message.
+- False alarm closed: axum 0.7.9 + matchit 0.7.3 accepts `:param` routes
+  (execution-proven with a standalone test crate) — no fix needed.
+- Fresh-DB table count corrected to 66 (+2 FTS5); Session-A's "85" was a
+  stale-database artifact that masked the business-hours panic.
+
+F-IDs advanced (Session B): F-029 (OAuth route surface) MATCH;
+F-035 (.sosync upload) MATCH; F-041 (.sosync format) MATCH for the crypto
+layer with documented data-interop limitation; F-142 (business hours) MATCH;
+F-140 partial→ (appearance + qdrant/test + business-hours now reference-
+exact; 18-route settings surface still incomplete); F-077 partial→
+(saved-replies real; inbox-fields/workflows/users-statuses/webhook-configs
+mirror readouts added); audit/errors/backups route cluster landed
+(F-038-adjacent); +33 Session-A WIP route registrations committed.
+
+Evidence trail: /home/z/my-project/scripts/*.sh|*.py|*.js +
+/home/z/my-project/sosync-test/ + cross_compat_test.rs (ignored test with
+harness instructions). All new units tested (encrypted_sync 3, backup_service
+2, audit 1, mirror_readouts 1). Suite: 916 pass / 0 fail.
+
+Remaining blockers (unchanged unless noted): F-027/F-028/F-032/F-034 (sync
+engine + real provider — the 55 missing routes are dominated by sync,
+conversations ops, outreach lifecycle, ticket-states CRUD, attributes,
+reports-builder run/saved, incidents from-cluster, knowledge gap draft/
+decide, attachments, memory/interaction overrides, queue clear, rebuilds);
+F-044 (HTML sanitizer), F-045 (SSRF DNS), F-052–F-058 (AI wiring),
+F-059–F-063 (vector + hybrid), F-083 (SLA business-minutes),
+F-109–F-139 (UI), packaging F-148/F-149 (sandbox: no GTK dev headers, no
+root — CI jobs exist, local .deb/.AppImage verification still pending).
 
 This file is updated as fixes land; each F-ID gains evidence + verification
 command + result.

@@ -763,3 +763,54 @@ fn oauth_success_page() -> (
         html,
     )
 }
+
+/// POST /api/sync/encrypted/upload — raw .sosync bundle upload
+/// (application/octet-stream; per-route 512 MB limit). Saved into the local
+/// bundles dir; decrypt+import happens in a second, explicit step so the
+/// passphrase never appears in a URL (reference routes/sync.ts:238-261).
+pub async fn encrypted_upload(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if body.len() < 32 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(
+                json!({ "ok": false, "message": "Upload a .sosync bundle as the raw request body (application/octet-stream)." }),
+            ),
+        );
+    }
+    if &body[0..6] != b"SOSYNC" {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(
+                json!({ "ok": false, "message": "This is not a SupportOS encrypted sync bundle (.sosync files start with SOSYNC)." }),
+            ),
+        );
+    }
+    let _ = headers; // content-type not enforced beyond the magic check (ref parity)
+    let dir = state.data_dir.join("bundles");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "message": "Could not create the bundles directory." })),
+        );
+    }
+    let name = format!("uploaded-{}.sosync", chrono::Utc::now().timestamp_millis());
+    let target = dir.join(&name);
+    if std::fs::write(&target, &body).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "message": "Could not write the uploaded bundle." })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "path": target.to_string_lossy(),
+            "message": "Bundle uploaded. Now import it with your passphrase.",
+        })),
+    )
+}

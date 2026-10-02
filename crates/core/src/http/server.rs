@@ -439,6 +439,14 @@ impl HttpServer {
                 "/api/sync/encrypted/import",
                 post(routes::sync::encrypted_import),
             )
+            .route(
+                "/api/sync/encrypted/upload",
+                post(routes::sync::encrypted_upload)
+                    // Per-route override: bundles are whole encrypted
+                    // databases and can be far larger than the JSON API
+                    // limit (reference: 512 MB).
+                    .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+            )
             // OAuth flow (reference routes/sync.ts:269-385)
             .route(
                 "/api/oauth/authorize-url",

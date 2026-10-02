@@ -12,11 +12,17 @@ Canonical audit record: **PARITY.md** (F-IDs + evidence).
 
 ## Current phase
 
-**Phase 3–4** (repository cleanup landed; execution audit + repair in
-progress). Overall flow: Phase 0 freeze → Phase 1 reference inventory →
+**Phase 4–7 loop** (repository cleanup landed; execution audit + repair
+cycling). Overall flow: Phase 0 freeze → Phase 1 reference inventory →
 Phase 2 port inventory → PARITY.md F-IDs → Phase 3 cleanup → Phase 4
 execution audit → Phase 5 differential → Phase 6 UI parity → Phase 7 fix
 everything → final proof (rebuild, packages, cleanliness scan, verdict).
+
+**Session B (2026-10-02/03) state:** reference route count corrected to
+**311** (multiline registrations). Port: **257/311** registered, 55 missing.
+Webhook HMAC 5/5 verified. .sosync format byte-compatible (crypto interop
+verified BOTH directions). business-hours/OAuth/audit/errors/backups/mirror
+readout routes landed with live-diff evidence. 916 tests pass.
 
 ## Completed (this audit)
 
@@ -69,7 +75,22 @@ everything → final proof (rebuild, packages, cleanliness scan, verdict).
 11. F-144–F-149 packaging verification (deb install/launch, AppImage) —
     environment-limited without root; see PARITY.md notes.
 
-## Last verification (Session A, 2026-10-02)
+## Last verification (Session B, 2026-10-02/03)
+
+- `cargo fmt --all` — clean.
+- `cargo clippy -D warnings` — clean (core, ui-wasm, xtask, catalog; app
+  crate needs GTK dev headers absent from this sandbox).
+- `cargo test --workspace --exclude supportos-plusplus-app` — **916
+  passed, 0 failed** (794 core / 71 ui / 21 catalog / 26 xtask + bins; 1
+  ignored cross-compat test requires the JS harness by design).
+- Live differential (ref :3471 vs port :3470): 86-endpoint broad sweep +
+  18-check focused run on new routes + 6/6 OAuth routes + upload 422/200 —
+  all matching status + shape; /oauth/callback HTML byte-identical.
+- .sosync cross-app: reference bundle → port verify OK; port bundle →
+  reference decrypt OK; wrong passphrase + tampered tag rejected with
+  reference-exact messages.
+
+## Prior verification (Session A, 2026-10-02)
 
 - `cargo fmt --all` — clean.
 - `cargo clippy` -D warnings — clean on core, ui, xtask, catalog, app
@@ -92,7 +113,19 @@ everything → final proof (rebuild, packages, cleanliness scan, verdict).
 - Session A (2026-10-02): phases 0–4 complete; Phase 7 fixes landed in 6
   commits (PARITY rewrite, Linux-only cleanup, webhook pipeline, SSE wire
   format, SQL drift + prefs, status codes, EXTRA provider removal). 24
-  F-IDs advanced to MATCH with execution evidence. Next session: T9 sync
-  engine wiring (real HelpScout provider + OAuth + job runner + boot
-  drain), then T10 .sosync byte-compat, T11 sanitizer/SSRF, T13-T14 AI +
-  vector wiring, T15+ inbox routes, T20 UI pages.
+  F-IDs advanced to MATCH with execution evidence.
+- Session B (2026-10-02/03): from-scratch re-verification + repair round.
+  Recovered Session-A uncommitted WIP (33 route registrations +
+  withGlobalTauri + capabilities). Commits 3fce745 + 360e3c4 + OAuth batch:
+  business-hours fixed (was a runtime panic), audit/errors/backups routes,
+  .sosync reference byte format + cross-verified both directions, OAuth
+  route surface (byte-identical callback HTML), mirror readouts
+  (inbox-fields/workflows/user-statuses/webhook-configs/saved-replies),
+  appearance + qdrant/test, health/detailed shape parity, corrected
+  reference route count to 311. Route coverage 107→55 missing. Tests
+  906→916. Next: T9 sync engine (fake-provider initial sync seeds the demo
+  mirror — needed for data parity), then conversations ops routes
+  (schedule/snooze/tags/fields/move/refresh/workflow/bulk), outreach
+  lifecycle, ticket-states CRUD, reports-builder run/saved, attributes,
+  incidents/knowledge/interaction/memory/attachments clusters, T20 UI
+  pages, packaging verification when a GTK-capable environment exists.
