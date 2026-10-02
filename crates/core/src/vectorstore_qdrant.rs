@@ -589,8 +589,7 @@ mod tests {
 
     #[test]
     fn qdrant_filter_translation() {
-        let mut filter = Filter::new();
-        filter.must_eq("color", "red");
+        let filter = Filter::new().must_eq("color", "red");
         let qdrant_filter = QdrantEdgeVectorStore::translate_filter(&filter);
         assert!(qdrant_filter.is_some());
         let f = qdrant_filter.unwrap();
