@@ -57,6 +57,46 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-targets
 
+  clean-build-check:
+    name: Clean build check (no TODOs, no secrets, no dead code)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for TODO/FIXME/HACK in production code
+        run: |
+          # Fail if TODO/FIXME/HACK found in production code (excluding tests).
+          if grep -rn "TODO\|FIXME\|HACK\|XXX" crates/core/src/ crates/ui/src/ crates/app/src-tauri/src/ \
+            --include="*.rs" | grep -v "test\|tests\|#\[cfg(test" | grep -v "demo_mode\|Fake\|demo mode"; then
+            echo "❌ Found TODO/FIXME/HACK in production code"
+            exit 1
+          fi
+          echo "✅ No TODO/FIXME/HACK in production code"
+      - name: Check for debug leftovers (dbg!, println!, eprintln!)
+        run: |
+          if grep -rn "dbg!\|println!\|eprintln!" crates/core/src/ crates/ui/src/ crates/app/src-tauri/src/ \
+            --include="*.rs" | grep -v "test\|tests\|#\[cfg(test"; then
+            echo "❌ Found debug leftovers in production code"
+            exit 1
+          fi
+          echo "✅ No debug leftovers in production code"
+      - name: Check for secrets/build outputs in tracked files
+        run: |
+          if git ls-files | grep -E "\.db$|\.db-wal|\.db-shm|\.sosync|target/|\.env$"; then
+            echo "❌ Found build outputs or secrets in tracked files"
+            exit 1
+          fi
+          echo "✅ No secrets or build outputs in tracked files"
+      - name: Check for commented-out code
+        run: |
+          # Look for blocks of 3+ consecutive commented-out lines (excluding docs).
+          if grep -rn "^\s*//.*[a-z]" crates/core/src/ crates/ui/src/ crates/app/src-tauri/src/ \
+            --include="*.rs" | grep -v "test\|tests\|#\[cfg(test\|//!" | grep -v "^.*://" | \
+            awk -F: '{print $1}' | sort | uniq -c | sort -rn | head -5 | awk '$1 > 10 {print}'; then
+            echo "⚠️ Possible commented-out code blocks found (manual review needed)"
+          else
+            echo "✅ No large commented-out code blocks"
+          fi
+
   build-wasm:
     name: cargo check on wasm32 + trunk build (debug)
     runs-on: ubuntu-22.04
@@ -149,7 +189,7 @@ jobs:
 
   ci-report:
     name: Publish CI report
-    needs: [lint-and-test, build-wasm, build-tauri, step3-real-mode, cargo-audit]
+    needs: [lint-and-test, build-wasm, build-tauri, step3-real-mode, cargo-audit, clean-build-check]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -174,6 +214,7 @@ jobs:
           | build-tauri (Linux) | ${{ needs.build-tauri.result }} |
           | step3-real-mode | ${{ needs.step3-real-mode.result }} |
           | cargo-audit | ${{ needs.cargo-audit.result }} |
+          | clean-build-check | ${{ needs.clean-build-check.result }} |
 
           Overall: ${{ needs.lint-and-test.result == 'success' && needs.build-wasm.result == 'success' && '✅ GREEN' || '❌ RED' }}
           REPORT
