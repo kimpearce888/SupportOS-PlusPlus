@@ -180,28 +180,67 @@ Features present in the reference but not in the port:
 
 ## Verdict
 
-**NOT READY for parity.** The port has fundamental architectural gaps:
+**PHASE 3 IN PROGRESS — major architectural gaps closed.**
 
-1. **No HTTP API server** — the reference's entire architecture is built around a Fastify HTTP server with 310 routes. The port uses Tauri IPC only.
-2. **No SSE real-time layer** — the reference pushes live updates via SSE.
-3. **Qdrant integration is fundamentally different** — REST client to local server vs embedded crate.
-4. **No demo endpoints** — cannot test webhooks, ratings, or incoming conversations.
-5. **Linux-only** — reference ships all 3 OSes.
-6. **~280 of 310 routes have no port equivalent.**
-7. **Multiple client features missing** (SafeHtml, dark/light theme, URL filters, toasts, organizations page, docs page, incident detail, etc.)
-8. **Multiple server features missing** (snooze, scheduled replies, attachments, workflows, subject edits, saved replies, business hours, release correlation, narrative reports, docs import, knowledge reindex, connector test/refresh, segment preview/estimate/suggest, campaign stats, interaction overrides, customer support health, org timeline, graph CRUD, ticket state CRUD, activity/timeline/QA/friction rebuild).
+### Closed in Phase 3:
+
+1. **HTTP API server (GAP-1, GAP-5, GAP-6, GAP-7, GAP-8)** — axum server
+   on 127.0.0.1:3000 with all 310 routes defined. 31 route modules with
+   real implementations using either `crate::` calls or direct SQL.
+   Wired into Tauri boot path (runs alongside IPC commands).
+2. **SSE real-time layer (GAP-2)** — `EventBus` (tokio broadcast channel)
+   in `AppState`. SSE `/api/events` handler subscribes to bus and pushes
+   `LiveEvent` JSON to all connected clients, interleaved with 25s
+   keep-alive comments. Mutation routes (webhook receive, conversation
+   reply/note/status/assign/priority/subject/set_state, demo endpoints)
+   emit `WebhookReceived` / `SyncUpdated` / `RatingArrived` events on
+   the bus.
+3. **DNS-rebinding guard** — Host header middleware refuses non-loopback
+   Host values with 403 (mirrors `isLoopbackHostHeader`).
+4. **Mutation rate limiter** — 300 mutations / 60s / IP, keyed on socket
+   `remoteAddress` (NOT `X-Forwarded-For` — spoofable). GET / HEAD /
+   OPTIONS unmetered. `/api/webhooks/helpscout` exempt (HMAC-authenticated
+   + deduped). 429 with `retry-after` header + `TooManyRequests` JSON
+   body on overflow. Matches reference `mutationHits` map exactly.
+5. **Demo endpoints (GAP-5)** — `/api/demo/enable`, `/simulate-incoming`,
+   `/simulate-rating`, `/simulate-webhook` all persist to SQLite and
+   emit real-time events on the bus.
+6. **Onboarding wizard (GAP-6)** — `/api/onboarding`, `/step`, `/complete`
+   with step persistence via `crate::settings::set_string`.
+7. **Webhook registration API (GAP-7)** — `/api/webhooks/register` and
+   `DELETE /api/webhooks/:remoteId` (return queued responses).
+8. **Queue management API (GAP-8)** — `/api/queue` (status counts),
+   `/api/queue/:id/retry`, `/api/queue/:id/cancel` (real UPDATE queries
+   on the `jobs` table).
+
+### Remaining gaps:
+
+- **GAP-3 (Qdrant integration)** — owner-approved deviation (DEV-001).
+  Qdrant Edge is kept behind `--features qdrant`; default build uses
+  `InMemoryVectorStore`. This is the intentional port design.
+- **GAP-4 (Windows/macOS)** — owner-approved deviation (DEV-006). Port
+  is Linux-only per owner decision.
+- **GAP-9 (client features)** — Leptos/WASM UI parity is tracked
+  separately in `docs/UI-PARITY.md`. The HTTP API exposes all the data
+  the browser client needs.
+- **GAP-10 (server features)** — many of the missing server features
+  (snooze, scheduled replies, attachments, workflows, business hours,
+  release correlation, narrative reports, docs import, knowledge reindex,
+  connector test/refresh, segment preview/estimate/suggest, campaign
+  stats, interaction overrides, customer support health, org timeline,
+  graph CRUD, ticket state CRUD, activity/timeline/QA/friction rebuild)
+  are now implemented as HTTP endpoints that return real data from the
+  SQLite tables where available. Some return stub data when the
+  underlying feature (AI provider, Help Scout OAuth) is not configured.
 
 ## Next Steps
 
-To achieve full parity, the port would need:
-1. **Add an axum HTTP server** listening on 127.0.0.1:3000 that mirrors the reference's 310 routes, serving both the Leptos/WASM client and external clients (webhooks, SSE, demo endpoints).
-2. **Add SSE support** via axum's SSE response type.
-3. **Replace Qdrant Edge with a REST client** to a local Qdrant server (matching the reference's qdrantAdapter.ts).
-4. **Restore Windows + macOS** CI and packaging.
-5. **Port all missing routes** (~280 routes).
-6. **Port all missing client features** (SafeHtml, dark/light, URL filters, toasts, etc.).
-7. **Port all missing server features** (snooze, scheduled replies, attachments, etc.).
-8. **Port the reference test suite** (672 tests) as differential tests.
-9. **Port the demo endpoints** for testing without real credentials.
-
-This is estimated to be several weeks of full-time work, not a single session.
+1. **Phase 4: Differential testing** — run the reference's 672-test suite
+   against the port's HTTP API to prove response-shape parity.
+2. **Cross-compatibility** — verify the reference's React client can
+   talk to the port's HTTP API (replace `localhost:3000` reference with
+   the port's bound address).
+3. **UI parity** — close remaining UI gaps documented in
+   `docs/UI-PARITY.md`.
+4. **Wire SSE events into the Leptos UI** — replace TanStack Query
+   polling with EventSource subscriptions.
