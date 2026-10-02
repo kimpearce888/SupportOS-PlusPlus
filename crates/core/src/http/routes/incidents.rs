@@ -41,7 +41,7 @@ pub async fn update(
 ) -> Json<Value> {
     let conn = state.conn.lock().expect("mutex poisoned");
     if let Some(status) = body.get("status").and_then(|v| v.as_str()) {
-        // TODO: parse status string to IncidentStatus enum
+        // Status update via HTTP needs IncidentStatus enum parsing (not yet wired)
     }
     Json(json!({"ok": true}))
 }
