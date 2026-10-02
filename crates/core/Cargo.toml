@@ -33,6 +33,9 @@ regex.workspace = true
 async-trait = "0.1"
 reqwest = { workspace = true }
 url = { workspace = true }
+futures-util = { workspace = true }
+tokio-stream = { workspace = true }
+crc32fast = { workspace = true }
 # Re-export the catalog crate so callers don't need a separate dep.
 supportos-plusplus-catalog = { workspace = true }
 

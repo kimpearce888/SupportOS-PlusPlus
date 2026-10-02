@@ -53,7 +53,7 @@ rand = "0.8"
 subtle = "2.5"
 
 # HTTP (loopback listener only, D-002)
-axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "tower-log", "macros"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "tower-log", "macros", "json", "query"] }
 tower = { version = "0.5", features = ["limit", "timeout"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 hyper = "1"
@@ -64,6 +64,11 @@ regex = "1"
 
 # HTTP client (for LocalAIProvider adapters — LM Studio, Ollama, Generic)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# SSE streaming
+futures-util = "0.3"
+tokio-stream = "0.1"
+crc32fast = "1.4"
 
 # URL parsing (for SSRF guard in connectors)
 url = "2"
