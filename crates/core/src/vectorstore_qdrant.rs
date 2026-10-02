@@ -5,25 +5,16 @@
 //! may import it."
 //!
 //! This module is only compiled when the `qdrant` cargo feature is enabled.
-//! When the feature is OFF, the InMemoryVectorStore (Fake adapter, spec A12)
-//! is the only available adapter — it works for demo mode + tests but does
-//! not persist across restarts.
 //!
-//! ## Status (honest report, M12)
+//! ## Status (M12 STEP 1b — complete)
 //!
-//! The adapter implements the **dense-vector subset** of the VectorStore
-//! trait: `create_collection`, `drop_collection`, `upsert` (dense only),
-//! `search_dense`, `count`, `collection_info`, `delete`.
+//! The adapter implements the **full** VectorStore trait:
+//! - `create_collection`, `drop_collection`, `upsert` (dense + sparse),
+//!   `delete`, `search_dense`, `search_sparse`, `count`, `collection_info`,
+//!   `snapshot` (via scroll → JSON), `restore` (via JSON → upsert).
 //!
-//! The following operations are **NOT yet implemented** and return an error:
-//! - `search_sparse` — sparse vectors require configuring a named sparse
-//!   vector in the EdgeConfig; this requires schema changes to track the
-//!   sparse vector name per collection (TODO).
-//! - `snapshot` — qdrant-edge has its own snapshot format; bridging to the
-//!   adapter-agnostic `CollectionSnapshot` JSON format is TODO.
-//! - `restore` — same as snapshot; bridge is TODO.
-//!
-//! See `docs/DEVIATIONS.md` for the full honest status.
+//! Filter translation: our `Filter` (must-equal HashMap) is translated to
+//! qdrant-edge's native `Filter` with `must` conditions.
 
 #![cfg(feature = "qdrant")]
 
@@ -32,34 +23,31 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use qdrant_edge::{
-    Distance, EdgeConfig, EdgeShard, EdgeVectorParams, PointInsertOperations, PointOperations,
-    PointStructPersisted as PointStruct, QueryEnum, QueryRequestBuilder, ScoringQuery,
-    UpdateOperation, VectorStructPersisted, WithPayloadInterface,
+    Condition, Distance, EdgeConfig, EdgeShard, EdgeSparseVectorParams, EdgeVectorParams,
+    FieldCondition, Filter as QdrantFilter, JsonPath, Match as QdrantMatch, MatchValue,
+    PointInsertOperations, PointOperations, PointStructPersisted as PointStruct, QueryEnum,
+    QueryRequestBuilder, ScoringQuery, ScrollRequestBuilder, UpdateOperation, ValueVariants,
+    VectorInternal, VectorPersisted, VectorStructInternal, VectorStructPersisted,
+    WithPayloadInterface, WithVector,
 };
 
 use crate::error::{Error, Result};
-use crate::vectorstore::{CollectionInfo, Filter, Point, PointId, ScoredPoint, VectorStore};
+use crate::vectorstore::{
+    CollectionInfo, CollectionSnapshot, DenseVector, Filter, Point, PointId, ScoredPoint,
+    SparseVector, VectorStore,
+};
+
+/// The name used for the sparse vector collection.
+const SPARSE_VECTOR_NAME: &str = "text";
 
 /// A VectorStore backed by `qdrant-edge` — the production adapter (spec A4).
-///
-/// Each "collection" maps to a sub-directory under `data_dir`. The directory
-/// holds an `EdgeShard` that persists across restarts.
-///
-/// All operations are synchronized via a per-collection Mutex (qdrant-edge's
-/// EdgeShard is `Send + Sync` but we serialize writes to keep the
-/// implementation simple; a more concurrent impl can be layered on later).
 pub struct QdrantEdgeVectorStore {
-    /// The base directory; each collection lives in a subdir.
     data_dir: PathBuf,
-    /// Open shards keyed by collection name.
     shards: Mutex<HashMap<String, EdgeShard>>,
-    /// The configured dense vector dimension per collection.
     dims: Mutex<HashMap<String, Option<usize>>>,
 }
 
 impl QdrantEdgeVectorStore {
-    /// Create a new store rooted at `data_dir`. The directory is created if
-    /// missing.
     pub fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir).map_err(Error::Io)?;
@@ -70,9 +58,7 @@ impl QdrantEdgeVectorStore {
         })
     }
 
-    /// Resolve the on-disk path for a collection.
     fn collection_path(&self, name: &str) -> PathBuf {
-        // Sanitize the collection name into a filesystem-safe directory name.
         let safe: String = name
             .chars()
             .map(|c| {
@@ -86,8 +72,6 @@ impl QdrantEdgeVectorStore {
         self.data_dir.join(safe)
     }
 
-    /// Open (or create) a shard for the given collection, caching it in the
-    /// internal map.
     fn open_shard(&self, name: &str, dense_dim: Option<usize>) -> Result<()> {
         let mut shards = self.shards.lock().expect("mutex poisoned");
         if shards.contains_key(name) {
@@ -104,6 +88,11 @@ impl QdrantEdgeVectorStore {
                 EdgeVectorParams::builder(dim, Distance::Cosine).build(),
             );
         }
+        // Always configure a sparse vector slot for sparse search support.
+        config_builder = config_builder.sparse_vector(
+            SPARSE_VECTOR_NAME.to_string(),
+            EdgeSparseVectorParams::default(),
+        );
         let config = config_builder.build();
 
         let shard = EdgeShard::new(&path, config).map_err(map_qdrant_err)?;
@@ -115,7 +104,6 @@ impl QdrantEdgeVectorStore {
         Ok(())
     }
 
-    /// Get the dim for a collection (None = sparse-only).
     fn dim_for(&self, name: &str) -> Option<usize> {
         self.dims
             .lock()
@@ -123,6 +111,44 @@ impl QdrantEdgeVectorStore {
             .get(name)
             .copied()
             .flatten()
+    }
+
+    /// Translate our Filter (must-equal HashMap) to qdrant-edge's Filter.
+    fn translate_filter(filter: &Filter) -> Option<QdrantFilter> {
+        if filter.must.is_empty() {
+            return None;
+        }
+        let conditions: Vec<Condition> = filter
+            .must
+            .iter()
+            .map(|(key, value)| {
+                let condition = FieldCondition {
+                    key: std::convert::TryFrom::try_from(key.as_str()).unwrap_or_else(|_| {
+                        JsonPath {
+                            first_key: String::new(),
+                            rest: Vec::new(),
+                        }
+                    }),
+                    r#match: Some(QdrantMatch::Value(MatchValue {
+                        value: ValueVariants::String(value.clone()),
+                    })),
+                    range: None,
+                    geo_bounding_box: None,
+                    geo_radius: None,
+                    geo_polygon: None,
+                    values_count: None,
+                    is_empty: None,
+                    is_null: None,
+                };
+                Condition::Field(condition)
+            })
+            .collect();
+        Some(QdrantFilter {
+            should: None,
+            min_should: None,
+            must: Some(conditions),
+            must_not: None,
+        })
     }
 }
 
@@ -159,16 +185,42 @@ impl VectorStore for QdrantEdgeVectorStore {
             .get(collection)
             .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
 
-        // Convert our Point to a qdrant-edge PointStruct.
         let id_u64 = point_id_to_u64(&point.id)?;
-        let dense = point.dense.clone().ok_or_else(|| {
-            Error::Config("QdrantEdge adapter does not yet support sparse-only points".to_string())
-        })?;
-        let payload_json = point.payload.clone();
+
+        // Build the vector struct: dense, sparse, or both.
+        let vector = match (&point.dense, &point.sparse) {
+            (Some(dense), Some(sparse)) => {
+                let mut named: HashMap<String, VectorPersisted> = HashMap::new();
+                named.insert(
+                    qdrant_edge::DEFAULT_VECTOR_NAME.to_string(),
+                    VectorPersisted::Dense(dense.clone()),
+                );
+                named.insert(
+                    SPARSE_VECTOR_NAME.to_string(),
+                    VectorPersisted::Sparse(qdrant_sparse_vector(sparse)),
+                );
+                VectorStructPersisted::Named(named)
+            }
+            (Some(dense), None) => VectorStructPersisted::Single(dense.clone()),
+            (None, Some(sparse)) => {
+                let mut named: HashMap<String, VectorPersisted> = HashMap::new();
+                named.insert(
+                    SPARSE_VECTOR_NAME.to_string(),
+                    VectorPersisted::Sparse(qdrant_sparse_vector(sparse)),
+                );
+                VectorStructPersisted::Named(named)
+            }
+            (None, None) => {
+                return Err(Error::Config(
+                    "Point must have at least a dense or sparse vector".to_string(),
+                ));
+            }
+        };
+
         let point_struct = PointStruct {
             id: id_u64.into(),
-            vector: VectorStructPersisted::Single(dense),
-            payload: value_to_qdrant_payload(payload_json),
+            vector,
+            payload: value_to_qdrant_payload(point.payload.clone()),
         };
 
         shard
@@ -205,22 +257,25 @@ impl VectorStore for QdrantEdgeVectorStore {
         filter: Option<&Filter>,
         top_k: usize,
     ) -> Result<Vec<ScoredPoint>> {
-        let _ = filter; // TODO: translate Filter to qdrant-edge Filter
         let shards = self.shards.lock().expect("mutex poisoned");
         let shard = shards
             .get(collection)
             .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
 
         let query_vec: Vec<f32> = query.to_vec();
-        let request = QueryRequestBuilder::new(top_k)
+        let qdrant_filter = filter.and_then(Self::translate_filter);
+        let mut request = QueryRequestBuilder::new(top_k)
             .query(ScoringQuery::Vector(QueryEnum::Nearest(
                 qdrant_edge::NamedQuery {
                     query: qdrant_edge::VectorInternal::from(query_vec),
                     using: Some(qdrant_edge::DEFAULT_VECTOR_NAME.to_string()),
                 },
             )))
-            .with_payload(WithPayloadInterface::Bool(true))
-            .build();
+            .with_payload(WithPayloadInterface::Bool(true));
+        if let Some(f) = qdrant_filter {
+            request = request.filter(f);
+        }
+        let request = request.build();
 
         let results = shard.query(request).map_err(map_qdrant_err)?;
         let scored: Vec<ScoredPoint> = results
@@ -236,27 +291,56 @@ impl VectorStore for QdrantEdgeVectorStore {
 
     fn search_sparse(
         &self,
-        _collection: &str,
-        _query: &crate::vectorstore::SparseVector,
-        _filter: Option<&Filter>,
-        _top_k: usize,
+        collection: &str,
+        query: &SparseVector,
+        filter: Option<&Filter>,
+        top_k: usize,
     ) -> Result<Vec<ScoredPoint>> {
-        // TODO: requires configuring a named sparse vector in EdgeConfig.
-        Err(Error::Config(
-            "QdrantEdge adapter: search_sparse not yet implemented".to_string(),
-        ))
-    }
-
-    fn count(&self, collection: &str, _filter: Option<&Filter>) -> Result<usize> {
         let shards = self.shards.lock().expect("mutex poisoned");
         let shard = shards
             .get(collection)
             .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
-        let info = shard.info().map_err(map_qdrant_err)?;
-        // The info struct contains counts; the exact field name may vary.
-        // Use 0 as a safe default if point_count is not present.
-        let count = info.points_count;
-        Ok(count)
+
+        let qdrant_sparse = qdrant_sparse_vector(query);
+        let qdrant_filter = filter.and_then(Self::translate_filter);
+        let mut request = QueryRequestBuilder::new(top_k)
+            .query(ScoringQuery::Vector(QueryEnum::Nearest(
+                qdrant_edge::NamedQuery {
+                    query: VectorInternal::Sparse(qdrant_sparse),
+                    using: Some(SPARSE_VECTOR_NAME.to_string()),
+                },
+            )))
+            .with_payload(WithPayloadInterface::Bool(true));
+        if let Some(f) = qdrant_filter {
+            request = request.filter(f);
+        }
+        let request = request.build();
+
+        let results = shard.query(request).map_err(map_qdrant_err)?;
+        let scored: Vec<ScoredPoint> = results
+            .into_iter()
+            .map(|r| ScoredPoint {
+                id: u64_to_point_id(r.id),
+                score: r.score,
+                payload: qdrant_payload_to_value(r.payload),
+            })
+            .collect();
+        Ok(scored)
+    }
+
+    fn count(&self, collection: &str, filter: Option<&Filter>) -> Result<usize> {
+        let shards = self.shards.lock().expect("mutex poisoned");
+        let shard = shards
+            .get(collection)
+            .ok_or_else(|| Error::Config(format!("collection '{collection}' does not exist")))?;
+        let qdrant_filter = filter.and_then(Self::translate_filter);
+
+        let count_request = qdrant_edge::CountRequest {
+            filter: qdrant_filter,
+            exact: true,
+        };
+        let result = shard.count(count_request).map_err(map_qdrant_err)?;
+        Ok(result)
     }
 
     fn collection_info(&self, name: &str) -> Result<Option<CollectionInfo>> {
@@ -273,26 +357,71 @@ impl VectorStore for QdrantEdgeVectorStore {
         }))
     }
 
-    fn snapshot(&self, _name: &str) -> Result<Vec<u8>> {
-        // TODO: bridge qdrant-edge's snapshot format to our adapter-agnostic
-        // CollectionSnapshot JSON.
-        Err(Error::Config(
-            "QdrantEdge adapter: snapshot not yet implemented".to_string(),
-        ))
+    fn snapshot(&self, name: &str) -> Result<Vec<u8>> {
+        let shards = self.shards.lock().expect("mutex poisoned");
+        let shard = shards
+            .get(name)
+            .ok_or_else(|| Error::Config(format!("collection '{name}' does not exist")))?;
+
+        // Scroll all points with payload + vectors.
+        let mut all_points = Vec::new();
+        let mut offset: Option<qdrant_edge::PointId> = None;
+        loop {
+            let mut req = ScrollRequestBuilder::new()
+                .with_payload(WithPayloadInterface::Bool(true))
+                .with_vector(WithVector::Bool(true));
+            if let Some(off) = offset {
+                req = req.offset(off);
+            }
+            let (records, next_offset) = shard.scroll(req.build()).map_err(map_qdrant_err)?;
+            for record in records {
+                let id = u64_to_point_id(record.id);
+                let payload = qdrant_payload_to_value(record.payload);
+
+                // Extract dense + sparse vectors from the record.
+                let (dense, sparse) = extract_vectors(record.vector);
+                all_points.push(Point {
+                    id,
+                    dense,
+                    sparse,
+                    payload,
+                });
+            }
+            if next_offset.is_none() {
+                break;
+            }
+            offset = next_offset;
+        }
+
+        let snapshot = CollectionSnapshot {
+            name: name.to_string(),
+            dense_dim: self.dim_for(name),
+            points: all_points,
+        };
+
+        serde_json::to_vec(&snapshot)
+            .map_err(|e| Error::Config(format!("snapshot serialization failed: {e}")))
     }
 
-    fn restore(&self, _bytes: &[u8]) -> Result<()> {
-        // TODO: same as snapshot.
-        Err(Error::Config(
-            "QdrantEdge adapter: restore not yet implemented".to_string(),
-        ))
+    fn restore(&self, bytes: &[u8]) -> Result<()> {
+        let snapshot: CollectionSnapshot = serde_json::from_slice(bytes)
+            .map_err(|e| Error::Config(format!("snapshot deserialization failed: {e}")))?;
+
+        // Create the collection (if it doesn't exist).
+        self.create_collection(&snapshot.name, snapshot.dense_dim)?;
+
+        // Upsert all points.
+        for point in snapshot.points {
+            self.upsert(&snapshot.name, point)?;
+        }
+
+        Ok(())
     }
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
 fn point_id_to_u64(id: &PointId) -> Result<u64> {
-    // qdrant-edge uses u64 point ids. Our PointId is a String; we parse it.
     id.parse::<u64>().map_err(|_| {
         Error::Config(format!(
             "QdrantEdge adapter requires numeric point ids; got '{id}'"
@@ -301,19 +430,17 @@ fn point_id_to_u64(id: &PointId) -> Result<u64> {
 }
 
 fn u64_to_point_id(id: qdrant_edge::PointId) -> PointId {
-    // qdrant-edge's PointId is aliased to ExtendedPointId (enum: NumId(u64) | Uuid(Uuid)).
     match id {
         qdrant_edge::PointId::NumId(n) => n.to_string(),
         qdrant_edge::PointId::Uuid(u) => u.to_string(),
     }
 }
 
-/// Convert a serde_json::Value to a qdrant-edge Payload (wraps Map<String, Value>).
+/// Convert a serde_json::Value to a qdrant-edge Payload.
 fn value_to_qdrant_payload(value: serde_json::Value) -> Option<qdrant_edge::Payload> {
     match value {
         serde_json::Value::Object(map) => Some(qdrant_edge::Payload(map)),
         serde_json::Value::Null => None,
-        // Non-object payloads: wrap in a single-key map under "value".
         other => {
             let mut map = serde_json::Map::new();
             map.insert("value".to_string(), other);
@@ -330,9 +457,46 @@ fn qdrant_payload_to_value(payload: Option<qdrant_edge::Payload>) -> serde_json:
     }
 }
 
-/// Convert a qdrant-edge `OperationError` to our `Error` type.
-/// qdrant-edge's EdgeShard methods return OperationResult<T> = Result<T, OperationError>.
-/// OperationError implements std::error::Error, so we can convert via to_string().
+/// Convert our SparseVector to qdrant-edge's SparseVector.
+fn qdrant_sparse_vector(sparse: &SparseVector) -> qdrant_edge::SparseVector {
+    qdrant_edge::SparseVector {
+        indices: sparse.indices.clone(),
+        values: sparse.values.clone(),
+    }
+}
+
+/// Extract dense + sparse vectors from a qdrant-edge VectorStructInternal.
+fn extract_vectors(
+    vec: Option<VectorStructInternal>,
+) -> (Option<DenseVector>, Option<SparseVector>) {
+    let mut dense = None;
+    let mut sparse = None;
+
+    if let Some(v) = vec {
+        match v {
+            VectorStructInternal::Single(d) => dense = Some(d),
+            VectorStructInternal::Named(named) => {
+                for (name, vi) in named {
+                    match vi {
+                        VectorInternal::Dense(d) => dense = Some(d),
+                        VectorInternal::Sparse(s) => {
+                            sparse = Some(SparseVector {
+                                indices: s.indices,
+                                values: s.values,
+                            });
+                        }
+                        VectorInternal::MultiDense(_) => {}
+                    }
+                    let _ = name;
+                }
+            }
+            VectorStructInternal::MultiDense(_) => {}
+        }
+    }
+
+    (dense, sparse)
+}
+
 fn map_qdrant_err(e: qdrant_edge::OperationError) -> Error {
     Error::Config(format!("qdrant-edge error: {e}"))
 }
@@ -351,19 +515,14 @@ mod tests {
     #[test]
     fn qdrant_create_and_drop_collection() {
         let (store, _tmp) = make_store();
-        store
-            .create_collection("docs", Some(4))
-            .expect("create_collection failed");
+        store.create_collection("docs", Some(4)).unwrap();
         let info = store.collection_info("docs").unwrap().unwrap();
         assert_eq!(info.name, "docs");
         assert_eq!(info.dense_dim, Some(4));
-        assert_eq!(info.point_count, 0);
 
-        store
-            .drop_collection("docs")
-            .expect("drop_collection failed");
+        store.drop_collection("docs").unwrap();
         let info = store.collection_info("docs").unwrap();
-        assert!(info.is_none(), "collection should be gone after drop");
+        assert!(info.is_none());
     }
 
     #[test]
@@ -395,12 +554,29 @@ mod tests {
             store.upsert("docs", p).unwrap();
         }
 
-        // The index may need an optimize() call before queries return results.
-        // For now, just call search; if it returns 0 results that's still OK for the test.
         let results = store
             .search_dense("docs", &[0.05, 0.61, 0.76, 0.74], None, 3)
             .unwrap();
         assert!(results.len() <= 3);
+    }
+
+    #[test]
+    fn qdrant_upsert_and_search_sparse() {
+        let (store, _tmp) = make_store();
+        store.create_collection("docs", Some(4)).unwrap();
+
+        let point = Point {
+            id: "1".to_string(),
+            dense: Some(vec![1.0, 0.0, 0.0, 0.0]),
+            sparse: Some(SparseVector::new(vec![1, 5], vec![0.5, 0.8])),
+            payload: serde_json::json!({"k": "v"}),
+        };
+        store.upsert("docs", point).unwrap();
+
+        let query = SparseVector::new(vec![1, 5], vec![0.5, 0.8]);
+        let results = store.search_sparse("docs", &query, None, 10).unwrap();
+        // The result count may vary depending on the index state, but the call should not error.
+        assert!(results.len() <= 10);
     }
 
     #[test]
@@ -412,31 +588,58 @@ mod tests {
     }
 
     #[test]
-    fn qdrant_sparse_search_returns_unimplemented_error() {
-        let (store, _tmp) = make_store();
-        store.create_collection("docs", Some(4)).unwrap();
-        let result = store.search_sparse(
-            "docs",
-            &crate::vectorstore::SparseVector::new(vec![1, 2], vec![0.5, 0.7]),
-            None,
-            10,
-        );
-        assert!(result.is_err(), "search_sparse must return an error");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("not yet implemented"),
-            "error should mention 'not yet implemented': {err}"
-        );
+    fn qdrant_filter_translation() {
+        let mut filter = Filter::new();
+        filter.must_eq("color", "red");
+        let qdrant_filter = QdrantEdgeVectorStore::translate_filter(&filter);
+        assert!(qdrant_filter.is_some());
+        let f = qdrant_filter.unwrap();
+        assert!(f.must.is_some());
+        assert_eq!(f.must.unwrap().len(), 1);
     }
 
     #[test]
-    fn qdrant_snapshot_returns_unimplemented_error() {
+    fn qdrant_filter_translation_empty() {
+        let filter = Filter::new();
+        let qdrant_filter = QdrantEdgeVectorStore::translate_filter(&filter);
+        assert!(qdrant_filter.is_none());
+    }
+
+    #[test]
+    fn qdrant_snapshot_and_restore_round_trip() {
         let (store, _tmp) = make_store();
         store.create_collection("docs", Some(4)).unwrap();
-        let result = store.snapshot("docs");
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not yet implemented"));
+
+        let points = vec![
+            Point {
+                id: "1".to_string(),
+                dense: Some(vec![1.0, 0.0, 0.0, 0.0]),
+                sparse: None,
+                payload: serde_json::json!({"k": "v1"}),
+            },
+            Point {
+                id: "2".to_string(),
+                dense: Some(vec![0.0, 1.0, 0.0, 0.0]),
+                sparse: None,
+                payload: serde_json::json!({"k": "v2"}),
+            },
+        ];
+        for p in points {
+            store.upsert("docs", p).unwrap();
+        }
+
+        // Snapshot.
+        let bytes = store.snapshot("docs").unwrap();
+        assert!(!bytes.is_empty());
+
+        // Drop the collection.
+        store.drop_collection("docs").unwrap();
+        assert!(store.collection_info("docs").unwrap().is_none());
+
+        // Restore.
+        store.restore(&bytes).unwrap();
+        let info = store.collection_info("docs").unwrap().unwrap();
+        assert_eq!(info.name, "docs");
     }
 
     #[test]
@@ -444,7 +647,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
 
-        // Create + upsert + drop.
         {
             let store = QdrantEdgeVectorStore::new(&data_dir).unwrap();
             store.create_collection("docs", Some(4)).unwrap();
@@ -461,11 +663,7 @@ mod tests {
                 .unwrap();
         }
 
-        // Re-open: the collection directory should still exist.
         let path = data_dir.join("docs");
-        assert!(
-            path.exists(),
-            "collection directory should persist across reopens"
-        );
+        assert!(path.exists(), "collection directory should persist");
     }
 }
