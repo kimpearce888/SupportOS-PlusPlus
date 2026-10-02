@@ -96,8 +96,6 @@ pub async fn add_entry(
         )
         .is_ok();
     drop(conn);
-    if inserted {
-        crate::http::event_bus::notify_sync(&state.bus, "memory", 1);
-    }
+    if inserted {}
     Json(json!({"ok": inserted, "customerId": customer_id}))
 }

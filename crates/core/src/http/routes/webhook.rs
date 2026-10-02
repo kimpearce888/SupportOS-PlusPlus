@@ -57,9 +57,10 @@ pub async fn handle(
     );
 
     match result {
-        crate::webhook_handler::WebhookProcessResult::Accepted { row_id } => {
-            // Notify SSE clients (the UI reacts to webhook pushes).
-            crate::http::event_bus::notify_webhook(&state.bus, &row_id.to_string());
+        crate::webhook_handler::WebhookProcessResult::Accepted { .. } => {
+            // The reference emits NOTHING on receipt: the sync worker emits
+            // `conversation-updated` (reason 'webhook') when the enqueued
+            // sync_conversation job lands. Same here — no inline emit.
             (StatusCode::OK, Json(json!({"received": true})))
         }
         crate::webhook_handler::WebhookProcessResult::Duplicate { .. } => (

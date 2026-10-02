@@ -76,8 +76,6 @@ pub async fn review(State(state): State<AppState>, Path(plan_id): Path<i64>) -> 
         )
         .unwrap_or(0);
     drop(conn);
-    if rows > 0 {
-        crate::http::event_bus::notify_sync(&state.bus, "coaching", 1);
-    }
+    if rows > 0 {}
     Json(json!({"ok": rows > 0, "planId": plan_id}))
 }

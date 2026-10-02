@@ -69,7 +69,6 @@ pub async fn refresh(
 ) -> Json<Value> {
     // Without an AI provider, this is a no-op + a real-time notification
     // so the UI shows a "refreshed" state.
-    crate::http::event_bus::notify_sync(&state.bus, "interactions", 1);
     Json(
         json!({"ok": true, "conversationId": conversation_id, "message": "Interaction signals refresh queued."}),
     )

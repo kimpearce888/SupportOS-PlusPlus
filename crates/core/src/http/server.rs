@@ -144,7 +144,9 @@ impl HttpServer {
             },
         );
 
-        // CORS: localhost-only (matching the reference's allowedOrigins).
+        // CORS: localhost-only (matching the reference's allowedOrigins
+        // exactly: configured port for localhost/127.0.0.1/[::1], plus the
+        // Vite dev ports 5173-5175 for both loopback names).
         let cors = CorsLayer::new()
             .allow_origin([
                 format!("http://localhost:{}", self.state.port)
@@ -153,10 +155,13 @@ impl HttpServer {
                 format!("http://127.0.0.1:{}", self.state.port)
                     .parse()
                     .unwrap(),
+                format!("http://[::1]:{}", self.state.port).parse().unwrap(),
                 "http://localhost:5173".parse().unwrap(),
                 "http://localhost:5174".parse().unwrap(),
                 "http://localhost:5175".parse().unwrap(),
                 "http://127.0.0.1:5173".parse().unwrap(),
+                "http://127.0.0.1:5174".parse().unwrap(),
+                "http://127.0.0.1:5175".parse().unwrap(),
             ])
             .allow_methods([
                 axum::http::Method::GET,
@@ -767,6 +772,12 @@ impl HttpServer {
             // 404 fallback for unknown /api/* routes
             .fallback(any(routes::not_found))
             .with_state(state)
+            // Request body limit: 20 MB — the reference's Fastify
+            // `bodyLimit: 20 * 1024 * 1024` (attachment uploads are
+            // base64-inflated). The .sosync octet-stream upload route
+            // (512 MB) is not implemented yet; when it lands it must
+            // override this per-route.
+            .layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024))
             .layer(cors)
             .layer(TraceLayer::new_for_http())
             .layer(rate_limit)

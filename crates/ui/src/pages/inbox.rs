@@ -123,17 +123,15 @@ pub fn InboxPage() -> impl IntoView {
     let selected_ids = create_rw_signal(Vec::<i64>::new());
 
     // ── SSE subscription: refresh the list when conversations change ──────
-    // Mirrors the reference's ServerEventsBridge — when the server pushes
-    // a SyncUpdated("conversations", ...) or WebhookReceived event, we
-    // bump `sse_refresh` to re-trigger the list-load effect below.
+    // Mirrors the reference's ServerEventsBridge — when the server pushes a
+    // `conversation` (conversation-updated) or `sync` (sync-completed) event,
+    // we bump `sse_refresh` to re-trigger the list-load effect below.
     let sse_refresh = create_rw_signal(0u32);
     {
         let sse_refresh_clone = sse_refresh;
         let _ = crate::sse::subscribe(Box::new(move |event| match event {
-            crate::sse::LiveEvent::SyncUpdated { resource, .. } if resource == "conversations" => {
-                sse_refresh_clone.update(|n| *n = n.wrapping_add(1));
-            }
-            crate::sse::LiveEvent::WebhookReceived { .. } => {
+            crate::sse::LiveEvent::ConversationUpdated { .. }
+            | crate::sse::LiveEvent::SyncCompleted { .. } => {
                 sse_refresh_clone.update(|n| *n = n.wrapping_add(1));
             }
             _ => {}

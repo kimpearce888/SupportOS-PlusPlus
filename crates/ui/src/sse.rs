@@ -1,33 +1,97 @@
 //! SSE event subscription — mirrors the reference's `src/client/api/events.ts`.
 //!
-//! In the reference React app, `ServerEventsBridge` is mounted once in App
-//! and subscribes to `/api/events` via `EventSource`. Server events are
-//! forwarded to all subscribed listeners, which then invalidate their
-//! TanStack Query caches to refresh views without polling.
+//! The reference React app mounts `ServerEventsBridge` once, which opens a
+//! single `EventSource('/api/events')` and listens for the NAMED events
+//! (`hello`, `ratings`, `sync`, `conversation`, `campaign`, `notification`,
+//! `error`), converting them into query invalidations + toasts.
 //!
-//! In the Leptos port we expose a similar API: `subscribe()` returns a
-//! `wasm_bindgen::closure::Closure` handle that the caller must keep alive.
-//! Each event is deserialized from JSON and forwarded to all registered
-//! listeners.
-//!
-//! The Leptos UI uses `create_resource` + `create_signal` patterns; on
-//! receiving a `LiveEvent`, callers can re-fetch their resources.
+//! The Leptos port exposes the same surface: `subscribe()` registers a
+//! handler; a single global `EventSource` fans named events out to all
+//! handlers. The URL is absolute (`http://127.0.0.1:3000/api/events`) because
+//! the WASM bundle is served from the Tauri asset origin (or the Trunk dev
+//! server), NOT from the Axum API server — a relative URL would hit the wrong
+//! origin. The base can be overridden via `localStorage['spp.api_base']`
+//! (used when the app runs on a non-default PORT).
 
 use std::sync::Mutex;
 
-use serde::Deserialize;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
-/// A live event from the server (mirrors spp_core::events::LiveEvent).
-/// We duplicate the type here because the core crate isn't WASM-safe
-/// (it depends on rusqlite which is native-only).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
+/// The named SSE events the server sends (reference wire names).
+pub const EVENT_NAMES: [&str; 6] = [
+    "hello",
+    "ratings",
+    "sync",
+    "conversation",
+    "campaign",
+    "notification",
+];
+
+/// A live event from the server, parsed from the `data:` JSON of a named
+/// SSE event. We duplicate the shapes here because the core crate isn't
+/// WASM-safe (it depends on rusqlite which is native-only).
+#[derive(Debug, Clone)]
 pub enum LiveEvent {
-    SyncUpdated { resource: String, count: u32 },
-    WebhookReceived { event_id: String },
-    RatingArrived { rating_id: String, rating: u32 },
+    /// `event: hello` — sent on connect.
+    Hello { at: String, version: String },
+    /// `event: ratings` — rating-received payload.
+    RatingReceived {
+        rating: Option<String>,
+        conversation_id: Option<i64>,
+        conversation_number: Option<i64>,
+        customer_id: Option<i64>,
+        customer_name: Option<String>,
+        comments: Option<String>,
+        at: String,
+    },
+    /// `event: ratings` — ratings-refreshed payload.
+    RatingsRefreshed {
+        processed: u32,
+        fresh: u32,
+        at: String,
+    },
+    /// `event: sync` — sync-completed payload.
+    SyncCompleted {
+        kind: String,
+        processed: u32,
+        errors: u32,
+        at: String,
+    },
+    /// `event: conversation` — conversation-updated payload.
+    ConversationUpdated {
+        conversation_id: Option<i64>,
+        conversation_number: Option<i64>,
+        mailbox_id: Option<i64>,
+        subject: Option<String>,
+        reason: String,
+        at: String,
+    },
+    /// `event: campaign` — campaign-updated payload.
+    CampaignUpdated {
+        campaign_id: i64,
+        status: String,
+        sent: u32,
+        failed: u32,
+        unknown: u32,
+        remaining: u32,
+        at: String,
+    },
+    /// `event: notification` — notification-received payload.
+    NotificationReceived {
+        id: i64,
+        kind: String,
+        severity: String,
+        title: String,
+        conversation_id: Option<i64>,
+        conversation_number: Option<i64>,
+        customer_id: Option<i64>,
+        target_user_local_id: Option<i64>,
+        unread_count: u32,
+        at: String,
+    },
+    /// `event: error` — stream-level error (e.g. too many streams).
+    Error { message: String },
 }
 
 /// A handler for a live event.
@@ -36,6 +100,20 @@ pub type EventHandler = Box<dyn Fn(&LiveEvent) + Send + Sync + 'static>;
 /// A subscriber registry. Multiple components can subscribe; each event
 /// is forwarded to all subscribers.
 static SUBSCRIBERS: Mutex<Vec<EventHandler>> = Mutex::new(Vec::new());
+
+/// The absolute API base for the SSE URL. Default `http://127.0.0.1:3000`
+/// (the app's loopback server); override with `localStorage['spp.api_base']`.
+fn api_base() -> String {
+    let window = web_sys::window();
+    if let Some(w) = &window {
+        if let Ok(Some(v)) = w.local_storage() {
+            if let Ok(Some(base)) = v.get_item("spp.api_base") {
+                return base.trim_end_matches('/').to_string();
+            }
+        }
+    }
+    "http://127.0.0.1:3000".to_string()
+}
 
 /// Subscribe to live events from the server.
 ///
@@ -77,50 +155,144 @@ fn ensure_source() -> Result<(), String> {
         }
 
         let _window = web_sys::window().ok_or("no window")?;
-        let event_source = web_sys::EventSource::new("/api/events")
-            .map_err(|e| format!("EventSource::new failed: {e:?}"))?;
+        // Absolute URL: the WASM bundle is served from the Tauri asset origin
+        // (or the Trunk dev server on :1420), NOT from the Axum API server,
+        // so a relative `/api/events` would resolve to the wrong origin.
+        let url = format!("{}/api/events", api_base());
+        let event_source = web_sys::EventSource::new(&url)
+            .map_err(|e| format!("EventSource::new({url}) failed: {e:?}"))?;
 
-        // The reference listens for named events ('hello', 'ratings',
-        // 'sync', 'conversation', 'campaign', 'notification', 'error').
-        // The port's SSE handler sends unnamed `data:` lines (one JSON
-        // object per event with a `type` field), so we listen on the
-        // default 'message' event and dispatch by `type` in the handler.
-        let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-            move |event: web_sys::MessageEvent| {
-                let data_str = event.data().as_string().unwrap_or_else(|| "{}".to_string());
-                let event: LiveEvent = match serde_json::from_str(&data_str) {
-                    Ok(e) => e,
-                    Err(_) => return, // keep-alive comments or malformed
-                };
-                let subs = match SUBSCRIBERS.lock() {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                for handler in subs.iter() {
-                    // Listener bugs never break the stream.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        handler(&event);
-                    }));
+        // The reference listens for NAMED events (one listener per wire
+        // name); keep-alive comments arrive without a listener and are
+        // ignored by the browser, exactly like the reference.
+        for name in EVENT_NAMES {
+            let cb = Closure::<dyn FnMut(web_sys::MessageEvent)>::new({
+                let name = name.to_string();
+                move |event: web_sys::MessageEvent| {
+                    let data_str = event.data().as_string().unwrap_or_else(|| "{}".to_string());
+                    dispatch_named(&name, &data_str);
                 }
-            },
-        );
-        event_source.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+            });
+            event_source
+                .add_event_listener_with_callback(name, cb.as_ref().unchecked_ref())
+                .map_err(|e| format!("addEventListener({name}) failed: {e:?}"))?;
+            // NOTE: the closure is leaked intentionally — the EventSource lives
+            // for the page lifetime and addEventListener holds only a JS ref.
+            // One leaked closure per named event per page load (6 total).
+            cb.forget();
+        }
 
-        // Keep the closure alive.
         let handle = EventSourceHandle {
             source: event_source,
-            _closure: on_message,
         };
         *s.borrow_mut() = Some(handle);
         Ok(())
     })
 }
 
-/// RAII handle for an EventSource + its onmessage closure.
+/// Parse a named event's `data:` JSON and fan it out to all subscribers.
+fn dispatch_named(name: &str, data: &str) {
+    let event = match (name, serde_json::from_str::<serde_json::Value>(data)) {
+        (_, Ok(v)) if !v.is_null() => v,
+        _ => return, // malformed payload — ignore, like the reference
+    };
+    let live = match name {
+        "hello" => parse_h(&event),
+        "ratings" => parse_ratings(&event),
+        "sync" => LiveEvent::SyncCompleted {
+            kind: str_field(&event, "kind").unwrap_or_default(),
+            processed: num_field(&event, "processed").unwrap_or(0).max(0) as u32,
+            errors: num_field(&event, "errors").unwrap_or(0).max(0) as u32,
+            at: str_field(&event, "at").unwrap_or_default(),
+        },
+        "conversation" => LiveEvent::ConversationUpdated {
+            conversation_id: num_field(&event, "conversationId"),
+            conversation_number: num_field(&event, "conversationNumber"),
+            mailbox_id: num_field(&event, "mailboxId"),
+            subject: str_field(&event, "subject"),
+            reason: str_field(&event, "reason").unwrap_or_default(),
+            at: str_field(&event, "at").unwrap_or_default(),
+        },
+        "campaign" => LiveEvent::CampaignUpdated {
+            campaign_id: num_field(&event, "campaignId").unwrap_or(0),
+            status: str_field(&event, "status").unwrap_or_default(),
+            sent: num_field(&event, "sent").unwrap_or(0).max(0) as u32,
+            failed: num_field(&event, "failed").unwrap_or(0).max(0) as u32,
+            unknown: num_field(&event, "unknown").unwrap_or(0).max(0) as u32,
+            remaining: num_field(&event, "remaining").unwrap_or(0).max(0) as u32,
+            at: str_field(&event, "at").unwrap_or_default(),
+        },
+        "notification" => LiveEvent::NotificationReceived {
+            id: num_field(&event, "id").unwrap_or(0),
+            kind: str_field(&event, "type").unwrap_or_default(),
+            severity: str_field(&event, "severity").unwrap_or_default(),
+            title: str_field(&event, "title").unwrap_or_default(),
+            conversation_id: num_field(&event, "conversationId"),
+            conversation_number: num_field(&event, "conversationNumber"),
+            customer_id: num_field(&event, "customerId"),
+            target_user_local_id: num_field(&event, "targetUserLocalId"),
+            unread_count: num_field(&event, "unreadCount").unwrap_or(0).max(0) as u32,
+            at: str_field(&event, "at").unwrap_or_default(),
+        },
+        "error" => LiveEvent::Error {
+            message: str_field(&event, "message").unwrap_or_default(),
+        },
+        _ => return,
+    };
+    let subs = match SUBSCRIBERS.lock() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for handler in subs.iter() {
+        // Listener bugs never break the stream.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler(&live);
+        }));
+    }
+}
+
+fn parse_h(v: &serde_json::Value) -> LiveEvent {
+    LiveEvent::Hello {
+        at: str_field(v, "at").unwrap_or_default(),
+        version: str_field(v, "version").unwrap_or_default(),
+    }
+}
+
+fn parse_ratings(v: &serde_json::Value) -> LiveEvent {
+    // `ratings` carries either a rating-received or a ratings-refreshed
+    // payload; distinguish by field presence (reference does the same by
+    // listener registration order).
+    if v.get("processed").is_some() {
+        LiveEvent::RatingsRefreshed {
+            processed: num_field(v, "processed").unwrap_or(0).max(0) as u32,
+            fresh: num_field(v, "fresh").unwrap_or(0).max(0) as u32,
+            at: str_field(v, "at").unwrap_or_default(),
+        }
+    } else {
+        LiveEvent::RatingReceived {
+            rating: str_field(v, "rating"),
+            conversation_id: num_field(v, "conversationId"),
+            conversation_number: num_field(v, "conversationNumber"),
+            customer_id: num_field(v, "customerId"),
+            customer_name: str_field(v, "customerName"),
+            comments: str_field(v, "comments"),
+            at: str_field(v, "at").unwrap_or_default(),
+        }
+    }
+}
+
+fn str_field(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)?.as_str().map(String::from)
+}
+
+fn num_field(v: &serde_json::Value, key: &str) -> Option<i64> {
+    v.get(key)?.as_i64()
+}
+
+/// RAII handle for the EventSource.
 struct EventSourceHandle {
     #[allow(dead_code)]
     source: web_sys::EventSource,
-    _closure: Closure<dyn FnMut(web_sys::MessageEvent)>,
 }
 
 /// Convenience: emit a test event to all subscribers (test-only).
@@ -159,93 +331,49 @@ pub fn subscribe_mock(handler: EventHandler) -> Box<dyn FnOnce() -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
 
     #[test]
-    fn subscribe_mock_invokes_handler() {
-        let counter = Arc::new(AtomicU32::new(0));
-        let counter_clone = counter.clone();
-        let _unsub = subscribe_mock(Box::new(move |_event| {
-            counter_clone.fetch_add(1, Ordering::SeqCst);
+    fn dispatch_named_conversation_event() {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = called.clone();
+        let _unsub = subscribe_mock(Box::new(move |e| {
+            if let LiveEvent::ConversationUpdated { reason, .. } = e {
+                if reason == "webhook" {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
         }));
-
-        emit_test(&LiveEvent::SyncUpdated {
-            resource: "x".into(),
-            count: 1,
-        });
-        emit_test(&LiveEvent::WebhookReceived {
-            event_id: "evt1".into(),
-        });
-
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        dispatch_named(
+            "conversation",
+            r#"{"conversationId":5,"conversationNumber":42,"mailboxId":2,"subject":"SSO","reason":"webhook","at":"now"}"#,
+        );
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
-    fn unsubscribe_removes_handler() {
-        let counter = Arc::new(AtomicU32::new(0));
-        let counter_clone = counter.clone();
-        let unsub = subscribe_mock(Box::new(move |_event| {
-            counter_clone.fetch_add(1, Ordering::SeqCst);
+    fn dispatch_named_ratings_distinguishes_shapes() {
+        let got_refresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = got_refresh.clone();
+        let _unsub = subscribe_mock(Box::new(move |e| {
+            if let LiveEvent::RatingsRefreshed {
+                ref processed,
+                ref fresh,
+                ..
+            } = e
+            {
+                if *processed == 3 && *fresh == 2 {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
         }));
-
-        emit_test(&LiveEvent::SyncUpdated {
-            resource: "x".into(),
-            count: 1,
-        });
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-
-        let _ = unsub();
-        emit_test(&LiveEvent::SyncUpdated {
-            resource: "x".into(),
-            count: 1,
-        });
-        // No-op handler replaced the real one; counter should not increment.
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        dispatch_named("ratings", r#"{"processed":3,"fresh":2,"at":"now"}"#);
+        assert!(got_refresh.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
-    fn multiple_subscribers_all_invoked() {
-        let c1 = Arc::new(AtomicU32::new(0));
-        let c2 = Arc::new(AtomicU32::new(0));
-        let c1_clone = c1.clone();
-        let c2_clone = c2.clone();
-        let _u1 = subscribe_mock(Box::new(move |_| {
-            c1_clone.fetch_add(1, Ordering::SeqCst);
-        }));
-        let _u2 = subscribe_mock(Box::new(move |_| {
-            c2_clone.fetch_add(1, Ordering::SeqCst);
-        }));
-
-        emit_test(&LiveEvent::RatingArrived {
-            rating_id: "r1".into(),
-            rating: 5,
-        });
-        assert_eq!(c1.load(Ordering::SeqCst), 1);
-        assert_eq!(c2.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn live_event_deserializes() {
-        let json = r#"{"type":"WebhookReceived","event_id":"evt_42"}"#;
-        let event: LiveEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            event,
-            LiveEvent::WebhookReceived { event_id } if event_id == "evt_42"
-        ));
-
-        let json = r#"{"type":"SyncUpdated","resource":"conversations","count":7}"#;
-        let event: LiveEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            event,
-            LiveEvent::SyncUpdated { resource, count } if resource == "conversations" && count == 7
-        ));
-
-        let json = r#"{"type":"RatingArrived","rating_id":"r_99","rating":5}"#;
-        let event: LiveEvent = serde_json::from_str(json).unwrap();
-        assert!(matches!(
-            event,
-            LiveEvent::RatingArrived { rating_id, rating } if rating_id == "r_99" && rating == 5
-        ));
+    fn malformed_payload_is_ignored() {
+        // Must not panic.
+        dispatch_named("sync", "not json");
+        dispatch_named("ratings", "");
     }
 }

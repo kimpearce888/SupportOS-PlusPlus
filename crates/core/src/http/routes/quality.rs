@@ -33,7 +33,6 @@ pub async fn list_gaps(State(state): State<AppState>) -> Json<Value> {
 
 /// POST /api/knowledge/gaps/rebuild
 pub async fn rebuild_gaps(State(state): State<AppState>) -> Json<Value> {
-    crate::http::event_bus::notify_sync(&state.bus, "knowledge_gaps", 1);
     Json(json!({"ok": true, "message": "Knowledge gap rebuild queued."}))
 }
 
@@ -78,7 +77,6 @@ pub async fn qa_overview(State(state): State<AppState>) -> Json<Value> {
 
 /// POST /api/qa/rebuild
 pub async fn qa_rebuild(State(state): State<AppState>) -> Json<Value> {
-    crate::http::event_bus::notify_sync(&state.bus, "qa", 1);
     Json(json!({"ok": true, "message": "QA rebuild queued."}))
 }
 
@@ -108,7 +106,6 @@ pub async fn qa_conversation(
 
 /// POST /api/qa/:conversationId/analyze
 pub async fn qa_analyze(State(state): State<AppState>, Path(conv_id): Path<i64>) -> Json<Value> {
-    crate::http::event_bus::notify_sync(&state.bus, "qa", 1);
     Json(json!({"ok": true, "conversation_id": conv_id, "message": "QA analysis queued."}))
 }
 
@@ -158,6 +155,5 @@ pub async fn friction_overview(State(state): State<AppState>) -> Json<Value> {
 
 /// POST /api/friction/rebuild
 pub async fn friction_rebuild(State(state): State<AppState>) -> Json<Value> {
-    crate::http::event_bus::notify_sync(&state.bus, "friction", 1);
     Json(json!({"ok": true, "message": "Friction rebuild queued."}))
 }

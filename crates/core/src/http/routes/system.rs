@@ -318,11 +318,41 @@ pub async fn demo_simulate_incoming(
             json!({"_status": 500, "ok": false, "message": "Failed to create conversation."}),
         );
     }
+    // Fetch the inserted row's identity fields for the live event.
+    let event_details = conn
+        .query_row(
+            "SELECT id, number, mailbox_id, subject FROM conversations ORDER BY id DESC LIMIT 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0).ok().flatten(),
+                    r.get::<_, Option<i64>>(1).ok().flatten(),
+                    r.get::<_, Option<i64>>(2).ok().flatten(),
+                    r.get::<_, Option<String>>(3).ok().flatten(),
+                ))
+            },
+        )
+        .ok();
     drop(conn);
 
-    // Push a real-time SyncUpdated event so connected SSE clients
-    // refresh their inbox view immediately.
-    crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+    // Push a real-time `conversation-updated` event (reason 'sync') so
+    // connected SSE clients refresh their inbox view immediately — the same
+    // event the reference's sync worker emits after the sync job lands.
+    if let Some((id, number, mailbox, subject)) = event_details {
+        crate::http::event_bus::notify_conversation_updated(
+            &state.bus,
+            &crate::events::ConversationUpdatedEvent {
+                conversation_id: id,
+                conversation_number: number,
+                mailbox_id: mailbox,
+                subject,
+                reason: "sync".into(),
+                at: chrono::Utc::now()
+                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                    .to_string(),
+            },
+        );
+    }
 
     Json(json!({
         "ok": true,
@@ -365,7 +395,23 @@ pub async fn demo_simulate_rating(
     // (The reference persists CSAT ratings to a `ratings` table; the port
     // receives them via the Help Scout API + ratings watcher, so demo mode
     // just emits the real-time event without persisting.)
-    crate::http::event_bus::notify_rating(&state.bus, &rating_id, rating_num);
+    // The reference demo simulate-rating emits BOTH events (routes/system.ts:183-192):
+    // rating-received with the full rating payload + ratings-refreshed (1 processed, 1 fresh).
+    let rating_word = match rating {
+        "great" => Some("great"),
+        "okay" => Some("okay"),
+        _ => Some("not-good"),
+    };
+    crate::http::event_bus::notify_rating_received(
+        &state.bus,
+        rating_word,
+        Some(conv_id),
+        None,
+        None,
+        None,
+        None,
+    );
+    crate::http::event_bus::notify_ratings_refreshed(&state.bus, 1, 1);
 
     Json(json!({
         "ok": true,
@@ -431,16 +477,12 @@ pub async fn demo_simulate_webhook(
 
     let event_id = format!("demo_wh_{}", chrono::Utc::now().timestamp_millis());
     match result {
-        crate::webhook_handler::WebhookProcessResult::Accepted { row_id } => {
-            // Push a WebhookReceived event so the Sync Health page refreshes.
-            crate::http::event_bus::notify_webhook(&state.bus, &row_id.to_string());
-            Json(json!({
-                "ok": true,
-                "message": format!("{event} pushed through the webhook pipeline."),
-                "remoteId": remote_id,
-                "event_id": event_id,
-            }))
-        }
+        crate::webhook_handler::WebhookProcessResult::Accepted { row_id } => Json(json!({
+            "ok": true,
+            "message": format!("{event} pushed through the webhook pipeline."),
+            "remoteId": remote_id,
+            "event_id": event_id,
+        })),
         crate::webhook_handler::WebhookProcessResult::Duplicate { .. } => Json(json!({
             "ok": true,
             "message": format!("{event} was a duplicate (already processed)."),

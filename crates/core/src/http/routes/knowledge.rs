@@ -163,7 +163,6 @@ pub async fn import(State(state): State<AppState>, Json(body): Json<Value>) -> J
     // Push a real-time SyncUpdated event so connected clients refresh.
     if imported > 0 {
         drop(conn);
-        crate::http::event_bus::notify_sync(&state.bus, "knowledge", imported);
     }
     Json(json!({"ok": true, "imported": imported}))
 }
@@ -191,7 +190,6 @@ pub async fn import_file(State(state): State<AppState>, Json(body): Json<Value>)
     };
     if imported > 0 {
         drop(conn);
-        crate::http::event_bus::notify_sync(&state.bus, "knowledge", imported);
     }
     Json(json!({"ok": true, "imported": imported}))
 }
@@ -241,9 +239,7 @@ pub async fn verify_document(State(state): State<AppState>, Path(id): Path<i64>)
         .unwrap_or(0);
     drop(conn);
     let verified = rows > 0;
-    if verified {
-        crate::http::event_bus::notify_sync(&state.bus, "knowledge", 1);
-    }
+    if verified {}
     Json(json!({"ok": verified, "verified": verified}))
 }
 
@@ -264,9 +260,7 @@ pub async fn reindex(State(state): State<AppState>) -> Json<Value> {
         )
         .unwrap_or(0);
     drop(conn);
-    if marked > 0 {
-        crate::http::event_bus::notify_sync(&state.bus, "knowledge", marked as u32);
-    }
+    if marked > 0 {}
     Json(json!({"ok": true, "marked_stale": marked, "message": "Reindex queued."}))
 }
 
@@ -280,8 +274,6 @@ pub async fn delete_document(State(state): State<AppState>, Path(id): Path<i64>)
         )
         .unwrap_or(0);
     drop(conn);
-    if rows > 0 {
-        crate::http::event_bus::notify_sync(&state.bus, "knowledge", rows as u32);
-    }
+    if rows > 0 {}
     Json(json!({"ok": rows > 0}))
 }

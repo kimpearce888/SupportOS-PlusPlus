@@ -94,7 +94,19 @@ pub async fn reply(
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             if ok {
-                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+                crate::http::event_bus::notify_conversation_updated(
+                    &state.bus,
+                    &crate::events::ConversationUpdatedEvent {
+                        conversation_id: Some(id),
+                        conversation_number: None,
+                        mailbox_id: None,
+                        subject: None,
+                        reason: "sync".into(),
+                        at: chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string(),
+                    },
+                );
             }
             Json(json!({"ok": ok, "message": "Reply sent."}))
         }
@@ -124,7 +136,19 @@ pub async fn note(
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             if ok {
-                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+                crate::http::event_bus::notify_conversation_updated(
+                    &state.bus,
+                    &crate::events::ConversationUpdatedEvent {
+                        conversation_id: Some(id),
+                        conversation_number: None,
+                        mailbox_id: None,
+                        subject: None,
+                        reason: "sync".into(),
+                        at: chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string(),
+                    },
+                );
             }
             Json(json!({"ok": ok}))
         }
@@ -157,7 +181,19 @@ pub async fn status(
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             if ok {
-                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+                crate::http::event_bus::notify_conversation_updated(
+                    &state.bus,
+                    &crate::events::ConversationUpdatedEvent {
+                        conversation_id: Some(id),
+                        conversation_number: None,
+                        mailbox_id: None,
+                        subject: None,
+                        reason: "sync".into(),
+                        at: chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string(),
+                    },
+                );
             }
             Json(json!({"ok": ok}))
         }
@@ -181,7 +217,19 @@ pub async fn assign(
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             if ok {
-                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+                crate::http::event_bus::notify_conversation_updated(
+                    &state.bus,
+                    &crate::events::ConversationUpdatedEvent {
+                        conversation_id: Some(id),
+                        conversation_number: None,
+                        mailbox_id: None,
+                        subject: None,
+                        reason: "sync".into(),
+                        at: chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string(),
+                    },
+                );
             }
             Json(json!({"ok": ok}))
         }
@@ -215,7 +263,19 @@ pub async fn priority(
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             drop(conn);
             if ok {
-                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+                crate::http::event_bus::notify_conversation_updated(
+                    &state.bus,
+                    &crate::events::ConversationUpdatedEvent {
+                        conversation_id: Some(id),
+                        conversation_number: None,
+                        mailbox_id: None,
+                        subject: None,
+                        reason: "sync".into(),
+                        at: chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string(),
+                    },
+                );
             }
             Json(json!({"ok": ok}))
         }
@@ -243,7 +303,19 @@ pub async fn subject(
     let updated = result.as_ref().map(|rows| *rows > 0).unwrap_or(false);
     drop(conn);
     if updated {
-        crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+        crate::http::event_bus::notify_conversation_updated(
+            &state.bus,
+            &crate::events::ConversationUpdatedEvent {
+                conversation_id: Some(id),
+                conversation_number: None,
+                mailbox_id: None,
+                subject: None,
+                reason: "sync".into(),
+                at: chrono::Utc::now()
+                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                    .to_string(),
+            },
+        );
     }
     match result {
         Ok(rows) => Json(json!({"ok": rows > 0})),
@@ -273,7 +345,19 @@ pub async fn set_state(
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             drop(conn);
             if ok {
-                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+                crate::http::event_bus::notify_conversation_updated(
+                    &state.bus,
+                    &crate::events::ConversationUpdatedEvent {
+                        conversation_id: Some(id),
+                        conversation_number: None,
+                        mailbox_id: None,
+                        subject: None,
+                        reason: "sync".into(),
+                        at: chrono::Utc::now()
+                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                            .to_string(),
+                    },
+                );
             }
             Json(json!({"ok": ok}))
         }
