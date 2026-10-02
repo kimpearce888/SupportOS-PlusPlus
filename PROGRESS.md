@@ -11,14 +11,14 @@
 | Current milestone | M12 — Packaging verification + UI wiring + E2E (IN PROGRESS — all priorities done; awaiting owner sign-off) |
 | Current task ID | (none — all M12 priorities complete; 24 UI pages, 49+ IPC commands, smoke-install all-pass, real WebDriver E2E passing) |
 | Last completed task | M12-P4: Real WebDriver E2E — tauri-driver + per-page control clicking + text reports |
-| Last commit hash | `481695f` — Fix E2E: use empty capabilities (tauri-driver matches WebKitWebDriver automatically) |
-| Last updated | Session 38 — M12 complete: 24 UI pages, 49+ IPC commands, smoke-install all-pass, real WebDriver E2E passing, CI 100% green |
+| Last commit hash | `914edfd` — STEP 1b: Complete Qdrant Edge adapter — sparse, snapshot, restore, filter translation |
+| Last updated | Session 39 — SCOPE changed to Linux-only; STEP 1a (OPEN-ITEMS) + STEP 1b (complete Qdrant adapter) done |
 
 ## Next 3 tasks
 
-1. **Owner action**: Run `docs/MANUAL-VERIFICATION.md` on clean machines to promote rows to VERIFIED.
-2. **Owner action**: Provide signing certificates (M1-T10) for signed installers.
-3. **(Done)**: M12 — all priorities (P1 smoke-install, P2 self-check+Qdrant, P3 packaging matrix, P4 real WebDriver E2E, P5 24 UI pages) are complete.
+1. **STEP 2**: Write PAGE-EVIDENCE.md + upgrade E2E to click every control, submit forms, test states.
+2. **STEP 3**: Real-mode checks (Help Scout stand-in, AI providers, backup/restore/recovery).
+3. **STEP 4-6**: Independent audit, clean build, docs + release.
 
 ## Resume protocol for next session
 
