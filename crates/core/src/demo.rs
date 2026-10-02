@@ -101,18 +101,17 @@ pub fn run_demo_tool(conn: &Connection, tool: DemoTool) -> DemoToolResult {
 /// compute the HMAC signature, and push it through the real `process_webhook`
 /// pipeline (persist-first → HMAC verify → dedup → job enqueue).
 fn simulate_webhook_event(conn: &Connection) -> DemoToolResult {
-    // Build a simulated webhook payload.
-    let event_id = format!("demo_evt_{}", chrono::Utc::now().timestamp_millis());
+    // Reference-shaped payload: `{conversationId, objectID, id, nonce}` with
+    // the event type carried out-of-band (the X-Helpscout-Event header in the
+    // real flow; passed as the `event_type` argument here).
+    let remote_id = 1000 + (chrono::Utc::now().timestamp_millis() % 100);
     let body = serde_json::json!({
-        "id": event_id,
-        "type": "convo.created",
-        "data": {
-            "number": 1000 + (chrono::Utc::now().timestamp_millis() % 100),
-            "subject": "Simulated customer question",
-            "status": "active",
-            "mailboxId": 101,
-        }
+        "conversationId": remote_id,
+        "objectID": remote_id,
+        "id": remote_id,
+        "nonce": chrono::Utc::now().timestamp_millis(),
     });
+    let event_id = format!("demo_evt_{}", chrono::Utc::now().timestamp_millis());
     let body_bytes = body.to_string().into_bytes();
 
     // Get the webhook secret from settings (or use a demo secret).
@@ -125,16 +124,21 @@ fn simulate_webhook_event(conn: &Connection) -> DemoToolResult {
     let signature = webhook::compute_signature(secret_bytes, &body_bytes);
 
     // Push through the REAL pipeline.
-    let result =
-        webhook_handler::process_webhook(conn, secret_bytes, &body_bytes, Some(&signature));
+    let result = webhook_handler::process_webhook(
+        conn,
+        secret_bytes,
+        &body_bytes,
+        Some(&signature),
+        "convo.created",
+    );
 
     match result {
-        webhook_handler::WebhookProcessResult::Accepted { event_id } => DemoToolResult::Success {
+        webhook_handler::WebhookProcessResult::Accepted { .. } => DemoToolResult::Success {
             message: format!(
                 "Simulated webhook event {event_id} accepted and enqueued for processing."
             ),
         },
-        webhook_handler::WebhookProcessResult::Duplicate { event_id } => DemoToolResult::Success {
+        webhook_handler::WebhookProcessResult::Duplicate { .. } => DemoToolResult::Success {
             message: format!(
                 "Simulated webhook event {event_id} was a duplicate (already processed)."
             ),
@@ -262,13 +266,21 @@ mod tests {
             _ => panic!("expected Success, got {result:?}"),
         }
 
-        // A webhook event was persisted.
-        assert_eq!(webhook::pending_event_count(&conn).unwrap(), 1);
-
-        // A webhook.process job was enqueued.
+        // A webhook event was persisted AND processed through the reference
+        // pipeline (state ends 'processed'; the demo payload is a
+        // convo.created event, so a sync_conversation job is enqueued).
+        let (state, count): (String, i64) = conn
+            .query_row(
+                "SELECT processing_state, COUNT(*) FROM webhook_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(state, "processed");
         let job_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM jobs WHERE kind = 'webhook.process'",
+                "SELECT COUNT(*) FROM jobs WHERE kind = 'sync_conversation'",
                 [],
                 |r| r.get(0),
             )
@@ -338,11 +350,15 @@ mod tests {
             "second call should succeed (either as new event or dedup): {result2:?}"
         );
 
-        // At least 1 event persisted (the first call always creates one).
-        let pending = webhook::pending_event_count(&conn).unwrap();
+        // At least 1 event persisted (the first call always creates one;
+        // with the reference pipeline the event is processed synchronously
+        // so its state ends as 'processed', which still counts as persisted).
+        let persisted: i64 = conn
+            .query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0))
+            .unwrap();
         assert!(
-            pending >= 1,
-            "at least 1 event should be persisted: {pending}"
+            persisted >= 1,
+            "at least 1 event should be persisted: {persisted}"
         );
     }
 

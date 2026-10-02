@@ -14,8 +14,9 @@ use crate::error::{Error, Result};
 /// The header Help Scout uses to send the webhook signature.
 pub const HELPSCOUT_SIGNATURE_HEADER: &str = "X-Helpscout-Signature";
 
-/// Compute the HMAC-SHA1 of `body` keyed by `secret`, returning the lowercase
-/// hex digest (the format Help Scout uses in the signature header).
+/// Compute the HMAC-SHA1 of `body` keyed by `secret`, returning the
+/// **base64** digest — the exact format Help Scout uses in the signature
+/// header (reference: `crypto.createHmac('sha1', secret).update(rawBody).digest('base64')`).
 ///
 /// This is the canonical computation; [`verify_signature`] does the
 /// timing-safe comparison.
@@ -49,7 +50,7 @@ pub fn compute_signature(secret: &[u8], body: &[u8]) -> String {
     outer.write_all(&inner_hash).ok();
     let outer_hash = sha1(&outer);
 
-    hex_lower(&outer_hash)
+    base64_std(&outer_hash)
 }
 
 /// Verify that `provided_signature` matches the HMAC-SHA1 of `body` keyed
@@ -159,6 +160,32 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Standard base64 encoding (RFC 4648, with `=` padding) — the format
+/// `crypto.createHmac(...).digest('base64')` produces in the reference.
+fn base64_std(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 0x3f] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(triple >> 6) as usize & 0x3f] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[triple as usize & 0x3f] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 fn hex_digit(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
@@ -168,48 +195,184 @@ fn hex_digit(n: u8) -> char {
 }
 
 // ---------------------------------------------------------------------------
-// Persist-first + dedup (event store in SQLite)
+// Event store (reference-compatible schema + dedup + state machine)
 // ---------------------------------------------------------------------------
 
-/// Create the `webhook_events` table if it doesn't exist. Idempotent.
+/// A persisted webhook event row (mirrors the reference `webhook_events` shape).
+#[derive(Debug, Clone)]
+pub struct WebhookEventRecord {
+    pub id: i64,
+    pub event_id: Option<String>,
+    pub event_type: String,
+    pub payload: String,
+    pub processing_state: String,
+}
+
+/// Create the `webhook_events` table if it doesn't exist, and forward-migrate
+/// the pre-parity-audit schema (`id TEXT PK, body, status, processed_at`) to
+/// the reference-compatible one. Idempotent.
 pub fn ensure_webhook_events_table(conn: &Connection) -> Result<()> {
+    // Forward migration: if the old-format table exists (TEXT id + `body`
+    // column), rename it out of the way. Its rows were never processable by
+    // the reference pipeline (the old route 500'd on every insert), so they
+    // are not carried over.
+    let old_schema: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='webhook_events'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(schema) = old_schema {
+        if schema.contains("body") && !schema.contains("event_hash") {
+            conn.execute_batch(
+                "ALTER TABLE webhook_events RENAME TO webhook_events_legacy;
+                 DROP TABLE IF EXISTS webhook_events_legacy;",
+            )?;
+        }
+    }
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS webhook_events (
-            id           TEXT PRIMARY KEY,
-            received_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            body         TEXT NOT NULL,
-            status       TEXT NOT NULL DEFAULT 'pending',
-            -- 'pending' | 'processed' | 'failed'
-            processed_at TEXT
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id          TEXT,
+            event_hash        TEXT NOT NULL UNIQUE,
+            event_type        TEXT NOT NULL,
+            received_at       TEXT NOT NULL,
+            payload           TEXT NOT NULL,
+            processing_state  TEXT NOT NULL DEFAULT 'pending',
+            processing_error  TEXT,
+            attempts          INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_webhook_events_status
-            ON webhook_events (status, received_at);",
+        CREATE INDEX IF NOT EXISTS idx_webhook_events_state
+            ON webhook_events (processing_state, id);",
     )?;
     Ok(())
 }
 
-/// Persist a webhook event BEFORE processing it (persist-first per A2).
-/// Returns `Ok(true)` if the event was newly stored; `Ok(false)` if it was
-/// a duplicate (already in the table — the dedup case). The caller then
-/// skips processing.
+/// Insert a webhook event with dedup by `sha256("{eventType}:{payload}")`
+/// (exact reference dedup key). Returns `(row_id, duplicate)`.
+pub fn insert_webhook_event(
+    conn: &Connection,
+    event_type: &str,
+    payload: &str,
+    event_id: Option<&str>,
+) -> Result<(i64, bool)> {
+    use sha2::{Digest, Sha256};
+    ensure_webhook_events_table(conn)?;
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{event_type}:{payload}"));
+    let hash = hex_lower(&hasher.finalize());
+
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM webhook_events WHERE event_hash = ?1",
+            params![hash],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(id) = existing {
+        return Ok((id, true));
+    }
+
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    conn.execute(
+        "INSERT INTO webhook_events (event_id, event_hash, event_type, received_at, payload, processing_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+        params![event_id, hash, event_type, now, payload],
+    )?;
+    Ok((conn.last_insert_rowid(), false))
+}
+
+/// Set the processing state of an event (increments `attempts`, like the
+/// reference `setWebhookEventState`).
+pub fn set_webhook_event_state(
+    conn: &Connection,
+    id: i64,
+    state: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE webhook_events SET processing_state = ?1, processing_error = ?2, attempts = attempts + 1 WHERE id = ?3",
+        params![state, error, id],
+    )?;
+    Ok(())
+}
+
+/// Keep only the newest `keep` rows (reference: 5,000). Bounds the
+/// rate-limit-exempt endpoint against unbounded growth.
+pub fn prune_webhook_events(conn: &Connection, keep: u32) -> Result<()> {
+    conn.execute(
+        "DELETE FROM webhook_events WHERE id NOT IN (SELECT id FROM webhook_events ORDER BY id DESC LIMIT ?1)",
+        params![keep.max(1)],
+    )?;
+    Ok(())
+}
+
+/// Pending/failed events with attempts below the cap (reference drain query).
+pub fn get_pending_webhook_events(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<WebhookEventRecord>> {
+    ensure_webhook_events_table(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, event_id, event_type, payload FROM webhook_events
+          WHERE processing_state IN ('pending','failed') AND attempts < 5
+          ORDER BY id LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |r| {
+            Ok(WebhookEventRecord {
+                id: r.get(0)?,
+                event_id: r.get(1)?,
+                event_type: r.get(2)?,
+                payload: r.get(3)?,
+                processing_state: "pending".into(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Legacy compat shim: persist by explicit event id (used by demo tools and
+/// older tests). Dedups on the event id itself.
 pub fn persist_event(conn: &Connection, event_id: &str, body: &str) -> Result<bool> {
     ensure_webhook_events_table(conn)?;
-    match conn.execute(
-        "INSERT OR IGNORE INTO webhook_events (id, body) VALUES (?1, ?2)",
-        params![event_id, body],
-    ) {
-        Ok(rows) => Ok(rows > 0),
-        Err(e) => Err(Error::Sqlite(e)),
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM webhook_events WHERE event_id = ?1",
+            params![event_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if existing.is_some() {
+        return Ok(false);
     }
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    // Deterministic hash keyed on the explicit event id (stable across replays).
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!("legacy:{event_id}:{body}"));
+    let hash = hex_lower(&hasher.finalize());
+    conn.execute(
+        "INSERT INTO webhook_events (event_id, event_hash, event_type, received_at, payload, processing_state)
+         VALUES (?1, ?2, 'unknown', ?3, ?4, 'pending')",
+        params![event_id, hash, now, body],
+    )?;
+    Ok(true)
 }
 
 /// Mark a persisted event as processed. Idempotent.
 pub fn mark_event_processed(conn: &Connection, event_id: &str) -> Result<()> {
     conn.execute(
         "UPDATE webhook_events
-            SET status = 'processed',
-                processed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-          WHERE id = ?1",
+            SET processing_state = 'processed',
+                processing_error = NULL
+          WHERE event_id = ?1",
         params![event_id],
     )?;
     Ok(())
@@ -218,7 +381,7 @@ pub fn mark_event_processed(conn: &Connection, event_id: &str) -> Result<()> {
 /// Count pending (unprocessed) events. Used by the boot drain.
 pub fn pending_event_count(conn: &Connection) -> Result<u32> {
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM webhook_events WHERE status = 'pending'",
+        "SELECT COUNT(*) FROM webhook_events WHERE processing_state = 'pending'",
         [],
         |r| r.get(0),
     )?;
@@ -229,7 +392,7 @@ pub fn pending_event_count(conn: &Connection) -> Result<u32> {
 /// the boot drain to replay unprocessed events.
 pub fn pending_event_ids(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT id FROM webhook_events WHERE status = 'pending' ORDER BY received_at ASC",
+        "SELECT event_id FROM webhook_events WHERE processing_state = 'pending' AND event_id IS NOT NULL ORDER BY id ASC",
     )?;
     let rows = stmt
         .query_map([], |r| r.get::<_, String>(0))?
@@ -275,12 +438,33 @@ mod tests {
     }
 
     #[test]
-    fn compute_signature_is_lowercase_hex_of_correct_length() {
+    fn compute_signature_is_standard_base64_of_correct_length() {
         let s = compute_signature(b"secret", b"body");
-        assert_eq!(s.len(), 40); // SHA-1 = 20 bytes = 40 hex chars
+        // SHA-1 = 20 bytes → 28 base64 chars (with one '=' pad).
+        assert_eq!(s.len(), 28);
         assert!(s
             .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='));
+    }
+
+    #[test]
+    fn compute_signature_matches_openssl_vectors() {
+        // Cross-check against real OpenSSL base64 HMAC-SHA1 vectors:
+        // `printf 'body' | openssl dgst -sha1 -hmac secret -binary | base64`
+        assert_eq!(
+            compute_signature(b"secret", b"body"),
+            "oYmR/35FE6HC0u5R46jpnKiR2c0="
+        );
+        // `printf 'hello world' | openssl dgst -sha1 -hmac key -binary | base64`
+        assert_eq!(
+            compute_signature(b"key", b"hello world"),
+            "NN0jS5JoNZNWBSj2GT6mjIAF9hU="
+        );
+        // `printf '{"event":"customer.created"}' | openssl dgst -sha1 -hmac super_secret -binary | base64`
+        assert_eq!(
+            compute_signature(b"super_secret", b"{\"event\":\"customer.created\"}"),
+            "O2niiFFi6O3L82txSdmbIiXxHqM="
+        );
     }
 
     #[test]

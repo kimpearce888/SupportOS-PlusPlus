@@ -375,6 +375,13 @@ pub async fn demo_simulate_rating(
 }
 
 /// POST /api/demo/simulate-webhook — simulate a webhook push (demo mode only).
+///
+/// Reference behavior: self-POSTs through the REAL HMAC-verified webhook
+/// endpoint with a nonce to defeat dedup, so the actual pipeline
+/// (verify → persist → process → enqueue) runs. The port reproduces this by
+/// calling the same `process_webhook` pipeline directly with a computed
+/// signature (network-loopback self-POST is an implementation detail; the
+/// observable result — a processed webhook event + enqueued job — matches).
 pub async fn demo_simulate_webhook(
     State(state): State<AppState>,
     Json(body): Json<Value>,
@@ -392,25 +399,64 @@ pub async fn demo_simulate_webhook(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
-    let event_id = format!("demo_wh_{}", chrono::Utc::now().timestamp_millis());
+    // Build the reference-shaped payload: `{conversationId, objectID, id,
+    // nonce}` — the event type rides in the X-Helpscout-Event header, and the
+    // nonce mirrors Help Scout's unique payloads so repeated demos are NOT
+    // swallowed by dedup.
+    let remote_id = if remote_id > 0 { remote_id } else { 1001 };
+    let envelope = serde_json::json!({
+        "conversationId": remote_id,
+        "objectID": remote_id,
+        "id": remote_id,
+        "nonce": chrono::Utc::now().timestamp_millis(),
+    });
+    let envelope_bytes = envelope.to_string().into_bytes();
 
-    // Persist the simulated webhook event (dedup by hash, same as real webhooks).
-    {
+    let secret = {
         let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let payload = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO webhook_events (id, event_type, payload, received_at) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            rusqlite::params![event_id, event, payload],
-        );
+        crate::settings::get_string(&conn, "webhook_secret")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "demo_webhook_secret".into())
+    };
+    let signature = crate::webhook::compute_signature(secret.as_bytes(), &envelope_bytes);
+
+    let result = crate::webhook_handler::process_webhook(
+        &state.conn.lock().unwrap_or_else(|p| p.into_inner()),
+        secret.as_bytes(),
+        &envelope_bytes,
+        Some(&signature),
+        event,
+    );
+
+    let event_id = format!("demo_wh_{}", chrono::Utc::now().timestamp_millis());
+    match result {
+        crate::webhook_handler::WebhookProcessResult::Accepted { row_id } => {
+            // Push a WebhookReceived event so the Sync Health page refreshes.
+            crate::http::event_bus::notify_webhook(&state.bus, &row_id.to_string());
+            Json(json!({
+                "ok": true,
+                "message": format!("{event} pushed through the webhook pipeline."),
+                "remoteId": remote_id,
+                "event_id": event_id,
+            }))
+        }
+        crate::webhook_handler::WebhookProcessResult::Duplicate { .. } => Json(json!({
+            "ok": true,
+            "message": format!("{event} was a duplicate (already processed)."),
+            "remoteId": remote_id,
+            "event_id": event_id,
+            "duplicate": true,
+        })),
+        crate::webhook_handler::WebhookProcessResult::SignatureInvalid => Json(json!({
+            "ok": false,
+            "message": "Signature verification failed for simulated webhook event.",
+            "event_id": event_id,
+        })),
+        crate::webhook_handler::WebhookProcessResult::BadRequest => Json(json!({
+            "ok": false,
+            "message": "Simulated webhook payload was rejected.",
+            "event_id": event_id,
+        })),
     }
-
-    // Push a WebhookReceived event so the Sync Health page refreshes.
-    crate::http::event_bus::notify_webhook(&state.bus, &event_id);
-
-    Json(json!({
-        "ok": true,
-        "message": format!("{event} pushed through the webhook pipeline."),
-        "remoteId": remote_id,
-        "event_id": event_id,
-    }))
 }

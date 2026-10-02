@@ -25,6 +25,7 @@ aes-gcm.workspace = true
 scrypt.workspace = true
 rand.workspace = true
 subtle.workspace = true
+sha2 = "0.10"
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
