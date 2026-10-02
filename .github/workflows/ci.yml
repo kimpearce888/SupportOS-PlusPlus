@@ -121,6 +121,16 @@ jobs:
           cd crates/app/src-tauri
           cargo tauri build
 
+  cargo-audit:
+    name: cargo audit (security advisories)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit --deny warnings
+
   step3-real-mode:
     name: STEP 3 — Real-mode checks (stand-in servers)
     needs: [lint-and-test, build-wasm]
@@ -139,7 +149,7 @@ jobs:
 
   ci-report:
     name: Publish CI report
-    needs: [lint-and-test, build-wasm, build-tauri, step3-real-mode]
+    needs: [lint-and-test, build-wasm, build-tauri, step3-real-mode, cargo-audit]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -163,6 +173,7 @@ jobs:
           | build-wasm | ${{ needs.build-wasm.result }} |
           | build-tauri (Linux) | ${{ needs.build-tauri.result }} |
           | step3-real-mode | ${{ needs.step3-real-mode.result }} |
+          | cargo-audit | ${{ needs.cargo-audit.result }} |
 
           Overall: ${{ needs.lint-and-test.result == 'success' && needs.build-wasm.result == 'success' && '✅ GREEN' || '❌ RED' }}
           REPORT
