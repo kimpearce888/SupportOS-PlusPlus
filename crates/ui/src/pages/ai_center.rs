@@ -1,7 +1,7 @@
 //! AI Center page — model selection + status + Copilot allowlist.
 //!
 //! Per spec M6: "AI Center." Per A10: show the Copilot tool allowlist.
-//! Per A5: "LM Studio and Ollama are optional, never bundled: auto-detect,
+//! Per A5: "LM Studio is optional, never bundled: auto-detect,
 //! list models, select, test. The app works fully without them."
 //!
 //! Every control calls a real IPC command:
@@ -132,7 +132,7 @@ pub fn AiCenterPage() -> impl IntoView {
 
             <p class="spp-page__intro">
                 "Configure your local AI provider. The app works fully without AI (spec A5). "
-                "LM Studio and Ollama are optional, never bundled."
+                "LM Studio is optional, never bundled."
             </p>
 
             <Show when=move || loading.get() fallback=|| ()>
@@ -183,8 +183,7 @@ pub fn AiCenterPage() -> impl IntoView {
                                 >
                                     <option value="none">"None (no AI provider)"</option>
                                     <option value="lm_studio">"LM Studio"</option>
-                                    <option value="ollama">"Ollama"</option>
-                                    <option value="generic">"Generic (OpenAI-compatible)"</option>
+                                                                        <option value="generic">"Generic (OpenAI-compatible)"</option>
                                 </select>
                             </div>
 

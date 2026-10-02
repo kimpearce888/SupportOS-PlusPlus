@@ -61,8 +61,6 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
     let provider_kind = match crate::ai_center::get_ai_status(&conn) {
         Ok(s) => match s.provider_kind {
             crate::ai_center::ProviderKind::LmStudio => "lmstudio",
-            crate::ai_center::ProviderKind::Ollama => "ollama",
-            crate::ai_center::ProviderKind::Generic => "generic",
             crate::ai_center::ProviderKind::None => "none",
         },
         Err(_) => "none",

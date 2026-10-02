@@ -478,13 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn default_preferences_campaign_reply_is_disabled() {
-        let prefs = default_preferences();
-        let campaign = prefs
-            .iter()
-            .find(|(t, _)| *t == NotificationType::CampaignReply)
-            .map(|(_, p)| *p);
-        assert_eq!(campaign, Some(NotificationPreferenceView::Disabled));
+    fn default_preferences_all_enabled() {
+        // Reference: ALL notification types are default-enabled.
+        for t in spp_catalog::NotificationType::ALL {
+            assert!(t.default_enabled(), "{t:?} must be default-enabled");
+        }
     }
 
     #[test]

@@ -17,7 +17,9 @@ use crate::catalog::ConditionKind;
 use crate::error::{Error, Result};
 
 /// Maximum depth of a condition tree. Per KNOWN PITFALLS: "cap condition-tree depth."
-pub const MAX_TREE_DEPTH: u32 = 5;
+/// The reference caps condition-tree nesting at depth 10
+/// (inbox/viewEngine.ts:72).
+pub const MAX_TREE_DEPTH: u32 = 10;
 
 /// Maximum number of nodes in a condition tree. Per KNOWN PITFALLS: "cap node counts."
 pub const MAX_TREE_NODES: u32 = 50;

@@ -20,7 +20,7 @@ pub struct AppConfig {
     pub demo_mode: bool,
     /// Help Scout OAuth config (masked on read when present).
     pub helpscout: HelpScoutConfig,
-    /// Local AI provider config (LM Studio / Ollama).
+    /// Local AI provider config (LM Studio).
     pub ai: AiConfig,
     /// Sync interval in minutes (default 5, per A9).
     pub sync_interval_minutes: u32,

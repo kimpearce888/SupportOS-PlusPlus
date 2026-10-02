@@ -60,23 +60,19 @@ pub enum ProviderKind {
     None,
     /// LM Studio (OpenAI-compatible at 127.0.0.1:1234).
     LmStudio,
-    /// Ollama (native API at 127.0.0.1:11434).
-    Ollama,
-    /// Generic OpenAI-compatible endpoint (user-configured URL + optional key).
-    Generic,
 }
 
 impl ProviderKind {
     /// All variants in spec order.
-    pub const ALL: [Self; 4] = [Self::None, Self::LmStudio, Self::Ollama, Self::Generic];
+    /// The reference supports exactly LM Studio + Disabled
+    /// (src/server/ai/*: LmStudioProvider + Disabled only).
+    pub const ALL: [Self; 2] = [Self::None, Self::LmStudio];
 
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::LmStudio => "lm_studio",
-            Self::Ollama => "ollama",
-            Self::Generic => "generic",
         }
     }
 
@@ -86,8 +82,6 @@ impl ProviderKind {
         match s {
             "none" => Some(Self::None),
             "lm_studio" => Some(Self::LmStudio),
-            "ollama" => Some(Self::Ollama),
-            "generic" => Some(Self::Generic),
             _ => None,
         }
     }
@@ -98,8 +92,6 @@ impl ProviderKind {
         match self {
             Self::None => "None (no AI provider)",
             Self::LmStudio => "LM Studio",
-            Self::Ollama => "Ollama",
-            Self::Generic => "Generic (OpenAI-compatible)",
         }
     }
 }
@@ -312,26 +304,6 @@ mod tests {
         assert_eq!(status.provider_kind, ProviderKind::LmStudio);
     }
 
-    #[test]
-    fn set_provider_kind_ollama() {
-        let conn = fresh_db();
-        set_provider_kind(&conn, ProviderKind::Ollama).unwrap();
-        assert_eq!(
-            get_ai_status(&conn).unwrap().provider_kind,
-            ProviderKind::Ollama
-        );
-    }
-
-    #[test]
-    fn set_provider_kind_generic() {
-        let conn = fresh_db();
-        set_provider_kind(&conn, ProviderKind::Generic).unwrap();
-        assert_eq!(
-            get_ai_status(&conn).unwrap().provider_kind,
-            ProviderKind::Generic
-        );
-    }
-
     // ---- set_chat_model ----------------------------------------------------
 
     #[test]
@@ -361,7 +333,7 @@ mod tests {
     #[test]
     fn set_base_url_round_trips() {
         let conn = fresh_db();
-        set_provider_kind(&conn, ProviderKind::Generic).unwrap();
+        set_provider_kind(&conn, ProviderKind::LmStudio).unwrap();
         set_base_url(&conn, "http://localhost:8080/v1").unwrap();
         let status = get_ai_status(&conn).unwrap();
         assert_eq!(status.base_url.as_deref(), Some("http://localhost:8080/v1"));
@@ -413,8 +385,9 @@ mod tests {
     // ---- ProviderKind ------------------------------------------------------
 
     #[test]
-    fn provider_kind_all_has_four_variants() {
-        assert_eq!(ProviderKind::ALL.len(), 4);
+    fn provider_kind_all_has_two_variants() {
+        // Reference parity: exactly LM Studio + Disabled (None).
+        assert_eq!(ProviderKind::ALL.len(), 2);
     }
 
     #[test]
@@ -452,15 +425,15 @@ mod tests {
     #[test]
     fn ai_status_serializes() {
         let status = AiStatus {
-            provider_kind: ProviderKind::Ollama,
+            provider_kind: ProviderKind::LmStudio,
             chat_model: Some("llama3".into()),
             embedding_model: Some("nomic-embed-text".into()),
             embedding_dim: Some(768),
-            base_url: Some("http://127.0.0.1:11434".into()),
+            base_url: Some("http://127.0.0.1:1234/v1".into()),
             provider_available: Some(true),
         };
         let s = serde_json::to_string(&status).unwrap();
-        assert!(s.contains("\"provider_kind\":\"ollama\""));
+        assert!(s.contains("\"provider_kind\":\"lm_studio\""));
         assert!(s.contains("\"chat_model\":\"llama3\""));
         assert!(s.contains("\"embedding_dim\":768"));
         assert!(s.contains("\"provider_available\":true"));

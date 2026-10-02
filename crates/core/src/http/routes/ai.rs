@@ -27,8 +27,6 @@ pub async fn status(State(state): State<AppState>) -> Json<Value> {
     let provider_kind = match crate::ai_center::get_ai_status(&conn) {
         Ok(s) => match s.provider_kind {
             crate::ai_center::ProviderKind::LmStudio => "lmstudio",
-            crate::ai_center::ProviderKind::Ollama => "ollama",
-            crate::ai_center::ProviderKind::Generic => "generic",
             crate::ai_center::ProviderKind::None => "none",
         }
         .to_string(),

@@ -212,7 +212,7 @@ pub fn SettingsPage() -> impl IntoView {
                 <section class="spp-settings__section">
                     <h3>"AI provider"</h3>
                     <p class="spp-settings__hint">
-                        "Configure your local AI provider (LM Studio, Ollama, or generic OpenAI-compatible) in the "
+                        "Configure your local AI provider (LM Studio) in the "
                         <a href="#/ai-center">"AI Center"</a>
                         "."
                     </p>

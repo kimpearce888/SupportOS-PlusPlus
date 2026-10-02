@@ -473,7 +473,7 @@ fn ai_status(db_state: tauri::State<'_, DbState>) -> Result<serde_json::Value, S
     serde_json::to_value(&status).map_err(|e| e.to_string())
 }
 
-/// Set the AI provider kind (None/LmStudio/Ollama/Generic).
+/// Set the AI provider kind (None/LmStudio).
 #[tauri::command]
 fn ai_set_provider(
     db_state: tauri::State<'_, DbState>,
