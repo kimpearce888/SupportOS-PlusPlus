@@ -59,6 +59,7 @@ pub mod logging;
 pub mod loopback;
 pub mod mentions;
 pub mod migrations;
+pub mod mirror_readouts;
 pub mod notification_prefs;
 pub mod notification_sweep;
 pub mod notifications;

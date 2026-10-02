@@ -267,6 +267,19 @@ impl HttpServer {
                 "/api/saved-replies",
                 get(routes::conversations::list_saved_replies),
             )
+            .route(
+                "/api/inbox-fields",
+                get(routes::conversations::inbox_fields),
+            )
+            .route("/api/workflows", get(routes::conversations::workflows))
+            .route(
+                "/api/users/statuses",
+                get(routes::conversations::user_statuses),
+            )
+            .route(
+                "/api/webhook-configs",
+                get(routes::conversations::webhook_configs),
+            )
             // People (customers + organizations)
             .route("/api/customers", get(routes::people::list_customers))
             .route("/api/customers/:id", get(routes::people::get_customer))

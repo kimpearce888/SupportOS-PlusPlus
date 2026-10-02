@@ -566,15 +566,42 @@ pub async fn list_teams(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"teams": teams})))
 }
 
-/// GET /api/saved-replies — list saved reply templates (reference data for the UI).
+/// GET /api/saved-replies — list saved reply templates; `?q=` searches
+/// (reference: `?q` -> searchSavedReplies, else getSavedReplies).
 pub async fn list_saved_replies(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // The port doesn't have a saved_replies table; return an empty list
-    // matching the reference's response shape so the UI's "saved replies"
-    // dropdown renders without error.
-    let _ = params.get("q"); // query param is supported by the reference
-    Json(json!({"saved_replies": []}))
+    let conn = state.conn_lock();
+    let q = params.get("q").map(String::as_str);
+    let replies = crate::mirror_readouts::saved_replies(&conn, q).unwrap_or_default();
+    (StatusCode::OK, Json(json!({ "saved_replies": replies })))
+}
+
+/// GET /api/inbox-fields — custom field definitions with options.
+pub async fn inbox_fields(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let fields = crate::mirror_readouts::inbox_fields(&conn).unwrap_or_default();
+    (StatusCode::OK, Json(fields))
+}
+
+/// GET /api/workflows — mailbox workflows mirror.
+pub async fn workflows(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let list = crate::mirror_readouts::workflows(&conn).unwrap_or_default();
+    (StatusCode::OK, Json(list))
+}
+
+/// GET /api/users/statuses — user presence statuses.
+pub async fn user_statuses(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let list = crate::mirror_readouts::user_statuses(&conn).unwrap_or_default();
+    (StatusCode::OK, Json(list))
+}
+
+/// GET /api/webhook-configs — registered Help Scout webhook configurations.
+pub async fn webhook_configs(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let list = crate::mirror_readouts::webhook_configs(&conn).unwrap_or_default();
+    (StatusCode::OK, Json(list))
 }
