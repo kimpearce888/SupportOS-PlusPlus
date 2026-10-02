@@ -248,6 +248,16 @@ fn apply_inner(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // ------------------------------------------------------------------
+    // 5c. issue_clusters needs the reference's `trend` column for the
+    //     issue_spike operations tile ('rising' | 'stable' | 'declining').
+    // ------------------------------------------------------------------
+    if table_exists(conn, "issue_clusters")? && !column_exists(conn, "issue_clusters", "trend")? {
+        conn.execute_batch(
+            "ALTER TABLE issue_clusters ADD COLUMN trend TEXT NOT NULL DEFAULT 'stable';",
+        )?;
+    }
+
     // 5b. reference resource tables (migration 001 shapes)
     // ------------------------------------------------------------------
     conn.execute_batch(

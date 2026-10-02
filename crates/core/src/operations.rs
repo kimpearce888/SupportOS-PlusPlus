@@ -19,10 +19,9 @@
 //!
 //! Some tiles depend on data sources that ship in later milestones:
 //! - `automation_approvals` → M4-T10 (this milestone)
-//! - `ai_escalation` → M6 (AI features)
-//! - `sla_at_risk`, `sla_breached`, `repeated_issue`, `known_issue`,
-//!   `issue_spike` → M7 (Intelligence: SLA + known issues)
-//! - `campaign_activity` → M9 (Outreach)
+//! - `ai_escalation` → T13 (AI analysis wiring)
+//! - `sla_at_risk`, `sla_breached` → T16 (SLA business-minutes engine)
+
 //!
 //! Until their dependencies ship, those tiles return [`TileCount::NotAvailable`]
 //! so the UI can display a "Not yet available" badge rather than a misleading
@@ -54,8 +53,7 @@ pub type BoundParams = Vec<Box<dyn rusqlite::ToSql>>;
 ///
 /// `Available(n)` means the underlying data source exists and returned `n`.
 /// `NotAvailable { milestone }` means the data source ships in a later
-/// milestone (M4-T10 for automation_approvals, M6 for ai_escalation, M7 for
-/// SLA/known-issues, M9 for campaigns).
+/// milestone (T13 for ai_escalation, T16 for the SLA tiles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TileCount {
@@ -119,10 +117,7 @@ impl OperationsSnapshot {
 /// Per KNOWN PITFALLS: all timestamp comparisons use `julianday()` (never
 /// lexical ISO-8601 comparison against `datetime('now')`). All mailbox
 /// scoping uses bound parameters (never string interpolation).
-fn tile_sql(
-    tile: OperationsTileKey,
-    mailbox_id: Option<i64>,
-) -> Option<(&'static str, BoundParams)> {
+fn tile_sql(tile: OperationsTileKey, mailbox_id: Option<i64>) -> Option<(String, BoundParams)> {
     // All real tiles count conversations, except `failed_jobs` (counts the
     // `jobs` table) and `sync_problems` (counts the `sync_runs` table).
     //
@@ -149,7 +144,7 @@ fn tile_sql(
                 Some(mid) => vec![Box::new(mid)],
                 None => vec![],
             };
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::NeedsFirstResponse => {
             // Reuses RESPONSE_STATE_SQL — the stored `response_state` column.
@@ -168,7 +163,7 @@ fn tile_sql(
                 Some(mid) => vec![Box::new(mid)],
                 None => vec![],
             };
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::CustomerWaiting => {
             let sql = match mailbox_id {
@@ -186,7 +181,7 @@ fn tile_sql(
                 Some(mid) => vec![Box::new(mid)],
                 None => vec![],
             };
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::WaitingOverThreshold => {
             // Customer-waiting conversations whose `customer_waiting_since`
@@ -214,7 +209,7 @@ fn tile_sql(
             if let Some(mid) = mailbox_id {
                 params.push(Box::new(mid));
             }
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::Urgent => {
             // Uses the M3-T04 `supportos_priority` column.
@@ -235,7 +230,7 @@ fn tile_sql(
                 Some(mid) => vec![Box::new(mid)],
                 None => vec![],
             };
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::HighEffort => {
             // A conversation with > N activity events is "high effort".
@@ -261,36 +256,96 @@ fn tile_sql(
             if let Some(mid) = mailbox_id {
                 params.push(Box::new(mid));
             }
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::FailedJobs => {
-            // Counts jobs that exhausted their retry budget (status 'failed').
-            // This tile is NOT mailbox-scoped — jobs are global.
-            // Silently ignores a passed-in mailbox_id (jobs aren't scoped).
-            let sql = "SELECT COUNT(*) FROM jobs WHERE status = 'failed'";
-            Some((sql, vec![]))
+            // Reference: jobs that exhausted retries in the LAST 7 DAYS
+            // (label "Failed jobs (7d)"). Not mailbox-scoped.
+            let sql = String::from(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'failed'
+                AND julianday(COALESCE(completed_at, created_at)) >= julianday('now', '-7 days')",
+            );
+            Some((sql.to_string(), vec![]))
         }
         OperationsTileKey::SyncProblems => {
-            // Counts sync_runs that ended in 'failed' status.
-            // This tile is NOT mailbox-scoped — sync_runs are global.
-            let sql = "SELECT COUNT(*) FROM sync_runs WHERE status = 'failed'";
-            Some((sql, vec![]))
+            // Reference syncProblems(): sync_state ERROR counts 1, plus
+            // application_errors logged in the last 24 h. Not mailbox-scoped.
+            let sql = String::from("SELECT COALESCE((SELECT CASE WHEN REPLACE(value, '\"', '') = 'ERROR' THEN 1 ELSE 0 END
+                            FROM application_settings WHERE key = 'sync_state'), 0)
+                        + (SELECT COUNT(*) FROM application_errors
+                            WHERE julianday(timestamp) >= julianday('now', '-1 day'))");
+            Some((sql.to_string(), vec![]))
         }
         OperationsTileKey::AutomationApprovals => {
             // Wired in M4-T10: counts pending automation approvals.
             // This tile is NOT mailbox-scoped — approvals are global.
-            let sql = "SELECT COUNT(*) FROM automation_approvals WHERE status = 'pending'";
-            Some((sql, vec![]))
+            let sql =
+                String::from("SELECT COUNT(*) FROM automation_approvals WHERE status = 'pending'");
+            Some((sql.to_string(), vec![]))
         }
-        // Stubbed tiles — their dependencies ship in later milestones.
+        OperationsTileKey::RepeatedIssue => {
+            // Reference: the same customer has 2+ conversations linked to
+            // one known issue (open tickets only).
+            let scope = mailbox_scope_sql(mailbox_id);
+            let sql = format!(
+                "SELECT COUNT(*) FROM conversations c
+                  WHERE c.status IN ('active','pending') {scope} AND EXISTS (
+                    SELECT 1 FROM known_issue_links kil
+                     WHERE kil.conversation_id = c.id
+                       AND (SELECT COUNT(*) FROM known_issue_links kil2
+                            JOIN conversations c2 ON c2.id = kil2.conversation_id
+                            WHERE kil2.known_issue_id = kil.known_issue_id
+                              AND c2.customer_id = c.customer_id) >= 2)"
+            );
+            Some((sql, mailbox_params(mailbox_id)))
+        }
+        OperationsTileKey::KnownIssue => {
+            // Reference: open conversations linked to UNRESOLVED known issues.
+            let scope = mailbox_scope_sql(mailbox_id);
+            let sql = format!(
+                "SELECT COUNT(*) FROM conversations c
+                  WHERE c.status IN ('active','pending') {scope} AND EXISTS (
+                    SELECT 1 FROM known_issue_links kil
+                    JOIN known_issues ki ON ki.id = kil.known_issue_id
+                     WHERE kil.conversation_id = c.id AND ki.status != 'resolved')"
+            );
+            Some((sql, mailbox_params(mailbox_id)))
+        }
+        OperationsTileKey::IssueSpike => {
+            // Reference: issue clusters trending up (Issue Radar detail).
+            // Not mailbox-scoped.
+            let sql = String::from("SELECT COUNT(*) FROM issue_clusters WHERE trend = 'rising'");
+            Some((sql.to_string(), vec![]))
+        }
+        OperationsTileKey::CampaignActivity => {
+            // Reference: campaigns queued/sending/paused right now.
+            // Not mailbox-scoped.
+            let sql =
+                "SELECT COUNT(*) FROM campaigns WHERE status IN ('queued','sending','paused')";
+            Some((sql.to_string(), vec![]))
+        }
+        // Still stubbed — their engines land with T16 (SLA business-minutes)
+        // and T13 (AI analysis wiring populating ai_runs).
         OperationsTileKey::SlaAtRisk
         | OperationsTileKey::SlaBreached
-        | OperationsTileKey::RepeatedIssue
-        | OperationsTileKey::KnownIssue
-        | OperationsTileKey::AiEscalation
-        | OperationsTileKey::IssueSpike
-        | OperationsTileKey::CampaignActivity => None,
+        | OperationsTileKey::AiEscalation => None,
     }
+}
+
+/// The mailbox scope fragment ("AND c.mailbox_id = ?" or empty).
+fn mailbox_scope_sql(mailbox_id: Option<i64>) -> &'static str {
+    if mailbox_id.is_some() {
+        " AND c.mailbox_id = ?"
+    } else {
+        ""
+    }
+}
+
+/// The bound params for a mailbox-scoped tile.
+fn mailbox_params(mailbox_id: Option<i64>) -> Vec<Box<dyn rusqlite::ToSql>> {
+    mailbox_id
+        .map(|m| vec![Box::new(m) as Box<dyn rusqlite::ToSql>])
+        .unwrap_or_default()
 }
 
 /// The milestone that wires a stubbed tile. Used by [`count_tile`] to populate
@@ -299,13 +354,8 @@ fn tile_sql(
 #[must_use]
 pub fn tile_milestone(tile: OperationsTileKey) -> Option<u8> {
     match tile {
-        OperationsTileKey::AiEscalation => Some(6), // M6 (AI features)
-        OperationsTileKey::SlaAtRisk
-        | OperationsTileKey::SlaBreached
-        | OperationsTileKey::RepeatedIssue
-        | OperationsTileKey::KnownIssue
-        | OperationsTileKey::IssueSpike => Some(7), // M7 (Intelligence)
-        OperationsTileKey::CampaignActivity => Some(9), // M9 (Outreach)
+        OperationsTileKey::AiEscalation => Some(13), // T13 (AI analysis wiring)
+        OperationsTileKey::SlaAtRisk | OperationsTileKey::SlaBreached => Some(16), // T16 (SLA business-minutes)
         // Real tiles have no pending milestone.
         OperationsTileKey::Unassigned
         | OperationsTileKey::NeedsFirstResponse
@@ -315,7 +365,11 @@ pub fn tile_milestone(tile: OperationsTileKey) -> Option<u8> {
         | OperationsTileKey::HighEffort
         | OperationsTileKey::FailedJobs
         | OperationsTileKey::SyncProblems
-        | OperationsTileKey::AutomationApprovals => None,
+        | OperationsTileKey::AutomationApprovals
+        | OperationsTileKey::RepeatedIssue
+        | OperationsTileKey::KnownIssue
+        | OperationsTileKey::IssueSpike
+        | OperationsTileKey::CampaignActivity => None,
     }
 }
 
@@ -339,7 +393,7 @@ pub fn count_tile(
 
     // Bind the params: convert Vec<Box<dyn ToSql>> to &[&dyn ToSql].
     let param_refs: Vec<&dyn rusqlite::ToSql> = sql_params.iter().map(|b| b.as_ref()).collect();
-    let count: i64 = conn.query_row(sql, param_refs.as_slice(), |r| r.get(0))?;
+    let count: i64 = conn.query_row(sql.as_str(), param_refs.as_slice(), |r| r.get(0))?;
     Ok(TileCount::Available {
         count: u32::try_from(count).unwrap_or(0),
     })
@@ -426,7 +480,7 @@ fn tile_filter_fragment(
                 sql.push_str(" AND mailbox_id = ?1");
                 params.push(Box::new(mid));
             }
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::NeedsFirstResponse => {
             let mut sql = String::from("response_state = 'needs_first_response'");
@@ -435,7 +489,7 @@ fn tile_filter_fragment(
                 sql.push_str(" AND mailbox_id = ?1");
                 params.push(Box::new(mid));
             }
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::CustomerWaiting => {
             let mut sql = String::from("response_state = 'customer_waiting'");
@@ -444,7 +498,7 @@ fn tile_filter_fragment(
                 sql.push_str(" AND mailbox_id = ?1");
                 params.push(Box::new(mid));
             }
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::WaitingOverThreshold => {
             // Same fragment as the tile count — confirms the v1.7.0 invariant.
@@ -459,7 +513,7 @@ fn tile_filter_fragment(
                 sql.push_str(" AND mailbox_id = ?2");
                 params.push(Box::new(mid));
             }
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::Urgent => {
             let mut sql = String::from("supportos_priority = 'urgent' AND status != 'closed'");
@@ -468,7 +522,7 @@ fn tile_filter_fragment(
                 sql.push_str(" AND mailbox_id = ?1");
                 params.push(Box::new(mid));
             }
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         OperationsTileKey::HighEffort => {
             let mut sql = String::from(
@@ -480,7 +534,7 @@ fn tile_filter_fragment(
                 sql.push_str(" AND mailbox_id = ?2");
                 params.push(Box::new(mid));
             }
-            Some((sql, params))
+            Some((sql.to_string(), params))
         }
         // Global tiles (no inbox filter) + stubbed tiles return None.
         OperationsTileKey::FailedJobs
@@ -526,6 +580,11 @@ mod tests {
         crate::notifications::apply_m005(&conn).unwrap();
         crate::side_threads::apply_m006(&conn).unwrap();
         crate::automation::apply_m007(&conn).unwrap();
+        // M015+ (known issues + clusters) + outreach campaigns + M029
+        // (application_errors, sync_state) — needed by the new tile queries.
+        crate::intelligence_features::apply_m015_to_m019(&conn).unwrap();
+        crate::outreach::apply_m023_to_m025(&conn).unwrap();
+        crate::sync_schema::apply_m029(&conn).unwrap();
         conn
     }
 
@@ -583,11 +642,6 @@ mod tests {
             [],
         )
         .unwrap();
-    }
-
-    fn insert_failed_sync_run(conn: &Connection) {
-        conn.execute("INSERT INTO sync_runs (status) VALUES ('failed')", [])
-            .unwrap();
     }
 
     // ---- Tile count tests ----------------------------------------------------
@@ -765,12 +819,36 @@ mod tests {
     }
 
     #[test]
-    fn count_sync_problems_uses_sync_runs_table() {
+    fn count_sync_problems_uses_sync_state_and_recent_errors() {
         let conn = fresh_db();
+        // Fresh: no sync_state, no errors -> 0.
         let count = count_tile(&conn, OperationsTileKey::SyncProblems, None).unwrap();
         assert_eq!(count.count(), Some(0));
 
-        insert_failed_sync_run(&conn);
+        // sync_state ERROR -> +1.
+        conn.execute(
+            "INSERT INTO application_settings (key, value) VALUES ('sync_state', '\"ERROR\"')",
+            [],
+        )
+        .unwrap();
+        let count = count_tile(&conn, OperationsTileKey::SyncProblems, None).unwrap();
+        assert_eq!(count.count(), Some(1));
+
+        // A recent application error adds to the count.
+        conn.execute(
+            "INSERT INTO application_errors (service, message) VALUES ('sync', 'boom')",
+            [],
+        )
+        .unwrap();
+        let count = count_tile(&conn, OperationsTileKey::SyncProblems, None).unwrap();
+        assert_eq!(count.count(), Some(2));
+
+        // Non-ERROR state alone -> 0 again.
+        conn.execute(
+            "UPDATE application_settings SET value = '\"LIVE\"' WHERE key = 'sync_state'",
+            [],
+        )
+        .unwrap();
         let count = count_tile(&conn, OperationsTileKey::SyncProblems, None).unwrap();
         assert_eq!(count.count(), Some(1));
     }
@@ -819,13 +897,9 @@ mod tests {
         let conn = fresh_db();
         // AutomationApprovals is now wired (M4-T10) — removed from this list.
         let stubbed: &[(OperationsTileKey, u8)] = &[
-            (OperationsTileKey::AiEscalation, 6),
-            (OperationsTileKey::SlaAtRisk, 7),
-            (OperationsTileKey::SlaBreached, 7),
-            (OperationsTileKey::RepeatedIssue, 7),
-            (OperationsTileKey::KnownIssue, 7),
-            (OperationsTileKey::IssueSpike, 7),
-            (OperationsTileKey::CampaignActivity, 9),
+            (OperationsTileKey::AiEscalation, 13),
+            (OperationsTileKey::SlaAtRisk, 16),
+            (OperationsTileKey::SlaBreached, 16),
         ];
         for (tile, milestone) in stubbed {
             let count = count_tile(&conn, *tile, None).unwrap();
@@ -896,7 +970,7 @@ mod tests {
             Some(0),
             "AutomationApprovals is real and counts 0"
         );
-        // SlaBreached is still stubbed (ships in M7).
+        // SlaBreached is still stubbed (ships with T16).
         let sla_breached = snapshot.get(OperationsTileKey::SlaBreached).unwrap();
         assert!(sla_breached.is_not_available());
     }
@@ -1033,7 +1107,7 @@ mod tests {
 
     #[test]
     fn tile_count_not_available_count_helper() {
-        let c = TileCount::NotAvailable { milestone: 7 };
+        let c = TileCount::NotAvailable { milestone: 16 };
         assert_eq!(c.count(), None);
         assert!(c.is_not_available());
     }
@@ -1045,9 +1119,9 @@ mod tests {
         assert!(s.contains("\"kind\":\"available\""), "got: {s}");
         assert!(s.contains("\"count\":7"));
 
-        let c = TileCount::NotAvailable { milestone: 7 };
+        let c = TileCount::NotAvailable { milestone: 16 };
         let s = serde_json::to_string(&c).unwrap();
         assert!(s.contains("\"kind\":\"not_available\""), "got: {s}");
-        assert!(s.contains("\"milestone\":7"));
+        assert!(s.contains("\"milestone\":16"));
     }
 }
