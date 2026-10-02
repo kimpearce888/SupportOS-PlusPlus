@@ -13,7 +13,7 @@ use axum::response::IntoResponse;
 /// GET /health — basic health check.
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let db_ok = {
-        let conn = state.conn.lock().expect("mutex poisoned");
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute_batch("SELECT 1").is_ok()
     };
     let status = if db_ok { "ok" } else { "error" };
@@ -35,7 +35,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 
 /// GET /health/detailed — detailed health with all subsystems.
 pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let db_ok = conn.execute_batch("SELECT 1").is_ok();
 
     // Run the self-check.
@@ -66,7 +66,7 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
 
 /// GET /api/system/db — database stats.
 pub async fn db_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let db_path = state.data_dir.join("supportos-plusplus.db");
     let size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     let table_count: i64 = conn
@@ -82,6 +82,7 @@ pub async fn db_stats(State(state): State<AppState>) -> impl IntoResponse {
         "size_bytes": size,
         "tables": table_count,
         "wal": true,
+        "migrations": crate::migrations::latest_version(),
     }))
 }
 
@@ -99,30 +100,32 @@ pub async fn capabilities() -> impl IntoResponse {
 
 /// GET /api/system/tables — table stats.
 pub async fn table_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
-    let mut stmt = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-        .unwrap();
-    let tables: Vec<Value> = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .map(|name| {
-            let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| {
-                    r.get(0)
-                })
-                .unwrap_or(0);
-            json!({"name": name, "rows": count})
-        })
-        .collect();
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let tables: Vec<Value> =
+        match conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name") {
+            Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
+                Ok(rows) => rows
+                    .filter_map(|r| r.ok())
+                    .map(|name| {
+                        let count: i64 = conn
+                            .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| {
+                                r.get(0)
+                            })
+                            .unwrap_or(0);
+                        json!({"name": name, "rows": count})
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
 
     Json(json!({"tables": tables}))
 }
 
 /// GET /api/onboarding — onboarding state.
 pub async fn onboarding(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let first_run = crate::settings::first_run_done(&conn).unwrap_or(false);
     let conv_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
@@ -145,21 +148,21 @@ pub async fn onboarding_step(
         .get("step")
         .and_then(|v| v.as_str())
         .unwrap_or("welcome");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::settings::set_string(&conn, "onboarding_step", step);
     Json(json!({"ok": true}))
 }
 
 /// POST /api/onboarding/complete — mark onboarding done.
 pub async fn onboarding_complete(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::settings::mark_first_run_done(&conn);
     Json(json!({"ok": true, "message": "Onboarding complete."}))
 }
 
 /// POST /api/demo/enable — enable demo mode.
 pub async fn demo_enable(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::settings::set_bool(&conn, "demo_mode", true);
     let _ = crate::settings::mark_first_run_done(&conn);
     Json(json!({
@@ -194,7 +197,7 @@ pub async fn demo_simulate_incoming(
         .and_then(|v| v.as_i64())
         .unwrap_or(3003);
 
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     // Insert a simulated conversation directly.
     let result = conn.execute(
         "INSERT INTO conversations (remote_id, number, subject, preview, status, mailbox_id, customer_id, priority)
@@ -292,7 +295,7 @@ pub async fn demo_simulate_webhook(
 
     // Persist the simulated webhook event (dedup by hash, same as real webhooks).
     {
-        let conn = state.conn.lock().expect("mutex poisoned");
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
         let payload = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
         let _ = conn.execute(
             "INSERT OR IGNORE INTO webhook_events (id, event_type, payload, received_at) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",

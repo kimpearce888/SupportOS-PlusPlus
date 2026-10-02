@@ -13,7 +13,7 @@ pub async fn center(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mailbox_id = params.get("mailboxId").and_then(|m| m.parse::<i64>().ok());
     match crate::operations::build_snapshot(&conn, mailbox_id) {
         Ok(snapshot) => match serde_json::to_value(&snapshot) {
@@ -26,7 +26,7 @@ pub async fn center(
 
 /// GET /api/operations/workload
 pub async fn workload(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::workload::team_workload(&conn, 0, &[]) {
         Ok(w) => Json(serde_json::to_value(&w).unwrap_or(json!({}))),
         Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
@@ -39,7 +39,7 @@ pub async fn set_capacity(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let capacity = body.get("capacity").and_then(|v| v.as_i64()).unwrap_or(10);
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::settings::set_i64(&conn, "team_capacity", capacity);
     Json(json!({"ok": true}))
 }
@@ -50,19 +50,28 @@ pub async fn set_waiting_threshold(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let minutes = body.get("minutes").and_then(|v| v.as_i64()).unwrap_or(240);
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::settings::set_i64(&conn, "waiting_threshold_minutes", minutes);
     Json(json!({"ok": true}))
 }
 
 /// GET /api/operations/suggested-assignees
 pub async fn suggested_assignees(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
-    let mut stmt = conn
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let people: Vec<Value> = conn
         .prepare("SELECT id, first_name, last_name FROM users ORDER BY id LIMIT 10")
-        .unwrap();
-    let people: Vec<Value> = stmt.query_map([], |r| {
-        Ok(json!({"id": r.get::<_, i64>(0)?, "name": format!("{} {}", r.get::<_, String>(1)?, r.get::<_, String>(2)?)}))
-    }).unwrap().filter_map(|r| r.ok()).collect();
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "name": format!("{} {}", r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
     Json(json!({"assignees": people}))
 }

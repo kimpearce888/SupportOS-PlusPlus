@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/outreach/meta
 pub async fn meta(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let segments: i64 = conn
         .query_row("SELECT COUNT(*) FROM saved_segments", [], |r| r.get(0))
         .unwrap_or(0);
@@ -47,7 +47,7 @@ pub async fn suggest_segment(
 
 /// GET /api/outreach/segments
 pub async fn list_segments(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let segments = crate::outreach::list_segments(&conn).unwrap_or_default();
     let items: Vec<Value> = segments
         .iter()
@@ -60,7 +60,7 @@ pub async fn list_segments(State(state): State<AppState>) -> Json<Value> {
 pub async fn create_segment(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let criteria = body.get("criteria").and_then(|v| v.as_str()).unwrap_or("");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::outreach::create_segment(&conn, name, criteria) {
         Ok(id) => Json(json!({"ok": true, "id": id})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
@@ -69,7 +69,7 @@ pub async fn create_segment(State(state): State<AppState>, Json(body): Json<Valu
 
 /// DELETE /api/outreach/segments/:id
 pub async fn delete_segment(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM saved_segments WHERE id = ?1",
         rusqlite::params![id],
@@ -88,7 +88,7 @@ pub async fn create_campaign(
         .get("messageTemplate")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::outreach::create_campaign(&conn, name, segment_id, Some(template)) {
         Ok(id) => Json(json!({"ok": true, "id": id})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
@@ -97,7 +97,7 @@ pub async fn create_campaign(
 
 /// GET /api/outreach/campaigns
 pub async fn list_campaigns(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let campaigns = crate::outreach::list_campaigns(&conn).unwrap_or_default();
     let items: Vec<Value> = campaigns
         .iter()
@@ -108,7 +108,7 @@ pub async fn list_campaigns(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/outreach/campaigns/:id
 pub async fn get_campaign(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let campaigns = crate::outreach::list_campaigns(&conn).unwrap_or_default();
     if let Some(campaign) = campaigns.iter().find(|c| c.id == Some(id)) {
         Json(serde_json::to_value(campaign).unwrap_or(json!({})))

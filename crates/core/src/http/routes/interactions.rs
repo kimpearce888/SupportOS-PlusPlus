@@ -12,7 +12,7 @@ use super::super::server::AppState;
 
 /// GET /api/interaction/:conversationId — list signals for a conversation.
 pub async fn get(State(state): State<AppState>, Path(conversation_id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let signals: Vec<Value> = conn
         .prepare("SELECT id, conversation_id, signal_type, signal_value, confidence, created_at FROM interaction_signals WHERE conversation_id = ?1 ORDER BY created_at DESC")
         .ok()
@@ -53,7 +53,7 @@ pub async fn evidence(
     State(state): State<AppState>,
     Path(conversation_id): Path<i64>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let evidence: Vec<Value> = conn
         .prepare("SELECT id, conversation_id, evidence_type, evidence_data, created_at FROM interaction_evidence WHERE conversation_id = ?1 ORDER BY created_at DESC")
         .ok()
@@ -77,7 +77,7 @@ pub async fn evidence(
 
 /// GET /api/interaction/profile/:customerId — interaction profile for a customer.
 pub async fn profile(State(state): State<AppState>, Path(customer_id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     // Aggregate the customer's signals across all their conversations.
     let total_signals: i64 = conn
         .query_row(

@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/issues/clusters
 pub async fn list_clusters(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let clusters: Vec<Value> = conn
         .prepare("SELECT id, name, status, created_at FROM issue_clusters ORDER BY id DESC")
         .ok()
@@ -31,7 +31,7 @@ pub async fn list_clusters(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/issues/sla-alerts
 pub async fn sla_alerts(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let breached: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM conversations WHERE response_state = 'sla_breached'",
@@ -44,7 +44,7 @@ pub async fn sla_alerts(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/issues/clusters/:id
 pub async fn get_cluster(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let row = conn.query_row(
         "SELECT id, name, status, created_at FROM issue_clusters WHERE id = ?1",
         rusqlite::params![id],
@@ -65,7 +65,7 @@ pub async fn get_cluster(State(state): State<AppState>, Path(id): Path<i64>) -> 
 
 /// DELETE /api/issues/clusters/:id
 pub async fn delete_cluster(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM issue_clusters WHERE id = ?1",
         rusqlite::params![id],
@@ -75,7 +75,7 @@ pub async fn delete_cluster(State(state): State<AppState>, Path(id): Path<i64>) 
 
 /// GET /api/issues/known
 pub async fn list_known(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let issues = crate::intelligence_features::list_known_issues(&conn, None).unwrap_or_default();
     let items: Vec<Value> = issues
         .iter()
@@ -91,7 +91,7 @@ pub async fn create_known(State(state): State<AppState>, Json(body): Json<Value>
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "INSERT INTO known_issues (name, status, description, created_at, updated_at) VALUES (?1, 'active', ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![name, description],
@@ -101,7 +101,7 @@ pub async fn create_known(State(state): State<AppState>, Json(body): Json<Value>
 
 /// GET /api/issues/known/:id
 pub async fn get_known(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::intelligence_features::list_known_issues(&conn, Some("active")) {
         Ok(issues) => {
             if let Some(issue) = issues.iter().find(|i| i.id == Some(id)) {
@@ -120,7 +120,7 @@ pub async fn update_known(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
         let _ = conn.execute("UPDATE known_issues SET name = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?2", rusqlite::params![name, id]);
     }
@@ -132,7 +132,7 @@ pub async fn update_known(
 
 /// DELETE /api/issues/known/:id
 pub async fn delete_known(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM known_issues WHERE id = ?1",
         rusqlite::params![id],
@@ -145,7 +145,7 @@ pub async fn link_known(
     State(state): State<AppState>,
     Path((id, conversation_id)): Path<(i64, i64)>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "INSERT OR IGNORE INTO known_issue_links (known_issue_id, conversation_id, link_type) VALUES (?1, ?2, 'manual')",
         rusqlite::params![id, conversation_id],
@@ -158,7 +158,7 @@ pub async fn unlink_known(
     State(state): State<AppState>,
     Path((id, conversation_id)): Path<(i64, i64)>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM known_issue_links WHERE known_issue_id = ?1 AND conversation_id = ?2",
         rusqlite::params![id, conversation_id],

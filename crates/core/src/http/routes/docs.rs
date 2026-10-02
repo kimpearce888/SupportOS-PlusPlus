@@ -11,7 +11,7 @@ use super::super::server::AppState;
 
 /// GET /api/docs/collections — list all doc collections (grouped by source).
 pub async fn collections(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let collections: Vec<Value> = conn
         .prepare(
             "SELECT source, COUNT(*) FROM knowledge_doc_freshness GROUP BY source ORDER BY source",
@@ -29,12 +29,15 @@ pub async fn collections(State(state): State<AppState>) -> Json<Value> {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({"collections": collections}))
+    Json(json!({
+        "collections": collections,
+        "docs_sync_available": false,
+    }))
 }
 
 /// GET /api/docs/stats — aggregate stats over all docs.
 pub async fn stats(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM knowledge_doc_freshness", [], |r| {
             r.get(0)
@@ -66,6 +69,19 @@ pub async fn stats(State(state): State<AppState>) -> Json<Value> {
         "fresh": fresh,
         "stale": stale,
         "sources": sources,
+        "articles": total,
+        "collections": sources,
+        "drafts": 0,
+        "internal": 0,
+        "published": total,
+        "email_conversations": 0,
+        "chat_sessions": 0,
+        "total_views": 0,
+        "last_synced_at": null,
+        "docs_chunks": 0,
+        "docs_chunks_indexed": 0,
+        "docs_chunks_pending": 0,
+        "docs_chunks_failed": 0,
     }))
 }
 
@@ -78,7 +94,7 @@ pub async fn search(
     if q.trim().is_empty() {
         return Json(json!({"results": [], "query": q}));
     }
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     // LIKE-based search of the doc titles. The FTS5 search module indexes
     // conversations + customers, not docs; for docs we fall back to LIKE.
     let pattern = format!("%{q}%");
@@ -111,7 +127,7 @@ pub async fn articles(
         .and_then(|l| l.parse::<u32>().ok())
         .unwrap_or(50);
     let source = params.get("source").cloned();
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let articles: Vec<Value> = if let Some(s) = source.as_ref() {
         conn.prepare("SELECT id, title, source, freshness_status, last_reviewed_at FROM knowledge_doc_freshness WHERE source = ?1 ORDER BY id DESC LIMIT ?2")
             .ok()
@@ -149,12 +165,17 @@ pub async fn articles(
             })
             .unwrap_or_default()
     };
-    Json(json!({"articles": articles}))
+    Json(json!({
+        "articles": articles,
+        "total": articles.len(),
+        "page": 1,
+        "page_size": limit,
+    }))
 }
 
 /// GET /api/docs/articles/:id — single article by id.
 pub async fn article(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let row = conn.query_row(
         "SELECT id, title, source, freshness_status, last_reviewed_at FROM knowledge_doc_freshness WHERE id = ?1",
         rusqlite::params![id],

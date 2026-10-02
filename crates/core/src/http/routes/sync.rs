@@ -10,7 +10,7 @@ use super::super::server::AppState;
 
 /// GET /api/sync/status
 pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let sync_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sync_runs WHERE status != 'running'",
@@ -76,7 +76,7 @@ pub async fn unregister_webhook(
 
 /// GET /api/queue — job queue status.
 pub async fn queue(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let queued: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
@@ -103,7 +103,7 @@ pub async fn queue(State(state): State<AppState>) -> impl IntoResponse {
 
 /// POST /api/queue/:id/retry
 pub async fn retry_job(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "UPDATE jobs SET status = 'queued', attempts = 0 WHERE id = ?1",
         rusqlite::params![id],
@@ -113,7 +113,7 @@ pub async fn retry_job(State(state): State<AppState>, Path(id): Path<i64>) -> im
 
 /// POST /api/queue/:id/cancel
 pub async fn cancel_job(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "UPDATE jobs SET status = 'cancelled' WHERE id = ?1",
         rusqlite::params![id],

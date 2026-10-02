@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 
 /// GET /api/settings — get all settings.
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = conn
         .prepare("SELECT key, value FROM application_settings ORDER BY key")
         .unwrap();
@@ -29,7 +29,7 @@ pub async fn update_settings(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(obj) = body.as_object() {
         for (key, value) in obj {
             let val_str = match value {
@@ -44,7 +44,7 @@ pub async fn update_settings(
 
 /// GET /api/settings/lmstudio
 pub async fn get_lmstudio(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::ai_center::get_ai_status(&conn) {
         Ok(status) => Json(serde_json::to_value(&status).unwrap_or(json!({}))),
         Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
@@ -56,7 +56,7 @@ pub async fn update_lmstudio(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(provider) = body.get("provider").and_then(|v| v.as_str()) {
         let kind = crate::ai_center::ProviderKind::parse(provider);
         if let Some(k) = kind {
@@ -85,7 +85,7 @@ pub async fn test_lmstudio(State(_state): State<AppState>) -> impl IntoResponse 
 
 /// GET /api/settings/qdrant
 pub async fn get_qdrant(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let enabled = crate::settings::get_bool(&conn, "qdrant_enabled", false).unwrap_or(false);
     let url = crate::settings::get_string(&conn, "qdrant_url")
         .ok()
@@ -99,7 +99,7 @@ pub async fn update_qdrant(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(enabled) = body.get("enabled").and_then(|v| v.as_bool()) {
         let _ = crate::settings::set_bool(&conn, "qdrant_enabled", enabled);
     }
@@ -111,7 +111,7 @@ pub async fn update_qdrant(
 
 /// GET /api/settings/business-hours
 pub async fn get_business_hours(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = conn
         .prepare("SELECT mailbox_id, config_json FROM sla_configs ORDER BY mailbox_id")
         .unwrap();
@@ -131,7 +131,7 @@ pub async fn set_business_hours(
     axum::extract::Path(mailbox_id): axum::extract::Path<i64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let config = body.to_string();
     let _ = conn.execute(
         "INSERT OR REPLACE INTO sla_configs (mailbox_id, config_json) VALUES (?1, ?2)",
@@ -145,7 +145,7 @@ pub async fn delete_business_hours(
     State(state): State<AppState>,
     axum::extract::Path(mailbox_id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM sla_configs WHERE mailbox_id = ?1",
         rusqlite::params![mailbox_id],

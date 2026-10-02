@@ -33,7 +33,8 @@ pub async fn meta(State(_state): State<AppState>) -> Json<Value> {
     Json(json!({
         "provider": "none",
         "languages": languages,
-        "message": "No translation provider configured. Text is returned unchanged."
+        "agent_language": "en",
+        "note": "No translation provider configured. Text is returned unchanged."
     }))
 }
 
@@ -63,7 +64,7 @@ pub async fn detect(State(_state): State<AppState>, Json(body): Json<Value>) -> 
 
 /// GET /api/translation/conversation/:id — list translations for a conversation.
 pub async fn conversation(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let translations: Vec<Value> = conn
         .prepare("SELECT id, conversation_id, thread_id, target_language, translated_text, created_at FROM conversation_translations WHERE conversation_id = ?1 ORDER BY created_at DESC")
         .ok()

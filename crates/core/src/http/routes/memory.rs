@@ -12,7 +12,7 @@ use super::super::server::AppState;
 
 /// GET /api/memory/meta — overall memory store stats.
 pub async fn meta(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM customer_memory", [], |r| r.get(0))
         .unwrap_or(0);
@@ -31,12 +31,28 @@ pub async fn meta(State(state): State<AppState>) -> Json<Value> {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({"total": total, "by_source": by_source}))
+    Json(json!({
+        "total": total,
+        "by_source": by_source,
+        "sections": by_source.iter().map(|s| s["source"].clone()).collect::<Vec<_>>(),
+        "section_labels": by_source.iter().map(|s| {
+            let src = s["source"].as_str().unwrap_or("manual");
+            let label = match src {
+                "ai" => "AI-generated",
+                "manual" => "Manually added",
+                "imported" => "Imported",
+                _ => src,
+            };
+            json!({src: label})
+        }).collect::<Vec<_>>(),
+        "entry_kinds": ["preference", "history", "signal", "note"],
+        "notes": "Memory stats aggregated from the local customer_memory table."
+    }))
 }
 
 /// GET /api/memory/:customerId — list memory entries for a customer.
 pub async fn get(State(state): State<AppState>, Path(customer_id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let entries: Vec<Value> = conn
         .prepare("SELECT id, customer_id, key, value, source, created_at FROM customer_memory WHERE customer_id = ?1 ORDER BY created_at DESC")
         .ok()
@@ -71,7 +87,7 @@ pub async fn add_entry(
         .get("source")
         .and_then(|v| v.as_str())
         .unwrap_or("manual");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let inserted = conn
         .execute(
             "INSERT INTO customer_memory (customer_id, key, value, source, created_at)

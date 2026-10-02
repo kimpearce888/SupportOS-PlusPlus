@@ -13,7 +13,7 @@ pub async fn dashboard(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mailbox_id = params.get("mailboxId").and_then(|m| m.parse::<i64>().ok());
     let days_back = params
         .get("daysBack")
@@ -35,7 +35,7 @@ pub async fn sla_report(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let days_back = params
         .get("daysBack")
         .and_then(|d| d.parse::<u32>().ok())
@@ -59,7 +59,7 @@ pub async fn answer_reuse(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({"reuse": []}))
 }
 pub async fn issue_radar(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::intelligence_features::get_radar_snapshot(&conn) {
         Ok(snapshot) => {
             let alerts = vec![json!({
@@ -101,7 +101,7 @@ pub async fn effectiveness(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({"effectiveness": []}))
 }
 pub async fn report_catalog(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::reports::get_health_facts(&conn, 7) {
         Ok(facts) => Json(serde_json::to_value(&facts).unwrap_or(json!({}))),
         Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),

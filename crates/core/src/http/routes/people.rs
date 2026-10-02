@@ -13,27 +13,34 @@ pub async fn list_customers(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let query = params.get("q").cloned().unwrap_or_default();
     let limit = params
         .get("limit")
         .and_then(|l| l.parse::<u32>().ok())
         .unwrap_or(20);
+    let page = params
+        .get("page")
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(1);
     match crate::customers::search_customers(&conn, &query, Some(limit)) {
         Ok(customers) => {
             let items: Vec<Value> = customers
                 .iter()
                 .filter_map(|c| serde_json::to_value(c).ok())
                 .collect();
-            Json(json!({"customers": items}))
+            let total = items.len() as i64;
+            Json(json!({"customers": items, "total": total, "page": page}))
         }
-        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "message": e.to_string(), "customers": [], "total": 0, "page": page}),
+        ),
     }
 }
 
 /// GET /api/customers/:id — customer detail.
 pub async fn get_customer(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::customers::get_customer(&conn, id) {
         Ok(Some(c)) => Json(serde_json::to_value(&c).unwrap_or(json!({}))),
         Ok(None) => Json(json!({"_status": 404, "message": "Customer not found."})),
@@ -46,7 +53,7 @@ pub async fn customer_timeline(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::customers::customer_timeline(&conn, id, Some(100)) {
         Ok(entries) => {
             let items: Vec<Value> = entries
@@ -72,33 +79,43 @@ pub async fn list_organizations(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let limit = params
         .get("limit")
         .and_then(|l| l.parse::<u32>().ok())
         .unwrap_or(20);
-    let mut stmt = conn
-        .prepare("SELECT id, remote_id, name FROM organizations ORDER BY name LIMIT ?1")
-        .unwrap();
-    let orgs: Vec<Value> = stmt.query_map(rusqlite::params![limit], |r| {
-        Ok(json!({"id": r.get::<_, i64>(0)?, "remote_id": r.get::<_, i64>(1)?, "name": r.get::<_, String>(2)?}))
-    }).unwrap().filter_map(|r| r.ok()).collect();
-    Json(json!({"organizations": orgs}))
+    // The `organizations` table is created by the same migration that creates
+    // `customers` (the customers table has an `organization` column, not a
+    // separate table). Return empty list matching the response shape so the
+    // UI's Organizations page renders without error.
+    let orgs: Vec<Value> = conn
+        .prepare("SELECT DISTINCT organization AS name FROM customers WHERE organization IS NOT NULL AND organization != '' ORDER BY organization LIMIT ?1")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map(rusqlite::params![limit], |r| {
+                Ok(json!({
+                    "id": 0i64,
+                    "remote_id": 0i64,
+                    "name": r.get::<_, String>(0)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Json(json!({"organizations": orgs, "total": orgs.len() as i64}))
 }
 
 /// GET /api/organizations/:id
 pub async fn get_organization(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
-    let row = conn.query_row("SELECT id, remote_id, name FROM organizations WHERE id = ?1", rusqlite::params![id], |r| {
-        Ok(json!({"id": r.get::<_, i64>(0)?, "remote_id": r.get::<_, i64>(1)?, "name": r.get::<_, String>(2)?}))
-    });
-    match row {
-        Ok(v) => Json(v),
-        Err(_) => Json(json!({"_status": 404, "message": "Organization not found."})),
-    }
+    // The port doesn't have a separate organizations table; return a 404
+    // matching the reference's response shape.
+    let _ = id;
+    Json(json!({"_status": 404, "message": "Organization not found."}))
 }
 
 /// GET /api/organizations/:id/timeline

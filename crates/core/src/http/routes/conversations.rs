@@ -13,7 +13,7 @@ pub async fn list(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
 
     let mut filters = crate::inbox::InboxFilters::default();
     if let Some(status) = params.get("view") {
@@ -52,7 +52,7 @@ pub async fn list(
 
 /// GET /api/conversations/:id — conversation detail with threads.
 pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::inbox::get_conversation(&conn, id) {
         Ok(Some(detail)) => match serde_json::to_value(&detail) {
             Ok(v) => Json(v),
@@ -81,7 +81,7 @@ pub async fn reply(
             json!({"_status": 422, "statusCode": 422, "error": "ValidationError", "message": "Reply body cannot be empty."}),
         );
     }
-    let mut conn = state.conn.lock().expect("mutex poisoned");
+    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let result = crate::inbox::reply_to_conversation(
         &mut conn,
         id,
@@ -111,7 +111,7 @@ pub async fn note(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let mut conn = state.conn.lock().expect("mutex poisoned");
+    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let result = crate::inbox::add_note(
         &mut conn,
         id,
@@ -144,7 +144,7 @@ pub async fn status(
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("active");
-    let mut conn = state.conn.lock().expect("mutex poisoned");
+    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let result = crate::inbox::change_status(
         &mut conn,
         id,
@@ -174,7 +174,7 @@ pub async fn assign(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let assignee = body.get("assigneeLocalId").and_then(|v| v.as_i64());
-    let mut conn = state.conn.lock().expect("mutex poisoned");
+    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let result = crate::inbox::assign(&mut conn, id, assignee, "user".to_string(), None);
     drop(conn);
     match result {
@@ -201,7 +201,7 @@ pub async fn priority(
         .get("priority")
         .and_then(|v| v.as_str())
         .unwrap_or("normal");
-    let mut conn = state.conn.lock().expect("mutex poisoned");
+    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     use crate::ticket_ops::{execute, TicketOperation};
     let op = TicketOperation::SetPriority {
         conversation_remote_id: id,
@@ -235,7 +235,7 @@ pub async fn subject(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let new_subject = body.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let result = conn.execute(
         "UPDATE conversations SET subject = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE remote_id = ?2",
         rusqlite::params![new_subject, id],
@@ -260,7 +260,7 @@ pub async fn set_state(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let new_state = body.get("state").and_then(|v| v.as_str()).unwrap_or("");
-    let mut conn = state.conn.lock().expect("mutex poisoned");
+    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     use crate::ticket_ops::{execute, TicketOperation};
     let op = TicketOperation::SetTicketState {
         conversation_remote_id: id,
@@ -288,7 +288,7 @@ pub async fn set_state(
 
 /// GET /api/conversations/:id/events — activity events for a conversation.
 pub async fn events(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = match conn.prepare(
         "SELECT id, conversation_id, event_type, actor_type, actor_id, occurred_at
          FROM activity_events WHERE conversation_id = ?1 ORDER BY occurred_at ASC",
@@ -311,9 +311,9 @@ pub async fn events(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
                 "occurred_at": r.get::<_, String>(5)?,
             }))
         })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
 
     Json(json!({"events": events}))
 }
@@ -325,7 +325,7 @@ pub async fn activity_rebuild(State(state): State<AppState>) -> impl IntoRespons
 
 /// GET /api/ticket-states — list custom ticket states.
 pub async fn list_ticket_states(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = match conn.prepare("SELECT id, name, color FROM ticket_states ORDER BY id") {
         Ok(s) => s,
         Err(_) => {
@@ -340,9 +340,114 @@ pub async fn list_ticket_states(State(state): State<AppState>) -> impl IntoRespo
                 "color": r.get::<_, String>(2)?,
             }))
         })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
 
     Json(json!({"states": states, "bottlenecks": []}))
+}
+
+/// GET /api/mailboxes — list all mailboxes (reference data for the UI).
+pub async fn list_mailboxes(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mailboxes: Vec<Value> = conn
+        .prepare("SELECT id, remote_id, name, email FROM mailboxes ORDER BY id")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "remote_id": r.get::<_, i64>(1)?,
+                    "name": r.get::<_, String>(2)?,
+                    "email": r.get::<_, Option<String>>(3)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Json(mailboxes)
+}
+
+/// GET /api/tags — list all tags (reference data for the UI).
+pub async fn list_tags(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let tags: Vec<Value> = conn
+        .prepare("SELECT id, name, (SELECT COUNT(*) FROM conversation_tags WHERE tag_id = t.id) AS ticket_count FROM tags t ORDER BY t.name")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "ticket_count": r.get::<_, i64>(2)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Json(tags)
+}
+
+/// GET /api/users — list all users + system users (reference data for the UI).
+pub async fn list_users(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let users: Vec<Value> = conn
+        .prepare("SELECT id, remote_id, first_name, last_name, email FROM users ORDER BY id")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                let first: String = r.get::<_, String>(2).unwrap_or_default();
+                let last: String = r.get::<_, String>(3).unwrap_or_default();
+                let display_name = format!("{first} {last}").trim().to_string();
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "remote_id": r.get::<_, i64>(1)?,
+                    "display_name": display_name,
+                    "email": r.get::<_, Option<String>>(4)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Json(json!({"users": users, "system_users": []}))
+}
+
+/// GET /api/teams — list all teams (reference data for the UI).
+pub async fn list_teams(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let teams: Vec<Value> = conn
+        .prepare("SELECT id, name FROM teams ORDER BY id")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Json(json!({"teams": teams}))
+}
+
+/// GET /api/saved-replies — list saved reply templates (reference data for the UI).
+pub async fn list_saved_replies(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // The port doesn't have a saved_replies table; return an empty list
+    // matching the reference's response shape so the UI's "saved replies"
+    // dropdown renders without error.
+    let _ = params.get("q"); // query param is supported by the reference
+    Json(json!({"saved_replies": []}))
 }

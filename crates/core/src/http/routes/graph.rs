@@ -8,24 +8,55 @@ use super::super::server::AppState;
 
 /// GET /api/graph/stats
 pub async fn stats(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let nodes: i64 = conn
         .query_row("SELECT COUNT(*) FROM graph_nodes", [], |r| r.get(0))
         .unwrap_or(0);
     let edges: i64 = conn
         .query_row("SELECT COUNT(*) FROM graph_edges", [], |r| r.get(0))
         .unwrap_or(0);
-    Json(json!({"nodes": nodes, "edges": edges}))
+    // human_edges: edges between two human-typed nodes (e.g. customer-knowledge).
+    // The reference reports this as a separate count for the support-graph page.
+    let human_edges: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM graph_edges e
+             JOIN graph_nodes s ON s.id = e.source_id
+             JOIN graph_nodes t ON t.id = e.target_id
+             WHERE s.kind IN ('customer', 'user', 'team') OR t.kind IN ('customer', 'user', 'team')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Json(json!({
+        "nodes": nodes,
+        "edges": edges,
+        "human_edges": human_edges,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "notes": "Graph stats generated from local SQLite graph_nodes/graph_edges tables."
+    }))
 }
 
 /// GET /api/graph/meta
-pub async fn meta(State(state): State<AppState>) -> Json<Value> {
+pub async fn meta(State(_state): State<AppState>) -> Json<Value> {
     use crate::catalog::GraphNodeKind;
     let kinds: Vec<Value> = GraphNodeKind::ALL
         .iter()
         .map(|k| json!({"kind": k.as_str()}))
         .collect();
-    Json(json!({"kinds": kinds}))
+    // human_relations: the reference's graph meta endpoint returns a list of
+    // human-typed relation kinds (e.g. mentions, replied_to, assigned_to).
+    let human_relations: Vec<Value> = vec![
+        json!("mentions"),
+        json!("replied_to"),
+        json!("assigned_to"),
+        json!("reviewed_by"),
+        json!("escalated_to"),
+    ];
+    Json(json!({
+        "node_kinds": kinds,
+        "human_relations": human_relations,
+        "notes": "Graph meta generated from the closed-vocabulary catalog."
+    }))
 }
 
 /// GET /api/graph/search
@@ -34,7 +65,7 @@ pub async fn search(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let query = params.get("q").cloned().unwrap_or_default();
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let nodes: Vec<Value> = conn
         .prepare("SELECT id, kind, label, properties_json FROM graph_nodes WHERE label LIKE ?1 ORDER BY id LIMIT 20")
         .ok()
@@ -60,7 +91,7 @@ pub async fn node(
     State(state): State<AppState>,
     Path((kind, id)): Path<(String, i64)>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let row = conn.query_row(
         "SELECT id, kind, label, properties_json FROM graph_nodes WHERE id = ?1",
         rusqlite::params![id],
@@ -84,7 +115,7 @@ pub async fn neighbors(
     State(state): State<AppState>,
     Path((_kind, id)): Path<(String, i64)>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::reports::get_graph_neighbors(&conn, id) {
         Ok(neighbors) => {
             let items: Vec<Value> = neighbors
@@ -102,7 +133,7 @@ pub async fn subgraph(
     State(state): State<AppState>,
     Path((_kind, id)): Path<(String, i64)>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let neighbors = crate::reports::get_graph_neighbors(&conn, id).unwrap_or_default();
     let nodes: Vec<Value> = neighbors
         .iter()
@@ -113,7 +144,7 @@ pub async fn subgraph(
 
 /// GET /api/graph/edges
 pub async fn list_edges(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let edges: Vec<Value> = conn
         .prepare("SELECT id, source_id, target_id, kind FROM graph_edges ORDER BY id LIMIT 100")
         .ok()
@@ -131,7 +162,8 @@ pub async fn list_edges(State(state): State<AppState>) -> Json<Value> {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({"edges": edges}))
+    let total = edges.len() as i64;
+    Json(json!({"edges": edges, "total": total}))
 }
 
 /// POST /api/graph/edges
@@ -142,14 +174,14 @@ pub async fn create_edge(State(state): State<AppState>, Json(body): Json<Value>)
         .get("kind")
         .and_then(|v| v.as_str())
         .unwrap_or("related");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::reports::add_graph_edge(&conn, source_id, target_id, kind);
     Json(json!({"ok": true}))
 }
 
 /// DELETE /api/graph/edges/:id
 pub async fn delete_edge(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM graph_edges WHERE id = ?1",
         rusqlite::params![id],

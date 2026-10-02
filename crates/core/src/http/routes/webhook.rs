@@ -17,7 +17,7 @@ pub async fn handle(
 
     // Verify HMAC-SHA1 signature.
     let secret = crate::settings::get_string(
-        &state.conn.lock().expect("mutex poisoned"),
+        &state.conn.lock().unwrap_or_else(|p| p.into_inner()),
         "webhook_secret",
     )
     .ok()
@@ -56,7 +56,7 @@ pub async fn handle(
         .unwrap_or("unknown");
     let event_hash = format!("{:x}", crc32fast::hash(raw_body.as_bytes()));
 
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let result = conn.execute(
         "INSERT OR IGNORE INTO webhook_events (id, event_type, payload, received_at) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![event_hash, event_type, raw_body],

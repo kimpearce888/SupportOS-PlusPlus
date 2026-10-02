@@ -11,7 +11,7 @@ pub async fn list_side_threads(
     State(state): State<AppState>,
     Path(conversation_id): Path<i64>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let threads = crate::side_threads::list_side_threads_for_conversation(&conn, conversation_id)
         .unwrap_or_default();
     let items: Vec<Value> = threads
@@ -28,7 +28,7 @@ pub async fn create_side_thread(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let created_by = body.get("createdByUserId").and_then(|v| v.as_i64());
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::side_threads::create_side_thread(&conn, conversation_id, created_by) {
         Ok(id) => Json(json!({"ok": true, "id": id})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
@@ -37,7 +37,7 @@ pub async fn create_side_thread(
 
 /// GET /api/side-threads/:id
 pub async fn get_side_thread(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let messages = crate::side_threads::list_side_thread_messages(&conn, id).unwrap_or_default();
     let items: Vec<Value> = messages
         .iter()
@@ -54,7 +54,7 @@ pub async fn add_message(
 ) -> Json<Value> {
     let text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let author = body.get("authorUserId").and_then(|v| v.as_i64());
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::side_threads::add_side_thread_message(&conn, thread_id, text, author) {
         Ok(id) => Json(json!({"ok": true, "id": id})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
@@ -63,7 +63,7 @@ pub async fn add_message(
 
 /// POST /api/side-threads/:id/resolve
 pub async fn resolve(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "UPDATE side_threads SET resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
         rusqlite::params![id],
@@ -73,7 +73,7 @@ pub async fn resolve(State(state): State<AppState>, Path(id): Path<i64>) -> Json
 
 /// POST /api/side-threads/:id/reopen
 pub async fn reopen(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "UPDATE side_threads SET resolved_at = NULL WHERE id = ?1",
         rusqlite::params![id],
@@ -92,7 +92,7 @@ pub async fn add_participants(
 
 /// GET /api/mention-directory
 pub async fn mention_directory(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = conn
         .prepare("SELECT id, first_name, last_name FROM users ORDER BY first_name")
         .unwrap();

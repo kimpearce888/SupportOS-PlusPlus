@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/inbox-views
 pub async fn list_views(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::saved_views::ensure_saved_views_table(&conn);
     let views = crate::inbox::list_saved_views(&conn).unwrap_or_default();
     let items: Vec<Value> = views
@@ -20,7 +20,7 @@ pub async fn list_views(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/inbox-views/:id
 pub async fn get_view(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::saved_views::load_view(&conn, id) {
         Ok(view) => Json(serde_json::to_value(&view).unwrap_or(json!({}))),
         Err(_) => Json(json!({"error": "View not found"})),
@@ -32,7 +32,7 @@ pub async fn create_view(State(state): State<AppState>, Json(body): Json<Value>)
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let conditions = body.get("conditions").unwrap_or(&Value::Null);
     let mailbox_id = body.get("mailboxId").and_then(|v| v.as_i64());
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let view = crate::saved_views::SavedView {
         id: None,
         name: name.to_string(),
@@ -56,7 +56,7 @@ pub async fn update_view(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
         let _ = conn.execute(
             "UPDATE saved_views SET name = ?1 WHERE id = ?2",
@@ -68,7 +68,7 @@ pub async fn update_view(
 
 /// DELETE /api/inbox-views/:id
 pub async fn delete_view(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM saved_views WHERE id = ?1",
         rusqlite::params![id],

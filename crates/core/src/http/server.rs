@@ -21,6 +21,23 @@ use crate::error::Result;
 use super::rate_limit::RateLimiter;
 use super::routes;
 use super::EventBus;
+use std::sync::{Mutex, MutexGuard};
+
+/// Helper to lock the AppState mutex. Recovers from a poisoned mutex
+/// (which happens when a previous handler panicked while holding the
+/// lock) by clearing the poison and continuing — the SQLite connection
+/// is still valid after a panic in most cases. This keeps the HTTP
+/// server usable even if one route handler panics on an unexpected
+/// SQL error.
+pub fn lock_or_recover<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| {
+        // Clear the poison flag by force-recovering — the underlying
+        // data is still there, just flagged as poisoned because a
+        // thread panicked while holding the lock.
+        tracing::warn!("AppState mutex was poisoned — recovering");
+        poisoned.into_inner()
+    })
+}
 
 /// Shared application state for all HTTP handlers.
 /// This wraps the SQLite connection + config + event bus + rate limiter,
@@ -41,6 +58,16 @@ pub struct AppState {
     pub bus: EventBus,
     /// Mutation rate limiter — 300 writes/min per IP, mirrors the reference.
     pub limiter: RateLimiter,
+}
+
+impl AppState {
+    /// Lock the SQLite connection, recovering from a poisoned mutex
+    /// instead of panicking. This is the safe way to get the conn
+    /// from route handlers — use `state.conn_lock()` instead of
+    /// `state.conn.lock().expect("mutex poisoned")`.
+    pub fn conn_lock(&self) -> MutexGuard<'_, rusqlite::Connection> {
+        lock_or_recover(&self.conn)
+    }
 }
 
 /// The HTTP server. Owns the bound socket address.
@@ -223,6 +250,17 @@ impl HttpServer {
             .route(
                 "/api/ticket-states",
                 get(routes::conversations::list_ticket_states),
+            )
+            // Reference data endpoints — used by the React/Leptos UI to
+            // populate dropdowns, typeahead, etc. Mirrors the reference's
+            // routes/conversations.ts reference-data block.
+            .route("/api/mailboxes", get(routes::conversations::list_mailboxes))
+            .route("/api/tags", get(routes::conversations::list_tags))
+            .route("/api/users", get(routes::conversations::list_users))
+            .route("/api/teams", get(routes::conversations::list_teams))
+            .route(
+                "/api/saved-replies",
+                get(routes::conversations::list_saved_replies),
             )
             // People (customers + organizations)
             .route("/api/customers", get(routes::people::list_customers))

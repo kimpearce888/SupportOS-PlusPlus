@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/connectors
 pub async fn list(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let connectors = crate::data_tools::list_connectors(&conn).unwrap_or_default();
     let items: Vec<Value> = connectors
         .iter()
@@ -25,7 +25,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<Value>) -> J
         .and_then(|v| v.as_str())
         .unwrap_or("local_json");
     let config = body.get("config").and_then(|v| v.as_str()).unwrap_or("{}");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::data_tools::create_connector(
         &conn,
         name,
@@ -40,7 +40,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<Value>) -> J
 
 /// GET /api/connectors/:id
 pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let connectors = crate::data_tools::list_connectors(&conn).unwrap_or_default();
     if let Some(c) = connectors.iter().find(|c| c.id == Some(id)) {
         Json(serde_json::to_value(c).unwrap_or(json!({})))
@@ -55,7 +55,7 @@ pub async fn update(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
         let _ = conn.execute(
             "UPDATE connectors SET name = ?1 WHERE id = ?2",
@@ -67,7 +67,7 @@ pub async fn update(
 
 /// DELETE /api/connectors/:id
 pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::data_tools::delete_connector(&conn, id);
     Json(json!({"ok": true}))
 }

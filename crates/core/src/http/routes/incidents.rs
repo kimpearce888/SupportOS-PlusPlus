@@ -8,13 +8,14 @@ use super::super::server::AppState;
 
 /// GET /api/incidents
 pub async fn list(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let incidents = crate::intelligence_features::list_incidents(&conn, None).unwrap_or_default();
     let items: Vec<Value> = incidents
         .iter()
         .filter_map(|i| serde_json::to_value(i).ok())
         .collect();
-    Json(json!({"incidents": items}))
+    let total = items.len() as i64;
+    Json(json!({"incidents": items, "total": total}))
 }
 
 /// POST /api/incidents
@@ -24,7 +25,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<Value>) -> J
 
 /// GET /api/incidents/:id
 pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let incidents = crate::intelligence_features::list_incidents(&conn, None).unwrap_or_default();
     if let Some(incident) = incidents.iter().find(|i| i.id == Some(id)) {
         Json(serde_json::to_value(incident).unwrap_or(json!({})))
@@ -39,7 +40,7 @@ pub async fn update(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(status) = body.get("status").and_then(|v| v.as_str()) {
         // Status update via HTTP needs IncidentStatus enum parsing (not yet wired)
     }
@@ -48,7 +49,7 @@ pub async fn update(
 
 /// DELETE /api/incidents/:id
 pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute("DELETE FROM incidents WHERE id = ?1", rusqlite::params![id]);
     Json(json!({"ok": true}))
 }
@@ -58,7 +59,7 @@ pub async fn link_conversation(
     State(state): State<AppState>,
     Path((id, conversation_id)): Path<(i64, i64)>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id) VALUES (?1, ?2)",
         rusqlite::params![id, conversation_id],
@@ -73,7 +74,7 @@ pub async fn add_note(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let note = body.get("note").and_then(|v| v.as_str()).unwrap_or("");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "INSERT INTO incident_timeline (incident_id, event_type, description, created_at) VALUES (?1, 'note', ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![id, note],
@@ -126,7 +127,7 @@ pub async fn delete_related(
 
 /// GET /api/incidents/:id/impact
 pub async fn impact(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let linked: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM incident_conversations WHERE incident_id = ?1",

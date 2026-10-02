@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/automation/rules
 pub async fn list_rules(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let rules = crate::automation::list_rules(&conn).unwrap_or_default();
     let items: Vec<Value> = rules
         .iter()
@@ -33,7 +33,7 @@ pub async fn create_rule(State(state): State<AppState>, Json(body): Json<Value>)
         .get("action")
         .and_then(|v| v.as_str())
         .unwrap_or("change_status");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "INSERT INTO automation_rules (name, enabled, trigger, action, created_at) VALUES (?1, 1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![name, trigger, action],
@@ -47,7 +47,7 @@ pub async fn update_rule(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
         let _ = conn.execute(
             "UPDATE automation_rules SET name = ?1 WHERE id = ?2",
@@ -65,7 +65,7 @@ pub async fn update_rule(
 
 /// DELETE /api/automation/rules/:id
 pub async fn delete_rule(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM automation_rules WHERE id = ?1",
         rusqlite::params![id],

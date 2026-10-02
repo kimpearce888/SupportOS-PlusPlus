@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/ai/status
 pub async fn status(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::ai_center::get_ai_status(&conn) {
         Ok(s) => Json(serde_json::to_value(&s).unwrap_or(json!({}))),
         Err(_) => Json(json!({"provider_kind": "none"})),
@@ -62,7 +62,7 @@ pub async fn get_memory(
     State(state): State<AppState>,
     Path(customer_id): Path<i64>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let memories: Vec<Value> = conn
         .prepare("SELECT id, customer_id, key, value, source, created_at FROM customer_memory WHERE customer_id = ?1 ORDER BY created_at DESC")
         .ok()
@@ -97,7 +97,7 @@ pub async fn set_memory(
         .get("source")
         .and_then(|v| v.as_str())
         .unwrap_or("manual");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "INSERT INTO customer_memory (customer_id, key, value, source, created_at) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![customer_id, key, value, source],
@@ -114,7 +114,7 @@ pub async fn cluster_issues(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/ai/jobs
 pub async fn jobs(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let queued: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM jobs WHERE kind LIKE 'ai%' AND status = 'queued'",
@@ -134,7 +134,7 @@ pub async fn jobs(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/ai/analytics
 pub async fn ai_analytics(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM ai_runs", [], |r| r.get(0))
         .unwrap_or(0);
@@ -143,5 +143,10 @@ pub async fn ai_analytics(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/ai/evaluation
 pub async fn evaluation(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({"mode": "off", "message": "AI evaluation mode is permanently OFF."}))
+    Json(json!({
+        "evaluation_mode": "off",
+        "tests": [],
+        "mode": "off",
+        "message": "AI evaluation mode is permanently OFF. No tests are run."
+    }))
 }

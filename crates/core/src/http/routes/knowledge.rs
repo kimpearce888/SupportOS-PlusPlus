@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/knowledge/sources
 pub async fn list_sources(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let sources: Vec<Value> = conn
         .prepare("SELECT DISTINCT source FROM knowledge_doc_freshness ORDER BY source")
         .ok()
@@ -27,7 +27,7 @@ pub async fn list_documents(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let limit = params
         .get("limit")
         .and_then(|l| l.parse::<u32>().ok())
@@ -55,7 +55,7 @@ pub async fn list_documents(
 
 /// GET /api/knowledge/documents/:id
 pub async fn get_document(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let row = conn.query_row("SELECT id, title, source, last_reviewed_at, freshness_status FROM knowledge_doc_freshness WHERE id = ?1", rusqlite::params![id], |r| {
         Ok(json!({
             "id": r.get::<_, i64>(0)?,
@@ -80,7 +80,7 @@ pub async fn search(
     if query.trim().is_empty() {
         return Json(json!({"results": [], "query": query}));
     }
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     // Use the shared universal_search (FTS5) — same path the reference uses
     // when Qdrant is not configured.
     let results: Vec<Value> = crate::search::universal_search(&conn, &query)
@@ -93,7 +93,7 @@ pub async fn search(
 
 /// GET /api/knowledge/freshness
 pub async fn freshness(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let stale: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM knowledge_doc_freshness WHERE freshness_status = 'stale'",
@@ -108,7 +108,25 @@ pub async fn freshness(State(state): State<AppState>) -> Json<Value> {
             |r| r.get(0),
         )
         .unwrap_or(0);
-    Json(json!({"stale": stale, "fresh": fresh}))
+    let documents: Vec<Value> = conn
+        .prepare("SELECT id, title, source, freshness_status, last_reviewed_at FROM knowledge_doc_freshness ORDER BY id DESC LIMIT 200")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "title": r.get::<_, String>(1)?,
+                    "source": r.get::<_, String>(2)?,
+                    "freshness_status": r.get::<_, String>(3)?,
+                    "last_reviewed_at": r.get::<_, Option<String>>(4)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Json(json!({"stale": stale, "fresh": fresh, "documents": documents}))
 }
 
 /// POST /api/knowledge/import
@@ -119,7 +137,7 @@ pub async fn import(State(state): State<AppState>, Json(body): Json<Value>) -> J
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut imported = 0u32;
     for doc in docs {
         let title = doc
@@ -158,7 +176,7 @@ pub async fn import_file(State(state): State<AppState>, Json(body): Json<Value>)
         .and_then(|v| v.as_str())
         .unwrap_or("untitled.txt");
     let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let imported = if conn
         .execute(
             "INSERT INTO knowledge_doc_freshness (title, source, freshness_status, last_reviewed_at)
@@ -182,7 +200,7 @@ pub async fn import_file(State(state): State<AppState>, Json(body): Json<Value>)
 pub async fn importable(State(state): State<AppState>) -> Json<Value> {
     // Returns documents the user could import (from connectors etc).
     // For now, just list stale + unreviewed documents already in the DB.
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let docs: Vec<Value> = conn
         .prepare("SELECT id, title, source FROM knowledge_doc_freshness WHERE freshness_status = 'stale' ORDER BY last_reviewed_at ASC LIMIT 50")
         .ok()
@@ -204,14 +222,14 @@ pub async fn importable(State(state): State<AppState>) -> Json<Value> {
 
 /// POST /api/knowledge/documents/:id/review
 pub async fn review_document(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute("UPDATE knowledge_doc_freshness SET last_reviewed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), freshness_status = 'fresh' WHERE id = ?1", rusqlite::params![id]);
     Json(json!({"ok": true}))
 }
 
 /// POST /api/knowledge/documents/:id/verify
 pub async fn verify_document(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let rows = conn
         .execute(
             "UPDATE knowledge_doc_freshness
@@ -235,7 +253,7 @@ pub async fn reindex(State(state): State<AppState>) -> Json<Value> {
     // A real reindex would rebuild the FTS5/vector index from the source
     // documents; for the local SQLite-backed port, we just emit a
     // SyncUpdated event so the UI refreshes the freshness view.
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let marked = conn
         .execute(
             "UPDATE knowledge_doc_freshness
@@ -254,7 +272,7 @@ pub async fn reindex(State(state): State<AppState>) -> Json<Value> {
 
 /// DELETE /api/knowledge/documents/:id
 pub async fn delete_document(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let rows = conn
         .execute(
             "DELETE FROM knowledge_doc_freshness WHERE id = ?1",

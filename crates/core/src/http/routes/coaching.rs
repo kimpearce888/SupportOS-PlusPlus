@@ -12,7 +12,7 @@ use super::super::server::AppState;
 
 /// GET /api/coaching/meta — coaching program metadata.
 pub async fn meta(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let total: i64 = conn
         .query_row("SELECT COUNT(*) FROM coaching_plans", [], |r| r.get(0))
         .unwrap_or(0);
@@ -30,12 +30,19 @@ pub async fn meta(State(state): State<AppState>) -> Json<Value> {
             |r| r.get(0),
         )
         .unwrap_or(0);
-    Json(json!({"total": total, "open": open, "resolved": resolved}))
+    Json(json!({
+        "total": total,
+        "open": open,
+        "resolved": resolved,
+        "checks": [],
+        "advisory_only": true,
+        "note": "Coaching meta aggregated from the local coaching_plans table. AI-driven checks require a configured AI provider."
+    }))
 }
 
 /// GET /api/coaching/:userId — coaching plans for a specific user.
 pub async fn get_coaching(State(state): State<AppState>, Path(user_id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let plans: Vec<Value> = conn
         .prepare("SELECT id, user_id, conversation_id, summary, status, created_at, resolved_at FROM coaching_plans WHERE user_id = ?1 ORDER BY created_at DESC")
         .ok()
@@ -61,7 +68,7 @@ pub async fn get_coaching(State(state): State<AppState>, Path(user_id): Path<i64
 
 /// POST /api/coaching/:planId/review — mark a coaching plan as reviewed.
 pub async fn review(State(state): State<AppState>, Path(plan_id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let rows = conn
         .execute(
             "UPDATE coaching_plans SET status = 'reviewed', resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",

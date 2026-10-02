@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/copilot/sessions
 pub async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let sessions: Vec<Value> = conn
         .prepare("SELECT id, conversation_id, created_at FROM ai_runs WHERE type = 'copilot' ORDER BY created_at DESC LIMIT 50")
         .ok()
@@ -30,7 +30,7 @@ pub async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/copilot/sessions/:id
 pub async fn get_session(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let row = conn.query_row(
         "SELECT id, conversation_id, created_at, result_json FROM ai_runs WHERE id = ?1",
         rusqlite::params![id],
@@ -63,13 +63,13 @@ pub async fn chat(State(state): State<AppState>, Json(body): Json<Value>) -> Jso
 
 /// DELETE /api/copilot/sessions/:id
 pub async fn delete_session(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute("DELETE FROM ai_runs WHERE id = ?1", rusqlite::params![id]);
     Json(json!({"ok": true}))
 }
 
 /// GET /api/copilot/tools
-pub async fn tools(State(state): State<AppState>) -> Json<Value> {
+pub async fn tools(State(_state): State<AppState>) -> Json<Value> {
     use crate::catalog::CopilotTool;
     let tools: Vec<Value> = CopilotTool::ALL
         .iter()
@@ -80,5 +80,8 @@ pub async fn tools(State(state): State<AppState>) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({"tools": tools}))
+    Json(json!({
+        "tools": tools,
+        "note": "Copilot tools available — actual AI responses require a configured AI provider.",
+    }))
 }

@@ -8,7 +8,7 @@ use super::super::server::AppState;
 
 /// GET /api/custom-objects/types
 pub async fn list_types(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let types = crate::data_tools::list_object_types(&conn).unwrap_or_default();
     let items: Vec<Value> = types
         .iter()
@@ -21,7 +21,7 @@ pub async fn list_types(State(state): State<AppState>) -> Json<Value> {
 pub async fn create_type(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
     let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let slug = body.get("slug").and_then(|v| v.as_str()).unwrap_or(name);
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::data_tools::create_object_type(&conn, name, slug) {
         Ok(id) => Json(json!({"ok": true, "id": id})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
@@ -30,7 +30,7 @@ pub async fn create_type(State(state): State<AppState>, Json(body): Json<Value>)
 
 /// GET /api/custom-objects/types/:id
 pub async fn get_type(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let types = crate::data_tools::list_object_types(&conn).unwrap_or_default();
     if let Some(t) = types.iter().find(|t| t.id == Some(id)) {
         let fields = crate::data_tools::list_object_fields(&conn, id).unwrap_or_default();
@@ -54,7 +54,7 @@ pub async fn update_type(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
         let _ = conn.execute(
             "UPDATE custom_object_types SET name = ?1 WHERE id = ?2",
@@ -66,7 +66,7 @@ pub async fn update_type(
 
 /// DELETE /api/custom-objects/types/:id
 pub async fn delete_type(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::data_tools::delete_object_type(&conn, id);
     Json(json!({"ok": true}))
 }
@@ -77,7 +77,7 @@ pub async fn list_objects(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let type_id = params.get("typeId").and_then(|t| t.parse::<i64>().ok());
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let limit = params
         .get("limit")
         .and_then(|l| l.parse::<u32>().ok())
@@ -110,7 +110,7 @@ pub async fn list_objects(
 pub async fn create_object(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
     let type_id = body.get("typeId").and_then(|v| v.as_i64()).unwrap_or(0);
     let data = body.get("data").unwrap_or(&Value::Null).to_string();
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "INSERT INTO custom_objects (type_id, data_json, created_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![type_id, data],
@@ -120,7 +120,7 @@ pub async fn create_object(State(state): State<AppState>, Json(body): Json<Value
 
 /// GET /api/custom-objects/:id
 pub async fn get_object(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let row = conn.query_row(
         "SELECT id, type_id, data_json, created_at FROM custom_objects WHERE id = ?1",
         rusqlite::params![id],
@@ -146,7 +146,7 @@ pub async fn update_object(
     Json(body): Json<Value>,
 ) -> Json<Value> {
     let data = body.get("data").unwrap_or(&Value::Null).to_string();
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "UPDATE custom_objects SET data_json = ?1 WHERE id = ?2",
         rusqlite::params![data, id],
@@ -156,7 +156,7 @@ pub async fn update_object(
 
 /// DELETE /api/custom-objects/:id
 pub async fn delete_object(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM custom_objects WHERE id = ?1",
         rusqlite::params![id],
@@ -191,7 +191,7 @@ pub async fn list_for_target(
 
 /// GET /api/custom-objects/report
 pub async fn report(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().expect("mutex poisoned");
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = conn.prepare("SELECT t.name, COUNT(o.id) FROM custom_object_types t LEFT JOIN custom_objects o ON o.type_id = t.id GROUP BY t.id").unwrap();
     let report: Vec<Value> = stmt
         .query_map([], |r| {
