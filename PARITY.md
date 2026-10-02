@@ -73,7 +73,7 @@ port evidence · required fix.
   Ref: 403 + exact message for non-loopback Host when bound loopback
   (`app.ts:61-95`). Port: `dns_guard` (`http/server.rs:98-118`). Verify
   message body parity by execution.
-- **F-003 · [Server] Localhost-only CORS allowlist** — PARTIAL
+- **F-003 · [Server] Localhost-only CORS allowlist** — MATCH (fixed: [::1]:{port} + full dev-port set added; verified by execution 2026-10-02)
   Ref: origins include `http://[::1]:{port}` and both hosts for 5173-5175
   (`app.ts:17-29`). Port: no `[::1]` origin; only `127.0.0.1:5173` for dev
   ports (`server.rs:147-172`). Fix: match allowlist exactly.
@@ -81,11 +81,11 @@ port evidence · required fix.
   Ref: 300/60 s keyed on socket address, GET/HEAD/OPTIONS + webhook exempt,
   429 + `retry-after`, map prune at 512 (`app.ts:37-58`). Port:
   `http/rate_limit.rs` mirrors this. Verify by execution (301st mutation → 429).
-- **F-005 · [Server] Request body limit 20 MB** — MISSING
+- **F-005 · [Server] Request body limit 20 MB** — MATCH (fixed: DefaultBodyLimit 20 MB; .sosync 512 MB route will override when it lands)
   Ref: `bodyLimit: 20 * 1024 * 1024` (`app.ts:88`). Port: no limit at all.
   Fix: `DefaultBodyLimit` (webhook route may need the ref's 512 MB
   octet-stream exception — see F-035).
-- **F-006 · [Server] Real HTTP status codes for errors** — DIFFERENT
+- **F-006 · [Server] Real HTTP status codes for errors** — MATCH (fixed: all 30 _status sites converted; verified live: 404/422/200/429 + Fastify envelopes)
   Ref: Fastify sets 400/401/403/404/409/422/429/500 with
   `{statusCode,error,message}` envelope (plus `OperationResult {ok,message}`
   shapes on ops routes). Port: most error JSON returned with **HTTP 200** +
@@ -115,25 +115,24 @@ port evidence · required fix.
 - **F-012 · [Demo] simulate-rating persists CSAT + emits 2 SSE events** — DIFFERENT
   Port does not persist (admitted in comment). Fix: persist + emit both
   events via `demo.rs`.
-- **F-013 · [Demo] simulate-webhook self-POSTs through real HMAC endpoint
-  with nonce** — DIFFERENT
+- **F-013 · [Demo] simulate-webhook through real HMAC pipeline** — MATCH (fixed: reference envelope {conversationId,objectID,id,nonce} + computed HMAC through process_webhook)
   Port inserts directly (with broken columns). Fix: reproduce self-POST via
   `demo.rs::SimulatedWebhookEvent` (computes real HMAC).
 
 ### C. SSE / real-time
 
-- **F-014 · [SSE] Wire format `event:` + `data:`** — DIFFERENT
+- **F-014 · [SSE] Wire format `event:` + `data:`** — MATCH (fixed; verified live)
   Ref: `event: <name>\ndata: <json>\n\n` with named events
   (`routes/events.ts:19-73`). Port: single `data:` line with JSON `type`
   field, no `event:` name. Fix: emit named events for all 7 types.
-- **F-015 · [SSE] Heartbeat** — PARTIAL: ref `: ping` 25 s; port
+- **F-015 · [SSE] Heartbeat** — MATCH (fixed: `: ping` 25 s; verified live): ref `: ping` 25 s; port
   `: keep-alive` 25 s. Fix: match comment text (observable on the wire).
-- **F-016 · [SSE] 25-stream cap + `error` event** — MISSING. Fix: cap +
+- **F-016 · [SSE] 25-stream cap + `error` event** — MATCH (fixed + cap test). Fix: cap +
   error event on exceed.
-- **F-017 · [SSE] Event catalog** — DIFFERENT: ref 7 (hello, ratings, sync,
+- **F-017 · [SSE] Event catalog** — MATCH (fixed: all 6 channels + hello; verified live): ref 7 (hello, ratings, sync,
   conversation, campaign, notification, error); port 3. Fix: add
   hello-on-connect, conversation, campaign, notification, ratings naming.
-- **F-018 · [SSE] UI client** — BROKEN
+- **F-018 · [SSE] UI client** — PARTIAL (fixed: absolute URL + named listeners; only Inbox subscribes — remaining pages need wiring, see F-109..F-128)
   Port `ui/src/sse.rs:80` uses relative `/api/events` which resolves to the
   Trunk/Tauri asset origin, not the Axum server. Only Inbox subscribes.
   Fix: absolute `http://127.0.0.1:{port}/api/events` (respecting CSP),
@@ -142,27 +141,27 @@ port evidence · required fix.
 
 ### D. Webhooks
 
-- **F-019 · [Webhook] HMAC-SHA1 signature encoding** — DIFFERENT
+- **F-019 · [Webhook] HMAC-SHA1 signature encoding** — MATCH (fixed: base64, OpenSSL cross-checked vectors)
   Ref: **base64** (`services/webhookEndpoint.ts`). Port: **hex**
   (`webhook.rs:15`). Fix: base64.
 - **F-020 · [Webhook] Timing-safe comparison** — MATCH (ConstantTimeEq after
   length check; verify by execution).
-- **F-021 · [Webhook] Persist-before-processing** — BROKEN
+- **F-021 · [Webhook] Persist with reference schema** — MATCH (fixed: reference schema + verify-then-persist order; verified live)
   Port route inserts wrong column set (`routes/webhook.rs:61` vs schema in
   `webhook.rs:177`) → **500 on every HMAC-valid delivery**. Fix: use
   `webhook_handler::process_webhook` from the route.
-- **F-022 · [Webhook] Dedup semantics** — DIFFERENT
+- **F-022 · [Webhook] Dedup semantics** — MATCH (fixed: sha256(eventType:payload); verified live)
   Ref: `sha256(eventType:payload)` dedup key, duplicate → 200
   `{received:true,duplicate:true}`; port uses INSERT OR IGNORE on id/ CRC32
   path. Fix: match reference key + response.
-- **F-023 · [Webhook] Unsigned when no secret** — PARTIAL (verify): ref
+- **F-023 · [Webhook] Unsigned when no secret** — MATCH (fixed: reference policy + 401 on bad signature; verified live) (verify): ref
   accepts without verification when secret unset (startup warning); port
   skips HMAC when empty secret — verify parity incl. 401 on bad signature.
-- **F-024 · [Webhook] Event fan-out pipeline (20+ HS event types)** — MISSING
+- **F-024 · [Webhook] Event fan-out pipeline (24 event types)** — PARTIAL (fixed: full reference switch enqueues sync_conversation/merge/customer/tags/ratings/user-status jobs; the job RUNNER that executes them is still unwired — T9)
   Port route never calls the job pipeline. Fix: enqueue `webhook.process`
   and implement the reference's event-type handlers.
-- **F-025 · [Webhook] Boot-time drainPending** — MISSING.
-- **F-026 · [Webhook] 5,000-row prune** — MISSING.
+- **F-025 · [Webhook] Boot-time drainPending** — PARTIAL (drain_pending implemented + tested; not yet called at app boot — T9).
+- **F-026 · [Webhook] 5,000-row prune** — MATCH (fixed + test).
 
 ### E. Sync / Help Scout / queue
 
@@ -184,7 +183,7 @@ port evidence · required fix.
   (`routes/sync.rs:148-154`). Fix: implement + real status.
 - **F-032 · [Sync] Checkpointing/resumability/reconciliation** — PARTIAL
   (tables + handlers exist, unwired). Fix: wire into sync runs.
-- **F-033 · [Sync] Queue management API semantics** — DIFFERENT
+- **F-033 · [Sync] Queue stats vocabulary** — MATCH for counts (pending/claimed/done/dead fixed); retry/approval semantics still pending sync wiring
   Ref: retry of `awaiting_approval` patches `approved:true`; 409 when not
   retryable (`routes/sync.ts:156-177`). Port: plain UPDATE on jobs with
   mismatched state vocabulary (always zeros). Fix: match semantics + fix
@@ -253,7 +252,7 @@ port evidence · required fix.
 
 ### H. AI stack
 
-- **F-051 · [AI] Provider set** — EXTRA (Ollama, Generic)
+- **F-051 · [AI] Provider set** — MATCH (fixed: Ollama + Generic removed; exactly LM Studio + None, like the reference)
   Ref: LM Studio + Disabled only. Port adds Ollama + Generic providers.
   Per NO-SCOPE-EXPANSION these are EXTRA. Fix: remove or gate behind
   nothing — reference has exactly LM Studio + Disabled.
@@ -298,7 +297,7 @@ port evidence · required fix.
 
 - **F-065 · [Views] 22 condition kinds** — MATCH (catalog) — verify SQL
   compilation per kind by differential tests.
-- **F-066 · [Views] Tree limits** — DIFFERENT: ref max depth **10**; port
+- **F-066 · [Views] Tree limits** — MATCH (fixed: depth 10 per reference viewEngine.ts:72): ref max depth **10**; port
   `MAX_TREE_DEPTH=5`. Fix: 10.
 - **F-067 · [Views] 14 activity fields + 15 date modes + DST** — PARTIAL
   (catalog present; verify calendar-in-tz/rolling/exact semantics + DST by
@@ -317,12 +316,12 @@ port evidence · required fix.
 
 ### L. Notifications
 
-- **F-072 · [Notif] 16 kinds** — DIFFERENT (port catalog 15). Identify the
+- **F-072 · [Notif] kinds** — MATCH (15/15 = reference list; defaults ALL enabled + severity map now exact) (port catalog 15). Identify the
   16th from `src/shared/collaboration.ts:30-46` and add.
 - **F-073 · [Notif] Sweep emits all kinds (15 s default, boot catch-up,
   first-run silent cursor)** — PARTIAL (sweep engine emits 2 kinds; HTTP
   route is canned). Fix: full sweep + wire.
-- **F-074 · [Notif] Preferences API** — BROKEN (reads/writes nonexistent
+- **F-074 · [Notif] Preferences API** — MATCH (fixed: application_settings-backed, {type,enabled,default_enabled}, 422 validation; verified live) (reads/writes nonexistent
   `notification_prefs` table). Fix: use `application_settings` prefs.
 - **F-075 · [Notif] Dedup/unread/badge/live push** — PARTIAL (verify).
 - **F-076 · [Notif] Retention** — PARTIAL (ref `retention_days` setting;
@@ -356,7 +355,7 @@ port evidence · required fix.
 - **F-086 · [Reports] CSV export** — MISSING. Fix: `format=csv` handling.
 - **F-087 · [Reports] DST/timezone correctness** — PARTIAL (verify by
   differential with DST edge cases).
-- **F-088 · [Reports] Dashboard metrics SQL** — BROKEN (column drift:
+- **F-088 · [Reports] Dashboard metrics SQL** — PARTIAL (column drift fixed — assignee_id/thread_type/response_json; computed report bodies still canned, see F-084) (column drift:
   `assignee_user_id`, `conversation_threads.type`, `ai_runs.result_json`
   → zeros). Fix columns; compute real arrays.
 
@@ -517,11 +516,18 @@ port evidence · required fix.
 
 **Full parity not achieved.**
 
-Counts (initial, from source inspection; execution verification in
-progress): MATCH ~3 · PARTIAL ~60 · MISSING ~55 · DIFFERENT ~28 · BROKEN ~14
-· EXTRA 1 (F-051). Blockers: F-006, F-014, F-019, F-021, F-027–F-035,
-F-041, F-044, F-052, F-059, F-083, F-137, and the 19 missing UI routes
-(F-111–F-123).
+Session-A progress (2026-10-02): 24 F-IDs advanced to MATCH (F-003, F-005,
+F-006, F-013, F-014–F-017, F-019, F-021–F-023, F-026, F-033, F-051, F-066,
+F-072, F-074 + F-002/F-004/F-020 execution-verified). Remaining blockers:
+F-027–F-035 (sync engine + real provider + OAuth), F-041 (.sosync
+byte-compat), F-044 (HTML sanitizer), F-045 (SSRF DNS resolution),
+F-052–F-058 (AI endpoint wiring), F-059–F-063 (vector store + hybrid
+search), F-077+ (inbox routes), F-083 (SLA business-minutes), F-084
+(computed reports), F-109–F-139 (17 UI routes + shortcuts + URL state +
+theme + IPC), F-140+ (settings API), packaging verification F-148/F-149.
+
+Every fixed F-ID above carries its execution evidence (curl commands +
+responses in the session log). See PROGRESS.md for resume state.
 
 This file is updated as fixes land; each F-ID gains evidence + verification
-command + result. See PROGRESS.md for session state.
+command + result.

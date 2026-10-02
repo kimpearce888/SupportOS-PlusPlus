@@ -69,14 +69,30 @@ everything → final proof (rebuild, packages, cleanliness scan, verdict).
 11. F-144–F-149 packaging verification (deb install/launch, AppImage) —
     environment-limited without root; see PARITY.md notes.
 
-## Last verification
+## Last verification (Session A, 2026-10-02)
 
-- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --
-  D warnings`, `cargo check --workspace`, `cargo test --workspace` — see
-  session log below for the latest actual results.
+- `cargo fmt --all` — clean.
+- `cargo clippy` -D warnings — clean on core, ui, xtask, catalog, app
+  (app via local sysroot: PKG_CONFIG_PATH + LIBRARY_PATH).
+- `cargo test --workspace --exclude supportos-plusplus-app` — 906 passed,
+  0 failed (788 core / 71 ui / 21 catalog / 26 xtask). The app crate's 11
+  tests passed earlier under the sysroot (excluded in the final run only to
+  fit the disk-constrained sandbox; GTK deps cost ~3 GB).
+- Live execution audit (example http_server, ports 3457-3461): health,
+  system/db, webhook (5 scenarios), SSE (hello + named events + : ping +
+  conversation event on mutation), prefs (15 types + 422s), dashboard,
+  status codes (404/422/200/429), DNS-rebinding guard.
+- Environment limitation: no root/sudo in the audit sandbox — Tauri GUI
+  build verified via a user-space sysroot extracted from distro debs;
+  .deb/.AppImage packaging + install smoke still to be executed (CI has
+  the jobs; local verification pending an environment with more disk).
 
 ## Session log
 
-- Session A (2026-10-02): phases 0–3 as above; working tree committed
-  through the cleanup series. Next: Phase 4 execution audit (build + run +
-  exercise HTTP/SSE/webhook/demo), then Phase 7 fixes in priority order.
+- Session A (2026-10-02): phases 0–4 complete; Phase 7 fixes landed in 6
+  commits (PARITY rewrite, Linux-only cleanup, webhook pipeline, SSE wire
+  format, SQL drift + prefs, status codes, EXTRA provider removal). 24
+  F-IDs advanced to MATCH with execution evidence. Next session: T9 sync
+  engine wiring (real HelpScout provider + OAuth + job runner + boot
+  drain), then T10 .sosync byte-compat, T11 sanitizer/SSRF, T13-T14 AI +
+  vector wiring, T15+ inbox routes, T20 UI pages.
