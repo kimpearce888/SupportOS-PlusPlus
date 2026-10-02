@@ -61,7 +61,7 @@ cargo xtask verify-config    # verify tauri.conf.json meets spec amendment A0 (n
 cargo xtask audit            # black-box audit binary (port of reference audit-phase1)
 ```
 
-Bootstrap scripts: `./bootstrap.sh` (macOS/Linux) and `./bootstrap.ps1` (Windows) install prerequisites silently, then build and launch. Safe to re-run.
+Bootstrap script: `./bootstrap.sh` (Linux) installs prerequisites silently, then builds and launches. Safe to re-run.
 
 ## Communication rules
 

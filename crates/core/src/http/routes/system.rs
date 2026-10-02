@@ -279,12 +279,32 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
 
 /// GET /api/system/db — database stats.
 pub async fn db_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Reference shape: {path, size_bytes, migrations, tables:[{table,rows}]}
+    // (context.ts:266-275 dbStats; no `wal` key).
+    let conn = state.conn_lock();
     let db_path = state.data_dir.join("supportos-plusplus.db");
     let size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    let table_count: i64 = conn
+    let mut tables: Vec<Value> = Vec::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    {
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .ok()
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default();
+        for name in names {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+            tables.push(json!({ "table": name, "rows": rows }));
+        }
+    }
+    let migrations: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+            "SELECT COALESCE(MAX(id), 0) FROM schema_migrations",
             [],
             |r| r.get(0),
         )
@@ -295,9 +315,8 @@ pub async fn db_stats(State(state): State<AppState>) -> impl IntoResponse {
         Json(json!({
             "path": db_path.display().to_string(),
             "size_bytes": size,
-            "tables": table_count,
-            "wal": true,
-            "migrations": crate::migrations::latest_version(),
+            "migrations": migrations,
+            "tables": tables,
         })),
     )
 }

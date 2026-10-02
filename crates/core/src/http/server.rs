@@ -941,11 +941,17 @@ impl HttpServer {
             // 404 fallback for unknown /api/* routes
             .fallback(any(routes::not_found))
             .with_state(state)
+            // Fastify parity: a request whose PATH matches a registered
+            // route but whose METHOD does not gets the 404 "Unknown API
+            // endpoint." body in the reference (Fastify's router has no
+            // 405 path); axum answers 405 by default. Rewrite 405 -> 404
+            // with the reference body so wrong-method probes observe the
+            // same status + JSON.
+            .layer(axum::middleware::from_fn(rewrite_405_to_404))
             // Request body limit: 20 MB — the reference's Fastify
             // `bodyLimit: 20 * 1024 * 1024` (attachment uploads are
             // base64-inflated). The .sosync octet-stream upload route
-            // (512 MB) is not implemented yet; when it lands it must
-            // override this per-route.
+            // overrides this per-route with 512 MB.
             .layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024))
             .layer(cors)
             .layer(TraceLayer::new_for_http())
@@ -966,6 +972,25 @@ impl HttpServer {
         axum::serve(listener, app).await?;
         Ok(())
     }
+}
+
+/// Fastify parity middleware: rewrite axum's 405 (method not allowed) to
+/// the reference's 404 "Unknown API endpoint." response — Fastify's router
+/// has no 405 path, so wrong-method probes must observe 404.
+async fn rewrite_405_to_404(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let resp = next.run(req).await;
+    if resp.status() == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            [("Content-Type", "application/json")],
+            r#"{"statusCode":404,"error":"NotFound","message":"Unknown API endpoint."}"#,
+        )
+            .into_response();
+    }
+    resp
 }
 
 /// Check if a Host header is a loopback address.

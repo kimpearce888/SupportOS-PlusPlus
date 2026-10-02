@@ -1,7 +1,7 @@
 //! Headless demo-mode boot smoke test (M1-T09).
 //!
 //! Per spec A5: "Use fresh CI runners for install-launch-smoke tests on
-//! Windows, macOS and Linux, plus automated UI end-to-end tests where the
+//! supported desktop platforms (Linux), plus automated UI end-to-end tests
 //! platform tooling supports them (verify what Tauri supports per OS; do not
 //! assume). All test code in Rust."
 //!
@@ -23,7 +23,7 @@
 // `run()` function expands to `embed_info_plist_bytes` which causes a
 // duplicate symbol linker error when the integration test links the lib.
 // This is a known Tauri 2 issue. The tests are skipped on macOS; the
-// headless boot is verified on Linux + Windows CI.
+// headless boot is verified on the Linux CI matrix.
 #![cfg(target_os = "linux")]
 // Port is Linux-only (DEV-006): headless boot smoke runs on Linux.
 

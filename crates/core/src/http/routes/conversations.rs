@@ -547,23 +547,30 @@ pub async fn list_users(State(state): State<AppState>) -> impl IntoResponse {
 
 /// GET /api/teams — list all teams (reference data for the UI).
 pub async fn list_teams(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Reference returns a BARE ARRAY of {id, remote_id, name, member_count}
+    // (member_count from the user mirror's team membership).
+    let conn = state.conn_lock();
     let teams: Vec<Value> = conn
-        .prepare("SELECT id, name FROM teams ORDER BY id")
+        .prepare(
+            "SELECT t.id, t.remote_id, t.name,
+                    (SELECT COUNT(*) FROM users u WHERE u.team_id = t.id) AS member_count
+             FROM teams t ORDER BY t.id",
+        )
         .ok()
-        .map(|mut stmt| {
+        .and_then(|mut stmt| {
             stmt.query_map([], |r| {
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?,
-                    "name": r.get::<_, String>(1)?,
+                    "remote_id": r.get::<_, Option<i64>>(1)?,
+                    "name": r.get::<_, String>(2)?,
+                    "member_count": r.get::<_, i64>(3)?,
                 }))
             })
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
         })
         .unwrap_or_default();
-    (StatusCode::OK, Json(json!({"teams": teams})))
+    (StatusCode::OK, Json(teams))
 }
 
 /// GET /api/saved-replies — list saved reply templates; `?q=` searches
