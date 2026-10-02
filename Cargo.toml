@@ -56,7 +56,6 @@ subtle = "2.5"
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "tower-log", "macros", "json", "query"] }
 tower = { version = "0.5", features = ["limit", "timeout"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-hyper = "1"
 
 # Regex (bounded NFA — no ReDoS surface; default features include unicode
 # look-around support which we need for the negative-lookbehind in mentions)

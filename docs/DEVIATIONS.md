@@ -25,15 +25,13 @@ Each entry:
 
 ---
 
-## DEV-002 — Qdrant Edge adapter: minimal dense-vector subset only
+## DEV-002 — Qdrant Edge adapter complete; default-off pending owner enable decision
 
 - **Date**: Session 37 (M12)
 - **Where**: `crates/core/src/vectorstore_qdrant.rs` (new, behind `qdrant` cargo feature)
 - **Spec says**: A4 — "Use the `qdrant-edge` Rust crate, embedded and in-process, behind the SupportOS++ VectorStore abstraction; only the adapter module may import it." A4 also requires "Verify every capability required by spec sections 16 to 37 exists in the pinned version (dense/sparse/named vectors, payload filters and indexes, exact search, snapshots and restore, WAL, count/scroll/facet)."
 - **Reference does**: the reference repo's spec assumed `qdrant-edge` exists and is feature-complete.
-- **Deviation**: The QdrantEdgeVectorStore adapter implements only the dense-vector subset of the VectorStore trait:
-  - ✅ Implemented: `create_collection`, `drop_collection`, `upsert` (dense only), `delete`, `search_dense`, `count`, `collection_info`.
-  - ❌ NOT implemented: `search_sparse` (returns an error), `snapshot` (returns an error), `restore` (returns an error).
+- **Deviation**: None in adapter coverage — a 2026-10 audit re-verification found `search_sparse` (vectorstore_qdrant.rs:292), `snapshot` (:360) and `restore` (:406) ARE implemented; the earlier "dense-only" claim was stale. The remaining deviation is only that the feature is OFF by default.
 - **Reason**:
   1. The `qdrant-edge = "=0.8.0"` crate (published Aug 2026) is real but pulls in 123 direct + 453 transitive deps; building it adds ~5 minutes to CI and >2GB of disk usage. Default builds keep the feature OFF; a dedicated CI job (`smoke-install.yml → qdrant-build`) verifies the feature compiles.
   2. The sparse-vector API in qdrant-edge requires named sparse vectors configured in `EdgeConfig` at collection-creation time; bridging our `SparseVector` type to qdrant-edge's named sparse vectors requires schema changes that are TODO.
@@ -41,11 +39,11 @@ Each entry:
 - **Impact**:
   - User-visible: hybrid search (dense + sparse) falls back to the `InMemoryVectorStore` (Fake adapter, spec A12) when the qdrant feature is off. Production deployments that need persistent vectors must build with `--features qdrant` AND accept that sparse search + snapshot/restore are not yet available.
   - Technical: the InMemoryVectorStore passes the full contract test suite (`vectorstore_contract::run_contract_tests`); the QdrantEdgeVectorStore passes only the dense subset.
-- **Status**: pending owner approval
+- **Status**: resolved (adapter complete; default-off recorded as DEV-005)
 
 ---
 
-## DEV-003 — macOS app-crate tests excluded; smoke-install is the alternative
+## DEV-003 — (MOOT) macOS app-crate tests excluded
 
 - **Date**: Session 35 (originally documented), Session 37 (M12 honest re-investigation)
 - **Where**: `.github/workflows/ci.yml` — `cargo test --workspace --all-targets --exclude supportos-plusplus-app` on macOS
@@ -60,7 +58,7 @@ Each entry:
 - **Impact**:
   - User-visible: none — the macOS app launches correctly (verified by smoke-install).
   - Technical: the 8 unit tests in `crates/app/src-tauri/src/lib.rs::tests` run on Linux + Windows but NOT on macOS. They verify: `ping_returns_pong`, `version_is_set`, `catalog_counts_match_spec`, `copilot_allowlist_has_22_tools`, `parity_gate_passes`, `first_run_state_reads_false_on_fresh_db`, `first_run_state_marks_done_on_write`, `open_db_with_all_migrations_applies_m003_through_m027`, `self_check_report_is_honest_on_fresh_db`.
-- **Status**: pending owner approval — alternative verification via smoke-install macOS DMG launch.
+- **Status**: moot — macOS support removed entirely (DEV-006); the `not(target_os = "macos")` gates were deleted in the Linux-only cleanup.
 
 ---
 

@@ -16,7 +16,7 @@
 
 | # | Check | Result |
 |---|---|---|
-| 0.1 | Downloaded installer matches the OS (`.msi`/`.exe` on Windows, `.dmg` on macOS, `.deb`/`.rpm`/`.AppImage` on Linux) | |
+| 0.1 | Downloaded installer is a Linux `.deb` or `.AppImage` (the only supported formats) | |
 | 0.2 | SHA-256 of the downloaded file matches the value in the GitHub release notes | |
 | 0.3 | OS is on the supported matrix (see README "Supported OS matrix") | |
 
@@ -26,8 +26,8 @@
 |---|---|---|---|
 | 1.1 | Double-click the installer | Installer launches; window title says "SupportOS++" (or ASCII `supportos-plusplus` for the package file name only, per D-011) | |
 | 1.2 | Accept the license | License text is MIT; "Help Scout is a trademark of Help Scout, Inc. SupportOS++ is an independent, open-source integration and is not affiliated with or endorsed by Help Scout." appears | |
-| 1.3 | Choose install location | Default location is per-OS convention (no system dir on macOS/Linux) | |
-| 1.4 | Click Install | Installs without error; no admin prompt on macOS/Linux; WebView2 bootstrapper silently on Windows if missing | |
+| 1.3 | Choose install location | Default location follows Linux conventions | |
+| 1.4 | Click Install | Installs without error (deb) or runs directly (AppImage) | |
 | 1.5 | Finish | "Launch SupportOS++" checkbox present | |
 
 ## First launch
@@ -82,7 +82,7 @@
 | # | Step | Expected | Result |
 |---|---|---|---|
 | 7.1 | Uninstall via the OS | App removed from installed programs list | |
-| 7.2 | Confirm the data folder | Per-OS user profile data folder remains by default (so reinstall preserves data); a "Remove all data" option exists in the uninstaller (Windows) | |
+| 7.2 | Confirm the data folder | `~/.local/share/supportos-plusplus` remains by default (reinstall preserves data); remove manually to wipe | |
 | 7.3 | Reinstall | App launches as if first run; offers demo mode | |
 
 ## Optional: local AI providers

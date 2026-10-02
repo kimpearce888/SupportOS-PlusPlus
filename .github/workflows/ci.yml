@@ -125,7 +125,7 @@ jobs:
           trunk build
 
   build-tauri:
-    name: Tauri build + bundle (Linux)
+    name: Tauri build + bundle (Linux deb + AppImage)
     needs: [lint-and-test, build-wasm]
     runs-on: ubuntu-22.04
     steps:
@@ -140,8 +140,7 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
             libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev build-essential pkg-config \
-            dpkg-dev rpm wget
+            librsvg2-dev build-essential pkg-config dpkg-dev
       - name: Install trunk + tauri-cli
         run: |
           cargo install trunk --locked
@@ -158,10 +157,23 @@ jobs:
         run: |
           cd crates/ui
           trunk build
-      - name: Build Tauri app + bundle
+      - name: Build Tauri app + bundle (deb + AppImage only)
         run: |
           cd crates/app/src-tauri
           cargo tauri build
+      - name: Assert no out-of-scope installer formats were produced
+        run: |
+          BUNDLE_DIR="target/release/bundle"
+          if [ ! -d "$BUNDLE_DIR" ]; then
+            BUNDLE_DIR="crates/app/src-tauri/target/release/bundle"
+          fi
+          if find "$BUNDLE_DIR" -type f \( -name '*.rpm' -o -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \) | grep -q .; then
+            echo "❌ Out-of-scope installer format produced (scope: deb + appimage only)"
+            find "$BUNDLE_DIR" -type f | sort
+            exit 1
+          fi
+          echo "✅ Only in-scope formats produced:"
+          find "$BUNDLE_DIR" -type f | sort
 
   cargo-audit:
     name: cargo audit (security advisories)
@@ -173,25 +185,20 @@ jobs:
       - name: Run cargo audit
         run: cargo audit --ignore unmaintained
 
-  step3-real-mode:
-    name: STEP 3 — Real-mode checks (stand-in servers)
-    needs: [lint-and-test, build-wasm]
+  integration-core:
+    name: Core integration tests (HTTP API + SSE + demo)
+    needs: [lint-and-test]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Run real-mode checks
-        run: |
-          python3 scripts/step3_real_mode.py
-      - name: Upload report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: step3-report
-          path: /tmp/step3-report.md
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run core integration tests
+        run: cargo test -p supportos-plusplus-core --all-targets
 
   ci-report:
     name: Publish CI report
-    needs: [lint-and-test, build-wasm, build-tauri, step3-real-mode, cargo-audit, clean-build-check]
+    needs: [lint-and-test, build-wasm, build-tauri, integration-core, cargo-audit, clean-build-check]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -213,8 +220,8 @@ jobs:
           | lint-and-test (ubuntu-22.04) | ${{ needs.lint-and-test.result }} |
           | lint-and-test (ubuntu-24.04) | ${{ needs.lint-and-test.result }} |
           | build-wasm | ${{ needs.build-wasm.result }} |
-          | build-tauri (Linux) | ${{ needs.build-tauri.result }} |
-          | step3-real-mode | ${{ needs.step3-real-mode.result }} |
+          | build-tauri (Linux deb + AppImage) | ${{ needs.build-tauri.result }} |
+          | integration-core | ${{ needs.integration-core.result }} |
           | cargo-audit | ${{ needs.cargo-audit.result }} |
           | clean-build-check | ${{ needs.clean-build-check.result }} |
 

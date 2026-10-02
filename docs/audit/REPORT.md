@@ -21,7 +21,7 @@ All of the following are true and evidenced:
 
 6. ✅ **Clean-build gates green** — CI `clean-build-check` job verifies: no TODO/FIXME/HACK in production code, no debug leftovers, no secrets/build outputs in tracked files, no commented-out code blocks. `cargo audit` checks for security advisories.
 
-7. ✅ **DEB, RPM, and AppImage install, launch, and uninstall in CI** — The smoke-install CI verifies Linux DEB (Ubuntu) + Linux RPM (Fedora 39 container) install, launch, self-check, DB init, and uninstall. The nightly workflow produces all three formats.
+7. **DEB and AppImage install, launch, and uninstall in CI** — smoke-install verifies the Linux DEB on Ubuntu; RPM verification was removed with the RPM package format (out of scope). This report predates the 2026-10 from-scratch parity audit; see PARITY.md for current status.
 
 8. ✅ **Docs agree with reality** — README rewritten in plain English. PROGRESS.md, PARITY-MATRIX.md, UI-GAP.md, FINDINGS.md, OPEN-ITEMS.md, PAGE-EVIDENCE.md, ARTIFACTS.md all updated and consistent.
 

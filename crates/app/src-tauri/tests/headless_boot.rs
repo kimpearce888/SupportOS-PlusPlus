@@ -24,7 +24,8 @@
 // duplicate symbol linker error when the integration test links the lib.
 // This is a known Tauri 2 issue. The tests are skipped on macOS; the
 // headless boot is verified on Linux + Windows CI.
-#![cfg(not(target_os = "macos"))]
+#![cfg(target_os = "linux")]
+// Port is Linux-only (DEV-006): headless boot smoke runs on Linux.
 
 /// Boot the foundation in demo mode against a throwaway DB and verify the
 /// boot-critical invariants. This is the "headless demo-mode boot" the spec

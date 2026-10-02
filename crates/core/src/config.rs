@@ -87,53 +87,25 @@ impl HelpScoutConfig {
     }
 }
 
-/// Compute the default per-OS data directory.
+/// Compute the default Linux data directory.
 ///
-/// - Windows: `%APPDATA%\supportos-plusplus`
-/// - macOS:   `~/Library/Application Support/supportos-plusplus`
-/// - Linux:   `${XDG_DATA_HOME:-~/.local/share}/supportos-plusplus`
+/// - Linux: `${XDG_DATA_HOME:-~/.local/share}/supportos-plusplus`
 ///
+/// The port is Linux-only (DEV-006): no Windows/macOS branches exist.
 /// Overridable via `SPP_DATA_DIR` for tests and dev.
 pub fn default_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SPP_DATA_DIR") {
         return PathBuf::from(dir);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("APPDATA")
-            .map(|appdata| PathBuf::from(appdata).join("supportos-plusplus"))
-            .unwrap_or_else(|_| PathBuf::from(".").join("data"))
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var("HOME")
-            .map(|home| {
-                PathBuf::from(home)
-                    .join("Library")
-                    .join("Application Support")
-                    .join("supportos-plusplus")
-            })
-            .unwrap_or_else(|_| PathBuf::from(".").join("data"))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let base = std::env::var("XDG_DATA_HOME")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let root = base
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(home).join(".local").join("share"));
-        root.join("supportos-plusplus")
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        PathBuf::from(".").join("data")
-    }
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let root = base
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(home).join(".local").join("share"));
+    root.join("supportos-plusplus")
 }
 
 /// Ensure a directory exists (create it if missing).

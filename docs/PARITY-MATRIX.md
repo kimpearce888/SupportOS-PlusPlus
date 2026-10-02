@@ -51,7 +51,7 @@ Each milestone groups dozens of capabilities. Detailed per-capability rows live 
 ### Milestone 1 — Foundation (CLOSED — pending owner sign-off)
 
 > **M1 milestone close report**: see `docs/FINAL-PARITY-AUDIT.md`.
-> CI green on `main` (commit `d27f413`): all 8 jobs pass on Win/macOS/Linux + WASM + Tauri build.
+> Historical note: that claim referred to the pre-cleanup multi-platform CI. The current CI is Linux-only (ubuntu-22.04/24.04).
 > 12 of 15 tasks done; 2 partial (T02, T04); 2 BLOCKED (T10, T11).
 > Tag `milestone-1-done` pushed. Waiting for owner to say "continue" to proceed to M2.
 
@@ -71,8 +71,8 @@ Each milestone groups dozens of capabilities. Detailed per-capability rows live 
 | Job queue | ✅ DONE (M1-T05) — `crates/core/src/runner.rs`: `JobHandler` trait + `JobRegistry` + `Runner` + `RunSummary` (D-021). End-to-end tests cover enqueue → claim → execute → complete, retry-then-succeed, always-fail → dead-letter. 10 new tests, stable across 5 runs |
 | Settings store | ✅ IMPLEMENTED (M1-T04 partial) — typed helpers `get_bool`/`set_bool`/`get_i64`/`set_i64`/`get_json`/`set_json` (D-017) + first-run flag; secrets redacted on read |
 | Theming | ✅ DONE (M1-T07) — CSS custom properties in `crates/ui/styles/app.css` (colors, spacing, typography, radii, shadows, motion) + `Severity` enum (D-019) mirroring Operations Center buckets |
-| CI matrix (Win/macOS/Linux: fmt + verify-config + clippy + test + build) | ✅ DONE — `.github/workflows/ci.yml` runs fmt + `cargo xtask verify-config` + clippy + tests + WASM build + Tauri build on ubuntu-22.04, ubuntu-24.04, macos-latest, windows-latest |
-| Installer pipelines (MSI, NSIS, DMG, DEB, RPM, AppImage) | SPECIFIED — bundle targets present in `tauri.conf.json` (verified by `verify-config`); actual builds happen in `.github/workflows/release.yml` on tag push |
+| CI matrix (Linux-only: fmt + verify-config + clippy + test + build) | DONE for the current Linux-only scope — `.github/workflows/ci.yml` runs on ubuntu-22.04/24.04 only (Windows/macOS runners removed by DEV-006 cleanup) |
+| Installer pipelines (DEB + AppImage only) | Current scope — `tauri.conf.json` targets are exactly `["deb","appimage"]` (verified by `verify-config` with a forbidden-format list); builds happen in `.github/workflows/release.yml` on tag push |
 | Qdrant Edge spike on all 5 platforms (A4) | SPECIFIED |
 | `xtask discover` (A7) replaces manual pass | ✅ DONE (10/10 canonical counts match; writes `docs/original-notes/inventory.json`) |
 | `xtask verify-config` (A0 in CI) | ✅ DONE (D-016) — 7 unit tests, runs on every CI push |
@@ -132,9 +132,9 @@ None. Reference HEAD `c346fb51466e237a89e70156ae20a3386be0b322` unchanged since 
 |---|---|
 | Startup self-check (6 subsystems) | ✅ DONE — `self_check` IPC + 7 tests |
 | Qdrant Edge adapter (dense subset, behind `qdrant` feature) | ✅ DONE — compiles in CI; DEV-002 for sparse/snapshot/restore TODO |
-| Smoke-install CI (6 jobs: Linux DEB+RPM, Windows MSI+NSIS, macOS DMG, qdrant-build) | ✅ ALL 6 PASS |
+| Smoke-install CI (Linux DEB + qdrant-build) | Current scope — RPM/Windows/macOS smoke jobs removed with those formats |
 | AppImage target re-enabled | ✅ DONE |
-| macOS Intel (macos-13) added to nightly matrix | ✅ DONE |
+| macOS nightly matrix | REMOVED — macOS is out of scope (DEV-006) |
 | Linux arm64 removed per owner decision | ✅ DONE (DEV-004) |
 | Real WebDriver E2E (tauri-driver + per-page control clicking + text reports) | ✅ DONE — passes on `481695f` |
 | 24 UI pages with real IPC wiring (49+ IPC commands) | ✅ DONE — covers all 21 reference pages + 3 extras |

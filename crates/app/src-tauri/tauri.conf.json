@@ -27,26 +27,16 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm", "appimage"],
+    "targets": ["deb", "appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
+      "icons/128x128@2x.png"
     ],
     "publisher": "kimpearce888",
     "category": "Productivity",
     "shortDescription": "Local-first AI-powered support operating system for Help Scout",
     "longDescription": "SupportOS++ is an independent, open-source Rust/Tauri desktop reimplementation of supportos. Local-first: no telemetry, no cloud AI, no data egress.",
-    "macOS": {
-      "minimumSystemVersion": "10.15"
-    },
-    "windows": {
-      "webviewInstallMode": {
-        "type": "embedBootstrapper"
-      }
-    },
     "linux": {
       "deb": {
         "depends": ["libwebkit2gtk-4.1-0", "libssl3"]

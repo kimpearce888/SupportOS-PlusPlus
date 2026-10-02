@@ -1143,7 +1143,7 @@ fn graph_neighbors(
         .collect()
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

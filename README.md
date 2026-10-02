@@ -8,23 +8,40 @@ SupportOS++ is a desktop app that mirrors your Help Scout conversations, custome
 
 ## Install (3 steps)
 
-1. Download the `.deb`, `.rpm`, or `.AppImage` from [Releases](https://github.com/kimpearce888/SupportOS-PlusPlus/releases).
-2. Install it (`sudo apt install ./SupportOS++_*.deb` or `sudo dnf install ./SupportOS++-*.rpm` or just run the `.AppImage`).
-3. Launch **SupportOS++**. On first run, click **"Try the 2-minute demo mode"** — no credentials needed.
+1. Download the `.deb` or `.AppImage` from [Releases](https://github.com/kimpearce888/SupportOS-PlusPlus/releases).
+2. Install it (`sudo apt install ./SupportOS++_*.deb`) or just run the `.AppImage`.
+3. Launch **SupportOS++**. On first run, use demo mode — no credentials needed.
 
-Linux x86_64 only. Windows and macOS are excluded for now (the code is portable; see [DEV-006](docs/DEVIATIONS.md)).
+**Linux x86_64 only.** The only supported package formats are `.deb` and `.AppImage`. There are no Windows, macOS, or RPM packages, and no plans to add them.
 
 ---
 
-## What's new
+## Status: parity audit in progress
 
-- **24 pages** with real data wiring — Dashboard, Inbox (3-pane with filters + saved views + reply/note/status/assign/bulk actions), Customer profiles + timeline, Operations Center, Notifications, Automation, AI Center, Reports (21×14 builder), Issue Radar, Incidents, Knowledge Gaps, Side Threads, Connectors, Custom Objects, Outreach (campaigns + segments + DNC), Search (FTS5), Backup, Support Graph, Support Health, Settings, Onboarding wizard, Command Palette, 404.
-- **49+ IPC commands** connecting every UI control to real Rust core functions.
-- **Startup self-check** — at boot, verifies database (28 migrations), FTS5, vector store, AI provider, loopback listener, and catalog conformance. Visible in logs + the Settings page.
-- **Real WebDriver E2E** — CI drives the actual UI via tauri-driver, clicks every control on every page, checks for errors and placeholder data.
-- **Smoke-install CI** — verifies each installer (DEB + RPM) actually installs, launches, runs the self-check, initializes the DB, and uninstalls correctly.
-- **Qdrant Edge adapter** — complete VectorStore implementation (dense + sparse search, snapshot, restore, filter translation) behind a cargo feature flag.
-- **786 core tests + 68 UI tests + 25 E2E pages + 3 smoke-install jobs** — all green.
+SupportOS++ is a Rust/Tauri 2/Leptos port of the TypeScript reference
+[`supportos`](https://github.com/kimpearce888/supportos). A strict
+reference-parity audit is in progress — see **[PARITY.md](PARITY.md)** for
+the canonical F-ID checklist (what matches, what is missing, what differs)
+and PROGRESS.md for current session state. Claims on this page are limited
+to what the audit has actually verified.
+
+**What is real today:**
+
+- Rust workspace: `core` (Axum HTTP server + SQLite/FTS5 business core),
+  `ui` (Leptos/WASM), `app` (Tauri 2 shell), `catalog` (closed vocabularies),
+  `xtask` (dev/test/lint/package/e2e tooling).
+- Loopback HTTP server (127.0.0.1:3000) with mutation rate limiting,
+  Host-header DNS-rebinding guard, and localhost-only CORS.
+- SQLite (bundled, WAL, FTS5) persistence with boot-time migrations.
+- SSE event bus (`/api/events`) wired to conversation/webhook/demo mutations.
+- Demo mode with simulate-incoming / simulate-rating / simulate-webhook endpoints.
+- 900+ cargo tests across the workspace.
+
+**What is not yet at reference parity (see PARITY.md for the full list):**
+the Leptos UI routes fewer pages than the reference, several HTTP routes are
+stubbed pending wiring to the engines behind them, the real Help Scout
+provider/OAuth flow and production vector search wiring are incomplete, and
+`.sosync` bundles are not yet byte-compatible with the reference format.
 
 ---
 
@@ -32,22 +49,16 @@ Linux x86_64 only. Windows and macOS are excluded for now (the code is portable;
 
 The reference `supportos` is a TypeScript web app that depends on a cloud database, cloud AI, and a server. We wanted a version that:
 
-- **Stays local.** Your Help Scout data lives on your machine, not in a cloud database. Network traffic goes to Help Scout (for sync), your local AI provider (LM Studio or Ollama, both optional), and user-configured connectors — nothing else.
+- **Stays local.** Your Help Scout data lives on your machine, not in a cloud database. Network traffic goes to Help Scout (for sync), your local AI provider (LM Studio, optional), and user-configured connectors — nothing else.
 - **Works offline.** No internet? The app still works. Sync pauses; everything else continues.
 - **Is auditable.** Every line is Rust. No `node_modules` black box. `cargo audit` checks for known vulnerabilities. The spec is committed verbatim in `docs/MASTER-SPEC.md`.
-
-## Why Rust and Tauri
-
-We chose Rust because it's fast, memory-safe, and has excellent SQLite + FTS5 support via `rusqlite` (bundled — no system SQLite dependency). The trade-off: slower compilation, and the Rust ecosystem for desktop UIs (Leptos/WASM) is less mature than React.
-
-We chose Tauri 2 because it produces small native binaries with a system webview (WebKit2GTK on Linux), not a bundled Chromium. The trade-off: you need WebKit2GTK installed (most Linux distros have it), and the webview rendering can differ slightly from Chromium.
 
 ## How it works (simple terms)
 
 1. **Sync.** SupportOS++ talks to the Help Scout API (OAuth 2.0), fetches conversations/customers/mailboxes, and stores them in a local SQLite database (with WAL + FTS5 for fast full-text search). Webhooks push updates in real-time when configured.
-2. **Analyze.** The local AI (if configured — LM Studio at `127.0.0.1:1234` or Ollama at `127.0.0.1:11434`) reads conversations and generates summaries, suggested replies, customer attributes, and coaching tips. AI is advisory only — auto-customer-reply is permanently OFF.
-3. **Organize.** The Operations Center shows 16 tiles of real-time metrics (active conversations, SLA breaches, automation approvals, etc.). The Issue Radar surfaces known issues, clusters, and incidents. Reports let you build any of 21 metrics × 14 dimensions with previous-period comparison.
-4. **Backup.** Export the entire database as JSON (encrypted with AES-256-GCM + scrypt if you use `.sosync` format). Restore on any machine.
+2. **Analyze.** The local AI (if configured — LM Studio at `127.0.0.1:1234`) reads conversations and generates summaries, suggested replies, customer attributes, and coaching tips. AI is advisory only — auto-customer-reply is permanently OFF.
+3. **Organize.** The Operations Center shows 16 tiles of real-time metrics. The Issue Radar surfaces known issues, clusters, and incidents. Reports support 21 metrics × 14 dimensions with previous-period comparison.
+4. **Backup.** Export the entire database (encrypted with AES-256-GCM + scrypt in `.sosync` format). Restore on any machine.
 
 ## Key decisions
 
@@ -55,40 +66,25 @@ We chose Tauri 2 because it produces small native binaries with a system webview
 |---|---|---|
 | Rust + Tauri 2 | Memory safety, small binaries, no Chromium | Slower compile; Leptos/WASM UI is less mature than React |
 | SQLite (bundled, WAL, FTS5) | No external database; ACID; full-text search built-in | Not a distributed database (single machine) |
-| Qdrant Edge behind a feature flag | Adds 400+ deps; InMemoryVectorStore works for demo/tests | Production vector search requires `--features qdrant` |
-| Linux-only (for now) | Owner decision; CI matrix simplified | Windows/macOS users build from source (code is portable) |
+| Linux-only, deb + AppImage only | Project scope decision | No Windows/macOS/RPM packages |
 | AI is advisory, never auto-reply | Spec rule: "Auto-customer-reply is permanently OFF" | Slower than fully automated; safer for support quality |
 | No telemetry, no cloud AI | Privacy-first; all data stays local | No remote monitoring; no GPT-4/Claude integration |
 
-## What's verified
+## Development
 
-- ✅ 786 core tests + 68 UI tests pass on every push.
-- ✅ CI: fmt + clippy + tests + WASM build + Tauri build + cargo audit + clean-build check.
-- ✅ E2E: WebDriver drives all 24 pages, clicks every control, checks for errors.
-- ✅ Smoke-install: DEB + RPM install, launch, self-check, DB init, uninstall — all verified.
-- ✅ Qdrant adapter: compiles + tests pass with `--features qdrant`.
-- ✅ Independent audit: 0 Blocker, 0 Critical, 0 Major findings.
+```bash
+./bootstrap.sh        # Linux only: install Rust + system deps, build, launch
+cargo xtask lint      # rustfmt --check + clippy -D warnings
+cargo xtask test      # workspace tests
+cargo xtask package   # tauri build (deb + AppImage)
+```
 
-## What's NOT verified
-
-- ❌ Installer signing (needs owner certificates — M1-T10).
-- ❌ Real Help Scout API integration (needs real OAuth credentials — stand-in server verified the protocol shape).
-- ❌ Real AI provider integration (needs running LM Studio or Ollama — stand-in server verified the protocol shape).
-- ❌ Manual verification on a clean machine (owner action — see `docs/MANUAL-VERIFICATION.md`).
-
-## Deviations awaiting owner approval
-
-| ID | Description | Status |
-|---|---|---|
-| DEV-002 | Qdrant adapter: complete but behind `qdrant` feature flag | Resolved (STEP 1b) |
-| DEV-003 | macOS app-crate tests excluded | Moot (DEV-006 removes macOS) |
-| DEV-004 | Linux arm64 not supported | Approved (owner decision) |
-| DEV-005 | Production builds use InMemoryVectorStore, not Qdrant Edge | Pending (depends on owner decision to enable `qdrant` feature) |
-| DEV-006 | Windows and macOS excluded | Approved (owner decision) |
+CI (Linux runners only): fmt + clippy + tests + WASM build + Tauri deb/AppImage
+bundle + package smoke tests + WebDriver E2E via tauri-driver + cargo audit.
 
 ## Credits
 
-Built by an AI agent (Claude) across 39 sessions, following the master spec in `docs/MASTER-SPEC.md`. The reference repo is [`supportos`](https://github.com/kimpearce888/supportos) (TypeScript).
+The reference repo is [`supportos`](https://github.com/kimpearce888/supportos) (TypeScript).
 
 ## License
 

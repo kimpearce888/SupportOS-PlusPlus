@@ -19,9 +19,6 @@ The DEB package contains:
 **Dependencies**: `libwebkit2gtk-4.1-0`, `libssl3`, `libwebkit2gtk-4.1-0`, `libgtk-3-0`
 **Installed size**: ~6.7 MB
 
-## RPM (`.rpm`)
-
-Same files as DEB. Package name: `support-os`.
 
 ## AppImage
 

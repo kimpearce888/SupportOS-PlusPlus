@@ -34,8 +34,8 @@ Independent Rust/Tauri 2 desktop reimplementation of the existing `supportos` TS
 
 ## Non-negotiable rules
 
-- Tauri 2 desktop app for Win/macOS/Linux. Rust backend, Rust/WASM frontend (Leptos). No hand-written JS/TS anywhere (tooling-generated glue is OK).
-- No Node, Python, Docker, or separate Qdrant process. SQLite bundled (WAL, FTS5). Everything ships inside the installer.
+- Tauri 2 desktop app for Linux only (x86_64); packages: .deb + .AppImage only. Rust backend, Rust/WASM frontend (Leptos). No hand-written JS/TS anywhere (tooling-generated glue is OK).
+- No Node, Python, Docker, PowerShell, or separate Qdrant process. (E2E/differential tooling is Rust, under crates/xtask.) SQLite bundled (WAL, FTS5). Everything ships inside the installer.
 - Local-first: no telemetry, no cloud AI, no data egress. Network = Help Scout + local AI + user connectors only.
 - AI is advisory. Auto-customer-reply is permanently OFF. "Unknown" is a legitimate answer.
 - Secrets never reach the UI; always redacted in reads. Never commit credentials/tokens/user data.
@@ -43,7 +43,7 @@ Independent Rust/Tauri 2 desktop reimplementation of the existing `supportos` TS
 
 ## Session start checklist (in order, no skipping)
 
-1. Read this file, then `PROGRESS.md`, then the current milestone in `TASKS.md`.
+1. Read this file, then `PROGRESS.md`, then `PARITY.md` (canonical audit record).
 2. If `PROGRESS.md` does not exist → session 1: state detection, discovery (A7/A8/A9), write matrix + notes, start Milestone 1. Otherwise RESUME: do not redo discovery, do not re-scaffold.
 3. Verify reality: `git status`, `git log --oneline -20`, run `cargo xtask test`. Commit or finish uncommitted work. If `PROGRESS.md` and git disagree, git wins.
 4. Read only the master-spec sections and original-notes relevant to the current milestone.

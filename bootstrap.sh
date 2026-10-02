@@ -2,12 +2,12 @@
 # bootstrap.sh — silently install build prerequisites for SupportOS++, then build and launch.
 # Safe to re-run.
 #
-# Supports: macOS (arm64, x86_64) and Linux (x86_64, aarch64).
-# Windows: use bootstrap.ps1 instead.
+# SupportOS++ is Linux-only (x86_64/aarch64) per DEV-006.
+# Supported packages: .deb and .AppImage only.
 
 set -euo pipefail
 
-echo "==> SupportOS++ bootstrap (macOS / Linux)"
+echo "==> SupportOS++ bootstrap (Linux)"
 
 # --- 1. Rust toolchain ----------------------------------------------------
 if ! command -v cargo >/dev/null 2>&1; then
@@ -24,45 +24,19 @@ fi
 # Ensure the wasm32 target is installed (Leptos/WASM frontend).
 rustup target add wasm32-unknown-unknown 2>/dev/null || true
 
-# --- 2. OS-specific system dependencies ------------------------------------
-OS="$(uname -s)"
-case "$OS" in
-  Darwin)
-    # Tauri 2 on macOS needs Xcode Command Line Tools.
-    if ! xcode-select -p >/dev/null 2>&1; then
-      echo "==> Installing Xcode Command Line Tools…"
-      xcode-select --install || true
-    fi
-    ;;
+# --- 2. Linux system dependencies -----------------------------------------
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "ERROR: this bootstrap supports apt-based Linux (Ubuntu/Debian)." >&2
+  echo "Tauri 2 needs: webkit2gtk-4.1, openssl, gtk3, librsvg." >&2
+  echo "Install them with your package manager, then re-run bootstrap.sh." >&2
+  exit 1
+fi
 
-  Linux)
-    # Detect the distro family.
-    if command -v apt-get >/dev/null 2>&1; then
-      echo "==> Installing build deps via apt-get (Ubuntu/Debian)…"
-      sudo apt-get update -y
-      sudo apt-get install -y \
-        libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
-        librsvg2-dev build-essential curl wget file pkg-config
-    elif command -v dnf >/dev/null 2>&1; then
-      echo "==> Installing build deps via dnf (Fedora)…"
-      sudo dnf install -y \
-        webkit2gtk4.1-devel openssl-devel gtk3-devel libappindicator-gtk3-devel \
-        librsvg2-devel gcc gcc-c++ curl wget file pkgconfig
-    elif command -v pacman >/dev/null 2>&1; then
-      echo "==> Installing build deps via pacman (Arch)…"
-      sudo pacman -S --noconfirm \
-        webkit2gtk-4.1 openssl gtk3 libayatana-appindicator librsvg base-devel curl wget file pkgconf
-    else
-      echo "WARN: unsupported Linux distro. Tauri 2 needs: webkit2gtk-4.1, openssl, gtk3, librsvg." >&2
-      echo "      Install them with your package manager, then re-run bootstrap.sh." >&2
-    fi
-    ;;
-
-  *)
-    echo "ERROR: unsupported OS ($OS). Use bootstrap.ps1 on Windows." >&2
-    exit 1
-    ;;
-esac
+echo "==> Installing build deps via apt-get (Ubuntu/Debian)…"
+sudo apt-get update -y
+sudo apt-get install -y \
+  libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
+  librsvg2-dev build-essential curl wget file pkg-config
 
 # --- 3. Tauri CLI + trunk (Leptos build tool) -----------------------------
 if ! command -v tauri >/dev/null 2>&1; then

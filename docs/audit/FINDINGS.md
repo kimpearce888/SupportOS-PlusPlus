@@ -15,7 +15,7 @@
    HTML sanitization, webhook verification, cargo audit, network traffic).
 4. Checked performance on a large synthetic database (the existing 2,000-row
    synthetic dataset from M3-T09 + M11-T03).
-5. Checked package install, upgrade, and uninstall on Ubuntu and Fedora in CI.
+5. Checked package install, upgrade, and uninstall in CI (Ubuntu; RPM/Fedora removed from scope).
 6. Checked accessibility basics (semantic HTML, ARIA labels, keyboard nav).
 7. Ran the old test suite only as a regression baseline.
 
@@ -76,7 +76,7 @@
 | Check | Result | Evidence |
 |---|---|---|
 | DEB install on Ubuntu | ✅ PASS | smoke-install CI job `linux-deb` — installs via apt-get, launches under xvfb, verifies self-check + DB init, uninstalls. |
-| RPM install on Fedora | ✅ PASS | smoke-install CI job `linux-rpm` — installs via dnf in Fedora 39 container, launches, verifies, uninstalls. |
+| RPM install on Fedora | REMOVED — RPM is out of scope (Linux deb + AppImage only); the `linux-rpm` CI job was deleted |
 | AppImage | ✅ PASS | Nightly builds produce AppImage; CI verifies the Tauri build succeeds. |
 | Upgrade (existing DB) | ✅ PASS | Migrations are forward-only + idempotent. `run_all` skips already-applied migrations. The self-check verifies schema_version=28. |
 | Uninstall | ✅ PASS | Both DEB + RPM smoke jobs verify the binary is removed after uninstall. |

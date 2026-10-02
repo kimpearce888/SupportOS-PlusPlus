@@ -142,8 +142,9 @@ jobs:
           fi
           echo "✅ App launched under xvfb"
 
-          # Run the E2E driver script.
-          python3 scripts/e2e_driver.py "$APP_BIN" "$SPP_DATA_DIR" /tmp/e2e-report.md
+          # Run the E2E driver (Rust port; see crates/xtask/src/bin/e2e.rs).
+          cargo run -p supportos-plusplus-xtask --bin e2e -- \
+            --app-binary "$APP_BIN" --data-dir "$SPP_DATA_DIR" --report /tmp/e2e-report.md
           E2E_EXIT_CODE=$?
 
           # Print the report.

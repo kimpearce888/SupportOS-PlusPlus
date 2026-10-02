@@ -2,7 +2,7 @@
 //!
 //! Per A0: the product name must be `SupportOS++`, the bundle identifier must be
 //! `com.supportos.plusplus`, and the bundle targets must include all required
-//! formats (deb, rpm, appimage — Linux-only per DEV-006).
+//! formats (deb, appimage — Linux-only per DEV-006; RPM is out of scope).
 //!
 //! This check runs without needing GTK/WebKit2GTK system libraries (it just parses
 //! the JSON config), so it works in any environment — including the local dev
@@ -44,8 +44,12 @@ pub struct BundleSection {
 }
 
 /// The bundle targets required for the current scope (Linux-only per DEV-006).
-/// Windows (msi, nsis) and macOS (dmg) are excluded by owner decision.
-pub const REQUIRED_BUNDLE_TARGETS: &[&str] = &["deb", "rpm", "appimage"];
+/// Exactly `.deb` and `.AppImage`; RPM, Windows (msi, nsis) and macOS (dmg) are
+/// all out of scope.
+pub const REQUIRED_BUNDLE_TARGETS: &[&str] = &["deb", "appimage"];
+
+/// Bundle targets that must NOT be present (out-of-scope formats).
+pub const FORBIDDEN_BUNDLE_TARGETS: &[&str] = &["rpm", "msi", "nsis", "dmg", "app", "updater"];
 
 /// Read + parse the `tauri.conf.json` at `path`.
 pub fn load(path: &Path) -> anyhow::Result<TauriConfig> {
@@ -84,6 +88,14 @@ pub fn violations(cfg: &TauriConfig) -> Vec<String> {
         if !cfg.bundle.targets.iter().any(|t| t == required) {
             out.push(format!(
                 "bundle.targets must include \"{required}\" (INSTALL AND PACKAGING + A0); got {:?}",
+                cfg.bundle.targets
+            ));
+        }
+    }
+    for forbidden in FORBIDDEN_BUNDLE_TARGETS {
+        if cfg.bundle.targets.iter().any(|t| t == forbidden) {
+            out.push(format!(
+                "bundle.targets must NOT include \"{forbidden}\" (Linux-only scope: deb + appimage only); got {:?}",
                 cfg.bundle.targets
             ));
         }
@@ -167,16 +179,16 @@ mod tests {
     }
 
     #[test]
-    fn flags_missing_bundle_target() {
+    fn flags_out_of_scope_bundle_target() {
         let cfg = sample_config(
             "SupportOS++",
             "com.supportos.plusplus",
             "SupportOS++",
-            &["deb", "appimage"], // missing rpm
+            &["deb", "rpm", "appimage"], // rpm is out of scope
         );
         let v = violations(&cfg);
         assert_eq!(v.len(), 1);
-        assert!(v.iter().any(|s| s.contains("\"rpm\"")));
+        assert!(v.iter().any(|s| s.contains("must NOT include \"rpm\"")));
     }
 
     #[test]
