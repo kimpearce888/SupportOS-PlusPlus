@@ -1,27 +1,12 @@
 name: Smoke Install
 
-# Verifies that the nightly installers actually install + launch + initialize
-# the database (M12 PRIORITY 1). Runs after the Nightly workflow succeeds.
-#
-# For each platform:
-# - Linux:   install the DEB via apt, install the RPM in a Fedora container,
-#            launch under xvfb, check process + data folder, uninstall, verify.
-# - Windows: silent-install the MSI and the NSIS exe, launch, check process
-#            and data folder, uninstall, verify.
-# - macOS:   mount the DMG, copy the .app, launch, check process.
-#
-# Fails the workflow on any problem. The self_check IPC command (M12-P2) is
-# used to verify all subsystems initialized.
+# Verifies that the nightly Linux installers actually install + launch +
+# initialize the database. Runs after the Nightly workflow succeeds.
 
 on:
   schedule:
-    - cron: '30 3 * * *'  # 30 min after nightly
+    - cron: '30 3 * * *'
   workflow_dispatch:
-    inputs:
-      nightly_run_id:
-        description: 'Optional: the Nightly workflow run ID to download artifacts from'
-        required: false
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,7 +17,7 @@ permissions:
   actions: read
 
 jobs:
-  # ─── Linux: DEB + RPM install ────────────────────────────────────────────
+  # ─── Linux: DEB install ──────────────────────────────────────────────────
   linux-deb:
     name: Linux DEB install + launch + self-check
     runs-on: ubuntu-22.04
@@ -44,7 +29,7 @@ jobs:
         with:
           workflow: nightly.yml
           workflow_conclusion: success
-          name: nightly-ubuntu-22.04
+          name: nightly-linux
           path: ./artifacts
           search_artifacts: true
 
@@ -58,61 +43,51 @@ jobs:
           DEB=$(find ./artifacts -name '*.deb' | head -1)
           echo "Installing $DEB"
           sudo apt-get install -y "$DEB"
-          which supportos-plusplus || (echo "Binary not in PATH after install" && exit 1)
+          if ! command -v supportos-plusplus >/dev/null 2>&1; then
+            echo "❌ Binary not in PATH after install"
+            exit 1
+          fi
 
       - name: Launch under xvfb + check self-check
         run: |
           export SPP_DATA_DIR=/tmp/spp-smoke-deb
           mkdir -p "$SPP_DATA_DIR"
-
-          # Launch the app under xvfb. The app will run the self-check at boot
-          # and log the result. We capture the log + check the process stays
-          # alive for at least 5 seconds.
           timeout 15 xvfb-run -a supportos-plusplus 2>&1 | tee /tmp/app.log &
           APP_PID=$!
           sleep 8
-
-          # Check the process is still running.
           if ! kill -0 $APP_PID 2>/dev/null; then
             echo "❌ App exited before the 8-second check"
             cat /tmp/app.log
             exit 1
           fi
-
-          # Check the self-check ran (look for the log line).
           if ! grep -q "startup self-check report" /tmp/app.log; then
             echo "❌ Self-check report not found in logs"
             cat /tmp/app.log
             exit 1
           fi
-
-          # Check the DB file was created in the data dir.
           if [ ! -f "$SPP_DATA_DIR/supportos-plusplus.db" ]; then
             echo "❌ SQLite DB file not created in data dir"
             ls -la "$SPP_DATA_DIR"
             exit 1
           fi
-
           echo "✅ App launched, self-check ran, DB initialized"
           kill $APP_PID 2>/dev/null || true
 
       - name: Uninstall the DEB + verify removal
         run: |
-          # Tauri derives the package name from productName ("SupportOS++")
-          # by lowercasing + removing '+'. The result is "support-os".
-          # Use dpkg to find the actual installed package name.
           PKG=$(dpkg -S /usr/bin/supportos-plusplus 2>/dev/null | cut -d: -f1 || true)
           if [ -z "$PKG" ]; then
             PKG="support-os"
           fi
           echo "Removing package: $PKG"
           sudo apt-get remove -y "$PKG"
-          if which supportos-plusplus 2>/dev/null; then
+          if command -v supportos-plusplus >/dev/null 2>&1; then
             echo "❌ Binary still in PATH after uninstall"
             exit 1
           fi
           echo "✅ Uninstall succeeded"
 
+  # ─── Linux: RPM install (Fedora container) ──────────────────────────────
   linux-rpm:
     name: Linux RPM install (Fedora container)
     runs-on: ubuntu-22.04
@@ -122,7 +97,6 @@ jobs:
 
       - name: Install Fedora deps
         run: |
-          # Fedora uses 'openssl-libs' (not 'libssl3' which is the Debian name).
           dnf install -y xorg-x11-server-Xvfb webkit2gtk4.1 openssl-libs findutils
 
       - name: Fetch nightly RPM artifact
@@ -130,7 +104,7 @@ jobs:
         with:
           workflow: nightly.yml
           workflow_conclusion: success
-          name: nightly-ubuntu-22.04
+          name: nightly-linux
           path: ./artifacts
           search_artifacts: true
 
@@ -139,7 +113,6 @@ jobs:
           RPM=$(find ./artifacts -name '*.rpm' | head -1)
           echo "Installing $RPM"
           dnf install -y "$RPM"
-          # Fedora minimal container may not have 'which' — use 'command -v' instead.
           if ! command -v supportos-plusplus >/dev/null 2>&1; then
             echo "❌ Binary not in PATH after install"
             exit 1
@@ -168,249 +141,11 @@ jobs:
 
       - name: Uninstall
         run: |
-          # The RPM package name is 'support-os' (derived from productName).
           dnf remove -y support-os || rpm -e support-os
           if command -v supportos-plusplus >/dev/null 2>&1; then
             echo "❌ Binary still in PATH after uninstall"
             exit 1
           fi
-
-  # ─── Windows: MSI + NSIS install ─────────────────────────────────────────
-  windows-msi:
-    name: Windows MSI install + launch + self-check
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch nightly MSI artifact
-        uses: dawidd6/action-download-artifact@v3
-        with:
-          workflow: nightly.yml
-          workflow_conclusion: success
-          name: nightly-windows-latest
-          path: ./artifacts
-          search_artifacts: true
-
-      - name: Silent-install the MSI
-        shell: pwsh
-        run: |
-          # The MSI is nested in artifacts/target/release/bundle/msi/ — use -Recurse.
-          $msi = Get-ChildItem ./artifacts -Filter *.msi -Recurse | Select-Object -First 1
-          Write-Host "Installing $($msi.FullName)"
-          Start-Process msiexec.exe -ArgumentList "/i `"$($msi.FullName)`" /qn /norestart" -Wait -NoNewWindow
-          # Verify the binary exists in Program Files. Tauri on Windows uses
-          # the productName for the .exe name: 'SupportOS++.exe'.
-          $exe = "C:\Program Files\SupportOS++\SupportOS++.exe"
-          if (-not (Test-Path $exe)) {
-            # Try alternate install locations + ASCII binary name.
-            $exe = Get-ChildItem -Path "C:\Program Files" -Filter "SupportOS++.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-            if (-not $exe) {
-              $exe = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-            }
-            if (-not $exe) { Write-Host "❌ Installed binary not found"; exit 1 }
-          }
-          Write-Host "✅ Installed at $exe"
-          echo "SPP_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Launch + self-check
-        shell: pwsh
-        run: |
-          $env:SPP_DATA_DIR = "$env:TEMP\spp-smoke-msi"
-          New-Item -ItemType Directory -Path $env:SPP_DATA_DIR -Force | Out-Null
-          # Launch the app and capture output for 10 seconds.
-          $p = Start-Process -FilePath $env:SPP_EXE -PassThru -RedirectStandardOutput "$env:TEMP\app-stdout.log" -RedirectStandardError "$env:TEMP\app-stderr.log"
-          Start-Sleep -Seconds 8
-          if ($p.HasExited) {
-            Write-Host "❌ App exited before the 8-second check (exit code: $($p.ExitCode))"
-            Get-Content "$env:TEMP\app-stderr.log"
-            exit 1
-          }
-          # Stop the app.
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          # Verify the DB file was created.
-          $dbPath = Join-Path $env:SPP_DATA_DIR "supportos-plusplus.db"
-          if (-not (Test-Path $dbPath)) {
-            Write-Host "❌ SQLite DB file not created at $dbPath"
-            Get-ChildItem $env:SPP_DATA_DIR
-            exit 1
-          }
-          Write-Host "✅ App launched + DB initialized"
-
-      - name: Uninstall the MSI
-        shell: pwsh
-        run: |
-          $msi = Get-ChildItem ./artifacts -Filter *.msi -Recurse | Select-Object -First 1
-          Start-Process msiexec.exe -ArgumentList "/x `"$($msi.FullName)`" /qn /norestart" -Wait -NoNewWindow
-          # Verify removal — check both productName and ASCII binary names.
-          $exe1 = Get-ChildItem -Path "C:\Program Files" -Filter "SupportOS++.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          $exe2 = Get-ChildItem -Path "C:\Program Files" -Filter "supportos-plusplus.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($exe1 -or $exe2) {
-            Write-Host "❌ Binary still exists after uninstall"
-            exit 1
-          }
-          Write-Host "✅ Uninstall succeeded"
-
-  windows-nsis:
-    name: Windows NSIS install + launch + self-check
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch nightly NSIS artifact
-        uses: dawidd6/action-download-artifact@v3
-        with:
-          workflow: nightly.yml
-          workflow_conclusion: success
-          name: nightly-windows-latest
-          path: ./artifacts
-          search_artifacts: true
-
-      - name: Silent-install the NSIS exe
-        shell: pwsh
-        run: |
-          # The NSIS exe is nested in artifacts/target/release/bundle/nsis/ — use -Recurse.
-          $exe = Get-ChildItem ./artifacts -Filter *-setup.exe -Recurse | Select-Object -First 1
-          Write-Host "Installing $($exe.FullName)"
-          # NSIS installers use /S for silent install. Wait up to 120 seconds.
-          $p = Start-Process -FilePath $exe.FullName -ArgumentList "/S" -PassThru -NoNewWindow
-          $p | Wait-Process -Timeout 120 -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 5
-          # Find the installed binary. Try multiple common NSIS install locations
-          # and both productName and ASCII binary names.
-          $searchPaths = @(
-            "$env:LOCALAPPDATA\Programs\SupportOS++",
-            "$env:LOCALAPPDATA\Programs\supportos-plusplus",
-            "$env:LOCALAPPDATA\SupportOS++",
-            "$env:LOCALAPPDATA\supportos-plusplus",
-            "C:\Program Files\SupportOS++",
-            "C:\Program Files\supportos-plusplus",
-            "C:\Program Files (x86)\SupportOS++",
-            "C:\Program Files (x86)\supportos-plusplus"
-          )
-          $installed = $null
-          foreach ($path in $searchPaths) {
-            if (Test-Path $path) {
-              $installed = Get-ChildItem -Path $path -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($installed) { break }
-            }
-          }
-          if (-not $installed) {
-            # Last resort: search all of Program Files + LOCALAPPDATA.
-            $installed = Get-ChildItem -Path "$env:LOCALAPPDATA","C:\Program Files","C:\Program Files (x86)" -Filter "SupportOS*.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $installed) {
-              $installed = Get-ChildItem -Path "$env:LOCALAPPDATA","C:\Program Files","C:\Program Files (x86)" -Filter "supportos-plusplus.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
-            }
-          }
-          if (-not $installed) {
-            Write-Host "❌ Installed binary not found in any standard location"
-            Write-Host "Searched paths:"
-            $searchPaths | ForEach-Object { Write-Host "  $_" }
-            exit 1
-          }
-          Write-Host "✅ Installed at $($installed.FullName)"
-          echo "SPP_EXE=$($installed.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Launch + self-check
-        shell: pwsh
-        run: |
-          $env:SPP_DATA_DIR = "$env:TEMP\spp-smoke-nsis"
-          New-Item -ItemType Directory -Path $env:SPP_DATA_DIR -Force | Out-Null
-          $p = Start-Process -FilePath $env:SPP_EXE -PassThru -RedirectStandardOutput "$env:TEMP\app-stdout.log" -RedirectStandardError "$env:TEMP\app-stderr.log"
-          Start-Sleep -Seconds 8
-          if ($p.HasExited) {
-            Write-Host "❌ App exited before the 8-second check (exit code: $($p.ExitCode))"
-            Get-Content "$env:TEMP\app-stderr.log"
-            exit 1
-          }
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-          $dbPath = Join-Path $env:SPP_DATA_DIR "supportos-plusplus.db"
-          if (-not (Test-Path $dbPath)) {
-            Write-Host "❌ SQLite DB file not created"
-            Get-ChildItem $env:SPP_DATA_DIR
-            exit 1
-          }
-          Write-Host "✅ App launched + DB initialized"
-
-  # ─── macOS: DMG install ──────────────────────────────────────────────────
-  macos-dmg:
-    name: macOS DMG install + launch + self-check
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch nightly DMG artifact
-        uses: dawidd6/action-download-artifact@v3
-        with:
-          workflow: nightly.yml
-          workflow_conclusion: success
-          name: nightly-macos-latest
-          path: ./artifacts
-          search_artifacts: true
-
-      - name: Mount the DMG + copy the app
-        run: |
-          DMG=$(find ./artifacts -name '*.dmg' -type f | head -1)
-          if [ -z "$DMG" ]; then
-            echo "❌ No DMG file found in artifacts"
-            ls -R ./artifacts
-            exit 1
-          fi
-          echo "Mounting $DMG"
-          # Use a fixed mount point so the variable can't be empty.
-          MOUNT_POINT="/Volumes/SupportOS"
-          hdiutil attach "$DMG" -nobrowse -mountpoint "$MOUNT_POINT" -quiet
-          if [ ! -d "$MOUNT_POINT" ]; then
-            echo "❌ DMG did not mount at $MOUNT_POINT"
-            exit 1
-          fi
-          echo "Mounted at $MOUNT_POINT"
-          # Find the .app inside the mounted DMG.
-          APP=$(find "$MOUNT_POINT" -maxdepth 1 -name '*.app' -type d | head -1)
-          if [ -z "$APP" ]; then
-            echo "❌ No .app found in DMG"
-            ls -la "$MOUNT_POINT"
-            hdiutil detach "$MOUNT_POINT" -quiet || true
-            exit 1
-          fi
-          echo "Copying $APP to /Applications"
-          # Remove any existing copy with the same basename.
-          BASENAME=$(basename "$APP")
-          rm -rf "/Applications/$BASENAME" 2>/dev/null || true
-          cp -R "$APP" /Applications/
-          # Unmount the DMG (cleanup).
-          hdiutil detach "$MOUNT_POINT" -quiet || true
-
-      - name: Launch + self-check
-        run: |
-          export SPP_DATA_DIR=/tmp/spp-smoke-dmg
-          mkdir -p "$SPP_DATA_DIR"
-          APP_NAME=$(ls /Applications | grep -i supportos | head -1)
-          # Launch the app for 8 seconds.
-          open -a "/Applications/$APP_NAME" &
-          APP_PID=$!
-          sleep 8
-          # Check the process is still running.
-          if ! pgrep -f "supportos" > /dev/null; then
-            echo "❌ App process not found after launch"
-            exit 1
-          fi
-          # Verify the DB file was created.
-          if [ ! -f "$SPP_DATA_DIR/supportos-plusplus.db" ]; then
-            echo "❌ SQLite DB file not created"
-            ls -la "$SPP_DATA_DIR"
-            exit 1
-          fi
-          echo "✅ App launched + DB initialized"
-          # Kill the app.
-          pkill -f "supportos" 2>/dev/null || true
-
-      - name: Unmount the DMG + cleanup
-        run: |
-          MOUNT_POINT=$(ls -d /Volumes/* 2>/dev/null | grep -i supportos | head -1)
-          if [ -n "$MOUNT_POINT" ]; then
-            hdiutil detach "$MOUNT_POINT" -quiet || true
-          fi
-          rm -rf "/Applications/SupportOS++.app"
 
   # ─── Qdrant feature build verification ────────────────────────────────────
   qdrant-build:
@@ -449,7 +184,7 @@ jobs:
   # ─── Publish the smoke-test report ────────────────────────────────────────
   publish-report:
     name: Publish smoke-install report
-    needs: [linux-deb, linux-rpm, windows-msi, windows-nsis, macos-dmg, qdrant-build]
+    needs: [linux-deb, linux-rpm, qdrant-build]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -470,12 +205,9 @@ jobs:
           |---|---|
           | Linux DEB install + launch | ${{ needs.linux-deb.result }} |
           | Linux RPM install (Fedora) | ${{ needs.linux-rpm.result }} |
-          | Windows MSI install + launch | ${{ needs.windows-msi.result }} |
-          | Windows NSIS install + launch | ${{ needs.windows-nsis.result }} |
-          | macOS DMG install + launch | ${{ needs.macos-dmg.result }} |
           | cargo check --features qdrant | ${{ needs.qdrant-build.result }} |
 
-          Overall: ${{ needs.linux-deb.result == 'success' && needs.linux-rpm.result == 'success' && needs.windows-msi.result == 'success' && needs.windows-nsis.result == 'success' && needs.macos-dmg.result == 'success' && needs.qdrant-build.result == 'success' && '✅ ALL PASS' || '❌ AT LEAST ONE FAILED' }}
+          Overall: ${{ needs.linux-deb.result == 'success' && needs.linux-rpm.result == 'success' && needs.qdrant-build.result == 'success' && '✅ ALL PASS' || '❌ AT LEAST ONE FAILED' }}
           REPORT
 
       - name: Upload report artifact

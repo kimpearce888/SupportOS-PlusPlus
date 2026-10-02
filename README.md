@@ -33,14 +33,12 @@ cargo xtask package    # build installers for the host OS
 
 | OS | Versions | Architectures |
 |---|---|---|
-| Windows | 10, 11 | x86_64 |
-| macOS | 10.15+ | x86_64 (Intel), aarch64 (Apple Silicon) |
 | Linux (Ubuntu) | 22.04, 24.04 | x86_64 |
 | Linux (Fedora) | 40+ | x86_64 |
 | Linux (generic) | any distro with glibc ≥ 2.31 + WebKit2GTK 4.1 | x86_64 |
 
-AppImage is the universal fallback for unsupported distros. Linux arm64 is
-not supported; users on arm64 Linux must build from source.
+AppImage is the universal fallback for unsupported distros. Windows and macOS
+are excluded by owner decision (DEV-006); the code remains portable.
 
 ### Stack
 

@@ -15,20 +15,8 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            rust_target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            rust_target: aarch64-apple-darwin
-          - os: macos-13
-            rust_target: x86_64-apple-darwin
+    name: Build (Linux x86_64)
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
@@ -36,10 +24,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown,${{ matrix.rust_target }}
+          targets: wasm32-unknown-unknown
 
       - name: Install Linux system deps
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
@@ -59,7 +46,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: nightly-${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: nightly-linux-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
 
       - name: Build WASM frontend
         run: |
@@ -74,37 +61,26 @@ jobs:
       - name: Generate SHA-256 checksums
         shell: bash
         run: |
-          # Tauri outputs to the workspace-level target/ dir.
           BUNDLE_DIR="target/release/bundle"
           if [ ! -d "$BUNDLE_DIR" ]; then
             BUNDLE_DIR="crates/app/src-tauri/target/release/bundle"
           fi
           cd "$BUNDLE_DIR" || exit 0
-          SHA_CMD="sha256sum"
-          if ! command -v sha256sum >/dev/null 2>&1; then
-            SHA_CMD="shasum -a 256"
-          fi
-          find . -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \
-            -o -name "*.msi" -o -name "*.exe" -o -name "*.dmg" \) -exec $SHA_CMD {} \; > checksums.txt || true
+          find . -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) -exec sha256sum {} \; > checksums.txt || true
           cat checksums.txt 2>/dev/null || echo "No installer files found"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-${{ matrix.os }}
+          name: nightly-linux
           path: |
             target/release/bundle/**/*.deb
             target/release/bundle/**/*.rpm
             target/release/bundle/**/*.AppImage
-            target/release/bundle/**/*.msi
-            target/release/bundle/**/*.exe
-            target/release/bundle/**/*.dmg
             target/release/bundle/**/checksums.txt
             crates/app/src-tauri/target/release/bundle/**/*.deb
             crates/app/src-tauri/target/release/bundle/**/*.rpm
             crates/app/src-tauri/target/release/bundle/**/*.AppImage
-            crates/app/src-tauri/target/release/bundle/**/*.msi
-            crates/app/src-tauri/target/release/bundle/**/*.exe
-            crates/app/src-tauri/target/release/bundle/**/*.dmg
           retention-days: 7
 
       - name: Upload to nightly pre-release
@@ -112,27 +88,23 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: nightly
-          name: "Nightly Development Build"
+          name: "Nightly Development Build (Linux x86_64)"
           body: |
             ⚠️ Development build, unsigned.
 
-            Built from commit ${{ github.sha }} on ${{ matrix.os }}.
+            Built from commit ${{ github.sha }} on Linux x86_64.
 
             DO NOT use in production. Testing only.
+
+            Windows and macOS are excluded by owner decision (see docs/DEVIATIONS.md DEV-006).
           prerelease: true
           files: |
             target/release/bundle/**/*.deb
             target/release/bundle/**/*.rpm
             target/release/bundle/**/*.AppImage
-            target/release/bundle/**/*.msi
-            target/release/bundle/**/*.exe
-            target/release/bundle/**/*.dmg
             target/release/bundle/**/checksums.txt
             crates/app/src-tauri/target/release/bundle/**/*.deb
             crates/app/src-tauri/target/release/bundle/**/*.rpm
             crates/app/src-tauri/target/release/bundle/**/*.AppImage
-            crates/app/src-tauri/target/release/bundle/**/*.msi
-            crates/app/src-tauri/target/release/bundle/**/*.exe
-            crates/app/src-tauri/target/release/bundle/**/*.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -98,3 +98,25 @@ Each entry:
   - User-visible: hybrid search + vector-backed features work in-memory only; vectors are NOT persisted across restarts in the default build.
   - Technical: demo mode + tests pass; production deployments need `--features qdrant` + adapter completion (DEV-002).
 - **Status**: pending owner approval
+
+---
+
+## DEV-006 — Windows and macOS: excluded by owner
+
+- **Date**: Session 39 (owner directive)
+- **Where**: `.github/workflows/`, `tauri.conf.json`, `README.md`
+- **Spec says**: A4 — Tauri 2 desktop app for Win/macOS/Linux.
+- **Reference does**: n/a
+- **Deviation**: Windows and macOS are excluded from CI, smoke-install, and
+  nightly builds. Only Linux x86_64 is built and tested. The code remains
+  portable (no `#[cfg(target_os)]` gates on business logic); only the CI
+  matrix and installer targets are Linux-only.
+- **Reason**: Owner decision to focus on Linux for initial release.
+  Windows and macOS support can be re-enabled by re-adding the matrix
+  entries to the workflow files.
+- **Impact**:
+  - User-visible: No Windows .msi/.exe or macOS .dmg installers are
+    produced. Windows/macOS users must build from source.
+  - Technical: The code compiles on all platforms (CI verified this
+    before the exclusion); only packaging + smoke-testing are Linux-only.
+- **Status**: approved (owner decision)

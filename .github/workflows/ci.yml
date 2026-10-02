@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04, macos-latest, windows-latest]
+        os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +28,6 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install Linux system deps (Tauri 2)
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
@@ -55,13 +54,8 @@ jobs:
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Tests (exclude Tauri shell on macOS due to upstream _EMBED_INFO_PLIST duplicate symbol)
-        run: cargo test --workspace --all-targets --exclude supportos-plusplus-app
-        if: runner.os == 'macOS'
-
       - name: Tests
         run: cargo test --workspace --all-targets
-        if: runner.os != 'macOS'
 
   build-wasm:
     name: cargo check on wasm32 + trunk build (debug)
@@ -90,13 +84,9 @@ jobs:
           trunk build
 
   build-tauri:
-    name: Tauri build + bundle (${{ matrix.os }})
+    name: Tauri build + bundle (Linux)
     needs: [lint-and-test, build-wasm]
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -104,7 +94,6 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - name: Install Linux system deps (Tauri 2)
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
@@ -122,7 +111,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.os }}-release-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: linux-release-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
       - name: Build WASM frontend
         run: |
           cd crates/ui
@@ -155,12 +144,8 @@ jobs:
           |---|---|
           | lint-and-test (ubuntu-22.04) | ${{ needs.lint-and-test.result }} |
           | lint-and-test (ubuntu-24.04) | ${{ needs.lint-and-test.result }} |
-          | lint-and-test (macos-latest) | ${{ needs.lint-and-test.result }} |
-          | lint-and-test (windows-latest) | ${{ needs.lint-and-test.result }} |
           | build-wasm | ${{ needs.build-wasm.result }} |
-          | build-tauri (ubuntu-22.04) | ${{ needs.build-tauri.result }} |
-          | build-tauri (macos-latest) | ${{ needs.build-tauri.result }} |
-          | build-tauri (windows-latest) | ${{ needs.build-tauri.result }} |
+          | build-tauri (Linux) | ${{ needs.build-tauri.result }} |
 
           Overall: ${{ needs.lint-and-test.result == 'success' && needs.build-wasm.result == 'success' && '✅ GREEN' || '❌ RED' }}
           REPORT
