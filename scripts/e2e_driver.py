@@ -53,7 +53,7 @@ PAGES = [
 ]
 
 
-def webdriver_request(method, path, body=None):
+def webdriver_request(method, path, body=None, timeout=30):
     """Make a raw HTTP request to the WebDriver server."""
     url = f"{WEBDRIVER_URL}{path}"
     data = json.dumps(body).encode() if body else b""
@@ -64,7 +64,7 @@ def webdriver_request(method, path, body=None):
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode() if e.fp else ""
@@ -208,6 +208,8 @@ def main():
         sys.exit(1)
 
     # Create a WebDriver session.
+    # tauri-driver expects the "alwaysMatch" capabilities format.
+    # The browserName must be "wry" (Tauri's webview runtime) on Linux.
     cap_result = webdriver_request(
         "POST",
         "/session",
@@ -215,6 +217,7 @@ def main():
             "capabilities": {
                 "alwaysMatch": {
                     "browserName": "wry",
+                    "browserVersion": "2",
                     "platformName": "linux",
                 }
             }
@@ -222,9 +225,14 @@ def main():
     )
     session_id = None
     if "value" in cap_result:
-        session_id = cap_result["value"].get("sessionId")
-        if not session_id and isinstance(cap_result.get("value"), str):
-            session_id = cap_result["value"]
+        val = cap_result["value"]
+        if isinstance(val, dict):
+            session_id = val.get("sessionId") or val.get("session_id")
+        elif isinstance(val, str):
+            session_id = val
+
+    if not session_id and "sessionId" in cap_result:
+        session_id = cap_result["sessionId"]
 
     if not session_id:
         print(f"❌ Failed to create WebDriver session: {cap_result}")
