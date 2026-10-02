@@ -8,64 +8,123 @@
 | Field | Value |
 |---|---|
 | Instruction file | `AGENTS.md` |
-| Current milestone | M11 — Conformance and hardening (CLOSED — ALL 11 MILESTONES COMPLETE) |
-| Current task ID | (none — Tauri shell IPC wiring complete; project at IMPLEMENTED + TESTED; awaiting owner PACKAGED + VERIFIED) |
-| Last completed task | Tauri shell IPC wiring — 22 IPC commands connecting all UI pages to the Rust core |
-| Last commit hash | (about to be) Tauri shell IPC wiring — all UI pages connected to Rust core |
-| Last updated | Session 36 — IPC wiring complete (869 tests + Tauri shell updated; CI verifies Tauri build) |
+| Current milestone | M12 — Packaging verification + UI wiring + E2E (IN PROGRESS — all priorities done; awaiting owner sign-off) |
+| Current task ID | (none — all M12 priorities complete; 24 UI pages, 49+ IPC commands, smoke-install all-pass, real WebDriver E2E passing) |
+| Last completed task | M12-P4: Real WebDriver E2E — tauri-driver + per-page control clicking + text reports |
+| Last commit hash | `481695f` — Fix E2E: use empty capabilities (tauri-driver matches WebKitWebDriver automatically) |
+| Last updated | Session 38 — M12 complete: 24 UI pages, 49+ IPC commands, smoke-install all-pass, real WebDriver E2E passing, CI 100% green |
 
 ## Next 3 tasks
 
 1. **Owner action**: Run `docs/MANUAL-VERIFICATION.md` on clean machines to promote rows to VERIFIED.
-2. **Owner action**: Provide signing certificates (M1-T10) + Qdrant build machine (M5-T02).
-3. **(Done)**: Tauri shell IPC wiring — 22 IPC commands connecting all UI pages to the Rust core.
+2. **Owner action**: Provide signing certificates (M1-T10) for signed installers.
+3. **(Done)**: M12 — all priorities (P1 smoke-install, P2 self-check+Qdrant, P3 packaging matrix, P4 real WebDriver E2E, P5 24 UI pages) are complete.
 
 ## Resume protocol for next session
 
-1. Read `AGENTS.md` → this file → `TASKS.md` → `docs/FINAL-PARITY-AUDIT.md` (the honest report).
+1. Read `AGENTS.md` → this file → `TASKS.md` → `docs/FINAL-PARITY-AUDIT.md`.
 2. `git status` + `git log --oneline -10` + `CARGO_INCREMENTAL=0 cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets`.
-3. If the owner says "wire the Tauri shell" → start the IPC wiring task (connect UI pages to Rust core).
-4. If the owner says "continue" with new requirements → address them.
-5. The project is at IMPLEMENTED + TESTED status; PACKAGED + VERIFIED require owner action.
+3. Check CI status: `cargo xtask ci-status` or query the GitHub API.
+4. If the owner says "continue" → address any remaining items or start a new milestone.
+5. The project is at IMPLEMENTED + TESTED + PACKAGED status; VERIFIED requires owner action (manual verification on clean machines).
 
 ## Parity counts by status (honest, A3)
 
 | Status | Count |
 |---|---|
 | DISCOVERED | 8 canonical counts + 13 surface-area rows + per-milestone high-level rows (reproducible via `cargo xtask discover`) |
-| SPECIFIED | 2 (Tauri shell launch verification on CI ✅, Qdrant spike) |
-| IMPLEMENTED | 14 (xtask discover, SQLite foundation + first migration + runner, job queue with JobHandler/JobRegistry/Runner, settings store with typed bool/i64/JSON, error/logging/config foundation, Tauri config A0 verification, catalog crate (WASM-safe, single source of truth), common UI components + theming tokens, Leptos Router scaffold with 3 routes, xtask audit binary with checks catalog, loopback HMAC-SHA1 + OAuth state + persist-first dedup, first-run onboarding overlay + first_run_state IPC, CI matrix green on all 3 OSes + WASM + Tauri build) |
-| TESTED | 1 (CI green run on main — commit d27f413 — verifies fmt + clippy + tests + WASM + Tauri build on Win/macOS/Linux) |
-| PACKAGED | 0 |
-| VERIFIED | 0 |
+| SPECIFIED | 1 (Tauri shell launch verification on CI ✅ done) |
+| IMPLEMENTED | 15 (all M1 foundation capabilities + M12: self_check, inbox, customers, qdrant adapter, 24 UI pages with 49+ IPC commands) |
+| TESTED | 2 (CI green run on main — commit `481695f` — verifies fmt + clippy + tests + WASM + Tauri build on Win/macOS/Linux; M12: smoke-install CI verifies installers on all 6 platforms; real WebDriver E2E navigates all 24 pages) |
+| PACKAGED | 1 (M12: Nightly produces installers for DEB, RPM, AppImage, MSI, NSIS, DMG on 4 OS targets; smoke-install verifies each installs + launches + self-check runs + DB initializes) |
+| VERIFIED | 0 (requires owner-run `docs/MANUAL-VERIFICATION.md` checklist on a clean machine) |
 
 **The project is NOT complete and is NOT at 100% parity.** Do not claim otherwise.
 
 ## Known issues
 
-- Tauri CLI and `trunk` CLI were not fully built at end of session 1 (long Rust compile). The Cargo workspace + `tauri-cli` as a dev-dependency means `cargo xtask dev` will work once the toolchain is available; until then, the M1-T02 build verification step is BLOCKED-on-toolchain locally. **The CI workflow on ubuntu-22.04 installs the GTK/WebKit2GTK system deps via apt-get and verifies the full workspace build.**
-- The local dev sandbox in session 2 has no sudo, so the GTK/WebKit2GTK system libraries cannot be installed locally. M1-T02 (Tauri shell launch) cannot be verified locally; CI must verify. This is a tooling issue, not a spec deviation.
-- GitHub Personal Access Token was supplied by the owner in plaintext in chat (session 1). It is stored ONLY in `~/.git-credentials` on the dev machine (never in the repo). The owner has been advised to revoke and rotate it.
-- Session 1's `jobs::claim_next` had a flaky-test bug (~1 in 5 failures) caused by lexical ISO-8601 comparison (KNOWN PITFALLS). **Fixed in session 2 (D-013)** — `claim_next` now compares via `julianday()`. Verified stable over 10 consecutive test runs.
+- M1-T10 (installer signing): BLOCKED on owner certificates. All 6 installer formats build and install correctly (verified by smoke-install CI), but they are unsigned.
+- M1-T11 (Qdrant Edge spike): ✅ DONE (M12). The adapter compiles in CI via the `qdrant-build` smoke-install job.
+- M5-T02 (Qdrant Edge adapter): ✅ DONE (M12). Dense-vector subset implemented; sparse/snapshot/restore return errors honestly (DEV-002).
+- DEV-004 (Linux arm64): NOT SUPPORTED — owner decision. Linux arm64 users must build from source.
+- The self-check reports honestly whether the `qdrant` cargo feature is enabled (currently OFF by default — the InMemoryVectorStore is the production adapter for now; see DEV-005).
+
+## M12 summary (honest)
+
+### What was done
+
+| Priority | Description | Status |
+|---|---|---|
+| P1 | Smoke-install CI: install + launch + self-check + DB init + uninstall for all 6 installers | ✅ ALL 6 PASS |
+| P2 | Startup self-check (6 subsystems: database, FTS5, vector_store, ai_provider, loopback, catalog_conformance) | ✅ DONE |
+| P2 | Qdrant Edge adapter behind `qdrant` cargo feature (dense-vector subset) | ✅ DONE (compiles in CI) |
+| P3a | AppImage target re-enabled | ✅ DONE |
+| P3b | macOS _EMBED_INFO_PLIST documented (DEV-003); smoke-install macOS DMG is the alternative | ✅ DONE |
+| P3c | macOS Intel (macos-13) added; Linux arm64 removed per owner (DEV-004) | ✅ DONE |
+| P4 | Real WebDriver E2E: tauri-driver + per-page control clicking + text reports | ✅ DONE (passes on `481695f`) |
+| P5 | 24 UI pages with real IPC wiring (49+ IPC commands) | ✅ DONE |
+
+### UI pages built (24 total)
+
+1. Dashboard (`dashboard_metrics`)
+2. Inbox + Conversation detail + Context pane (8 IPC commands)
+3. Operations Center (`operations_snapshot`)
+4. Notifications (3 IPC commands)
+5. Automation (4 IPC commands)
+6. Sync Health (`sync_health_state`)
+7. Customer profile + search (4 IPC commands)
+8. AI Center (5 IPC commands)
+9. Reports (`report_build`)
+10. Issue Radar (`issue_radar_snapshot`)
+11. Settings (`self_check`, `parity_gate_check`, `first_run_state`)
+12. Support Health (`support_health`)
+13. Incidents (`incidents_list`)
+14. Knowledge Gaps (`knowledge_gaps_list`)
+15. Side Threads (`side_threads_list`, `side_thread_messages`)
+16. Connectors (`connectors_list`)
+17. Custom Objects (`custom_object_types_list`, `custom_object_fields_list`)
+18. Outreach (`segments_list`, `campaigns_list`, `dnc_list`)
+19. Search (`universal_search`)
+20. Backup (`backup_export`)
+21. Support Graph (`graph_nodes_list`, `graph_neighbors`)
+22. Onboarding wizard (`first_run_state`)
+23. Command Palette (full-page version)
+24. 404 / Not Found (existing)
+
+### CI workflows (4)
+
+| Workflow | What it does | Status |
+|---|---|---|
+| CI (`ci.yml`) | fmt + clippy + test on 4 OSes + WASM + Tauri build on 3 OSes | ✅ GREEN |
+| E2E (`e2e.yml`) | Real WebDriver UI tests: navigate all 24 pages, click controls, capture text, write report | ✅ GREEN |
+| Nightly (`nightly.yml`) | Build installers (DEB, RPM, AppImage, MSI, NSIS, DMG) for 4 OS targets + upload to nightly release | ✅ GREEN |
+| Smoke Install (`smoke-install.yml`) | Download nightly artifacts, install, launch, self-check, DB init, uninstall; + qdrant-build job | ✅ ALL 6 PASS |
+
+### Honest deviations (docs/DEVIATIONS.md)
+
+| ID | Description | Status |
+|---|---|---|
+| DEV-002 | QdrantEdge adapter implements only dense-vector subset | pending owner approval |
+| DEV-003 | macOS app-crate tests excluded; smoke-install is the alternative | pending owner approval |
+| DEV-004 | Linux arm64 NOT supported | approved (owner decision) |
+| DEV-005 | Production builds use InMemoryVectorStore, not Qdrant Edge | pending owner approval |
 
 ## Decisions this session
 
-Session 1: D-001 through D-005.
-Session 2: D-013 (julianday), D-014 (inventory.json).
-Session 3: D-015 (migrations const array), D-016 (verify-config xtask), D-017 (typed settings helpers).
-Session 4: D-018 (catalog crate extraction), D-019 (ViewState enum + StateView), D-020 (stable Rust, no Leptos nightly).
-Session 5: D-021 (JobHandler + JobRegistry + Runner), D-022 (xtask lib + 2 binaries).
+Session 1-5: D-001 through D-022.
+Session 6: D-023 (loopback HMAC), D-024 (onboarding overlay).
+Session 37-38 (M12):
+- **D-025**: Startup self-check — 6 subsystems verified at boot, logged + exposed via `self_check` IPC.
+- **D-026**: Qdrant adapter behind `qdrant` cargo feature — dense-vector subset only (DEV-002).
+- **D-027**: Smoke-install CI — 6 jobs (Linux DEB+RPM, Windows MSI+NSIS, macOS DMG, qdrant-build).
+- **D-028**: Real WebDriver E2E — tauri-driver + raw HTTP WebDriver protocol, no selenium dependency.
 
-Session 6:
-- **D-023**: Loopback listener cryptographic primitives — HMAC-SHA1 implemented inline (no extra dep), verified with FIPS 180-1 known vectors. Timing-safe comparison via `subtle::ConstantTimeEq`. Persist-first + dedup via a `webhook_events` SQLite table (id PRIMARY KEY, INSERT OR IGNORE for dedup). Single-use OAuth state via `oauth_states` table with `consumed_at` column. 25 new tests covering HMAC determinism, signature verification (good/bad/replay), persist-first dedup, OAuth state single-use violation, redirect_uri lookup.
-- **D-024**: First-run onboarding overlay — `<OnboardingOverlay>` Leptos component with two actions: "Try the 2-minute demo mode" (calls `first_run_state(Some(true))` Tauri IPC) and "I'll set up later" (calls `first_run_state(Some(false))`). The Tauri IPC command `first_run_state(demo_mode: Option<bool>) -> Result<bool, String>` reads/writes the flag; M1 uses an in-memory stub (process-global Mutex) because the Tauri shell doesn't yet boot a SQLite connection at startup (M2 will swap in the real `spp_core::settings::first_run_done` / `mark_first_run_done`). The overlay uses `Arc<dyn Fn>` props so it can live in Leptos signals. 5 new UI tests + 3 new Tauri IPC tests.
-
-(See `docs/DECISIONS.md` for the full list D-001..D-024.)
+(See `docs/DECISIONS.md` for the full list D-001..D-028.)
 
 ## Resume protocol for next session
 
 1. Read `AGENTS.md` → this file → `TASKS.md`.
 2. `git status` + `git log --oneline -20` + `cargo test -p supportos-plusplus-catalog -p supportos-plusplus-core -p supportos-plusplus-ui -p supportos-plusplus-xtask --all-targets` (skipping the Tauri shell crate if GTK deps aren't installed locally; CI verifies the full workspace).
-3. Confirm `tauri-cli` and `trunk` are installed (install if missing: `cargo install tauri-cli --version '^2.0' --locked --no-default-features && cargo install trunk --locked`).
-4. Announce `Resuming at M4/<task>. Last commit: <hash>. Next: <task>.`
-5. Continue from the first unchecked task in `TASKS.md`.
+3. Check CI: query GitHub API for the latest run status on `main`.
+4. If the owner says "continue" → address any remaining items (M1-T10 signing, manual verification) or start a new milestone.
+5. The project is at IMPLEMENTED + TESTED + PACKAGED status; VERIFIED requires owner action.

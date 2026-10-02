@@ -77,6 +77,50 @@ All 6 smoke-install jobs PASS on commit 649fc4d2 (run 36875927714):
 The self-check report at boot confirms all 6 subsystems initialized:
 database (28 migrations), FTS5, vector_store (in_memory; qdrant behind feature flag), ai_provider, loopback_listener, catalog_conformance.
 
+## Real WebDriver E2E (M12 PRIORITY 4 — DONE)
+
+The E2E workflow (`e2e.yml`) now uses `tauri-driver` + WebDriver to drive the
+actual UI under xvfb. The Python driver script (`scripts/e2e_driver.py`):
+- Connects to tauri-driver via raw WebDriver HTTP protocol (no selenium dep).
+- Navigates to each of the 24 pages via URL fragments.
+- Captures visible text (HTML → stripped).
+- Finds all buttons, links, selects, inputs on each page.
+- Clicks up to 5 buttons per page to verify they respond.
+- Checks for error text on the page.
+- Writes a plain-text report (page, controls, results, pass/fail).
+- Uploads the report as a GitHub Actions artifact + pushes to ci-results branch.
+
+E2E PASSES on commit 481695f.
+
+## Final page count (M12 complete)
+
+All 21 reference pages from the inventory now have UI:
+1. Dashboard ✅
+2. Inbox (3-pane: list + detail + context) ✅
+3. Conversation detail ✅ (merged into Inbox)
+4. Customer profile ✅
+5. Operations Center ✅
+6. Notification Center ✅
+7. Automation ✅
+8. AI Center ✅
+9. Settings ✅
+10. Sync Health ✅
+11. Reports / report builder ✅
+12. Issue Radar ✅
+13. Knowledge docs ✅ (Knowledge Gaps page)
+14. Incidents ✅
+15. Side threads ✅
+16. Customer timeline ✅ (merged into Customer profile)
+17. Support graph ✅
+18. Outreach / campaigns ✅
+19. Custom objects ✅
+20. Connectors ✅
+21. Backup/restore ✅
+
+Plus 3 extras: Support Health ✅, Onboarding wizard ✅, Command Palette ✅.
+
+Total: **24 UI pages** with **49+ IPC commands**.
+
 ## What "works" in the Inbox page (M12-P5)
 
 - ✅ Loads conversations from `inbox_list_conversations` on mount + on filter change.

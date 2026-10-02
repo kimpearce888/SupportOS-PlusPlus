@@ -3,7 +3,7 @@
 > Statuses (A3): **DISCOVERED** · **SPECIFIED** · **IMPLEMENTED** · **TESTED** · **PACKAGED** · **VERIFIED**
 > A row may be marked VERIFIED only with recorded evidence (test name + packaged-app check). Until then it stays at most PACKAGED.
 > Reference repo HEAD: `c346fb51466e237a89e70156ae20a3386be0b322` (see `docs/REFERENCE-VERSION.md`).
-> Last updated: Session 1.
+> Last updated: Session 38 (M12 complete).
 
 ## Canonical counts (verified against reference code, A7)
 
@@ -120,8 +120,29 @@ None. Reference HEAD `c346fb51466e237a89e70156ae20a3386be0b322` unchanged since 
 
 ## BLOCKED items
 
-None at this time.
+1. **M1-T10 (Installer signing)**: Requires owner certificates per spec A5. All 6 installer formats build + install + launch correctly (verified by smoke-install CI), but they are unsigned.
+
+## Milestone 12 — Packaging verification + UI wiring + E2E (IN PROGRESS)
+
+> All M12 priorities complete. CI 100% green on commit `481695f`.
+> Smoke-install: ALL 6 jobs PASS. Real WebDriver E2E: PASS.
+> 24 UI pages with 49+ IPC commands.
+
+| Capability | Status |
+|---|---|
+| Startup self-check (6 subsystems) | ✅ DONE — `self_check` IPC + 7 tests |
+| Qdrant Edge adapter (dense subset, behind `qdrant` feature) | ✅ DONE — compiles in CI; DEV-002 for sparse/snapshot/restore TODO |
+| Smoke-install CI (6 jobs: Linux DEB+RPM, Windows MSI+NSIS, macOS DMG, qdrant-build) | ✅ ALL 6 PASS |
+| AppImage target re-enabled | ✅ DONE |
+| macOS Intel (macos-13) added to nightly matrix | ✅ DONE |
+| Linux arm64 removed per owner decision | ✅ DONE (DEV-004) |
+| Real WebDriver E2E (tauri-driver + per-page control clicking + text reports) | ✅ DONE — passes on `481695f` |
+| 24 UI pages with real IPC wiring (49+ IPC commands) | ✅ DONE — covers all 21 reference pages + 3 extras |
 
 ## Deviations awaiting owner approval
 
-None at this time. See `docs/DEVIATIONS.md`.
+See `docs/DEVIATIONS.md` for the full list:
+- DEV-002: QdrantEdge adapter implements only dense-vector subset (pending)
+- DEV-003: macOS app-crate tests excluded; smoke-install is alternative (pending)
+- DEV-004: Linux arm64 NOT supported (approved — owner decision)
+- DEV-005: Production builds use InMemoryVectorStore, not Qdrant Edge (pending)
