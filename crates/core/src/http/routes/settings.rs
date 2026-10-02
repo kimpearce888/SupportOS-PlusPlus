@@ -9,19 +9,75 @@ use super::super::server::AppState;
 use axum::response::IntoResponse;
 
 /// GET /api/settings — get all settings.
+///
+/// Reference response shape: a flat object with one key per setting
+/// (no nesting). Values are typed (bool, number, string, null).
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let mut stmt = conn
-        .prepare("SELECT key, value FROM application_settings ORDER BY key")
-        .unwrap();
-    let settings: Vec<Value> = stmt
-        .query_map([], |r| {
-            Ok(json!({"key": r.get::<_, String>(0)?, "value": r.get::<_, String>(1)?}))
+    // Load all settings from the application_settings table into a HashMap.
+    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM application_settings") {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            for row in rows.flatten() {
+                map.insert(row.0, row.1);
+            }
+        }
+    }
+    // Helper: parse a setting value as a typed JSON value.
+    fn get_str(
+        map: &std::collections::HashMap<String, String>,
+        key: &str,
+        default: &str,
+    ) -> String {
+        map.get(key).cloned().unwrap_or_else(|| default.to_string())
+    }
+    fn get_bool(map: &std::collections::HashMap<String, String>, key: &str, default: bool) -> bool {
+        map.get(key)
+            .and_then(|v| match v.as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(default)
+    }
+    fn get_i64(map: &std::collections::HashMap<String, String>, key: &str, default: i64) -> i64 {
+        map.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+    fn get_opt_i64(
+        map: &std::collections::HashMap<String, String>,
+        key: &str,
+    ) -> Option<serde_json::Value> {
+        map.get(key).and_then(|v| {
+            if v.is_empty() || v == "null" {
+                None
+            } else {
+                v.parse::<i64>().ok().map(serde_json::Value::from)
+            }
         })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
-    Json(json!({"settings": settings}))
+    }
+
+    Json(json!({
+        "sync_interval_minutes": get_i64(&map, "sync_interval_minutes", 5),
+        "api_concurrency": get_i64(&map, "api_concurrency", 2),
+        "ai_enabled": get_bool(&map, "ai_enabled", true),
+        "automatic_analysis_enabled": get_bool(&map, "automatic_analysis_enabled", true),
+        "automatic_note_enabled": get_bool(&map, "automatic_note_enabled", false),
+        "automatic_draft_enabled": get_bool(&map, "automatic_draft_enabled", false),
+        "automation_enabled": get_bool(&map, "automation_enabled", false),
+        "automation_write_actions_enabled": get_bool(&map, "automation_write_actions_enabled", false),
+        "qdrant_enabled": get_bool(&map, "qdrant_enabled", true),
+        "attachment_auto_download": get_bool(&map, "attachment_auto_download", true),
+        "automatic_reply_sending": get_bool(&map, "automatic_reply_sending", false),
+        "retention_days": get_opt_i64(&map, "retention_days"),
+        "backup_interval_hours": get_i64(&map, "backup_interval_hours", 24),
+        "log_level": get_str(&map, "log_level", "info"),
+        "display_timezone": get_str(&map, "display_timezone", "system"),
+        "redaction_enabled": get_bool(&map, "redaction_enabled", true),
+        "ai_evaluation_mode": get_bool(&map, "ai_evaluation_mode", false),
+        "agent_language": get_str(&map, "agent_language", "en"),
+    }))
 }
 
 /// PATCH /api/settings — update settings.

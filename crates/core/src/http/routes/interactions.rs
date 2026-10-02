@@ -5,14 +5,38 @@
 //! the customer support health score. Stored in `interaction_signals`.
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
 
 /// GET /api/interaction/:conversationId — list signals for a conversation.
-pub async fn get(State(state): State<AppState>, Path(conversation_id): Path<i64>) -> Json<Value> {
+///
+/// Returns 404 when the conversation does not exist (matching the reference).
+pub async fn get(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<i64>,
+) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE remote_id = ?1",
+            rusqlite::params![conversation_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
+            })),
+        );
+    }
     let signals: Vec<Value> = conn
         .prepare("SELECT id, conversation_id, signal_type, signal_value, confidence, created_at FROM interaction_signals WHERE conversation_id = ?1 ORDER BY created_at DESC")
         .ok()
@@ -32,7 +56,10 @@ pub async fn get(State(state): State<AppState>, Path(conversation_id): Path<i64>
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({"conversationId": conversation_id, "signals": signals}))
+    (
+        StatusCode::OK,
+        Json(json!({"conversationId": conversation_id, "signals": signals})),
+    )
 }
 
 /// POST /api/interaction/:conversationId/refresh — recompute interaction signals.
@@ -76,8 +103,30 @@ pub async fn evidence(
 }
 
 /// GET /api/interaction/profile/:customerId — interaction profile for a customer.
-pub async fn profile(State(state): State<AppState>, Path(customer_id): Path<i64>) -> Json<Value> {
+///
+/// Returns 404 when the customer does not exist (matching the reference).
+pub async fn profile(
+    State(state): State<AppState>,
+    Path(customer_id): Path<i64>,
+) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM customers WHERE remote_id = ?1",
+            rusqlite::params![customer_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Customer not found or no interaction data."
+            })),
+        );
+    }
     // Aggregate the customer's signals across all their conversations.
     let total_signals: i64 = conn
         .query_row(
@@ -103,9 +152,12 @@ pub async fn profile(State(state): State<AppState>, Path(customer_id): Path<i64>
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({
-        "customerId": customer_id,
-        "total_signals": total_signals,
-        "signal_breakdown": signal_breakdown,
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "customerId": customer_id,
+            "total_signals": total_signals,
+            "signal_breakdown": signal_breakdown,
+        })),
+    )
 }

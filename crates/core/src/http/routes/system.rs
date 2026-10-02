@@ -34,12 +34,78 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /health/detailed — detailed health with all subsystems.
+///
+/// Reference response shape includes subsystems: database, helpscout,
+/// lmstudio, qdrant, sync, workers, in addition to status/version/time.
 pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let db_ok = conn.execute_batch("SELECT 1").is_ok();
 
     // Run the self-check.
     let self_check = crate::self_check::run(&conn, None).ok();
+
+    // Subsystem: Help Scout — configured when we have OAuth tokens.
+    let hs_configured: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM oauth_tokens WHERE access_token IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let helpscout = json!({
+        "configured": hs_configured > 0,
+        "authenticated": hs_configured > 0,
+    });
+
+    // Subsystem: LM Studio / AI provider.
+    let provider_kind = match crate::ai_center::get_ai_status(&conn) {
+        Ok(s) => match s.provider_kind {
+            crate::ai_center::ProviderKind::LmStudio => "lmstudio",
+            crate::ai_center::ProviderKind::Ollama => "ollama",
+            crate::ai_center::ProviderKind::Generic => "generic",
+            crate::ai_center::ProviderKind::None => "none",
+        },
+        Err(_) => "none",
+    };
+    let lmstudio = json!({
+        "connected": false,
+        "provider": provider_kind,
+        "models": [],
+        "error": null,
+    });
+
+    // Subsystem: Qdrant — enabled behind the cargo feature.
+    let qdrant_enabled = cfg!(feature = "qdrant");
+    let qdrant = json!({
+        "enabled": qdrant_enabled,
+        "url": crate::settings::get_string(&conn, "qdrant_url").ok().flatten().unwrap_or_default(),
+        "connected": false,
+    });
+
+    // Subsystem: Sync — running if any sync_run is in progress.
+    let sync_running: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_runs WHERE status = 'running'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let webhook_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0))
+        .unwrap_or(0);
+    let sync = json!({
+        "running": sync_running > 0,
+        "is_realtime": webhook_count > 0,
+        "last_sync": null,
+    });
+
+    // Subsystem: Workers — always running in the Tauri shell (background pollers).
+    let workers = json!({
+        "sync_interval_minutes": 5,
+        "ratings_refresh_seconds": 30,
+        "notification_sweep_seconds": 15,
+        "customer_event_sweep_seconds": 60,
+    });
 
     let status = if db_ok { "ok" } else { "error" };
     let code = if db_ok {
@@ -60,6 +126,11 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
             },
             "demo_mode": state.demo_mode,
             "self_check": self_check,
+            "helpscout": helpscout,
+            "lmstudio": lmstudio,
+            "qdrant": qdrant,
+            "sync": sync,
+            "workers": workers,
         })),
     )
 }
@@ -124,18 +195,48 @@ pub async fn table_stats(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /api/onboarding — onboarding state.
+///
+/// Reference response shape:
+/// ```json
+/// {
+///   "step": "...", "completed": bool, "demo_mode": bool, "conversations": N,
+///   "hs_configured": bool, "hs_authenticated": bool, "sync_state": "..."
+/// }
+/// ```
 pub async fn onboarding(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let first_run = crate::settings::first_run_done(&conn).unwrap_or(false);
     let conv_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
         .unwrap_or(0);
-
+    let hs_configured: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM oauth_tokens WHERE access_token IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let sync_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_runs", [], |r| r.get(0))
+        .unwrap_or(0);
+    let webhook_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0))
+        .unwrap_or(0);
+    let sync_state = if webhook_count > 0 {
+        "receiving"
+    } else if sync_count > 0 {
+        "registered"
+    } else {
+        "new"
+    };
     Json(json!({
         "step": if first_run { "complete" } else { "welcome" },
         "completed": first_run,
         "demo_mode": state.demo_mode,
         "conversations": conv_count,
+        "hs_configured": hs_configured > 0,
+        "hs_authenticated": hs_configured > 0,
+        "sync_state": sync_state,
     }))
 }
 

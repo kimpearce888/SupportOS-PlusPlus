@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::super::server::AppState;
 
-/// GET /api/sync/status
+/// GET /api/sync/status — mirrors reference's response shape.
 pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let sync_count: i64 = conn
@@ -21,18 +21,145 @@ pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
     let webhook_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0))
         .unwrap_or(0);
+    let running_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_runs WHERE status = 'running'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let last_success: Option<String> = conn
+        .query_row(
+            "SELECT MAX(completed_at) FROM sync_runs WHERE status = 'completed'",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
     let state_str = if webhook_count > 0 {
-        "receiving"
+        "RECEIVING"
+    } else if running_count > 0 {
+        "RUNNING"
     } else if sync_count > 0 {
-        "registered"
+        "REGISTERED"
     } else {
-        "not_configured"
+        "NEW"
     };
+    let recent_runs: Vec<Value> = conn
+        .prepare("SELECT id, status, started_at, completed_at, error, resources_synced FROM sync_runs ORDER BY id DESC LIMIT 10")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "status": r.get::<_, String>(1)?,
+                    "started_at": r.get::<_, String>(2)?,
+                    "completed_at": r.get::<_, Option<String>>(3)?,
+                    "error": r.get::<_, Option<String>>(4)?,
+                    "resources_synced": r.get::<_, i64>(5)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let webhook_recent: Vec<Value> = conn
+        .prepare("SELECT id, received_at FROM webhook_events ORDER BY received_at DESC LIMIT 5")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "received_at": r.get::<_, String>(1)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let webhook_secret: Option<String> = crate::settings::get_string(&conn, "webhook_secret")
+        .ok()
+        .flatten();
+    let webhook_configured = webhook_secret.is_some();
+    let checkpoints: Vec<Value> = conn
+        .prepare("SELECT resource, last_seen_at FROM sync_cursors ORDER BY resource")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "resource": r.get::<_, String>(0)?,
+                    "last_synced_at": r.get::<_, Option<String>>(1)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let queued: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state = 'queued'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let active: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state = 'running'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let completed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state = 'completed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let failed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state = 'failed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let dispatched: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state IN ('dispatched', 'running', 'completed', 'failed')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     Json(json!({
         "state": state_str,
-        "sync_runs_completed": sync_count,
-        "webhook_events_received": webhook_count,
-        "is_realtime": webhook_count > 0,
+        "running": running_count > 0,
+        "checkpoints": checkpoints,
+        "last_success": last_success,
+        "recent_runs": recent_runs,
+        "webhook": {
+            "events": webhook_count,
+            "recent": webhook_recent,
+            "configured": webhook_configured,
+            "secret_configured": webhook_configured,
+        },
+        "rate_limit": {
+            "limitPerMinute": 300,
+            "remaining": 300,
+            "retryAfterSec": 0,
+            "updatedAt": null,
+            "inFlightWindow": false,
+        },
+        "api_queue": {
+            "queued": queued,
+            "active": active,
+            "dispatched": dispatched,
+            "completed": completed,
+            "failed": failed,
+            "highWater": 0,
+        },
     }))
 }
 
@@ -75,37 +202,81 @@ pub async fn unregister_webhook(
 }
 
 /// GET /api/queue — job queue status.
+///
+/// Reference response shape:
+/// ```json
+/// { "jobs": [...], "stats": { "queued": N, "running": N, "failed": N, "completed": N }, "outbound": [] }
+/// ```
 pub async fn queue(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let queued: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
+            "SELECT COUNT(*) FROM jobs WHERE state = 'queued'",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
     let failed: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE status = 'failed'",
+            "SELECT COUNT(*) FROM jobs WHERE state = 'failed'",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
     let running: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE status = 'running'",
+            "SELECT COUNT(*) FROM jobs WHERE state = 'running'",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
-    Json(json!({"queued": queued, "failed": failed, "running": running}))
+    let completed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE state = 'completed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    // List recent jobs (last 50).
+    let jobs: Vec<Value> = conn
+        .prepare("SELECT id, kind, state, payload, attempts, available_at, claimed_at, completed_at, last_error FROM jobs ORDER BY id DESC LIMIT 50")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "kind": r.get::<_, String>(1)?,
+                    "status": r.get::<_, String>(2)?,
+                    "payload": r.get::<_, Option<String>>(3)?,
+                    "attempts": r.get::<_, i64>(4)?,
+                    "created_at": r.get::<_, Option<String>>(5)?,
+                    "claimed_at": r.get::<_, Option<String>>(6)?,
+                    "completed_at": r.get::<_, Option<String>>(7)?,
+                    "error": r.get::<_, Option<String>>(8)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Json(json!({
+        "jobs": jobs,
+        "stats": {
+            "queued": queued,
+            "running": running,
+            "failed": failed,
+            "completed": completed,
+        },
+        "outbound": [],
+    }))
 }
 
 /// POST /api/queue/:id/retry
 pub async fn retry_job(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
-        "UPDATE jobs SET status = 'queued', attempts = 0 WHERE id = ?1",
+        "UPDATE jobs SET state = 'queued', attempts = 0 WHERE id = ?1",
         rusqlite::params![id],
     );
     Json(json!({"ok": true}))
@@ -115,7 +286,7 @@ pub async fn retry_job(State(state): State<AppState>, Path(id): Path<i64>) -> im
 pub async fn cancel_job(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
-        "UPDATE jobs SET status = 'cancelled' WHERE id = ?1",
+        "UPDATE jobs SET state = 'cancelled' WHERE id = ?1",
         rusqlite::params![id],
     );
     Json(json!({"ok": true}))

@@ -7,6 +7,16 @@ use serde_json::{json, Value};
 use super::super::server::AppState;
 
 /// GET /api/automation/rules
+///
+/// Reference response shape:
+/// ```json
+/// {
+///   "rules": [...],
+///   "runs": [...],
+///   "risk_tiers": { "read": [...], "non_destructive": [...], "higher_risk": [...], "note": "..." },
+///   "automation_enabled": false
+/// }
+/// ```
 pub async fn list_rules(State(state): State<AppState>) -> Json<Value> {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let rules = crate::automation::list_rules(&conn).unwrap_or_default();
@@ -15,11 +25,51 @@ pub async fn list_rules(State(state): State<AppState>) -> Json<Value> {
         .filter_map(|r| serde_json::to_value(r).ok())
         .collect();
     let pending = crate::automation::list_pending_approvals(&conn).unwrap_or_default();
-    let pending_items: Vec<Value> = pending
+    let _pending_items: Vec<Value> = pending
         .iter()
         .filter_map(|a| serde_json::to_value(a).ok())
         .collect();
-    Json(json!({"rules": items, "pending_approvals": pending_items}))
+    let automation_enabled =
+        crate::settings::get_bool(&conn, "automation_enabled", false).unwrap_or(false);
+    // Risk tiers: classify rules into tiers based on their action.
+    // - read: rules that only read state (no writes)
+    // - non_destructive: rules that change non-destructive state (priority, tags)
+    // - higher_risk: rules that change status, assignee, or send replies
+    let read_tiers: Vec<Value> = items
+        .iter()
+        .filter(|r| {
+            let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            action == "tag" || action == "analyze"
+        })
+        .cloned()
+        .collect();
+    let non_destructive_tiers: Vec<Value> = items
+        .iter()
+        .filter(|r| {
+            let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            action == "change_priority" || action == "add_tag"
+        })
+        .cloned()
+        .collect();
+    let higher_risk_tiers: Vec<Value> = items
+        .iter()
+        .filter(|r| {
+            let action = r.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            action == "change_status" || action == "assign" || action == "send_reply"
+        })
+        .cloned()
+        .collect();
+    Json(json!({
+        "rules": items,
+        "runs": [],
+        "risk_tiers": {
+            "read": read_tiers,
+            "non_destructive": non_destructive_tiers,
+            "higher_risk": higher_risk_tiers,
+            "note": "Rules classified by action risk: read-only < non-destructive (priority/tags) < higher-risk (status/assignee/reply)."
+        },
+        "automation_enabled": automation_enabled,
+    }))
 }
 
 /// POST /api/automation/rules

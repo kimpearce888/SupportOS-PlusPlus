@@ -1,24 +1,46 @@
 //! Collaboration routes — mirrors src/server/routes/collaboration.ts
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
 
 /// GET /api/conversations/:id/side-threads
+///
+/// Returns 404 when the conversation does not exist (matching the reference).
 pub async fn list_side_threads(
     State(state): State<AppState>,
     Path(conversation_id): Path<i64>,
-) -> Json<Value> {
+) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Check that the conversation exists first.
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE remote_id = ?1",
+            rusqlite::params![conversation_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
+            })),
+        );
+    }
     let threads = crate::side_threads::list_side_threads_for_conversation(&conn, conversation_id)
         .unwrap_or_default();
     let items: Vec<Value> = threads
         .iter()
         .filter_map(|t| serde_json::to_value(t).ok())
         .collect();
-    Json(json!({"side_threads": items}))
+    (StatusCode::OK, Json(json!({"side_threads": items})))
 }
 
 /// POST /api/conversations/:id/side-threads
@@ -91,20 +113,22 @@ pub async fn add_participants(
 }
 
 /// GET /api/mention-directory
-pub async fn mention_directory(State(state): State<AppState>) -> Json<Value> {
+pub async fn mention_directory(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let mut stmt = conn
+    let people: Vec<Value> = conn
         .prepare("SELECT id, first_name, last_name FROM users ORDER BY first_name")
-        .unwrap();
-    let people: Vec<Value> = stmt
-        .query_map([], |r| {
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?,
-                "name": format!("{} {}", r.get::<_, String>(1)?, r.get::<_, String>(2)?),
-            }))
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "name": format!("{} {}", r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
         })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+        .unwrap_or_default();
     Json(json!({"directory": people}))
 }
