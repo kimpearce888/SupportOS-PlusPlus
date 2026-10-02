@@ -122,13 +122,33 @@ pub fn InboxPage() -> impl IntoView {
     let composer_success = create_rw_signal(None::<String>);
     let selected_ids = create_rw_signal(Vec::<i64>::new());
 
-    // ── Load conversation list on mount + on filter change ─────────────
+    // ── SSE subscription: refresh the list when conversations change ──────
+    // Mirrors the reference's ServerEventsBridge — when the server pushes
+    // a SyncUpdated("conversations", ...) or WebhookReceived event, we
+    // bump `sse_refresh` to re-trigger the list-load effect below.
+    let sse_refresh = create_rw_signal(0u32);
+    {
+        let sse_refresh_clone = sse_refresh;
+        let _ = crate::sse::subscribe(Box::new(move |event| match event {
+            crate::sse::LiveEvent::SyncUpdated { resource, .. } if resource == "conversations" => {
+                sse_refresh_clone.update(|n| *n = n.wrapping_add(1));
+            }
+            crate::sse::LiveEvent::WebhookReceived { .. } => {
+                sse_refresh_clone.update(|n| *n = n.wrapping_add(1));
+            }
+            _ => {}
+        }));
+    }
+
+    // ── Load conversation list on mount + on filter change + on SSE refresh ─
     create_effect(move |_| {
         let conversations = conversations;
         let total = total;
         let list_loading = list_loading;
         let list_error = list_error;
         let current_filters = filters.get();
+        // Read sse_refresh so the effect re-runs when it changes.
+        let _ = sse_refresh.get();
         wasm_bindgen_futures::spawn_local(async move {
             let args = serde_json::json!({
                 "filters": {

@@ -21,6 +21,7 @@ pub mod components;
 pub mod ipc;
 pub mod layout;
 pub mod pages;
+pub mod sse;
 
 // Re-export the catalog so the UI has type-safe access to closed
 // vocabularies (one source of truth per spec A12). The catalog crate is
