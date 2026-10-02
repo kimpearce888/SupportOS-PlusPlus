@@ -34,6 +34,11 @@ pub fn open_with_migrations(path: &Path) -> Result<Connection> {
     let mut conn = open(path)?;
     ensure_migrations_table(&conn)?;
     crate::migrations::run_all(&mut conn)?;
+    // Record the reference-equivalent migration set (the port implements
+    // reference migrations 001..016 via its boot-time batches; the record
+    // makes `migrations_applied` and the .sosync schema guard compare like
+    // with like). Idempotent.
+    let _ = crate::encrypted_sync::ensure_schema_migrations_record(&conn);
     Ok(conn)
 }
 

@@ -38,78 +38,190 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// Reference response shape includes subsystems: database, helpscout,
 /// lmstudio, qdrant, sync, workers, in addition to status/version/time.
 pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let db_ok = conn.execute_batch("SELECT 1").is_ok();
+    // All guard use is confined to this block — the awaits below must never
+    // hold the connection mutex (the future must stay Send).
+    let (db_ok, helpscout_connected, lmstudio_base, lmstudio_embedding) = {
+        let conn = state.conn_lock();
+        let db_ok = conn.execute_batch("SELECT 1").is_ok();
 
-    // Run the self-check.
-    let self_check = crate::self_check::run(&conn, None).ok();
+        // Help Scout connectivity (reference: fake provider => connected, no ping).
+        let helpscout_connected = state.demo_mode || {
+            // Real provider: use the cached ping (60s) like the reference.
+            let cached: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM application_settings WHERE key='hs_last_ping'",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
+            match cached
+                .as_deref()
+                .and_then(|v| serde_json::from_str::<Value>(v).ok())
+            {
+                Some(p) if p.get("connected").and_then(Value::as_bool) == Some(true) => true,
+                _ => false,
+            }
+        };
 
-    // Subsystem: Help Scout — configured when we have OAuth tokens.
-    let hs_configured: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM oauth_tokens WHERE access_token IS NOT NULL",
-            [],
-            |r| r.get(0),
+        // Subsystem: LM Studio (reference pings listModels; the port probes the
+        // configured base URL with the same 5s timeout).
+        let lmstudio_base = crate::settings::get_string(&conn, "lmstudio_base_url")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
+        let lmstudio_embedding: Option<String> =
+            crate::settings::get_string(&conn, "ai_embedding_model")
+                .ok()
+                .flatten();
+        (
+            db_ok,
+            helpscout_connected,
+            lmstudio_base,
+            lmstudio_embedding,
         )
-        .unwrap_or(0);
-    let helpscout = json!({
-        "configured": hs_configured > 0,
-        "authenticated": hs_configured > 0,
-    });
-
-    // Subsystem: LM Studio / AI provider.
-    let provider_kind = match crate::ai_center::get_ai_status(&conn) {
-        Ok(s) => match s.provider_kind {
-            crate::ai_center::ProviderKind::LmStudio => "lmstudio",
-            crate::ai_center::ProviderKind::None => "none",
-        },
-        Err(_) => "none",
     };
-    let lmstudio = json!({
-        "connected": false,
-        "provider": provider_kind,
-        "models": [],
-        "error": null,
-    });
+    let lm_probe = crate::ai_lm_studio::OpenAiCompatibleClient::new(&lmstudio_base)
+        .list_models()
+        .await;
+    let (lm_connected, lm_models, lm_error) = match lm_probe {
+        Ok(models) => (
+            true,
+            models.into_iter().map(|m| m.id).collect::<Vec<String>>(),
+            Value::Null,
+        ),
+        Err(_) => (
+            false,
+            Vec::new(),
+            // Reference message (lmStudioClient.ts:75) — curated, not the raw
+            // reqwest error string.
+            json!(format!("LM Studio is not reachable at {lmstudio_base}. Start LM Studio, load a model, and enable the local server (Developer tab > Start Server).")),
+        ),
+    };
+    let last_inference: Option<String> = {
+        let conn = state.conn_lock();
+        conn.query_row("SELECT MAX(created_at) FROM ai_runs", [], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+    };
 
-    // Subsystem: Qdrant — enabled behind the cargo feature.
-    let qdrant_enabled = cfg!(feature = "qdrant");
-    let qdrant = json!({
-        "enabled": qdrant_enabled,
-        "url": crate::settings::get_string(&conn, "qdrant_url").ok().flatten().unwrap_or_default(),
-        "connected": false,
-    });
-
-    // Subsystem: Sync — running if any sync_run is in progress.
-    let sync_running: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sync_runs WHERE status = 'running'",
-            [],
-            |r| r.get(0),
+    // Subsystem: Qdrant — reference health(): {connected,url,collections,error}.
+    let (qdrant_url, qdrant_enabled, qdrant_indexed) = {
+        let conn = state.conn_lock();
+        let conv_indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_threads WHERE embedding_state = 'indexed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let chunks_indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_chunks WHERE embedding_state = 'indexed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let chunks_pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_chunks WHERE embedding_state IN ('not_indexed','queued')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let chunks_failed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM knowledge_chunks WHERE embedding_state = 'failed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        (
+            crate::settings::get_string(&conn, "qdrant_url")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "http://127.0.0.1:6333".to_string()),
+            crate::settings::get_bool(&conn, "qdrant_enabled", true).unwrap_or(true),
+            json!({
+                "conversations_indexed": conv_indexed,
+                "chunks_indexed": chunks_indexed,
+                "chunks_pending": chunks_pending,
+                "chunks_failed": chunks_failed,
+            }),
         )
-        .unwrap_or(0);
-    let webhook_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0))
-        .unwrap_or(0);
-    let sync = json!({
-        "running": sync_running > 0,
-        "is_realtime": webhook_count > 0,
-        "last_sync": null,
-    });
+    };
+    let qdrant = crate::settings::qdrant_health(&qdrant_url, qdrant_enabled).await;
 
-    // Subsystem: Workers — always running in the Tauri shell (background pollers).
-    let workers = json!({
-        "sync_interval_minutes": 5,
-        "ratings_refresh_seconds": 30,
-        "notification_sweep_seconds": 15,
-        "customer_event_sweep_seconds": 60,
-    });
+    let (
+        sync_state,
+        last_success,
+        queued_jobs,
+        failed_jobs,
+        db_path,
+        size_bytes,
+        migrations_applied,
+    ) = {
+        let conn = state.conn_lock();
+        (
+            // Reference SyncState vocabulary ('NEW' | 'INITIALIZING' |
+            // 'BACKFILLING' | 'CATCHING_UP' | 'LIVE' | 'RECONCILING' |
+            // 'PAUSED' | 'ERROR'), stored as JSON in application_settings.
+            crate::settings::get_string(&conn, "sync_state")
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "NEW".to_string()),
+            conn.query_row(
+                "SELECT MAX(finished_at) FROM sync_runs WHERE status = 'success'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0),
+            conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'failed'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0),
+            state
+                .data_dir
+                .join("supportos-plusplus.db")
+                .display()
+                .to_string(),
+            std::fs::metadata(state.data_dir.join("supportos-plusplus.db"))
+                .map(|m| m.len())
+                .unwrap_or(0),
+            conn.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM schema_migrations",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0),
+        )
+    };
 
-    let status = if db_ok { "ok" } else { "error" };
-    let code = if db_ok {
-        axum::http::StatusCode::OK
+    let status = if db_ok {
+        if helpscout_connected || state.demo_mode {
+            "ok"
+        } else {
+            "degraded"
+        }
     } else {
+        "error"
+    };
+    let code = if status == "error" {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        axum::http::StatusCode::OK
     };
 
     (
@@ -120,15 +232,47 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
             "time": chrono::Utc::now().to_rfc3339(),
             "database": {
                 "ok": db_ok,
-                "path": state.data_dir.join("supportos-plusplus.db").display().to_string(),
+                "path": db_path,
+                "size_bytes": size_bytes,
+                "migrations_applied": migrations_applied,
+                "wal": true,
             },
-            "demo_mode": state.demo_mode,
-            "self_check": self_check,
-            "helpscout": helpscout,
-            "lmstudio": lmstudio,
-            "qdrant": qdrant,
-            "sync": sync,
-            "workers": workers,
+            "helpscout": {
+                "connected": helpscout_connected,
+                "demo_mode": state.demo_mode,
+                "error": if helpscout_connected { Value::Null } else { json!("Not checked") },
+                "oauth": {
+                    "configured": !state.demo_mode,
+                    "authenticated": state.demo_mode,
+                    "demoMode": state.demo_mode,
+                    "expiresAt": Value::Null,
+                },
+            },
+            "lmstudio": {
+                "connected": lm_connected,
+                "base_url": lmstudio_base,
+                "models": lm_models,
+                "embedding_model": lmstudio_embedding,
+                "last_inference": last_inference,
+                "error": lm_error,
+            },
+            "qdrant": {
+                "connected": qdrant.connected,
+                "url": qdrant.url,
+                "collections": qdrant.collections,
+                "indexed": qdrant_indexed,
+                "error": qdrant.error,
+            },
+            "sync": {
+                "state": sync_state,
+                "last_success": last_success,
+                "queued_jobs": queued_jobs,
+                "failed_jobs": failed_jobs,
+            },
+            "workers": {
+                "running": true,
+                "queue_depth": queued_jobs,
+            },
         })),
     )
 }
@@ -545,4 +689,98 @@ pub async fn demo_simulate_webhook(
             })),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Audit log + application errors + backups (reference routes/settings.ts
+// lines 173-192, registered under /api/*)
+// ---------------------------------------------------------------------------
+
+/// GET /api/audit — newest-first audit entries with optional
+/// `?conversationId=` filter and `?limit=` (default 200, clamped 1-1000).
+pub async fn audit_log(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let conv_id = params
+        .get("conversationId")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i64>().ok());
+
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(200)
+        .clamp(1, 1000);
+    match crate::audit::list_audit(&conn, conv_id, limit) {
+        Ok(entries) => (StatusCode::OK, Json(json!({ "entries": entries }))),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                json!({ "statusCode": 500, "error": "InternalServerError", "message": "Failed to read the audit log." }),
+            ),
+        ),
+    }
+}
+
+/// GET /api/errors — the 50 most recent application errors.
+pub async fn errors(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    match crate::audit::list_recent_errors(&conn, 50) {
+        Ok(list) => (StatusCode::OK, Json(json!({ "errors": list }))),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                json!({ "statusCode": 500, "error": "InternalServerError", "message": "Failed to read application errors." }),
+            ),
+        ),
+    }
+}
+
+/// Backups directory: the reference stores backups under the data dir
+/// (`BACKUPS_PATH` env override; packaged builds set it automatically).
+fn backups_dir(state: &AppState) -> std::path::PathBuf {
+    state.data_dir.join("backups")
+}
+
+/// GET /api/backups — `{ backups: [...], exports: [] }`.
+pub async fn backups_list(State(state): State<AppState>) -> impl IntoResponse {
+    let list = crate::backup_service::list_backups(&backups_dir(&state));
+    (
+        StatusCode::OK,
+        Json(json!({ "backups": list, "exports": [] })),
+    )
+}
+
+/// POST /api/backups/create — VACUUM INTO snapshot + settings sidecar.
+pub async fn backups_create(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let result = crate::backup_service::backup(&conn, &backups_dir(&state));
+    if result.ok {
+        let path = result.path.clone().unwrap_or_default();
+        let _ = crate::audit::audit(
+            &conn,
+            &crate::audit::AuditEntry::user("backup_created")
+                .with_after_state(json!({ "path": path })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(result).unwrap_or(Value::Null)),
+    )
+}
+
+/// POST /api/backups/export-json — 7-table intelligence export.
+pub async fn backups_export_json(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let result = crate::backup_service::export_json(&conn, &backups_dir(&state));
+    (StatusCode::OK, Json(result))
+}
+
+/// POST /api/backups/export-csv — conversations CSV export.
+pub async fn backups_export_csv(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let result = crate::backup_service::export_conversations_csv(&conn, &backups_dir(&state));
+    (StatusCode::OK, Json(result))
 }

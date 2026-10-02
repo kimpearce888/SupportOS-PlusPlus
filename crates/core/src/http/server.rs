@@ -388,6 +388,14 @@ impl HttpServer {
                 axum::routing::patch(routes::settings::update_qdrant),
             )
             .route(
+                "/api/settings/qdrant/test",
+                post(routes::settings::qdrant_test),
+            )
+            .route(
+                "/api/settings/appearance",
+                get(routes::settings::appearance),
+            )
+            .route(
                 "/api/settings/business-hours",
                 get(routes::settings::get_business_hours),
             )
@@ -405,6 +413,32 @@ impl HttpServer {
             .route("/api/sync/incremental", post(routes::sync::incremental))
             .route("/api/sync/reconcile", post(routes::sync::reconcile))
             .route("/api/sync/cancel", post(routes::sync::cancel))
+            .route("/api/sync/encrypted", get(routes::sync::encrypted_list))
+            .route(
+                "/api/sync/encrypted/export",
+                post(routes::sync::encrypted_export),
+            )
+            .route(
+                "/api/sync/encrypted/verify",
+                post(routes::sync::encrypted_verify),
+            )
+            .route(
+                "/api/sync/encrypted/import",
+                post(routes::sync::encrypted_import),
+            )
+            // Audit log + application errors + backups
+            .route("/api/audit", get(routes::system::audit_log))
+            .route("/api/errors", get(routes::system::errors))
+            .route("/api/backups", get(routes::system::backups_list))
+            .route("/api/backups/create", post(routes::system::backups_create))
+            .route(
+                "/api/backups/export-json",
+                post(routes::system::backups_export_json),
+            )
+            .route(
+                "/api/backups/export-csv",
+                post(routes::system::backups_export_csv),
+            )
             .route(
                 "/api/webhooks/register",
                 post(routes::sync::register_webhook),
@@ -451,6 +485,19 @@ impl HttpServer {
                 get(routes::analytics::effectiveness),
             )
             .route(
+                "/api/reports/release-correlation",
+                get(routes::analytics::release_correlation),
+            )
+            .route(
+                "/api/reports/release-events",
+                post(routes::analytics::release_events),
+            )
+            .route(
+                "/api/reports/helpscout/:reportKey",
+                get(routes::analytics::helpscout_report),
+            )
+            .route("/api/reports/narrative", post(routes::analytics::narrative))
+            .route(
                 "/api/reports/builder/catalog",
                 get(routes::analytics::report_catalog),
             )
@@ -464,6 +511,13 @@ impl HttpServer {
             .route("/api/ai/jobs", get(routes::ai::jobs))
             .route("/api/ai/analytics", get(routes::ai::ai_analytics))
             .route("/api/ai/evaluation", get(routes::ai::evaluation))
+            .route("/api/ai/cluster-issues", post(routes::ai::cluster_issues))
+            .route("/api/ai/draft/:draftId/rewrite", post(routes::ai::rewrite))
+            .route("/api/ai/draft/:draftId/verify", post(routes::ai::verify))
+            .route(
+                "/api/ai/draft/:draftId/feedback",
+                post(routes::ai::feedback),
+            )
             // Issues
             .route("/api/issues/clusters", get(routes::issues::list_clusters))
             .route("/api/issues/sla-alerts", get(routes::issues::sla_alerts))
@@ -479,6 +533,24 @@ impl HttpServer {
                 axum::routing::delete(routes::issues::delete_known),
             )
             .route("/api/issues/cases", get(routes::issues::list_cases))
+            .route(
+                "/api/issues/cases/from-conversation/:conversationId",
+                post(routes::issues::case_from_conversation),
+            )
+            .route("/api/issues/clusters/:id", get(routes::issues::get_cluster))
+            .route(
+                "/api/issues/clusters/:id",
+                axum::routing::delete(routes::issues::delete_cluster),
+            )
+            .route("/api/issues/known/:id/refs", post(routes::issues::add_ref))
+            .route(
+                "/api/issues/known/:id/link/:conversationId",
+                post(routes::issues::link_known),
+            )
+            .route(
+                "/api/issues/known/:id/link/:conversationId",
+                axum::routing::delete(routes::issues::unlink_known),
+            )
             // Automation
             .route("/api/automation/rules", get(routes::automation::list_rules))
             .route(
@@ -519,6 +591,10 @@ impl HttpServer {
                 post(routes::collaboration::reopen),
             )
             .route(
+                "/api/side-threads/:id/participants",
+                post(routes::collaboration::add_participants),
+            )
+            .route(
                 "/api/mention-directory",
                 get(routes::collaboration::mention_directory),
             )
@@ -557,6 +633,22 @@ impl HttpServer {
             .route(
                 "/api/knowledge/importable",
                 get(routes::knowledge::importable),
+            )
+            .route(
+                "/api/knowledge/import-file",
+                post(routes::knowledge::import_file),
+            )
+            .route(
+                "/api/knowledge/documents/:id",
+                axum::routing::delete(routes::knowledge::delete_document),
+            )
+            .route(
+                "/api/knowledge/documents/:id/review",
+                post(routes::knowledge::review_document),
+            )
+            .route(
+                "/api/knowledge/documents/:id/verify",
+                post(routes::knowledge::verify_document),
             )
             // Outreach
             .route("/api/outreach/meta", get(routes::outreach::meta))
@@ -637,6 +729,22 @@ impl HttpServer {
                 "/api/custom-objects/:id",
                 axum::routing::delete(routes::custom_objects::delete_object),
             )
+            .route(
+                "/api/custom-objects/report",
+                get(routes::custom_objects::report),
+            )
+            .route(
+                "/api/custom-objects/for/:targetKind/:targetId",
+                get(routes::custom_objects::list_for_target),
+            )
+            .route(
+                "/api/custom-objects/:id/links",
+                post(routes::custom_objects::create_link),
+            )
+            .route(
+                "/api/custom-objects/:id/links/:targetKind/:targetLocalId",
+                axum::routing::delete(routes::custom_objects::delete_link),
+            )
             // Connectors
             .route("/api/connectors", get(routes::connectors::list))
             .route("/api/connectors", post(routes::connectors::create))
@@ -668,6 +776,31 @@ impl HttpServer {
                 axum::routing::delete(routes::incidents::delete),
             )
             .route("/api/incidents/:id/impact", get(routes::incidents::impact))
+            .route(
+                "/api/incidents/:id/notes",
+                post(routes::incidents::add_note),
+            )
+            .route("/api/incidents/:id/refs", post(routes::incidents::add_ref))
+            .route(
+                "/api/incidents/:id/related",
+                post(routes::incidents::add_related),
+            )
+            .route(
+                "/api/incidents/:id/related/:targetKind/:targetLocalId",
+                axum::routing::delete(routes::incidents::delete_related),
+            )
+            .route(
+                "/api/incidents/:id/releases",
+                post(routes::incidents::add_release),
+            )
+            .route(
+                "/api/incidents/:id/releases/:releaseId",
+                axum::routing::delete(routes::incidents::delete_release),
+            )
+            .route(
+                "/api/incidents/:id/conversations/:conversationId",
+                post(routes::incidents::link_conversation),
+            )
             // Graph
             .route("/api/graph/stats", get(routes::graph::stats))
             .route("/api/graph/meta", get(routes::graph::meta))

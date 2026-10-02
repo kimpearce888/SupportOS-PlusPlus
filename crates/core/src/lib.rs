@@ -33,8 +33,10 @@ pub mod ai_center;
 pub mod ai_features;
 pub mod ai_lm_studio;
 pub mod ai_provider;
+pub mod audit;
 pub mod automation;
 pub mod backup;
+pub mod backup_service;
 pub mod config;
 pub mod conformance;
 pub mod copilot;
@@ -43,6 +45,7 @@ pub mod data_tools;
 pub mod db;
 pub mod demo;
 pub mod embeddings;
+pub mod encrypted_sync;
 pub mod error;
 pub mod events;
 pub mod helpscout;
@@ -90,3 +93,6 @@ pub use error::{Error, Result};
 pub mod catalog {
     pub use spp_catalog::*;
 }
+
+#[cfg(test)]
+mod cross_compat_test;

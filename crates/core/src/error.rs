@@ -46,6 +46,10 @@ pub enum Error {
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 
+    /// JSON (de)serialization failed.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
     /// A typed wrapper for any other error.
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),

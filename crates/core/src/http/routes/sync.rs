@@ -283,3 +283,125 @@ pub async fn cancel_job(State(state): State<AppState>, Path(id): Path<i64>) -> i
     );
     Json(json!({"ok": true}))
 }
+
+// ---------------------------------------------------------------------------
+// Encrypted multi-device sync (.sosync) — reference routes/sync.ts:204-232
+// ---------------------------------------------------------------------------
+
+/// Bundles directory (the reference stores .sosync bundles under the data
+/// dir's `bundles` folder).
+fn bundles_dir(state: &AppState) -> std::path::PathBuf {
+    state.data_dir.join("bundles")
+}
+
+/// GET /api/sync/encrypted — bundle listing + ledger + design note.
+pub async fn encrypted_list(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let bundles = crate::encrypted_sync::list_bundles(&bundles_dir(&state));
+    let log = crate::encrypted_sync::sync_log(&conn);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "bundles": bundles,
+            "log": log,
+            "bundle_dir": bundles_dir(&state).to_string_lossy(),
+            "design": "File-based end-to-end encrypted bundles. No relay server: SupportOS never sees your data in transit - move the .sosync file yourself (cloud drive, USB, company share). Only the passphrase holder can decrypt it."
+        })),
+    )
+}
+
+/// POST /api/sync/encrypted/export — `{ passphrase }` (min 8 chars).
+pub async fn encrypted_export(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let passphrase = body
+        .and_then(|Json(v)| {
+            v.get("passphrase")
+                .and_then(|p| p.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    let conn = state.conn_lock();
+    let result = crate::encrypted_sync::export_bundle(&conn, &bundles_dir(&state), &passphrase);
+    if result.ok {
+        let _ = crate::audit::audit(
+            &conn,
+            &crate::audit::AuditEntry::user("encrypted_sync_export").with_after_state(json!({
+                "path": result.path.clone().unwrap_or_default(),
+                "size": result.size_bytes.unwrap_or(0),
+            })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(result).unwrap_or(Value::Null)),
+    )
+}
+
+/// POST /api/sync/encrypted/verify — `{ path, passphrase }`.
+pub async fn encrypted_verify(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let Json(v) = body.unwrap_or(Json(Value::Null));
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or_default();
+    if path.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "message": "A bundle path is required." })),
+        );
+    }
+    let passphrase = v
+        .get("passphrase")
+        .and_then(|p| p.as_str())
+        .unwrap_or_default();
+    let conn = state.conn_lock();
+    let result = crate::encrypted_sync::verify_bundle(
+        &conn,
+        &bundles_dir(&state),
+        std::path::Path::new(path),
+        passphrase,
+    );
+    (StatusCode::OK, Json(result))
+}
+
+/// POST /api/sync/encrypted/import — `{ path, passphrase }`. Swaps the DB;
+/// the app must restart to use the restored mirror.
+pub async fn encrypted_import(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let Json(v) = body.unwrap_or(Json(Value::Null));
+    let path = v.get("path").and_then(|p| p.as_str()).unwrap_or_default();
+    if path.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "ok": false, "message": "A bundle path is required." })),
+        );
+    }
+    let passphrase = v
+        .get("passphrase")
+        .and_then(|p| p.as_str())
+        .unwrap_or_default();
+    let conn = state.conn_lock();
+    let db_path = state.data_dir.join("supportos-plusplus.db");
+    let result = crate::encrypted_sync::import_bundle(
+        &conn,
+        &db_path,
+        &bundles_dir(&state),
+        std::path::Path::new(path),
+        passphrase,
+    );
+    if result.ok {
+        let _ = crate::audit::audit(
+            &conn,
+            &crate::audit::AuditEntry::user("encrypted_sync_import")
+                .with_after_state(json!({ "path": path })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(result).unwrap_or(Value::Null)),
+    )
+}

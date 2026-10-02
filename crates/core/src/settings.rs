@@ -145,6 +145,85 @@ pub fn mark_first_run_done(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Qdrant health probe — mirrors the reference `QdrantAdapter.health()`
+/// (`src/server/integrations/qdrant/qdrantAdapter.ts:62-74`): GET
+/// `{url}/collections` with a 5s timeout; graceful failure shape.
+pub async fn qdrant_health(url: &str, enabled: bool) -> QdrantHealth {
+    if !enabled {
+        return QdrantHealth {
+            connected: false,
+            url: url.to_string(),
+            collections: Vec::new(),
+            error: Some("Qdrant disabled in settings".to_string()),
+        };
+    }
+    let url = url.trim_end_matches('/').to_string();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok();
+    match client {
+        Some(client) => match client.get(format!("{url}/collections")).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let collections = body
+                            .get("result")
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|c| {
+                                        c.get("name").and_then(|n| n.as_str()).map(String::from)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        QdrantHealth {
+                            connected: true,
+                            url,
+                            collections,
+                            error: None,
+                        }
+                    }
+                    Err(e) => QdrantHealth {
+                        connected: false,
+                        url,
+                        collections: Vec::new(),
+                        error: Some(e.to_string()),
+                    },
+                }
+            }
+            Ok(resp) => QdrantHealth {
+                connected: false,
+                url,
+                collections: Vec::new(),
+                error: Some(format!("Qdrant GET /collections -> {}", resp.status())),
+            },
+            Err(e) => QdrantHealth {
+                connected: false,
+                url,
+                collections: Vec::new(),
+                error: Some(e.to_string()),
+            },
+        },
+        None => QdrantHealth {
+            connected: false,
+            url,
+            collections: Vec::new(),
+            error: Some("could not build HTTP client".to_string()),
+        },
+    }
+}
+
+/// Reference `QdrantHealth` shape.
+#[derive(Debug, Clone)]
+pub struct QdrantHealth {
+    pub connected: bool,
+    pub url: String,
+    pub collections: Vec<String>,
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

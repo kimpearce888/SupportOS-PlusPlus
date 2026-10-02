@@ -38,6 +38,9 @@ serde_json = "1.0"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+# IANA timezone validation (reference uses Intl.DateTimeFormat/ICU; chrono-tz
+# embeds the same IANA database) — required for business-hours parity.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 
 # Async
