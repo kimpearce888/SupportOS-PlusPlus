@@ -243,7 +243,8 @@ fn run_verify_config(config: Option<&str>) -> anyhow::Result<()> {
         println!("  identifier:          \"com.supportos.plusplus\"");
         println!("  window[0].title:     \"SupportOS++\"");
         println!(
-            "  bundle.targets:      all 6 formats present ({})",
+            "  bundle.targets:      all {} formats present ({})",
+            verify_config::REQUIRED_BUNDLE_TARGETS.len(),
             verify_config::REQUIRED_BUNDLE_TARGETS.join(", ")
         );
         Ok(())

@@ -1,8 +1,8 @@
 //! `verify-config` — statically verifies the Tauri 2 config meets spec amendment A0.
 //!
 //! Per A0: the product name must be `SupportOS++`, the bundle identifier must be
-//! `com.supportos.plusplus`, and the bundle targets must include all six formats
-//! (MSI, NSIS, DMG, DEB, RPM, AppImage).
+//! `com.supportos.plusplus`, and the bundle targets must include all required
+//! formats (deb, rpm, appimage — Linux-only per DEV-006).
 //!
 //! This check runs without needing GTK/WebKit2GTK system libraries (it just parses
 //! the JSON config), so it works in any environment — including the local dev
@@ -43,8 +43,9 @@ pub struct BundleSection {
     pub targets: Vec<String>,
 }
 
-/// The six bundle targets the spec mandates (INSTALL AND PACKAGING + A0).
-pub const REQUIRED_BUNDLE_TARGETS: &[&str] = &["msi", "nsis", "dmg", "deb", "rpm"];
+/// The bundle targets required for the current scope (Linux-only per DEV-006).
+/// Windows (msi, nsis) and macOS (dmg) are excluded by owner decision.
+pub const REQUIRED_BUNDLE_TARGETS: &[&str] = &["deb", "rpm", "appimage"];
 
 /// Read + parse the `tauri.conf.json` at `path`.
 pub fn load(path: &Path) -> anyhow::Result<TauriConfig> {
@@ -171,11 +172,10 @@ mod tests {
             "SupportOS++",
             "com.supportos.plusplus",
             "SupportOS++",
-            &["msi", "nsis", "dmg", "appimage"], // missing deb + rpm
+            &["deb", "appimage"], // missing rpm
         );
         let v = violations(&cfg);
-        assert_eq!(v.len(), 2);
-        assert!(v.iter().any(|s| s.contains("\"deb\"")));
+        assert_eq!(v.len(), 1);
         assert!(v.iter().any(|s| s.contains("\"rpm\"")));
     }
 
