@@ -13,31 +13,20 @@ fn empty_response(key: &str) -> impl IntoResponse {
     Json(json!({key: []}))
 }
 
-
 // Auto-generated stub functions to match the router
-pub async fn list_views(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn list_views(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn get_view(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn get_view(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn create_view(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn create_view(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn update_view(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn update_view(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn delete_view(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn delete_view(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn preview_view(

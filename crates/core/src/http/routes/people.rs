@@ -2,11 +2,11 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use axum::response::IntoResponse;
 
 /// GET /api/customers — list/search customers.
 pub async fn list_customers(
@@ -15,26 +15,29 @@ pub async fn list_customers(
 ) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
     let query = params.get("q").cloned().unwrap_or_default();
-    let limit = params.get("limit").and_then(|l| l.parse::<u32>().ok()).unwrap_or(20);
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<u32>().ok())
+        .unwrap_or(20);
     match crate::customers::search_customers(&conn, &query, Some(limit)) {
         Ok(customers) => {
-            let items: Vec<Value> = customers.iter().filter_map(|c| serde_json::to_value(c).ok()).collect();
+            let items: Vec<Value> = customers
+                .iter()
+                .filter_map(|c| serde_json::to_value(c).ok())
+                .collect();
             Json(json!({"customers": items}))
         }
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))),
+        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
     }
 }
 
 /// GET /api/customers/:id — customer detail.
-pub async fn get_customer(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+pub async fn get_customer(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
     match crate::customers::get_customer(&conn, id) {
         Ok(Some(c)) => Json(serde_json::to_value(&c).unwrap_or(json!({}))),
-        Ok(None) => (axum::http::StatusCode::NOT_FOUND, Json(json!({"message": "Customer not found."}))),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))),
+        Ok(None) => Json(json!({"_status": 404, "message": "Customer not found."})),
+        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
     }
 }
 
@@ -46,10 +49,13 @@ pub async fn customer_timeline(
     let conn = state.conn.lock().expect("mutex poisoned");
     match crate::customers::customer_timeline(&conn, id, Some(100)) {
         Ok(entries) => {
-            let items: Vec<Value> = entries.iter().filter_map(|e| serde_json::to_value(e).ok()).collect();
+            let items: Vec<Value> = entries
+                .iter()
+                .filter_map(|e| serde_json::to_value(e).ok())
+                .collect();
             Json(json!({"timeline": items}))
         }
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))),
+        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
     }
 }
 
@@ -67,8 +73,13 @@ pub async fn list_organizations(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
-    let limit = params.get("limit").and_then(|l| l.parse::<u32>().ok()).unwrap_or(20);
-    let mut stmt = conn.prepare("SELECT id, remote_id, name FROM organizations ORDER BY name LIMIT ?1").unwrap();
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<u32>().ok())
+        .unwrap_or(20);
+    let mut stmt = conn
+        .prepare("SELECT id, remote_id, name FROM organizations ORDER BY name LIMIT ?1")
+        .unwrap();
     let orgs: Vec<Value> = stmt.query_map(rusqlite::params![limit], |r| {
         Ok(json!({"id": r.get::<_, i64>(0)?, "remote_id": r.get::<_, i64>(1)?, "name": r.get::<_, String>(2)?}))
     }).unwrap().filter_map(|r| r.ok()).collect();
@@ -86,7 +97,7 @@ pub async fn get_organization(
     });
     match row {
         Ok(v) => Json(v),
-        Err(_) => (axum::http::StatusCode::NOT_FOUND, Json(json!({"message": "Organization not found."}))),
+        Err(_) => Json(json!({"_status": 404, "message": "Organization not found."})),
     }
 }
 

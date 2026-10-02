@@ -2,11 +2,11 @@
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use axum::response::IntoResponse;
 /// POST /api/webhooks/helpscout — webhook receiver with HMAC-SHA1 verification.
 pub async fn handle(
     State(state): State<AppState>,
@@ -19,15 +19,21 @@ pub async fn handle(
     let secret = crate::settings::get_string(
         &state.conn.lock().expect("mutex poisoned"),
         "webhook_secret",
-    ).unwrap_or_default();
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_default();
 
     if !secret.is_empty() {
-        let signature = headers.get("x-helpscout-signature").and_then(|v| v.to_str().ok());
+        let signature = headers
+            .get("x-helpscout-signature")
+            .and_then(|v| v.to_str().ok());
         if let Some(sig) = signature {
-            if crate::webhook::verify_signature(secret.as_bytes(), raw_body.as_bytes(), sig).is_err() {
-                return (
-                    axum::http::StatusCode::UNAUTHORIZED,
-                    Json(json!({"received": false, "error": "Invalid signature."})),
+            if crate::webhook::verify_signature(secret.as_bytes(), raw_body.as_bytes(), sig)
+                .is_err()
+            {
+                return Json(
+                    json!({"_status": 401, "received": false, "error": "Invalid signature."}),
                 );
             }
         }
@@ -37,15 +43,17 @@ pub async fn handle(
     let payload: Value = match serde_json::from_str(&raw_body) {
         Ok(v) => v,
         Err(e) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(json!({"received": false, "error": format!("Invalid JSON: {e}")})),
+            return Json(
+                json!({"_status": 400, "received": false, "error": format!("Invalid JSON: {e}")}),
             );
         }
     };
 
     // Persist the webhook event (dedup by hash).
-    let event_type = headers.get("x-helpscout-event").and_then(|v| v.to_str().ok()).unwrap_or("unknown");
+    let event_type = headers
+        .get("x-helpscout-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
     let event_hash = format!("{:x}", crc32fast::hash(raw_body.as_bytes()));
 
     let conn = state.conn.lock().expect("mutex poisoned");
@@ -55,9 +63,8 @@ pub async fn handle(
     );
 
     if result.is_err() {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"received": false, "error": "Failed to persist webhook event."})),
+        return Json(
+            json!({"_status": 500, "received": false, "error": "Failed to persist webhook event."}),
         );
     }
 

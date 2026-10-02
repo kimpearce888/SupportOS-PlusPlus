@@ -4,11 +4,11 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use axum::response::IntoResponse;
 
 /// GET /health — basic health check.
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -17,7 +17,11 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         conn.execute_batch("SELECT 1").is_ok()
     };
     let status = if db_ok { "ok" } else { "error" };
-    let code = if db_ok { axum::http::StatusCode::OK } else { axum::http::StatusCode::SERVICE_UNAVAILABLE };
+    let code = if db_ok {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
     (
         code,
         Json(json!({
@@ -38,7 +42,11 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
     let self_check = crate::self_check::run(&conn, None).ok();
 
     let status = if db_ok { "ok" } else { "error" };
-    let code = if db_ok { axum::http::StatusCode::OK } else { axum::http::StatusCode::SERVICE_UNAVAILABLE };
+    let code = if db_ok {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
 
     (
         code,
@@ -101,7 +109,9 @@ pub async fn table_stats(State(state): State<AppState>) -> impl IntoResponse {
         .filter_map(|r| r.ok())
         .map(|name| {
             let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| r.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| {
+                    r.get(0)
+                })
                 .unwrap_or(0);
             json!({"name": name, "rows": count})
         })
@@ -131,7 +141,10 @@ pub async fn onboarding_step(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let step = body.get("step").and_then(|v| v.as_str()).unwrap_or("welcome");
+    let step = body
+        .get("step")
+        .and_then(|v| v.as_str())
+        .unwrap_or("welcome");
     let conn = state.conn.lock().expect("mutex poisoned");
     let _ = crate::settings::set_string(&conn, "onboarding_step", step);
     Json(json!({"ok": true}))
@@ -161,13 +174,25 @@ pub async fn demo_simulate_incoming(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !state.demo_mode {
-        return (axum::http::StatusCode::OK, Json(json!({"ok": false, "message": "Not in demo mode."})));
+        return Json(json!({"_status": 200, "ok": false, "message": "Not in demo mode."}));
     }
 
-    let subject = body.get("subject").and_then(|v| v.as_str()).unwrap_or("New question about exports");
-    let text = body.get("body").and_then(|v| v.as_str()).unwrap_or("Hello, can scheduled exports include the raw JSON fields in addition to CSV?");
-    let mailbox_id = body.get("mailboxId").and_then(|v| v.as_i64()).unwrap_or(201);
-    let customer_id = body.get("customerRemoteId").and_then(|v| v.as_i64()).unwrap_or(3003);
+    let subject = body
+        .get("subject")
+        .and_then(|v| v.as_str())
+        .unwrap_or("New question about exports");
+    let text = body
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Hello, can scheduled exports include the raw JSON fields in addition to CSV?");
+    let mailbox_id = body
+        .get("mailboxId")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(201);
+    let customer_id = body
+        .get("customerRemoteId")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3003);
 
     let conn = state.conn.lock().expect("mutex poisoned");
     // Insert a simulated conversation directly.
@@ -185,7 +210,9 @@ pub async fn demo_simulate_incoming(
     );
 
     if result.is_err() {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok": false, "message": "Failed to create conversation."})));
+        return Json(
+            json!({"_status": 500, "ok": false, "message": "Failed to create conversation."}),
+        );
     }
 
     Json(json!({
@@ -200,17 +227,19 @@ pub async fn demo_simulate_rating(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !state.demo_mode {
-        return (axum::http::StatusCode::OK, Json(json!({"ok": false, "message": "Not in demo mode."})));
+        return Json(json!({"_status": 200, "ok": false, "message": "Not in demo mode."}));
     }
 
     let conversation_id = body.get("conversationRemoteId").and_then(|v| v.as_i64());
-    let rating = body.get("rating").and_then(|v| v.as_str()).unwrap_or("great");
+    let rating = body
+        .get("rating")
+        .and_then(|v| v.as_str())
+        .unwrap_or("great");
     let comments = body.get("comments").and_then(|v| v.as_str()).unwrap_or("");
 
     if conversation_id.is_none() {
-        return (
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"statusCode": 422, "error": "ValidationError", "message": "conversationRemoteId is required."})),
+        return Json(
+            json!({"_status": 422, "error": "ValidationError", "message": "conversationRemoteId is required."}),
         );
     }
 
@@ -226,11 +255,17 @@ pub async fn demo_simulate_webhook(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !state.demo_mode {
-        return (axum::http::StatusCode::OK, Json(json!({"ok": false, "message": "Not in demo mode."})));
+        return Json(json!({"_status": 200, "ok": false, "message": "Not in demo mode."}));
     }
 
-    let event = body.get("event").and_then(|v| v.as_str()).unwrap_or("convo.created");
-    let remote_id = body.get("conversationRemoteId").and_then(|v| v.as_i64()).unwrap_or(0);
+    let event = body
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("convo.created");
+    let remote_id = body
+        .get("conversationRemoteId")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     Json(json!({
         "ok": true,

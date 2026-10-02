@@ -13,21 +13,16 @@ fn empty_response(key: &str) -> impl IntoResponse {
     Json(json!({key: []}))
 }
 
-
 // Auto-generated stub functions to match the router
 pub async fn list_sessions(
     State(state): State<super::super::server::AppState>,
 ) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn chat(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn chat(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn get_session(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn get_session(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn delete_session(
@@ -35,8 +30,6 @@ pub async fn delete_session(
 ) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn tools(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn tools(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }

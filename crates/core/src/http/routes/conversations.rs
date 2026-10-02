@@ -2,11 +2,11 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use axum::response::IntoResponse;
 
 /// GET /api/conversations — list conversations with filters.
 pub async fn list(
@@ -44,36 +44,27 @@ pub async fn list(
                 "notes": [],
             }))
         }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
         ),
     }
 }
 
 /// GET /api/conversations/:id — conversation detail with threads.
-pub async fn get(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
     match crate::inbox::get_conversation(&conn, id) {
-        Ok(Some(detail)) => {
-            match serde_json::to_value(&detail) {
-                Ok(v) => (axum::http::StatusCode::OK, Json(v)),
-                Err(e) => (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
-                ),
-            }
-        }
-        Ok(None) => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(json!({"statusCode": 404, "error": "NotFound", "message": "Conversation not found locally."})),
+        Ok(Some(detail)) => match serde_json::to_value(&detail) {
+            Ok(v) => Json(v),
+            Err(e) => Json(
+                json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+            ),
+        },
+        Ok(None) => Json(
+            json!({"_status": 404, "statusCode": 404, "error": "NotFound", "message": "Conversation not found locally."}),
         ),
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
         ),
     }
 }
@@ -86,20 +77,24 @@ pub async fn reply(
 ) -> impl IntoResponse {
     let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
     if body_text.trim().is_empty() {
-        return (
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"statusCode": 422, "error": "ValidationError", "message": "Reply body cannot be empty."})),
+        return Json(
+            json!({"_status": 422, "statusCode": 422, "error": "ValidationError", "message": "Reply body cannot be empty."}),
         );
     }
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    match crate::inbox::reply_to_conversation(&mut conn, id, body_text.to_string(), "user".to_string(), None) {
+    match crate::inbox::reply_to_conversation(
+        &mut conn,
+        id,
+        body_text.to_string(),
+        "user".to_string(),
+        None,
+    ) {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             Json(json!({"ok": ok, "message": "Reply sent."}))
         }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
         ),
     }
 }
@@ -112,14 +107,19 @@ pub async fn note(
 ) -> impl IntoResponse {
     let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    match crate::inbox::add_note(&mut conn, id, body_text.to_string(), "user".to_string(), None) {
+    match crate::inbox::add_note(
+        &mut conn,
+        id,
+        body_text.to_string(),
+        "user".to_string(),
+        None,
+    ) {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             Json(json!({"ok": ok}))
         }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
         ),
     }
 }
@@ -130,16 +130,24 @@ pub async fn status(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let new_status = body.get("status").and_then(|v| v.as_str()).unwrap_or("active");
+    let new_status = body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("active");
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    match crate::inbox::change_status(&mut conn, id, new_status.to_string(), "user".to_string(), None) {
+    match crate::inbox::change_status(
+        &mut conn,
+        id,
+        new_status.to_string(),
+        "user".to_string(),
+        None,
+    ) {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             Json(json!({"ok": ok}))
         }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
         ),
     }
 }
@@ -157,9 +165,8 @@ pub async fn assign(
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             Json(json!({"ok": ok}))
         }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
         ),
     }
 }
@@ -170,12 +177,16 @@ pub async fn priority(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let priority = body.get("priority").and_then(|v| v.as_str()).unwrap_or("normal");
+    let priority = body
+        .get("priority")
+        .and_then(|v| v.as_str())
+        .unwrap_or("normal");
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    use crate::ticket_ops::{TicketOperation, execute};
+    use crate::ticket_ops::{execute, TicketOperation};
     let op = TicketOperation::SetPriority {
         conversation_remote_id: id,
-        new_priority: crate::ticket_states::TicketPriority::parse(priority).unwrap_or(crate::ticket_states::TicketPriority::Normal),
+        new_priority: crate::ticket_states::TicketPriority::parse(priority)
+            .unwrap_or(crate::ticket_states::TicketPriority::Normal),
         actor_type: "user".to_string(),
         actor_id: None,
     };
@@ -184,9 +195,8 @@ pub async fn priority(
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             Json(json!({"ok": ok}))
         }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
         ),
     }
 }
@@ -204,10 +214,7 @@ pub async fn subject(
         rusqlite::params![new_subject, id],
     ) {
         Ok(rows) => Json(json!({"ok": rows > 0})),
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
-        ),
+        Err(e) => Json(json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()})),
     }
 }
 
@@ -219,7 +226,7 @@ pub async fn set_state(
 ) -> impl IntoResponse {
     let new_state = body.get("state").and_then(|v| v.as_str()).unwrap_or("");
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    use crate::ticket_ops::{TicketOperation, execute};
+    use crate::ticket_ops::{execute, TicketOperation};
     let op = TicketOperation::SetTicketState {
         conversation_remote_id: id,
         new_state: new_state.to_string(),
@@ -231,18 +238,14 @@ pub async fn set_state(
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
             Json(json!({"ok": ok}))
         }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
         ),
     }
 }
 
 /// GET /api/conversations/:id/events — activity events for a conversation.
-pub async fn events(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+pub async fn events(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
     let mut stmt = match conn.prepare(
         "SELECT id, conversation_id, event_type, actor_type, actor_id, occurred_at
@@ -250,10 +253,9 @@ pub async fn events(
     ) {
         Ok(s) => s,
         Err(e) => {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
-            ).into_response();
+            return Json(
+                json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+            );
         }
     };
     let events: Vec<Value> = stmt

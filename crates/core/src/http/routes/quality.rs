@@ -13,11 +13,8 @@ fn empty_response(key: &str) -> impl IntoResponse {
     Json(json!({key: []}))
 }
 
-
 // Auto-generated stub functions to match the router
-pub async fn list_gaps(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn list_gaps(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn rebuild_gaps(
@@ -25,14 +22,10 @@ pub async fn rebuild_gaps(
 ) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn qa_overview(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn qa_overview(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn qa_rebuild(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn qa_rebuild(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn qa_conversation(
@@ -40,9 +33,7 @@ pub async fn qa_conversation(
 ) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn qa_analyze(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn qa_analyze(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn friction_overview(

@@ -13,7 +13,6 @@ fn empty_response(key: &str) -> impl IntoResponse {
     Json(json!({key: []}))
 }
 
-
 // Auto-generated stub functions to match the router
 pub async fn list_side_threads(
     State(state): State<super::super::server::AppState>,
@@ -30,19 +29,13 @@ pub async fn get_side_thread(
 ) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn add_message(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn add_message(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn resolve(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn resolve(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn reopen(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn reopen(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn mention_directory(

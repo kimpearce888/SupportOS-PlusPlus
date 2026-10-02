@@ -2,11 +2,11 @@
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use axum::response::IntoResponse;
 
 /// GET /api/operations/center — operations center snapshot.
 pub async fn center(
@@ -16,22 +16,20 @@ pub async fn center(
     let conn = state.conn.lock().expect("mutex poisoned");
     let mailbox_id = params.get("mailboxId").and_then(|m| m.parse::<i64>().ok());
     match crate::operations::build_snapshot(&conn, mailbox_id) {
-        Ok(snapshot) => {
-            match serde_json::to_value(&snapshot) {
-                Ok(v) => Json(v),
-                Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))),
-            }
-        }
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))),
+        Ok(snapshot) => match serde_json::to_value(&snapshot) {
+            Ok(v) => Json(v),
+            Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
+        },
+        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
     }
 }
 
 /// GET /api/operations/workload
 pub async fn workload(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
-    match crate::workload::team_workload(&conn) {
+    match crate::workload::team_workload(&conn, 0, &[]) {
         Ok(w) => Json(serde_json::to_value(&w).unwrap_or(json!({}))),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"message": e.to_string()}))),
+        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
     }
 }
 
@@ -60,7 +58,9 @@ pub async fn set_waiting_threshold(
 /// GET /api/operations/suggested-assignees
 pub async fn suggested_assignees(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
-    let mut stmt = conn.prepare("SELECT id, first_name, last_name FROM users ORDER BY id LIMIT 10").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, first_name, last_name FROM users ORDER BY id LIMIT 10")
+        .unwrap();
     let people: Vec<Value> = stmt.query_map([], |r| {
         Ok(json!({"id": r.get::<_, i64>(0)?, "name": format!("{} {}", r.get::<_, String>(1)?, r.get::<_, String>(2)?)}))
     }).unwrap().filter_map(|r| r.ok()).collect();

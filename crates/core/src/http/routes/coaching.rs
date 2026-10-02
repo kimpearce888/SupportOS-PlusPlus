@@ -13,11 +13,8 @@ fn empty_response(key: &str) -> impl IntoResponse {
     Json(json!({key: []}))
 }
 
-
 // Auto-generated stub functions to match the router
-pub async fn meta(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn meta(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn get_coaching(
@@ -25,8 +22,6 @@ pub async fn get_coaching(
 ) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn review(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn review(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }

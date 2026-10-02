@@ -13,31 +13,20 @@ fn empty_response(key: &str) -> impl IntoResponse {
     Json(json!({key: []}))
 }
 
-
 // Auto-generated stub functions to match the router
-pub async fn list_types(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn list_types(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn create_type(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn create_type(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn get_type(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn get_type(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn update_type(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn update_type(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn delete_type(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn delete_type(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn list_objects(
@@ -50,9 +39,7 @@ pub async fn create_object(
 ) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn get_object(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn get_object(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn update_object(

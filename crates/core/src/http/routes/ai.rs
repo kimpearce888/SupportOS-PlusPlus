@@ -13,41 +13,26 @@ fn empty_response(key: &str) -> impl IntoResponse {
     Json(json!({key: []}))
 }
 
-
 // Auto-generated stub functions to match the router
-pub async fn status(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn status(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn analyze(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn analyze(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn draft(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn draft(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn similar(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn similar(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn get_memory(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn get_memory(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn set_memory(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn set_memory(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn jobs(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn jobs(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
 pub async fn ai_analytics(
@@ -55,8 +40,6 @@ pub async fn ai_analytics(
 ) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn evaluation(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn evaluation(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }

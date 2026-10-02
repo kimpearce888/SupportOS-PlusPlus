@@ -3,39 +3,69 @@
 //! Each module corresponds to a reference route file.
 //! Handlers take `AppState` and return `impl IntoResponse`.
 
-pub mod system;
-pub mod events;
-pub mod conversations;
-pub mod people;
-pub mod search;
-pub mod views;
-pub mod operations;
-pub mod notifications;
-pub mod settings;
-pub mod sync;
-pub mod webhook;
-pub mod analytics;
+#[allow(warnings)]
 pub mod ai;
-pub mod issues;
-pub mod automation;
-pub mod collaboration;
-pub mod copilot;
-pub mod knowledge;
-pub mod outreach;
-pub mod custom_objects;
-pub mod connectors;
-pub mod incidents;
-pub mod graph;
+#[allow(warnings)]
+pub mod analytics;
+#[allow(warnings)]
 pub mod attributes;
+#[allow(warnings)]
+pub mod automation;
+#[allow(warnings)]
 pub mod coaching;
-pub mod translation;
-pub mod memory;
-pub mod interactions;
-pub mod quality;
+#[allow(warnings)]
+pub mod collaboration;
+#[allow(warnings)]
+pub mod connectors;
+#[allow(warnings)]
+pub mod conversations;
+#[allow(warnings)]
+pub mod copilot;
+#[allow(warnings)]
+pub mod custom_objects;
+#[allow(warnings)]
 pub mod docs;
+#[allow(warnings)]
+pub mod events;
+#[allow(warnings)]
+pub mod graph;
+#[allow(warnings)]
+pub mod incidents;
+#[allow(warnings)]
+pub mod interactions;
+#[allow(warnings)]
+pub mod issues;
+#[allow(warnings)]
+pub mod knowledge;
+#[allow(warnings)]
+pub mod memory;
+#[allow(warnings)]
+pub mod notifications;
+#[allow(warnings)]
+pub mod operations;
+#[allow(warnings)]
+pub mod outreach;
+#[allow(warnings)]
+pub mod people;
+#[allow(warnings)]
+pub mod quality;
+#[allow(warnings)]
+pub mod search;
+#[allow(warnings)]
+pub mod settings;
+#[allow(warnings)]
+pub mod sync;
+#[allow(warnings)]
+pub mod system;
+#[allow(warnings)]
+pub mod translation;
+#[allow(warnings)]
+pub mod views;
+#[allow(warnings)]
+pub mod webhook;
 
-use axum::response::{IntoResponse, Response};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 
 /// 404 JSON response for unknown routes.
 pub async fn not_found() -> Response {

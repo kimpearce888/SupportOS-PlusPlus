@@ -13,50 +13,31 @@ fn empty_response(key: &str) -> impl IntoResponse {
     Json(json!({key: []}))
 }
 
-
 // Auto-generated stub functions to match the router
-pub async fn stats(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn stats(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn meta(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn meta(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn search(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn search(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn node(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn node(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn neighbors(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn neighbors(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn subgraph(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn subgraph(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn list_edges(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn list_edges(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn create_edge(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn create_edge(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }
-pub async fn delete_edge(
-    State(state): State<super::super::server::AppState>,
-) -> impl IntoResponse {
+pub async fn delete_edge(State(state): State<super::super::server::AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"data": []}))
 }

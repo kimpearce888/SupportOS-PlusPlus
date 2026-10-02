@@ -11,9 +11,23 @@ use super::super::server::AppState;
 /// GET /api/sync/status
 pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
-    let sync_count: i64 = conn.query_row("SELECT COUNT(*) FROM sync_runs WHERE status != 'running'", [], |r| r.get(0)).unwrap_or(0);
-    let webhook_count: i64 = conn.query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0)).unwrap_or(0);
-    let state_str = if webhook_count > 0 { "receiving" } else if sync_count > 0 { "registered" } else { "not_configured" };
+    let sync_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_runs WHERE status != 'running'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let webhook_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0))
+        .unwrap_or(0);
+    let state_str = if webhook_count > 0 {
+        "receiving"
+    } else if sync_count > 0 {
+        "registered"
+    } else {
+        "not_configured"
+    };
     Json(json!({
         "state": state_str,
         "sync_runs_completed": sync_count,
@@ -47,7 +61,9 @@ pub async fn register_webhook(
     State(state): State<AppState>,
     Json(_body): Json<Value>,
 ) -> impl IntoResponse {
-    Json(json!({"ok": true, "message": "Webhook registration requires Help Scout OAuth credentials."}))
+    Json(
+        json!({"ok": true, "message": "Webhook registration requires Help Scout OAuth credentials."}),
+    )
 }
 
 /// DELETE /api/webhooks/:remoteId
@@ -61,28 +77,46 @@ pub async fn unregister_webhook(
 /// GET /api/queue — job queue status.
 pub async fn queue(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
-    let queued: i64 = conn.query_row("SELECT COUNT(*) FROM jobs WHERE status = 'queued'", [], |r| r.get(0)).unwrap_or(0);
-    let failed: i64 = conn.query_row("SELECT COUNT(*) FROM jobs WHERE status = 'failed'", [], |r| r.get(0)).unwrap_or(0);
-    let running: i64 = conn.query_row("SELECT COUNT(*) FROM jobs WHERE status = 'running'", [], |r| r.get(0)).unwrap_or(0);
+    let queued: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let failed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'failed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let running: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'running'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     Json(json!({"queued": queued, "failed": failed, "running": running}))
 }
 
 /// POST /api/queue/:id/retry
-pub async fn retry_job(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+pub async fn retry_job(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
-    let _ = conn.execute("UPDATE jobs SET status = 'queued', attempts = 0 WHERE id = ?1", rusqlite::params![id]);
+    let _ = conn.execute(
+        "UPDATE jobs SET status = 'queued', attempts = 0 WHERE id = ?1",
+        rusqlite::params![id],
+    );
     Json(json!({"ok": true}))
 }
 
 /// POST /api/queue/:id/cancel
-pub async fn cancel_job(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> impl IntoResponse {
+pub async fn cancel_job(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().expect("mutex poisoned");
-    let _ = conn.execute("UPDATE jobs SET status = 'cancelled' WHERE id = ?1", rusqlite::params![id]);
+    let _ = conn.execute(
+        "UPDATE jobs SET status = 'cancelled' WHERE id = ?1",
+        rusqlite::params![id],
+    );
     Json(json!({"ok": true}))
 }
