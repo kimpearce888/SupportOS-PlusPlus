@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(state, "processed");
         let job_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM jobs WHERE kind = 'sync_conversation'",
+                "SELECT COUNT(*) FROM jobs WHERE type = 'sync_conversation'",
                 [],
                 |r| r.get(0),
             )
@@ -302,7 +302,7 @@ mod tests {
         // A rating.process job was enqueued.
         let job_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM jobs WHERE kind = 'rating.process'",
+                "SELECT COUNT(*) FROM jobs WHERE type = 'rating.process'",
                 [],
                 |r| r.get(0),
             )
@@ -324,7 +324,7 @@ mod tests {
         // A sync.conversations job was enqueued.
         let job_count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM jobs WHERE kind = 'sync.conversations'",
+                "SELECT COUNT(*) FROM jobs WHERE type = 'sync.conversations'",
                 [],
                 |r| r.get(0),
             )

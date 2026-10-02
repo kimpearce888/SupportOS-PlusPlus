@@ -143,6 +143,135 @@ pub struct HsRating {
     pub created_at: Option<String>,
 }
 
+/// A Help Scout folder (per-mailbox view: Unassigned / Mine / Drafts).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsFolder {
+    pub remote_id: i64,
+    pub mailbox_id: i64,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub user_id: Option<i64>,
+    pub total_count: i64,
+    pub active_count: i64,
+}
+
+/// A Help Scout custom field definition on a mailbox.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsField {
+    pub remote_id: i64,
+    pub mailbox_id: i64,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub system_type: Option<String>,
+    pub required: bool,
+    pub sort_order: i64,
+    pub options: Vec<HsFieldOption>,
+}
+
+/// A dropdown option for a custom field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsFieldOption {
+    pub id: i64,
+    pub order: i64,
+    pub label: String,
+}
+
+/// A saved reply macro.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsSavedReply {
+    pub remote_id: i64,
+    pub name: String,
+    pub preview: Option<String>,
+    pub text: Option<String>,
+}
+
+/// A Help Scout workflow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsWorkflow {
+    pub remote_id: i64,
+    pub mailbox_id: Option<i64>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub status: String,
+    pub sort_order: i64,
+}
+
+/// A Help Scout webhook configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsWebhookConfig {
+    pub remote_id: i64,
+    pub url: String,
+    pub events: Vec<String>,
+    pub status: String,
+}
+
+/// A customer/organization property definition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsPropertyDef {
+    pub remote_id: i64,
+    pub name: String,
+    pub slug: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub sort_order: i64,
+}
+
+/// A Help Scout organization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsOrganization {
+    pub remote_id: i64,
+    pub name: String,
+    pub domains: Vec<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// A conversation thread (message/note/chat line).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsThread {
+    pub remote_id: i64,
+    pub conversation_id: i64,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub status: Option<String>,
+    pub state: Option<String>,
+    pub body: Option<String>,
+    pub created_by_customer_id: Option<i64>,
+    pub created_by_user_id: Option<i64>,
+    pub assigned_to_id: Option<i64>,
+    pub created_at: Option<String>,
+}
+
+/// A user's availability status (email/chat).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsUserStatus {
+    pub user_id: i64,
+    pub email_status: Option<String>,
+    pub email_updated_at: Option<String>,
+    pub chat_status: Option<String>,
+    pub mailbox_statuses: serde_json::Value,
+}
+
+/// A Docs collection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsDocCollection {
+    pub remote_id: i64,
+    pub slug: Option<String>,
+    pub name: String,
+}
+
+/// A Docs category within a collection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsDocCategory {
+    pub remote_id: i64,
+    pub collection_id: i64,
+    pub slug: Option<String>,
+    pub name: String,
+}
+
 /// Query parameters for listing conversations.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationQuery {
@@ -208,6 +337,112 @@ pub trait HelpScoutProvider: Send + Sync {
     /// List CSAT ratings (M2-T10). Used by the ratings watcher poller.
     async fn list_ratings(&self) -> Result<Vec<HsRating>>;
 
+    // -----------------------------------------------------------------
+    // Extended resource surface (reference provider.ts). Default impls
+    // keep bounded implementors compiling; the Fake and Real providers
+    // override every one.
+    // -----------------------------------------------------------------
+
+    /// List per-mailbox folders (Unassigned / Mine / Drafts ...).
+    async fn list_folders(&self, _mailbox_id: i64) -> Result<Vec<HsFolder>> {
+        Ok(Vec::new())
+    }
+
+    /// List custom field definitions for a mailbox.
+    async fn list_inbox_fields(&self, _mailbox_id: i64) -> Result<Vec<HsField>> {
+        Ok(Vec::new())
+    }
+
+    /// List saved replies for a mailbox.
+    async fn list_saved_replies(&self, _mailbox_id: i64) -> Result<Vec<HsSavedReply>> {
+        Ok(Vec::new())
+    }
+
+    /// List workflows.
+    async fn list_workflows(&self) -> Result<Vec<HsWorkflow>> {
+        Ok(Vec::new())
+    }
+
+    /// List registered remote webhooks.
+    async fn list_webhooks(&self) -> Result<Vec<HsWebhookConfig>> {
+        Ok(Vec::new())
+    }
+
+    /// Register a remote webhook; returns its remote id.
+    async fn create_webhook(
+        &self,
+        _url: &str,
+        _events: &[String],
+        _secret: &str,
+        _label: &str,
+    ) -> Result<i64> {
+        Err(crate::error::Error::Other(
+            "webhook registration requires the real provider".into(),
+        ))
+    }
+
+    /// Delete a remote webhook. Returns false when not found remotely.
+    async fn delete_webhook(&self, _remote_id: i64) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "webhook deletion requires the real provider".into(),
+        ))
+    }
+
+    /// List customer property definitions.
+    async fn list_customer_property_definitions(&self) -> Result<Vec<HsPropertyDef>> {
+        Ok(Vec::new())
+    }
+
+    /// List organization property definitions.
+    async fn list_organization_property_definitions(&self) -> Result<Vec<HsPropertyDef>> {
+        Ok(Vec::new())
+    }
+
+    /// List organizations.
+    async fn list_organizations(&self) -> Result<Vec<HsOrganization>> {
+        Ok(Vec::new())
+    }
+
+    /// Fetch a single conversation by remote id (None when 404).
+    async fn get_conversation(&self, _conversation_id: i64) -> Result<Option<HsConversation>> {
+        Ok(None)
+    }
+
+    /// Fetch the threads of a conversation.
+    async fn list_threads(&self, _conversation_id: i64) -> Result<Vec<HsThread>> {
+        Ok(Vec::new())
+    }
+
+    /// Fetch a single customer by remote id (None when 404).
+    async fn get_customer(&self, _customer_id: i64) -> Result<Option<HsCustomer>> {
+        Ok(None)
+    }
+
+    /// Fetch a user's availability status (None when 404).
+    async fn get_user_status(&self, _user_id: i64) -> Result<Option<HsUserStatus>> {
+        Ok(None)
+    }
+
+    /// List system users (automation identities).
+    async fn list_system_users(&self) -> Result<Vec<HsUser>> {
+        Ok(Vec::new())
+    }
+
+    /// List Docs collections.
+    async fn list_doc_collections(&self) -> Result<Vec<HsDocCollection>> {
+        Ok(Vec::new())
+    }
+
+    /// List Docs categories within a collection.
+    async fn list_doc_categories(&self, _collection_id: i64) -> Result<Vec<HsDocCategory>> {
+        Ok(Vec::new())
+    }
+
+    /// List Docs articles within a collection.
+    async fn list_doc_articles(&self, _collection_id: i64) -> Result<Vec<HsDocArticle>> {
+        Ok(Vec::new())
+    }
+
     /// Reset the provider's state (Fake only; Real is a no-op).
     /// Used by tests to get a clean slate.
     fn reset(&self) {}
@@ -235,6 +470,20 @@ pub struct FakeWorld {
     pub tags: Vec<HsTag>,
     pub conversations: Vec<HsConversation>,
     pub customers: Vec<HsCustomer>,
+    // Extended resource mirror (reference fakeData.ts shape).
+    pub folders: Vec<HsFolder>,
+    pub fields: Vec<HsField>,
+    pub saved_replies: Vec<HsSavedReply>,
+    pub workflows: Vec<HsWorkflow>,
+    pub webhooks: Vec<HsWebhookConfig>,
+    pub customer_props: Vec<HsPropertyDef>,
+    pub org_props: Vec<HsPropertyDef>,
+    pub organizations: Vec<HsOrganization>,
+    pub threads: Vec<HsThread>,
+    pub user_statuses: Vec<HsUserStatus>,
+    pub doc_collections: Vec<HsDocCollection>,
+    pub doc_categories: Vec<HsDocCategory>,
+    pub doc_articles: Vec<HsDocArticle>,
 }
 
 impl FakeWorld {
@@ -424,6 +673,145 @@ impl FakeWorld {
                     updated_at: Some("2026-01-01T00:00:00Z".into()),
                 })
                 .collect(),
+            folders: vec![
+                HsFolder { remote_id: 501, mailbox_id: 101, name: "Unassigned".into(), kind: "unassigned".into(), user_id: None, total_count: 3, active_count: 2 },
+                HsFolder { remote_id: 502, mailbox_id: 101, name: "Mine".into(), kind: "mine".into(), user_id: Some(1), total_count: 4, active_count: 3 },
+                HsFolder { remote_id: 503, mailbox_id: 101, name: "Drafts".into(), kind: "drafts".into(), user_id: Some(1), total_count: 1, active_count: 1 },
+                HsFolder { remote_id: 504, mailbox_id: 102, name: "Unassigned".into(), kind: "unassigned".into(), user_id: None, total_count: 2, active_count: 1 },
+            ],
+            fields: vec![
+                HsField {
+                    remote_id: 104,
+                    mailbox_id: 101,
+                    name: "Topic".into(),
+                    kind: "dropdown".into(),
+                    system_type: None,
+                    required: false,
+                    sort_order: 1,
+                    options: vec![
+                        HsFieldOption { id: 168, order: 1, label: "Timezone / Scheduling".into() },
+                        HsFieldOption { id: 169, order: 2, label: "Registration".into() },
+                        HsFieldOption { id: 170, order: 3, label: "Viewer".into() },
+                        HsFieldOption { id: 171, order: 4, label: "Integrations".into() },
+                        HsFieldOption { id: 172, order: 5, label: "Billing".into() },
+                        HsFieldOption { id: 173, order: 6, label: "Automation".into() },
+                    ],
+                },
+                HsField {
+                    remote_id: 105,
+                    mailbox_id: 101,
+                    name: "ai-topic".into(),
+                    kind: "dropdown".into(),
+                    system_type: Some("topic".into()),
+                    required: false,
+                    sort_order: 2,
+                    options: vec![
+                        HsFieldOption { id: 180, order: 1, label: "Billing".into() },
+                        HsFieldOption { id: 181, order: 2, label: "Shipping".into() },
+                    ],
+                },
+                HsField { remote_id: 107, mailbox_id: 102, name: "Plan issue".into(), kind: "singleline".into(), system_type: None, required: false, sort_order: 1, options: vec![] },
+            ],
+            saved_replies: vec![
+                HsSavedReply {
+                    remote_id: 401,
+                    name: "Timezone - set workspace timezone".into(),
+                    preview: Some("Hi there! You can change the workspace timezone under Settings > Workspace > Regional...".into()),
+                    text: Some("Hi there!\n\nYou can change the workspace timezone under **Settings > Workspace > Regional settings**. After changing it, new scheduled items use the new timezone.".into()),
+                },
+                HsSavedReply {
+                    remote_id: 402,
+                    name: "Registration - invite not arriving".into(),
+                    preview: Some("Sorry the invite did not arrive. Common causes: spam filtering or a typo in the address...".into()),
+                    text: Some("Hi there!\n\nSorry the invite did not arrive. The most common causes are spam filtering or a typo in the address. Could you check your spam folder and confirm the exact address you used?".into()),
+                },
+                HsSavedReply {
+                    remote_id: 403,
+                    name: "Billing - update card and retry".into(),
+                    preview: Some("You can update your card under Settings > Billing. After updating...".into()),
+                    text: Some("Hi there!\n\nYou can update your card under **Settings > Billing > Payment method**. After updating, click Retry payment so the pending invoice is charged again.".into()),
+                },
+            ],
+            workflows: vec![
+                HsWorkflow { remote_id: 601, mailbox_id: Some(101), name: "Assign to Tier 1".into(), kind: "manual".into(), status: "active".into(), sort_order: 1 },
+                HsWorkflow { remote_id: 602, mailbox_id: Some(101), name: "Spam cleanup".into(), kind: "manual".into(), status: "active".into(), sort_order: 2 },
+                HsWorkflow { remote_id: 603, mailbox_id: Some(102), name: "Auto-route billing".into(), kind: "automatic".into(), status: "active".into(), sort_order: 1 },
+            ],
+            webhooks: vec![
+                HsWebhookConfig {
+                    remote_id: 801,
+                    url: "https://relay.example.com/helpscout".into(),
+                    events: vec!["convo.created".into(), "convo.customer.reply.created".into(), "satisfaction.ratings".into()],
+                    status: "active".into(),
+                },
+            ],
+            customer_props: vec![
+                HsPropertyDef { remote_id: 4101, name: "Plan".into(), slug: Some("plan".into()), kind: "dropdown".into(), sort_order: 1 },
+                HsPropertyDef { remote_id: 4102, name: "Employees".into(), slug: Some("employees".into()), kind: "number".into(), sort_order: 2 },
+                HsPropertyDef { remote_id: 4103, name: "Region".into(), slug: Some("region".into()), kind: "dropdown".into(), sort_order: 3 },
+                HsPropertyDef { remote_id: 4104, name: "Account Manager".into(), slug: Some("account-manager".into()), kind: "text".into(), sort_order: 4 },
+            ],
+            org_props: vec![
+                HsPropertyDef { remote_id: 4201, name: "Industry".into(), slug: Some("industry".into()), kind: "text".into(), sort_order: 1 },
+            ],
+            organizations: vec![
+                HsOrganization { remote_id: 9001, name: "Acme Corp".into(), domains: vec!["acme.com".into()], created_at: Some("2025-06-01T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
+                HsOrganization { remote_id: 9002, name: "Globex".into(), domains: vec!["globex.io".into()], created_at: Some("2025-08-15T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
+            ],
+            threads: (1..=10)
+                .flat_map(|i| {
+                    let conv = 1000 + i;
+                    vec![
+                        HsThread {
+                            remote_id: conv * 10 + 1,
+                            conversation_id: conv,
+                            kind: "customer".into(),
+                            status: Some("active".into()),
+                            state: Some("published".into()),
+                            body: Some(format!("Customer message for conversation {} — please help with this issue.", i)),
+                            created_by_customer_id: Some(2000 + i),
+                            created_by_user_id: None,
+                            assigned_to_id: None,
+                            created_at: Some(format!("2026-01-{:02}T01:00:00Z", i)),
+                        },
+                        HsThread {
+                            remote_id: conv * 10 + 2,
+                            conversation_id: conv,
+                            kind: "message".into(),
+                            status: Some("active".into()),
+                            state: Some("published".into()),
+                            body: Some(format!("Agent reply for conversation {} — here is what we found.", i)),
+                            created_by_customer_id: None,
+                            created_by_user_id: Some((i % 3) + 1),
+                            assigned_to_id: None,
+                            created_at: Some(format!("2026-01-{:02}T05:00:00Z", i)),
+                        },
+                    ]
+                })
+                .collect(),
+            user_statuses: (1..=3)
+                .map(|i| HsUserStatus {
+                    user_id: i,
+                    email_status: Some(if i == 1 { "away".into() } else { "active".into() }),
+                    email_updated_at: Some("2026-01-01T00:00:00Z".into()),
+                    chat_status: Some("active".into()),
+                    mailbox_statuses: serde_json::json!({ "101": "active", "102": "away" }),
+                })
+                .collect(),
+            doc_collections: vec![
+                HsDocCollection { remote_id: 7001, slug: Some("guides".into()), name: "Product Guides".into() },
+                HsDocCollection { remote_id: 7002, slug: Some("faq".into()), name: "FAQ".into() },
+            ],
+            doc_categories: vec![
+                HsDocCategory { remote_id: 7101, collection_id: 7001, slug: Some("getting-started".into()), name: "Getting Started".into() },
+                HsDocCategory { remote_id: 7102, collection_id: 7001, slug: Some("advanced".into()), name: "Advanced".into() },
+                HsDocCategory { remote_id: 7103, collection_id: 7002, slug: Some("billing".into()), name: "Billing FAQ".into() },
+            ],
+            doc_articles: vec![
+                HsDocArticle { remote_id: 7201, collection_id: 7001, slug: Some("create-workspace".into()), name: "Create your first workspace".into(), text: Some("Workspaces hold your dashboards and reports. To create one...".into()), created_at: Some("2025-09-01T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
+                HsDocArticle { remote_id: 7202, collection_id: 7001, slug: Some("invite-teammates".into()), name: "Invite teammates".into(), text: Some("Go to Settings > Members and click Invite...".into()), created_at: Some("2025-09-05T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
+                HsDocArticle { remote_id: 7203, collection_id: 7002, slug: Some("refund-policy".into()), name: "Refund policy".into(), text: Some("Refunds are available within 30 days of purchase...".into()), created_at: Some("2025-10-01T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
+            ],
         }
     }
 }
@@ -443,6 +831,11 @@ impl FakeHelpScoutProvider {
         Self {
             world: Mutex::new(FakeWorld::default()),
         }
+    }
+
+    /// Lock the world mutex (poison-recovering).
+    fn lock_world(&self) -> std::sync::MutexGuard<'_, FakeWorld> {
+        self.world.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -501,7 +894,13 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             .conversations
             .iter()
             .filter(|c| query.mailbox_id.is_none_or(|m| c.mailbox_id == m))
-            .filter(|c| query.status.as_ref().is_none_or(|s| &c.status == s))
+            // 'all' means no status filter (reference fakeProvider parity).
+            .filter(|c| {
+                query
+                    .status
+                    .as_deref()
+                    .is_none_or(|s| s == "all" || s == c.status)
+            })
             .cloned()
             .collect();
         #[allow(clippy::cast_possible_truncation)]
@@ -615,6 +1014,157 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             .lock()
             .expect("FakeHelpScoutProvider mutex poisoned");
         *world = FakeWorld::demo();
+    }
+
+    // ---------------- Extended resource surface ----------------
+
+    async fn list_folders(&self, mailbox_id: i64) -> Result<Vec<HsFolder>> {
+        let world = self.lock_world();
+        Ok(world
+            .folders
+            .iter()
+            .filter(|f| f.mailbox_id == mailbox_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_inbox_fields(&self, mailbox_id: i64) -> Result<Vec<HsField>> {
+        let world = self.lock_world();
+        Ok(world
+            .fields
+            .iter()
+            .filter(|f| f.mailbox_id == mailbox_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_saved_replies(&self, _mailbox_id: i64) -> Result<Vec<HsSavedReply>> {
+        let world = self.lock_world();
+        Ok(world.saved_replies.clone())
+    }
+
+    async fn list_workflows(&self) -> Result<Vec<HsWorkflow>> {
+        let world = self.lock_world();
+        Ok(world.workflows.clone())
+    }
+
+    async fn list_webhooks(&self) -> Result<Vec<HsWebhookConfig>> {
+        let world = self.lock_world();
+        Ok(world.webhooks.clone())
+    }
+
+    async fn create_webhook(
+        &self,
+        url: &str,
+        events: &[String],
+        _secret: &str,
+        _label: &str,
+    ) -> Result<i64> {
+        let mut world = self.lock_world();
+        let next_id = world
+            .webhooks
+            .iter()
+            .map(|w| w.remote_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        world.webhooks.push(HsWebhookConfig {
+            remote_id: next_id,
+            url: url.to_string(),
+            events: events.to_vec(),
+            status: "enabled".into(),
+        });
+        Ok(next_id)
+    }
+
+    async fn delete_webhook(&self, remote_id: i64) -> Result<bool> {
+        let mut world = self.lock_world();
+        let before = world.webhooks.len();
+        world.webhooks.retain(|w| w.remote_id != remote_id);
+        Ok(world.webhooks.len() < before)
+    }
+
+    async fn list_customer_property_definitions(&self) -> Result<Vec<HsPropertyDef>> {
+        let world = self.lock_world();
+        Ok(world.customer_props.clone())
+    }
+
+    async fn list_organization_property_definitions(&self) -> Result<Vec<HsPropertyDef>> {
+        let world = self.lock_world();
+        Ok(world.org_props.clone())
+    }
+
+    async fn list_organizations(&self) -> Result<Vec<HsOrganization>> {
+        let world = self.lock_world();
+        Ok(world.organizations.clone())
+    }
+
+    async fn get_conversation(&self, conversation_id: i64) -> Result<Option<HsConversation>> {
+        let world = self.lock_world();
+        Ok(world
+            .conversations
+            .iter()
+            .find(|c| c.remote_id == conversation_id)
+            .cloned())
+    }
+
+    async fn list_threads(&self, conversation_id: i64) -> Result<Vec<HsThread>> {
+        let world = self.lock_world();
+        let mut threads: Vec<HsThread> = world
+            .threads
+            .iter()
+            .filter(|t| t.conversation_id == conversation_id)
+            .cloned()
+            .collect();
+        threads.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(threads)
+    }
+
+    async fn get_customer(&self, customer_id: i64) -> Result<Option<HsCustomer>> {
+        let world = self.lock_world();
+        Ok(world
+            .customers
+            .iter()
+            .find(|c| c.remote_id == customer_id)
+            .cloned())
+    }
+
+    async fn get_user_status(&self, user_id: i64) -> Result<Option<HsUserStatus>> {
+        let world = self.lock_world();
+        Ok(world
+            .user_statuses
+            .iter()
+            .find(|s| s.user_id == user_id)
+            .cloned())
+    }
+
+    async fn list_system_users(&self) -> Result<Vec<HsUser>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_doc_collections(&self) -> Result<Vec<HsDocCollection>> {
+        let world = self.lock_world();
+        Ok(world.doc_collections.clone())
+    }
+
+    async fn list_doc_categories(&self, collection_id: i64) -> Result<Vec<HsDocCategory>> {
+        let world = self.lock_world();
+        Ok(world
+            .doc_categories
+            .iter()
+            .filter(|c| c.collection_id == collection_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_doc_articles(&self, collection_id: i64) -> Result<Vec<HsDocArticle>> {
+        let world = self.lock_world();
+        Ok(world
+            .doc_articles
+            .iter()
+            .filter(|a| a.collection_id == collection_id)
+            .cloned()
+            .collect())
     }
 }
 

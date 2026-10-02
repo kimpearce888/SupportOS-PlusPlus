@@ -96,14 +96,51 @@ pub fn run() {
         }
     };
 
+    let http_conn = Arc::new(Mutex::new(http_conn));
+    let http_bus = spp_core::http::EventBus::default();
+
+    // Provider selection (reference context.ts): demo mode -> Fake, else Real
+    // with env credentials (HELPSCOUT_CLIENT_ID / _SECRET / _REDIRECT_URI).
+    let credentials = spp_core::helpscout_real::HsCredentials::from_env();
+    let use_real = !demo_mode && credentials.is_configured();
+    let (provider, real, provider_kind): (
+        Arc<dyn spp_core::helpscout::HelpScoutProvider>,
+        Option<Arc<spp_core::helpscout_real::RealHelpScoutProvider>>,
+        String,
+    ) = if use_real {
+        let real = Arc::new(spp_core::helpscout_real::RealHelpScoutProvider::new(
+            http_conn.clone(),
+            credentials,
+        ));
+        (
+            real.clone() as Arc<dyn spp_core::helpscout::HelpScoutProvider>,
+            Some(real),
+            "real".to_string(),
+        )
+    } else {
+        (
+            Arc::new(spp_core::helpscout::FakeHelpScoutProvider::new_demo())
+                as Arc<dyn spp_core::helpscout::HelpScoutProvider>,
+            None,
+            "fake".to_string(),
+        )
+    };
+    let sync = Arc::new(
+        spp_core::sync_engine::SyncEngine::new(http_conn.clone(), provider)
+            .with_bus(http_bus.clone()),
+    );
+
     let http_state = spp_core::http::server::AppState {
-        conn: Arc::new(Mutex::new(http_conn)),
+        conn: http_conn,
         data_dir: app_config.data_dir.clone(),
         port: http_port,
         host: "127.0.0.1".to_string(),
         demo_mode,
-        bus: spp_core::http::EventBus::default(),
+        bus: http_bus,
         limiter: spp_core::http::RateLimiter::new(),
+        sync: Some(sync),
+        real,
+        provider_kind,
     };
 
     let http_server = spp_core::http::HttpServer::new(http_state);
@@ -263,14 +300,25 @@ fn launch_without_db() {
     let mut http_conn = http_conn;
     let _ = spp_core::migrations::run_all(&mut http_conn);
 
+    let http_conn = Arc::new(Mutex::new(http_conn));
+    let http_bus = spp_core::http::EventBus::default();
+    let provider: Arc<dyn spp_core::helpscout::HelpScoutProvider> =
+        Arc::new(spp_core::helpscout::FakeHelpScoutProvider::new_demo());
+    let sync = Arc::new(
+        spp_core::sync_engine::SyncEngine::new(http_conn.clone(), provider)
+            .with_bus(http_bus.clone()),
+    );
     let http_state = spp_core::http::server::AppState {
-        conn: Arc::new(Mutex::new(http_conn)),
+        conn: http_conn,
         data_dir: std::env::temp_dir(),
         port: http_port,
         host: "127.0.0.1".to_string(),
         demo_mode,
-        bus: spp_core::http::EventBus::default(),
+        bus: http_bus,
         limiter: spp_core::http::RateLimiter::new(),
+        sync: Some(sync),
+        real: None,
+        provider_kind: "fake".to_string(),
     };
 
     let http_server = spp_core::http::HttpServer::new(http_state);

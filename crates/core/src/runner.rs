@@ -213,9 +213,11 @@ impl<'a> Runner<'a> {
 
 /// Count jobs in the `dead` state. Used by the runner to detect dead-lettering.
 fn count_dead(conn: &Connection) -> Result<u32> {
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM jobs WHERE state = 'dead'", [], |r| {
-        r.get(0)
-    })?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'failed'",
+        [],
+        |r| r.get(0),
+    )?;
     Ok(u32::try_from(n).unwrap_or(0))
 }
 
@@ -305,12 +307,12 @@ mod tests {
         // The job is now in `done` state.
         let state: String = conn
             .query_row(
-                "SELECT state FROM jobs WHERE id = ?1",
+                "SELECT status FROM jobs WHERE id = ?1",
                 rusqlite::params![id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(state, "done");
+        assert_eq!(state, "completed");
     }
 
     #[test]
@@ -340,12 +342,12 @@ mod tests {
         // The job should have failed (and been requeued with backoff).
         let (state, last_error): (String, Option<String>) = conn
             .query_row(
-                "SELECT state, last_error FROM jobs WHERE id = ?1",
+                "SELECT status, error FROM jobs WHERE id = ?1",
                 rusqlite::params![id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(state, "pending"); // requeued, not dead-lettered (attempts=1 < max=5)
+        assert_eq!(state, "queued"); // requeued, not dead-lettered (attempt=1 < max=3)
         assert!(last_error.unwrap().contains(r#"{"k":"v"}"#));
     }
 
@@ -366,7 +368,7 @@ mod tests {
         // last_error mentions the unknown kind.
         let last_error: Option<String> = conn
             .query_row(
-                "SELECT last_error FROM jobs WHERE id = ?1",
+                "SELECT error FROM jobs WHERE id = ?1",
                 rusqlite::params![id],
                 |r| r.get(0),
             )
@@ -393,7 +395,7 @@ mod tests {
         // (the enqueue inserts with now, but claim_next uses julianday which is
         // robust to format differences).
         conn.execute(
-            "UPDATE jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            "UPDATE jobs SET run_at = datetime('now') WHERE id = ?1",
             rusqlite::params![id],
         )
         .unwrap();
@@ -410,12 +412,12 @@ mod tests {
 
         let state: String = conn
             .query_row(
-                "SELECT state FROM jobs WHERE id = ?1",
+                "SELECT status FROM jobs WHERE id = ?1",
                 rusqlite::params![id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(state, "dead");
+        assert_eq!(state, "failed");
     }
 
     #[test]
@@ -440,7 +442,7 @@ mod tests {
 
         // Reset available_at to now (simulate backoff elapsing).
         conn.execute(
-            "UPDATE jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            "UPDATE jobs SET run_at = datetime('now') WHERE id = ?1",
             rusqlite::params![id],
         )
         .unwrap();
@@ -453,7 +455,7 @@ mod tests {
 
         // Reset and try again — should succeed this time.
         conn.execute(
-            "UPDATE jobs SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            "UPDATE jobs SET run_at = datetime('now') WHERE id = ?1",
             rusqlite::params![id],
         )
         .unwrap();
@@ -467,12 +469,12 @@ mod tests {
         // Final state is `done`.
         let state: String = conn
             .query_row(
-                "SELECT state FROM jobs WHERE id = ?1",
+                "SELECT status FROM jobs WHERE id = ?1",
                 rusqlite::params![id],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(state, "done");
+        assert_eq!(state, "completed");
     }
 
     #[test]

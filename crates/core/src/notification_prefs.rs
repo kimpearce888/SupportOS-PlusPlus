@@ -442,13 +442,13 @@ mod tests {
 
         let (kind, state): (String, String) = conn
             .query_row(
-                "SELECT kind, state FROM jobs WHERE id = ?1",
+                "SELECT type, status FROM jobs WHERE id = ?1",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(kind, NOTIFICATION_PRUNE_JOB_KIND);
-        assert_eq!(state, "pending");
+        assert_eq!(state, "queued");
     }
 
     #[test]

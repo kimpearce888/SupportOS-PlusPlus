@@ -1,97 +1,79 @@
-//! Sync routes — mirrors src/server/routes/sync.ts
+//! Sync routes — mirrors src/server/routes/sync.ts exactly.
+//!
+//! Contract highlights (verified against the reference source):
+//! - GET /api/sync/status: { state, running, current_run, checkpoints,
+//!   last_success, recent_runs, webhook{events,recent,configured,
+//!   secret_configured}, rate_limit, api_queue }
+//! - POST /api/sync/initial|incremental|reconcile: 409 when already running;
+//!   `{wait:true}` runs synchronously and returns results; fire-and-forget
+//!   logs failures to application_errors instead of swallowing them.
+//! - POST /api/sync/cancel: cooperative, current resource finishes first.
+//! - POST /api/webhooks/register: 422 validation / demo-mode / missing-secret
+//!   with the reference's exact messages; real-provider call + audit entry.
+//! - DELETE /api/webhooks/:remoteId: 422 non-numeric id; demo-mode message.
+//! - GET /api/queue: {jobs, stats, outbound} with limit/status/queue/
+//!   outbound_status filters (limit clamped to 1..=500, default 100).
+//! - POST /api/queue/:id/retry: 422 bad id, 404 unknown, 409 not retryable,
+//!   awaiting_approval retry is the APPROVE gesture (payload gains
+//!   approved:true).
+//! - POST /api/queue/clear-completed: deletes completed/cancelled > 24 h.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
 use crate::audit::AuditEntry;
+use crate::helpscout::HelpScoutProvider;
 
-/// GET /api/sync/status — mirrors reference's response shape.
+fn fastify_error(code: StatusCode, error: &str, message: &str) -> Response {
+    (
+        code,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(json!({ "statusCode": code.as_u16(), "error": error, "message": message })),
+    )
+        .into_response()
+}
+
+/// GET /api/sync/status — reference shape.
 pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let sync_count: i64 = conn
+    let conn = state.conn_lock();
+
+    // sync state from application_settings (syncRepo.getState).
+    let sync_state = crate::sync_engine::get_state(&conn);
+
+    // current_run: unfinished run.
+    let current_run: Option<Value> = conn
         .query_row(
-            "SELECT COUNT(*) FROM sync_runs WHERE status != 'running'",
+            "SELECT id, kind, state, started_at, finished_at, resources_done, resources_total,
+                    records_processed, errors, detail
+               FROM sync_runs WHERE finished_at IS NULL ORDER BY id DESC LIMIT 1",
             [],
-            |r| r.get(0),
+            row_to_json_run,
         )
-        .unwrap_or(0);
-    let webhook_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0))
-        .unwrap_or(0);
-    let running_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sync_runs WHERE status = 'running'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let last_success: Option<String> = conn
-        .query_row(
-            "SELECT MAX(completed_at) FROM sync_runs WHERE status = 'completed'",
-            [],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten();
-    let state_str = if webhook_count > 0 {
-        "RECEIVING"
-    } else if running_count > 0 {
-        "RUNNING"
-    } else if sync_count > 0 {
-        "REGISTERED"
-    } else {
-        "NEW"
-    };
-    let recent_runs: Vec<Value> = conn
-        .prepare("SELECT id, status, started_at, completed_at, error, resources_synced FROM sync_runs ORDER BY id DESC LIMIT 10")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "status": r.get::<_, String>(1)?,
-                    "started_at": r.get::<_, String>(2)?,
-                    "completed_at": r.get::<_, Option<String>>(3)?,
-                    "error": r.get::<_, Option<String>>(4)?,
-                    "resources_synced": r.get::<_, i64>(5)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let webhook_recent: Vec<Value> = conn
-        .prepare("SELECT id, received_at FROM webhook_events ORDER BY received_at DESC LIMIT 5")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({
-                    "id": r.get::<_, String>(0)?,
-                    "received_at": r.get::<_, String>(1)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let webhook_secret: Option<String> = crate::settings::get_string(&conn, "webhook_secret")
-        .ok()
-        .flatten();
-    let webhook_configured = webhook_secret.is_some();
+        .ok();
+
+    // checkpoints (syncRepo.getAllCheckpoints).
     let checkpoints: Vec<Value> = conn
-        .prepare("SELECT resource, last_seen_at FROM sync_cursors ORDER BY resource")
-        .ok()
+        .prepare(
+            "SELECT resource, last_success_at, remote_cursor, page_state, records_processed,
+                    records_failed, last_error, retry_count, status
+               FROM sync_checkpoints ORDER BY resource",
+        )
         .map(|mut stmt| {
             stmt.query_map([], |r| {
                 Ok(json!({
                     "resource": r.get::<_, String>(0)?,
-                    "last_synced_at": r.get::<_, Option<String>>(1)?,
+                    "last_success_at": r.get::<_, Option<String>>(1)?,
+                    "remote_cursor": r.get::<_, Option<String>>(2)?,
+                    "page_state": r.get::<_, Option<String>>(3)?,
+                    "records_processed": r.get::<_, i64>(4)?,
+                    "records_failed": r.get::<_, i64>(5)?,
+                    "last_error": r.get::<_, Option<String>>(6)?,
+                    "retry_count": r.get::<_, i64>(7)?,
+                    "status": r.get::<_, String>(8)?,
                 }))
             })
             .ok()
@@ -99,160 +81,527 @@ pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    let queued: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'pending'",
-            [],
-            |r| r.get(0),
+
+    let last_success = crate::sync_engine::last_successful_sync(&conn);
+
+    // recent runs (10).
+    let recent_runs: Vec<Value> = conn
+        .prepare(
+            "SELECT id, kind, state, started_at, finished_at, resources_done, resources_total,
+                    records_processed, errors, detail
+               FROM sync_runs ORDER BY id DESC LIMIT 10",
         )
-        .unwrap_or(0);
-    let active: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'claimed'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let completed: i64 = conn
-        .query_row("SELECT COUNT(*) FROM jobs WHERE state = 'done'", [], |r| {
-            r.get(0)
+        .map(|mut stmt| {
+            stmt.query_map([], row_to_json_run)
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
         })
-        .unwrap_or(0);
-    let failed: i64 = conn
-        .query_row("SELECT COUNT(*) FROM jobs WHERE state = 'dead'", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-    let dispatched: i64 = conn
+        .unwrap_or_default();
+
+    // webhook stats + recent + configured.
+    let (total, pending, processed, failed, duplicates): (i64, i64, i64, i64, i64) = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state IN ('claimed', 'done', 'dead')",
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN processing_state = 'pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN processing_state = 'processed' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN processing_state = 'failed' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN processing_state = 'duplicate' THEN 1 ELSE 0 END)
+               FROM webhook_events",
             [],
-            |r| r.get(0),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                ))
+            },
         )
-        .unwrap_or(0);
+        .unwrap_or((0, 0, 0, 0, 0));
+
+    let webhook_recent: Vec<Value> = conn
+        .prepare(
+            "SELECT id, event_id, event_type, received_at, processing_state, attempts, processing_error
+               FROM webhook_events ORDER BY id DESC LIMIT 20",
+        )
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "event_id": r.get::<_, Option<String>>(1)?,
+                    "event_type": r.get::<_, String>(2)?,
+                    "received_at": r.get::<_, String>(3)?,
+                    "processing_state": r.get::<_, String>(4)?,
+                    "attempts": r.get::<_, i64>(5)?,
+                    "processing_error": r.get::<_, Option<String>>(6)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    let webhook_configured: Vec<Value> = conn
+        .prepare("SELECT remote_id, url, events, status FROM webhook_configs ORDER BY id")
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                let events: Option<String> = r.get(2)?;
+                Ok(json!({
+                    "remote_id": r.get::<_, Option<i64>>(0)?,
+                    "url": r.get::<_, Option<String>>(1)?,
+                    "events": events
+                        .and_then(|e| serde_json::from_str::<Value>(&e).ok())
+                        .unwrap_or(json!([])),
+                    "status": r.get::<_, Option<String>>(3)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    let secret_configured = crate::settings::get_string(&conn, "webhook_secret")
+        .ok()
+        .flatten()
+        .is_some()
+        || std::env::var("HELPSCOUT_WEBHOOK_SECRET")
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+
+    let running = state.sync.as_ref().is_some_and(|s| s.is_running());
+
+    // rate_limit / api_queue: null in demo mode (reference: realProvider ? … : null).
+    let (rate_limit, api_queue) = match &state.real {
+        Some(real) => (real.limiter.snapshot(), real.queue.snapshot()),
+        None => (Value::Null, Value::Null),
+    };
+
     Json(json!({
-        "state": state_str,
-        "running": running_count > 0,
+        "state": sync_state,
+        "running": running,
+        "current_run": current_run,
         "checkpoints": checkpoints,
         "last_success": last_success,
         "recent_runs": recent_runs,
         "webhook": {
-            "events": webhook_count,
+            "events": {
+                "total": total,
+                "pending": pending,
+                "processed": processed,
+                "failed": failed,
+                "duplicates": duplicates,
+            },
             "recent": webhook_recent,
             "configured": webhook_configured,
-            "secret_configured": webhook_configured,
+            "secret_configured": secret_configured,
         },
-        "rate_limit": {
-            "limitPerMinute": 300,
-            "remaining": 300,
-            "retryAfterSec": 0,
-            "updatedAt": null,
-            "inFlightWindow": false,
-        },
-        "api_queue": {
-            "queued": queued,
-            "active": active,
-            "dispatched": dispatched,
-            "completed": completed,
-            "failed": failed,
-            "highWater": 0,
-        },
+        "rate_limit": rate_limit,
+        "api_queue": api_queue,
     }))
 }
 
-/// POST /api/sync/initial
-pub async fn initial(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"ok": true, "message": "Initial sync queued."}))
+fn row_to_json_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let detail: Option<String> = r.get(9)?;
+    Ok(json!({
+        "id": r.get::<_, i64>(0)?,
+        "kind": r.get::<_, String>(1)?,
+        "state": r.get::<_, String>(2)?,
+        "started_at": r.get::<_, String>(3)?,
+        "finished_at": r.get::<_, Option<String>>(4)?,
+        "resources_done": r.get::<_, i64>(5)?,
+        "resources_total": r.get::<_, i64>(6)?,
+        "records_processed": r.get::<_, i64>(7)?,
+        "errors": r.get::<_, i64>(8)?,
+        "detail": detail.and_then(|d| serde_json::from_str::<Value>(&d).ok()),
+    }))
 }
 
-/// POST /api/sync/incremental
-pub async fn incremental(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"ok": true, "message": "Incremental sync queued."}))
+/// POST /api/sync/initial — 409 when running; `{wait:true}` runs inline.
+pub async fn initial(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
+    let Some(sync) = state.sync.clone() else {
+        return fastify_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "The sync engine is not available in this build.",
+        );
+    };
+    if sync.is_running() {
+        return fastify_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "A sync is already running.",
+        );
+    }
+    let wait = body
+        .map(|Json(b)| b.get("wait").and_then(|w| w.as_bool()).unwrap_or(false))
+        .unwrap_or(false);
+    if wait {
+        let results = sync.initial_sync().await;
+        match results {
+            Ok(results) => Json(json!({
+                "ok": true,
+                "message": "Initial sync completed.",
+                "results": results,
+            }))
+            .into_response(),
+            Err(e) => fastify_error(StatusCode::CONFLICT, "Conflict", &e.to_string()),
+        }
+    } else {
+        // Fire-and-forget: failures are logged (visible in the server log /
+        // Sync Health error state) instead of vanishing.
+        let sync = sync.clone();
+        let conn = state.conn.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sync.initial_sync().await {
+                if let Ok(conn) = conn.lock() {
+                    let _ =
+                        crate::jobs::log_error(&conn, "sync", &format!("initial sync failed: {e}"));
+                }
+            }
+        });
+        Json(json!({
+            "ok": true,
+            "message": "Initial sync started. Watch Sync Health for progress.",
+        }))
+        .into_response()
+    }
 }
 
-/// POST /api/sync/reconcile
-pub async fn reconcile(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"ok": true, "message": "Reconciliation queued."}))
+/// POST /api/sync/incremental — same shape as initial.
+pub async fn incremental(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
+    let Some(sync) = state.sync.clone() else {
+        return fastify_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "The sync engine is not available in this build.",
+        );
+    };
+    if sync.is_running() {
+        return fastify_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "A sync is already running.",
+        );
+    }
+    let wait = body
+        .map(|Json(b)| b.get("wait").and_then(|w| w.as_bool()).unwrap_or(false))
+        .unwrap_or(false);
+    if wait {
+        let results = sync.incremental_sync().await;
+        match results {
+            Ok(results) => Json(json!({
+                "ok": true,
+                "message": "Incremental sync completed.",
+                "results": results,
+            }))
+            .into_response(),
+            Err(e) => fastify_error(StatusCode::CONFLICT, "Conflict", &e.to_string()),
+        }
+    } else {
+        let sync = sync.clone();
+        let conn = state.conn.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sync.incremental_sync().await {
+                if let Ok(conn) = conn.lock() {
+                    let _ = crate::jobs::log_error(
+                        &conn,
+                        "sync",
+                        &format!("incremental sync failed: {e}"),
+                    );
+                }
+            }
+        });
+        Json(json!({ "ok": true, "message": "Incremental sync started." })).into_response()
+    }
 }
 
-/// POST /api/sync/cancel
+/// POST /api/sync/reconcile — same shape, returns `result` (not `results`).
+pub async fn reconcile(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
+    let Some(sync) = state.sync.clone() else {
+        return fastify_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "The sync engine is not available in this build.",
+        );
+    };
+    if sync.is_running() {
+        return fastify_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "A sync is already running.",
+        );
+    }
+    let wait = body
+        .map(|Json(b)| b.get("wait").and_then(|w| w.as_bool()).unwrap_or(false))
+        .unwrap_or(false);
+    if wait {
+        let result = sync.reconcile().await;
+        match result {
+            Ok(result) => Json(json!({
+                "ok": true,
+                "message": "Reconciliation completed.",
+                "result": result,
+            }))
+            .into_response(),
+            Err(e) => fastify_error(StatusCode::CONFLICT, "Conflict", &e.to_string()),
+        }
+    } else {
+        let sync = sync.clone();
+        let conn = state.conn.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sync.reconcile().await {
+                if let Ok(conn) = conn.lock() {
+                    let _ =
+                        crate::jobs::log_error(&conn, "sync", &format!("reconcile failed: {e}"));
+                }
+            }
+        });
+        Json(json!({ "ok": true, "message": "Reconciliation started." })).into_response()
+    }
+}
+
+/// POST /api/sync/cancel — cooperative cancellation.
 pub async fn cancel(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"ok": true}))
+    if let Some(sync) = &state.sync {
+        sync.request_cancellation();
+    }
+    Json(json!({
+        "ok": true,
+        "message": "Cancellation requested - the current resource will finish, then the sync stops.",
+    }))
 }
+
+// ---------------------------------------------------------------------------
+// Webhook push registration (v1.4.0)
+// ---------------------------------------------------------------------------
+
+/// The supported Help Scout webhook event set (reference webhookRegisterSchema).
+const SUPPORTED_WEBHOOK_EVENTS: [&str; 12] = [
+    "convo.created",
+    "convo.updated",
+    "convo.assigned",
+    "convo.status",
+    "convo.customer.reply.created",
+    "convo.agent.reply.created",
+    "convo.note.created",
+    "satisfaction.ratings",
+    "customer.created",
+    "customer.updated",
+    "conversation.merged",
+    "team.updated",
+];
 
 /// POST /api/webhooks/register
-pub async fn register_webhook(
-    State(state): State<AppState>,
-    Json(_body): Json<Value>,
-) -> impl IntoResponse {
-    Json(
-        json!({"ok": true, "message": "Webhook registration requires Help Scout OAuth credentials."}),
-    )
+pub async fn register_webhook(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    // Validation: reachable https URL + at least one supported event.
+    let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let events: Vec<String> = body
+        .get("events")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let url_ok = url.starts_with("https://") && url.len() > "https://".len();
+    let events_ok = !events.is_empty()
+        && events
+            .iter()
+            .all(|e| SUPPORTED_WEBHOOK_EVENTS.contains(&e.as_str()));
+    if !url_ok || !events_ok {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "ok": false,
+                "message": "Invalid webhook registration: a reachable https URL and at least one supported event are required.",
+            })),
+        )
+            .into_response();
+    }
+    // Demo mode cannot register webhooks.
+    let provider_kind = state.provider_kind.clone();
+    if provider_kind != "real" {
+        return Json(json!({
+            "ok": false,
+            "message": "Webhook registration targets a real Help Scout account - demo mode cannot register webhooks. Use POST /api/demo/simulate-webhook to exercise the pipeline locally.",
+        }))
+        .into_response();
+    }
+    // Secret must be configured.
+    let secret = {
+        let conn = state.conn_lock();
+        crate::settings::get_string(&conn, "webhook_secret")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    };
+    let secret = if secret.is_empty() {
+        std::env::var("HELPSCOUT_WEBHOOK_SECRET").unwrap_or_default()
+    } else {
+        secret
+    };
+    if secret.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "ok": false,
+                "message": "HELPSCOUT_WEBHOOK_SECRET must be set in .env first: Help Scout signs events with it and SupportOS verifies that signature.",
+            })),
+        )
+            .into_response();
+    }
+    let Some(real) = state.real.clone() else {
+        return Json(json!({
+            "ok": false,
+            "message": "Webhook registration requires the real Help Scout provider.",
+        }))
+        .into_response();
+    };
+    match real
+        .create_webhook(url, &events, &secret, "SupportOS")
+        .await
+    {
+        Ok(remote_id) => {
+            let conn = state.conn_lock();
+            // Mirror the registration locally (webhook_configs).
+            let _ = conn.execute(
+                "INSERT INTO webhook_configs (remote_id, url, events, status, last_synced_at)
+                 VALUES (?1, ?2, ?3, 'enabled', datetime('now'))
+                 ON CONFLICT(remote_id) DO UPDATE SET url = excluded.url,
+                   events = excluded.events, status = 'enabled', last_synced_at = datetime('now')",
+                rusqlite::params![
+                    remote_id,
+                    url,
+                    serde_json::to_string(&events).unwrap_or_default()
+                ],
+            );
+            let _ = crate::jobs::audit(
+                &conn,
+                "user",
+                "webhook_registered",
+                None,
+                None,
+                Some(
+                    &serde_json::to_string(&json!({"url": url, "events": events}))
+                        .unwrap_or_default(),
+                ),
+                Some("POST /v2/webhooks"),
+                None,
+                false,
+            );
+            Json(json!({
+                "ok": true,
+                "message": format!("Webhook #{} registered for {} event type(s). Help Scout will push changes to that URL; a localhost app needs a relay (see docs/API-INTEGRATION.md).", remote_id, events.len()),
+                "remoteId": remote_id,
+                "events": events,
+            }))
+            .into_response()
+        }
+        Err(e) => Json(json!({
+            "ok": false,
+            "message": format!("Help Scout rejected the webhook registration: {e}"),
+        }))
+        .into_response(),
+    }
 }
 
 /// DELETE /api/webhooks/:remoteId
 pub async fn unregister_webhook(
     State(state): State<AppState>,
     Path(remote_id): Path<String>,
-) -> impl IntoResponse {
-    Json(json!({"ok": true, "message": format!("Webhook {remote_id} unregistered.")}))
+) -> Response {
+    let Ok(remote_id) = remote_id.parse::<i64>() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "message": "Webhook id must be a positive integer." })),
+        )
+            .into_response();
+    };
+    if remote_id <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "message": "Webhook id must be a positive integer." })),
+        )
+            .into_response();
+    }
+    if state.provider_kind != "real" {
+        return Json(json!({ "ok": false, "message": "Not available in demo mode." }))
+            .into_response();
+    }
+    let Some(real) = state.real.clone() else {
+        return Json(json!({ "ok": false, "message": "Not available in demo mode." }))
+            .into_response();
+    };
+    match real.delete_webhook(remote_id).await {
+        Ok(deleted) => {
+            let conn = state.conn_lock();
+            let _ = conn.execute(
+                "DELETE FROM webhook_configs WHERE remote_id = ?1",
+                rusqlite::params![remote_id],
+            );
+            let _ = crate::jobs::audit(
+                &conn,
+                "user",
+                "webhook_deleted",
+                None,
+                None,
+                None,
+                Some(&format!("DELETE /v2/webhooks/{remote_id}")),
+                None,
+                false,
+            );
+            Json(json!({
+                "ok": deleted,
+                "message": if deleted {
+                    format!("Webhook #{remote_id} deleted.")
+                } else {
+                    format!("Webhook #{remote_id} not found remotely.")
+                },
+            }))
+            .into_response()
+        }
+        Err(e) => Json(json!({
+            "ok": false,
+            "message": format!("Help Scout rejected the webhook deletion: {e}"),
+        }))
+        .into_response(),
+    }
 }
 
-/// GET /api/queue — job queue status.
-///
-/// Reference response shape:
-/// ```json
-/// { "jobs": [...], "stats": { "queued": N, "running": N, "failed": N, "completed": N }, "outbound": [] }
-/// ```
-pub async fn queue(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let queued: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'pending'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let failed: i64 = conn
-        .query_row("SELECT COUNT(*) FROM jobs WHERE state = 'dead'", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-    let running: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'claimed'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let completed: i64 = conn
-        .query_row("SELECT COUNT(*) FROM jobs WHERE state = 'done'", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-    // List recent jobs (last 50).
-    let jobs: Vec<Value> = conn
-        .prepare("SELECT id, kind, state, payload, attempts, available_at, claimed_at, completed_at, last_error FROM jobs ORDER BY id DESC LIMIT 50")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "kind": r.get::<_, String>(1)?,
-                    "status": r.get::<_, String>(2)?,
-                    "payload": r.get::<_, Option<String>>(3)?,
-                    "attempts": r.get::<_, i64>(4)?,
-                    "created_at": r.get::<_, Option<String>>(5)?,
-                    "claimed_at": r.get::<_, Option<String>>(6)?,
-                    "completed_at": r.get::<_, Option<String>>(7)?,
-                    "error": r.get::<_, Option<String>>(8)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
+// ---------------------------------------------------------------------------
+// Queue management (developer/admin panel)
+// ---------------------------------------------------------------------------
+
+/// GET /api/queue — jobs + stats + outbound.
+pub async fn queue(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = match q.get("limit").map(|s| s.trim()) {
+        Some(s) if !s.is_empty() => match s.parse::<f64>() {
+            Ok(n) if n.is_finite() => (n.trunc() as i64).clamp(1, 500),
+            _ => 100,
+        },
+        _ => 100,
+    };
+    let conn = state.conn_lock();
+    let jobs = crate::jobs::list_jobs(
+        &conn,
+        q.get("status").map(|s| s.as_str()),
+        q.get("queue").map(|s| s.as_str()),
+        limit,
+    )
+    .unwrap_or_default();
+    let (queued, running, failed, completed) =
+        crate::jobs::queue_stats(&conn).unwrap_or((0, 0, 0, 0));
+    let outbound =
+        crate::jobs::list_outbound_jobs(&conn, q.get("outbound_status").map(|s| s.as_str()), 50)
+            .unwrap_or_default();
     Json(json!({
         "jobs": jobs,
         "stats": {
@@ -261,28 +610,105 @@ pub async fn queue(State(state): State<AppState>) -> impl IntoResponse {
             "failed": failed,
             "completed": completed,
         },
-        "outbound": [],
+        "outbound": outbound,
     }))
 }
 
-/// POST /api/queue/:id/retry
-pub async fn retry_job(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute(
-        "UPDATE jobs SET state = 'queued', attempts = 0 WHERE id = ?1",
-        rusqlite::params![id],
-    );
-    Json(json!({"ok": true}))
+/// POST /api/queue/:id/retry — 422 bad id, 404 unknown, 409 not retryable.
+pub async fn retry_job(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return fastify_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "A positive numeric job id is required.",
+        );
+    };
+    if id <= 0 {
+        return fastify_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "A positive numeric job id is required.",
+        );
+    }
+    let conn = state.conn_lock();
+    let Some(job) = crate::jobs::get_job(&conn, id).unwrap_or(None) else {
+        return fastify_error(StatusCode::NOT_FOUND, "NotFound", "Job not found.");
+    };
+    // Retrying a parked awaiting-approval job is the APPROVE gesture.
+    let patch = if job.status == "awaiting_approval" {
+        Some(r#"{"approved":true}"#)
+    } else {
+        None
+    };
+    match crate::jobs::retry_job(&conn, id, patch) {
+        Ok(Some(true)) => Json(json!({
+            "ok": true,
+            "message": if job.status == "awaiting_approval" {
+                "Approved - the action runs on the next worker tick."
+            } else {
+                "Job requeued."
+            },
+        }))
+        .into_response(),
+        Ok(Some(false)) => fastify_error(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "Job is not in a retryable state.",
+        )
+        .into_response(),
+        _ => fastify_error(StatusCode::NOT_FOUND, "NotFound", "Job not found.").into_response(),
+    }
 }
 
-/// POST /api/queue/:id/cancel
-pub async fn cancel_job(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute(
-        "UPDATE jobs SET state = 'cancelled' WHERE id = ?1",
-        rusqlite::params![id],
-    );
-    Json(json!({"ok": true}))
+/// POST /api/queue/:id/cancel — 422 bad id, 404 not found/finished.
+pub async fn cancel_job(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return fastify_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "A positive numeric job id is required.",
+        );
+    };
+    if id <= 0 {
+        return fastify_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "A positive numeric job id is required.",
+        );
+    }
+    let conn = state.conn_lock();
+    match crate::jobs::cancel_job(&conn, id) {
+        Ok(true) => Json(json!({ "ok": true, "message": "Job cancelled." })).into_response(),
+        _ => fastify_error(
+            StatusCode::NOT_FOUND,
+            "NotFound",
+            "Job not found (or already finished).",
+        ),
+    }
+}
+
+/// POST /api/queue/clear-completed — deletes completed/cancelled older than 24h.
+pub async fn clear_completed(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let n = crate::jobs::clear_completed(&conn).unwrap_or(0);
+    Json(json!({ "ok": true, "message": format!("{n} completed jobs older than 24h removed.") }))
+}
+
+/// POST /api/sync/rebuild-search-index — enqueues maintenance job.
+pub async fn rebuild_search_index(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let _ = crate::jobs::enqueue_on(&conn, "maintenance", "rebuild_search_index", "{}", 4);
+    Json(json!({ "ok": true, "message": "Search index rebuild queued." }))
+}
+
+/// POST /api/sync/rebuild-embeddings — enqueues embeddings rebuild.
+pub async fn rebuild_embeddings(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let _ = crate::jobs::enqueue_on(&conn, "maintenance", "rebuild_embeddings", "{}", 4);
+    Json(json!({
+        "ok": true,
+        "message": "Embedding rebuild queued (requires LM Studio embedding model).",
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -404,363 +830,6 @@ pub async fn encrypted_import(
     (
         StatusCode::OK,
         Json(serde_json::to_value(result).unwrap_or(Value::Null)),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// OAuth flow (reference routes/sync.ts:269-385)
-// ---------------------------------------------------------------------------
-
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn oauth_fail_page(
-    message: &str,
-) -> (
-    StatusCode,
-    [(axum::http::HeaderName, &'static str); 1],
-    &'static str,
-) {
-    let html: &'static str = Box::leak(
-        format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><title>SupportOS - connection not completed</title>\
-<style>body{{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#1f2933}}h1{{font-size:1.2rem}}p{{line-height:1.5;color:#52606d}}</style></head>\
-<body><h1>Help Scout connection not completed</h1><p>{message}</p>\
-<p>Return to SupportOS Settings and try again, or use \"Connect with Client Credentials\".</p></body></html>"
-        )
-        .into_boxed_str(),
-    );
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/html")],
-        html,
-    )
-}
-
-/// Whether Help Scout client credentials are configured (the reference reads
-/// env config; the port persists them in application_settings).
-fn hs_credentials(conn: &rusqlite::Connection) -> (String, String) {
-    (
-        crate::settings::get_string(conn, "helpscout_client_id")
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-        crate::settings::get_string(conn, "helpscout_client_secret")
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
-    )
-}
-
-/// GET /api/oauth/authorize-url — begin the browser OAuth flow (demo mode:
-/// `{demo_mode: true, message}`).
-pub async fn oauth_authorize_url(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn_lock();
-    if state.demo_mode {
-        return (
-            StatusCode::OK,
-            Json(
-                json!({ "demo_mode": true, "message": "Demo mode is active - OAuth is not needed." }),
-            ),
-        );
-    }
-    let (client_id, _) = hs_credentials(&conn);
-    if client_id.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({ "ok": false, "message": "HELPSCOUT_CLIENT_ID and HELPSCOUT_CLIENT_SECRET must be set in .env first." }),
-            ),
-        );
-    }
-    // Reference: 16 random bytes hex + stored as JSON in application_settings.
-    use rand::RngCore;
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let state_token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let _ = crate::settings::set_json(&conn, "oauth_state", &state_token);
-    let url = format!(
-        "https://secure.helpscout.net/authentication/authorizeClientApplication?client_id={}&state={}",
-        client_id, state_token
-    );
-    (StatusCode::OK, Json(json!({ "url": url })))
-}
-
-/// POST /api/oauth/client-credentials — connect with client credentials.
-pub async fn oauth_client_credentials(State(state): State<AppState>) -> impl IntoResponse {
-    let (client_id, client_secret) = {
-        let conn = state.conn_lock();
-        if state.demo_mode {
-            return (StatusCode::OK, Json(json!({ "demo_mode": true })));
-        }
-        hs_credentials(&conn)
-    };
-    if client_id.is_empty() || client_secret.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                json!({ "ok": false, "message": "HELPSCOUT_CLIENT_ID and HELPSCOUT_CLIENT_SECRET must be set in .env first." }),
-            ),
-        );
-    }
-    // Exchange client credentials for a token (POST /v2/oauth2/token).
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build();
-    let Ok(client) = client else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "ok": false, "message": "could not build HTTP client" })),
-        );
-    };
-    let resp = client
-        .post("https://api.helpscout.net/v2/oauth2/token")
-        .json(&serde_json::json!({
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-        }))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-            Ok(body) => {
-                let token = crate::oauth::OAuthToken {
-                    access_token: body["access_token"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    refresh_token: body["refresh_token"].as_str().map(String::from),
-                    expires_in: body["expires_in"].as_u64(),
-                    token_type: body["token_type"].as_str().unwrap_or("bearer").to_string(),
-                    scope: body["scope"].as_str().map(String::from),
-                };
-                let conn = state.conn_lock();
-                if token.access_token.is_empty()
-                    || crate::oauth::store_token(&conn, &token).is_err()
-                {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(
-                            json!({ "ok": false, "message": "Token response was missing an access token." }),
-                        ),
-                    );
-                }
-                let _ = crate::audit::audit(
-                    &conn,
-                    &crate::audit::AuditEntry {
-                        actor: "user",
-                        action: "helpscout_connected".into(),
-                        remote_operation: Some("POST /v2/oauth2/token".into()),
-                        ..AuditEntry::user("helpscout_connected")
-                    },
-                );
-                (
-                    StatusCode::OK,
-                    Json(json!({ "ok": true, "message": "Connected to Help Scout." })),
-                )
-            }
-            Err(e) => (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "ok": false, "message": e.to_string() })),
-            ),
-        },
-        Ok(r) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "ok": false, "message": format!("Help Scout returned {}", r.status()) })),
-        ),
-        Err(e) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "ok": false, "message": e.to_string() })),
-        ),
-    }
-}
-
-/// GET /api/oauth/status — connection status (demo mode shape:
-/// `{configured:false, authenticated:true, demo_mode:true, expires_at:null, me:null}`).
-pub async fn oauth_status(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn_lock();
-    if state.demo_mode {
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "configured": false,
-                "authenticated": true,
-                "demo_mode": true,
-                "expires_at": Value::Null,
-                "me": Value::Null,
-            })),
-        );
-    }
-    let (client_id, _) = hs_credentials(&conn);
-    let authenticated = crate::oauth::has_token(&conn).unwrap_or(false);
-    let expires_at: Option<String> = conn
-        .query_row(
-            "SELECT expires_at FROM oauth_tokens WHERE id = 1 AND revoked = 0",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "configured": !client_id.is_empty(),
-            "authenticated": authenticated,
-            "demo_mode": false,
-            "expires_at": expires_at,
-            "me": Value::Null,
-        })),
-    )
-}
-
-/// POST /api/oauth/disconnect — revoke + preserve local data.
-pub async fn oauth_disconnect(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn_lock();
-    let _ = crate::oauth::delete_token(&conn);
-    let _ = crate::audit::audit(
-        &conn,
-        &crate::audit::AuditEntry::user("helpscout_disconnected"),
-    );
-    (
-        StatusCode::OK,
-        Json(json!({ "ok": true, "message": "Disconnected. Local data is fully preserved." })),
-    )
-}
-
-/// GET /oauth/callback — completes the browser OAuth code flow; verifies the
-/// single-use state parameter; returns styled HTML pages like the reference.
-pub async fn oauth_callback(
-    State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let (client_id, client_secret, code) = {
-        let conn = state.conn_lock();
-        if state.demo_mode {
-            return oauth_fail_page("Demo mode is active - OAuth is not needed.");
-        }
-        if let Some(error) = params.get("error") {
-            let desc = params
-                .get("error_description")
-                .map(|d| format!(" - {}", escape_html(d)))
-                .unwrap_or_default();
-            return oauth_fail_page(&format!(
-                "Help Scout returned an error: {}{}",
-                escape_html(error),
-                desc
-            ));
-        }
-        let (code, q_state) = match (params.get("code"), params.get("state")) {
-            (Some(c), Some(st)) => (c.clone(), st.clone()),
-            _ => {
-                return oauth_fail_page(
-                    "The callback is missing its authorization code or state parameter.",
-                )
-            }
-        };
-        let stored: Option<String> = crate::settings::get_string(&conn, "oauth_state")
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_str(&v).ok());
-        // Single-use: clear the stored state immediately after reading it.
-        let _ = conn.execute(
-            "DELETE FROM application_settings WHERE key = 'oauth_state'",
-            [],
-        );
-        match stored {
-            Some(stored) if stored == q_state => {}
-            _ => {
-                return oauth_fail_page("The state parameter did not match the authorization request (it may have expired or been reused). For safety the code was not exchanged.")
-            }
-        }
-        let creds = hs_credentials(&conn);
-        (creds.0, creds.1, code)
-    };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build();
-    let Ok(client) = client else {
-        return oauth_fail_page(
-            "Exchanging the authorization code failed: could not build HTTP client.",
-        );
-    };
-    let resp = client
-        .post("https://api.helpscout.net/v2/oauth2/token")
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-        }))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-            Ok(body) => {
-                let token = crate::oauth::OAuthToken {
-                    access_token: body["access_token"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    refresh_token: body["refresh_token"].as_str().map(String::from),
-                    expires_in: body["expires_in"].as_u64(),
-                    token_type: body["token_type"].as_str().unwrap_or("bearer").to_string(),
-                    scope: body["scope"].as_str().map(String::from),
-                };
-                let conn = state.conn_lock();
-                if token.access_token.is_empty()
-                    || crate::oauth::store_token(&conn, &token).is_err()
-                {
-                    return oauth_fail_page("Exchanging the authorization code failed: token response was missing an access token.");
-                }
-                let _ = crate::audit::audit(
-                    &conn,
-                    &crate::audit::AuditEntry {
-                        actor: "user",
-                        action: "helpscout_connected".into(),
-                        remote_operation: Some("GET /oauth/callback (code exchange)".into()),
-                        ..AuditEntry::user("helpscout_connected")
-                    },
-                );
-                oauth_success_page()
-            }
-            Err(e) => oauth_fail_page(&format!(
-                "Exchanging the authorization code failed: {}",
-                escape_html(&e.to_string())
-            )),
-        },
-        Ok(r) => oauth_fail_page(&format!(
-            "Exchanging the authorization code failed: Help Scout returned {}",
-            r.status()
-        )),
-        Err(e) => oauth_fail_page(&format!(
-            "Exchanging the authorization code failed: {}",
-            escape_html(&e.to_string())
-        )),
-    }
-}
-
-fn oauth_success_page() -> (
-    StatusCode,
-    [(axum::http::HeaderName, &'static str); 1],
-    &'static str,
-) {
-    let html: &'static str = Box::leak(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>SupportOS - connected</title>\
-<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#1f2933}}h1{font-size:1.2rem}}p{{line-height:1.5;color:#52606d}}</style></head>\
-<body><h1>Connected to Help Scout</h1><p>You can close this tab and return to SupportOS. Reload the Settings page to see the connection status.</p></body></html>"
-            .to_string()
-            .into_boxed_str(),
-    );
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/html")],
-        html,
     )
 }
 

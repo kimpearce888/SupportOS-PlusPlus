@@ -61,10 +61,13 @@ async fn main() -> std::io::Result<()> {
     let _ = spp_core::outreach::apply_m023_to_m025(&conn);
     let _ = spp_core::data_tools::apply_m026_to_m027(&conn);
     let _ = spp_core::inbox::apply_m028(&conn);
+    let _ = spp_core::sync_schema::apply_m029(&conn);
     let _ = spp_core::webhook::ensure_webhook_events_table(&conn);
     let _ = spp_core::saved_views::ensure_saved_views_table(&conn);
     let _ = spp_core::oauth_state::ensure_oauth_states_table(&conn);
     let _ = spp_core::jobs::ensure_jobs_table(&conn);
+    // Recover jobs stuck in running (reference recoverStaleJobs at boot).
+    let _ = spp_core::jobs::recover_stale_jobs(&conn);
 
     // Mark first run done + enable demo mode (so demo endpoints work).
     let _ = spp_core::settings::mark_first_run_done(&conn);
@@ -72,14 +75,56 @@ async fn main() -> std::io::Result<()> {
 
     let demo_mode = spp_core::settings::get_bool(&conn, "demo_mode", false).unwrap_or(true);
 
+    // Provider selection (reference context.ts): demo mode -> Fake, else Real
+    // with env credentials. SPP_FORCE_REAL=1 keeps the real provider even in
+    // demo-flagged DBs (differential testing against a live account).
+    let force_real = std::env::var("SPP_FORCE_REAL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let credentials = spp_core::helpscout_real::HsCredentials::from_env();
+    let use_real = (!demo_mode || force_real) && credentials.is_configured();
+
+    let conn = Arc::new(Mutex::new(conn));
+    let bus = EventBus::default();
+
+    let (provider, real, provider_kind): (
+        Arc<dyn spp_core::helpscout::HelpScoutProvider>,
+        Option<Arc<spp_core::helpscout_real::RealHelpScoutProvider>>,
+        String,
+    ) = if use_real {
+        let real = Arc::new(spp_core::helpscout_real::RealHelpScoutProvider::new(
+            conn.clone(),
+            credentials,
+        ));
+        (
+            real.clone() as Arc<dyn spp_core::helpscout::HelpScoutProvider>,
+            Some(real),
+            "real".to_string(),
+        )
+    } else {
+        (
+            Arc::new(spp_core::helpscout::FakeHelpScoutProvider::new_demo())
+                as Arc<dyn spp_core::helpscout::HelpScoutProvider>,
+            None,
+            "fake".to_string(),
+        )
+    };
+
+    let sync = Arc::new(
+        spp_core::sync_engine::SyncEngine::new(conn.clone(), provider).with_bus(bus.clone()),
+    );
+
     let state = AppState {
-        conn: Arc::new(Mutex::new(conn)),
+        conn,
         data_dir: app_config.data_dir.clone(),
         port,
         host: "127.0.0.1".to_string(),
         demo_mode,
-        bus: EventBus::default(),
+        bus,
         limiter: RateLimiter::new(),
+        sync: Some(sync),
+        real,
+        provider_kind,
     };
 
     let server = HttpServer::new(state);

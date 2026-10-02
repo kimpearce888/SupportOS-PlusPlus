@@ -271,7 +271,7 @@ mod tests {
 
     fn job_count(conn: &Connection, kind: &str) -> i64 {
         conn.query_row(
-            "SELECT COUNT(*) FROM jobs WHERE kind = ?1",
+            "SELECT COUNT(*) FROM jobs WHERE type = ?1",
             params![kind],
             |r| r.get(0),
         )
@@ -300,7 +300,7 @@ mod tests {
         // objectID was used as the remote id.
         let payload: String = conn
             .query_row(
-                "SELECT payload FROM jobs WHERE kind = 'sync_conversation'",
+                "SELECT payload FROM jobs WHERE type = 'sync_conversation'",
                 [],
                 |r| r.get(0),
             )
@@ -492,7 +492,7 @@ mod tests {
         assert!(matches!(result, WebhookProcessResult::Accepted { .. }));
         let payload: String = conn
             .query_row(
-                "SELECT payload FROM jobs WHERE kind = 'sync_conversation_ratings'",
+                "SELECT payload FROM jobs WHERE type = 'sync_conversation_ratings'",
                 [],
                 |r| r.get(0),
             )

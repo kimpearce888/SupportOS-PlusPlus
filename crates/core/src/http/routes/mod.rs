@@ -42,6 +42,8 @@ pub mod memory;
 #[allow(warnings)]
 pub mod notifications;
 #[allow(warnings)]
+pub mod oauth;
+#[allow(warnings)]
 pub mod operations;
 #[allow(warnings)]
 pub mod outreach;

@@ -264,10 +264,10 @@ fn tile_sql(
             Some((sql, params))
         }
         OperationsTileKey::FailedJobs => {
-            // Counts jobs that exhausted their retry budget (state = 'dead').
+            // Counts jobs that exhausted their retry budget (status 'failed').
             // This tile is NOT mailbox-scoped — jobs are global.
             // Silently ignores a passed-in mailbox_id (jobs aren't scoped).
-            let sql = "SELECT COUNT(*) FROM jobs WHERE state = 'dead'";
+            let sql = "SELECT COUNT(*) FROM jobs WHERE status = 'failed'";
             Some((sql, vec![]))
         }
         OperationsTileKey::SyncProblems => {
@@ -579,7 +579,7 @@ mod tests {
 
     fn enqueue_dead_job(conn: &Connection) {
         conn.execute(
-            "INSERT INTO jobs (kind, payload, state) VALUES ('test', '{}', 'dead')",
+            "INSERT INTO jobs (queue, type, payload, status) VALUES ('sync', 'test', '{}', 'failed')",
             [],
         )
         .unwrap();

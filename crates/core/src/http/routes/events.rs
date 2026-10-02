@@ -143,6 +143,9 @@ mod tests {
             demo_mode: false,
             bus: EventBus::new(64),
             limiter: crate::http::RateLimiter::new(),
+            sync: None,
+            real: None,
+            provider_kind: "fake".into(),
         }
     }
 

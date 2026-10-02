@@ -58,6 +58,13 @@ pub struct AppState {
     pub bus: EventBus,
     /// Mutation rate limiter — 300 writes/min per IP, mirrors the reference.
     pub limiter: RateLimiter,
+    /// The sync coordinator (reference SyncCoordinator). None in unit tests.
+    pub sync: Option<Arc<crate::sync_engine::SyncEngine>>,
+    /// The real Help Scout provider (reference ctx.realProvider). None in
+    /// demo mode / unit tests.
+    pub real: Option<Arc<crate::helpscout_real::RealHelpScoutProvider>>,
+    /// "fake" or "real" — which provider backs the app.
+    pub provider_kind: String,
 }
 
 impl AppState {
@@ -447,21 +454,9 @@ impl HttpServer {
                     // limit (reference: 512 MB).
                     .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
             )
-            // OAuth flow (reference routes/sync.ts:269-385)
-            .route(
-                "/api/oauth/authorize-url",
-                get(routes::sync::oauth_authorize_url),
-            )
-            .route(
-                "/api/oauth/client-credentials",
-                post(routes::sync::oauth_client_credentials),
-            )
-            .route("/api/oauth/status", get(routes::sync::oauth_status))
-            .route(
-                "/api/oauth/disconnect",
-                post(routes::sync::oauth_disconnect),
-            )
-            .route("/oauth/callback", get(routes::sync::oauth_callback))
+            // OAuth flow (reference routes/sync.ts:269-385) — handlers live in
+            // routes::oauth (audit-line port: provider-backed, me_remote_id
+            // persistence, exact reference messages).
             // Audit log + application errors + backups
             .route("/api/audit", get(routes::system::audit_log))
             .route("/api/errors", get(routes::system::errors))
@@ -476,6 +471,14 @@ impl HttpServer {
                 post(routes::system::backups_export_csv),
             )
             .route(
+                "/api/sync/rebuild-search-index",
+                post(routes::sync::rebuild_search_index),
+            )
+            .route(
+                "/api/sync/rebuild-embeddings",
+                post(routes::sync::rebuild_embeddings),
+            )
+            .route(
                 "/api/webhooks/register",
                 post(routes::sync::register_webhook),
             )
@@ -486,6 +489,22 @@ impl HttpServer {
             .route("/api/queue", get(routes::sync::queue))
             .route("/api/queue/:id/retry", post(routes::sync::retry_job))
             .route("/api/queue/:id/cancel", post(routes::sync::cancel_job))
+            .route(
+                "/api/queue/clear-completed",
+                post(routes::sync::clear_completed),
+            )
+            // OAuth
+            .route(
+                "/api/oauth/authorize-url",
+                get(routes::oauth::authorize_url),
+            )
+            .route(
+                "/api/oauth/client-credentials",
+                post(routes::oauth::client_credentials),
+            )
+            .route("/api/oauth/status", get(routes::oauth::status))
+            .route("/api/oauth/disconnect", post(routes::oauth::disconnect))
+            .route("/oauth/callback", get(routes::oauth::callback))
             // Webhook receiver
             .route("/api/webhooks/helpscout", post(routes::webhook::handle))
             // Analytics

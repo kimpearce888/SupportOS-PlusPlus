@@ -268,7 +268,7 @@ mod tests {
         let conn = crate::db::open(&f).unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM jobs WHERE state = 'pending'",
+                "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
                 [],
                 |r| r.get(0),
             )
