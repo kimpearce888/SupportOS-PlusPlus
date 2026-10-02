@@ -121,9 +121,25 @@ jobs:
           cd crates/app/src-tauri
           cargo tauri build
 
+  step3-real-mode:
+    name: STEP 3 — Real-mode checks (stand-in servers)
+    needs: [lint-and-test, build-wasm]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run real-mode checks
+        run: |
+          python3 scripts/step3_real_mode.py
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: step3-report
+          path: /tmp/step3-report.md
+
   ci-report:
     name: Publish CI report
-    needs: [lint-and-test, build-wasm, build-tauri]
+    needs: [lint-and-test, build-wasm, build-tauri, step3-real-mode]
     if: always()
     runs-on: ubuntu-22.04
     steps:
@@ -146,6 +162,7 @@ jobs:
           | lint-and-test (ubuntu-24.04) | ${{ needs.lint-and-test.result }} |
           | build-wasm | ${{ needs.build-wasm.result }} |
           | build-tauri (Linux) | ${{ needs.build-tauri.result }} |
+          | step3-real-mode | ${{ needs.step3-real-mode.result }} |
 
           Overall: ${{ needs.lint-and-test.result == 'success' && needs.build-wasm.result == 'success' && '✅ GREEN' || '❌ RED' }}
           REPORT
