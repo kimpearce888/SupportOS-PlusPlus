@@ -35,17 +35,21 @@ pub async fn list(
                 .iter()
                 .filter_map(|i| serde_json::to_value(i).ok())
                 .collect();
-            Json(json!({
-                "conversations": items_json,
-                "total": total,
-                "page": 1,
-                "page_size": 50,
-                "view": params.get("view").cloned().unwrap_or_default(),
-                "notes": [],
-            }))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "conversations": items_json,
+                    "total": total,
+                    "page": 1,
+                    "page_size": 50,
+                    "view": params.get("view").cloned().unwrap_or_default(),
+                    "notes": [],
+                })),
+            )
         }
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
         ),
     }
 }
@@ -55,16 +59,23 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> impl Int
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::inbox::get_conversation(&conn, id) {
         Ok(Some(detail)) => match serde_json::to_value(&detail) {
-            Ok(v) => Json(v),
-            Err(e) => Json(
-                json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+                ),
             ),
         },
-        Ok(None) => Json(
-            json!({"_status": 404, "statusCode": 404, "error": "NotFound", "message": "Conversation not found locally."}),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(
+                json!({"statusCode": 404, "error": "NotFound", "message": "Conversation not found locally."}),
+            ),
         ),
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
         ),
     }
 }
@@ -77,8 +88,11 @@ pub async fn reply(
 ) -> impl IntoResponse {
     let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
     if body_text.trim().is_empty() {
-        return Json(
-            json!({"_status": 422, "statusCode": 422, "error": "ValidationError", "message": "Reply body cannot be empty."}),
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(
+                json!({"statusCode": 422, "error": "ValidationError", "message": "Reply body cannot be empty."}),
+            ),
         );
     }
     let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -108,10 +122,14 @@ pub async fn reply(
                     },
                 );
             }
-            Json(json!({"ok": ok, "message": "Reply sent."}))
+            (
+                StatusCode::OK,
+                Json(json!({"ok": ok, "message": "Reply sent."})),
+            )
         }
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
         ),
     }
 }
@@ -150,10 +168,11 @@ pub async fn note(
                     },
                 );
             }
-            Json(json!({"ok": ok}))
+            (StatusCode::OK, Json(json!({"ok": ok})))
         }
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
         ),
     }
 }
@@ -195,10 +214,11 @@ pub async fn status(
                     },
                 );
             }
-            Json(json!({"ok": ok}))
+            (StatusCode::OK, Json(json!({"ok": ok})))
         }
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
         ),
     }
 }
@@ -231,10 +251,11 @@ pub async fn assign(
                     },
                 );
             }
-            Json(json!({"ok": ok}))
+            (StatusCode::OK, Json(json!({"ok": ok})))
         }
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
         ),
     }
 }
@@ -277,12 +298,15 @@ pub async fn priority(
                     },
                 );
             }
-            Json(json!({"ok": ok}))
+            (StatusCode::OK, Json(json!({"ok": ok})))
         }
         Err(e) => {
             drop(conn);
-            Json(
-                json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+                ),
             )
         }
     }
@@ -318,9 +342,10 @@ pub async fn subject(
         );
     }
     match result {
-        Ok(rows) => Json(json!({"ok": rows > 0})),
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+        Ok(rows) => (StatusCode::OK, Json(json!({"ok": rows > 0}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
         ),
     }
 }
@@ -359,12 +384,15 @@ pub async fn set_state(
                     },
                 );
             }
-            Json(json!({"ok": ok}))
+            (StatusCode::OK, Json(json!({"ok": ok})))
         }
         Err(e) => {
             drop(conn);
-            Json(
-                json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+                ),
             )
         }
     }
@@ -379,8 +407,11 @@ pub async fn events(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
     ) {
         Ok(s) => s,
         Err(e) => {
-            return Json(
-                json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+                ),
             );
         }
     };
@@ -399,12 +430,15 @@ pub async fn events(State(state): State<AppState>, Path(id): Path<i64>) -> impl 
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
-    Json(json!({"events": events}))
+    (StatusCode::OK, Json(json!({"events": events})))
 }
 
 /// POST /api/conversations/activity/rebuild — rebuild activity events.
 pub async fn activity_rebuild(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"ok": true, "message": "Activity rebuild queued."}))
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "message": "Activity rebuild queued."})),
+    )
 }
 
 /// GET /api/ticket-states — list custom ticket states.
@@ -413,7 +447,10 @@ pub async fn list_ticket_states(State(state): State<AppState>) -> impl IntoRespo
     let mut stmt = match conn.prepare("SELECT id, name, color FROM ticket_states ORDER BY id") {
         Ok(s) => s,
         Err(_) => {
-            return Json(json!({"states": [], "bottlenecks": []}));
+            return (
+                StatusCode::OK,
+                Json(json!({"states": [], "bottlenecks": []})),
+            );
         }
     };
     let states: Vec<Value> = stmt
@@ -428,7 +465,10 @@ pub async fn list_ticket_states(State(state): State<AppState>) -> impl IntoRespo
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
 
-    Json(json!({"states": states, "bottlenecks": []}))
+    (
+        StatusCode::OK,
+        Json(json!({"states": states, "bottlenecks": []})),
+    )
 }
 
 /// GET /api/mailboxes — list all mailboxes (reference data for the UI).
@@ -451,7 +491,7 @@ pub async fn list_mailboxes(State(state): State<AppState>) -> impl IntoResponse 
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(mailboxes)
+    (StatusCode::OK, Json(mailboxes))
 }
 
 /// GET /api/tags — list all tags (reference data for the UI).
@@ -473,7 +513,7 @@ pub async fn list_tags(State(state): State<AppState>) -> impl IntoResponse {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(tags)
+    (StatusCode::OK, Json(tags))
 }
 
 /// GET /api/users — list all users + system users (reference data for the UI).
@@ -499,7 +539,10 @@ pub async fn list_users(State(state): State<AppState>) -> impl IntoResponse {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({"users": users, "system_users": []}))
+    (
+        StatusCode::OK,
+        Json(json!({"users": users, "system_users": []})),
+    )
 }
 
 /// GET /api/teams — list all teams (reference data for the UI).
@@ -520,7 +563,7 @@ pub async fn list_teams(State(state): State<AppState>) -> impl IntoResponse {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({"teams": teams}))
+    (StatusCode::OK, Json(json!({"teams": teams})))
 }
 
 /// GET /api/saved-replies — list saved reply templates (reference data for the UI).

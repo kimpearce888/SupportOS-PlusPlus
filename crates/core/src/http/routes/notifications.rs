@@ -33,10 +33,14 @@ pub async fn list(
                 .iter()
                 .filter(|n| n.get("read_at").and_then(|v| v.as_str()).is_none())
                 .count() as i64;
-            Json(json!({"notifications": items, "total": total, "unread": unread}))
+            (
+                StatusCode::OK,
+                Json(json!({"notifications": items, "total": total, "unread": unread})),
+            )
         }
-        Err(e) => Json(
-            json!({"_status": 500, "message": e.to_string(), "notifications": [], "total": 0, "unread": 0}),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string(), "notifications": [], "total": 0, "unread": 0})),
         ),
     }
 }
@@ -45,15 +49,18 @@ pub async fn list(
 pub async fn unread_count(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let count = crate::notifications::count_unread_for_user(&conn, 1).unwrap_or(0);
-    Json(json!({"unread": count}))
+    (StatusCode::OK, Json(json!({"unread": count})))
 }
 
 /// POST /api/notifications/:id/read
 pub async fn mark_read(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::notifications::mark_as_read(&conn, id) {
-        Ok(ok) => Json(json!({"ok": ok})),
-        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
+        Ok(ok) => (StatusCode::OK, Json(json!({"ok": ok}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
     }
 }
 
@@ -61,7 +68,7 @@ pub async fn mark_read(State(state): State<AppState>, Path(id): Path<i64>) -> im
 pub async fn mark_all_read(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute("UPDATE notifications SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE read_at IS NULL", []);
-    Json(json!({"ok": true}))
+    (StatusCode::OK, Json(json!({"ok": true})))
 }
 
 /// Build the full prefs list (all catalog types, enabled falling back to the
@@ -87,7 +94,7 @@ fn build_prefs(conn: &rusqlite::Connection) -> Vec<Value> {
 /// for ALL 15 types (reference `notificationRepo.listPrefs`).
 pub async fn list_prefs(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    Json(json!({"prefs": build_prefs(&conn)}))
+    (StatusCode::OK, Json(json!({"prefs": build_prefs(&conn)})))
 }
 
 /// PUT /api/notifications/prefs/:type — validate + set + return full list.
@@ -171,10 +178,13 @@ pub async fn mentions(State(state): State<AppState>) -> impl IntoResponse {
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({"mentions": items}))
+    (StatusCode::OK, Json(json!({"mentions": items})))
 }
 
 /// POST /api/notifications/sweep
 pub async fn sweep(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"ok": true, "message": "Sweep completed."}))
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "message": "Sweep completed."})),
+    )
 }

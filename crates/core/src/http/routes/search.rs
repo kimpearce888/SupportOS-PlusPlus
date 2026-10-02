@@ -16,8 +16,11 @@ pub async fn search(State(state): State<AppState>, Json(body): Json<Value>) -> i
         .or_else(|| body.get("q").and_then(|v| v.as_str()))
         .unwrap_or("");
     if query.trim().is_empty() {
-        return Json(
-            json!({"hits": [], "total": 0, "query": query, "used_semantic": false, "semantic_available": false}),
+        return (
+            StatusCode::OK,
+            Json(
+                json!({"hits": [], "total": 0, "query": query, "used_semantic": false, "semantic_available": false}),
+            ),
         );
     }
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -32,22 +35,26 @@ pub async fn search(State(state): State<AppState>, Json(body): Json<Value>) -> i
             // The port uses FTS5 only (no Qdrant Edge by default), so
             // `used_semantic` is always false and `semantic_available`
             // is false unless the `qdrant` cargo feature is enabled.
-            Json(json!({
-                "hits": items,
-                "total": total,
-                "query": query,
-                "used_semantic": false,
-                "semantic_available": cfg!(feature = "qdrant"),
-            }))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "hits": items,
+                    "total": total,
+                    "query": query,
+                    "used_semantic": false,
+                    "semantic_available": cfg!(feature = "qdrant"),
+                })),
+            )
         }
-        Err(e) => Json(json!({
-            "_status": 500,
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
             "message": e.to_string(),
             "hits": [],
             "total": 0,
             "query": query,
             "used_semantic": false,
-            "semantic_available": cfg!(feature = "qdrant"),
-        })),
+            "semantic_available": cfg!(feature = "qdrant")})),
+        ),
     }
 }

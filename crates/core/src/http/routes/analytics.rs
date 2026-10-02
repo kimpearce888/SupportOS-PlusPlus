@@ -107,31 +107,34 @@ pub async fn dashboard(
         })
         .unwrap_or_default();
     let _ = mailbox_id;
-    Json(json!({
-        "range": {
-            "from": from.to_rfc3339(),
-            "to": now.to_rfc3339(),
-        },
-        "new_conversations": new_convs,
-        "active_conversations": active,
-        "pending_conversations": pending,
-        "closed_conversations": closed,
-        "unassigned": unassigned,
-        "backlog": backlog,
-        "first_response_time_avg_min": null,
-        "resolution_time_avg_min": null,
-        "replies_sent": replies_sent,
-        "ratings": { "great": 0, "okay": 0, "not-good": 0 },
-        "by_mailbox": by_mailbox,
-        "by_tag": [],
-        "by_agent": [],
-        "by_team": [],
-        "daily_new": [],
-        "by_channel": [],
-        "channel_metrics": [],
-        "mailbox_comparison": [],
-        "source": ["local"],
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "range": {
+                "from": from.to_rfc3339(),
+                "to": now.to_rfc3339(),
+            },
+            "new_conversations": new_convs,
+            "active_conversations": active,
+            "pending_conversations": pending,
+            "closed_conversations": closed,
+            "unassigned": unassigned,
+            "backlog": backlog,
+            "first_response_time_avg_min": null,
+            "resolution_time_avg_min": null,
+            "replies_sent": replies_sent,
+            "ratings": { "great": 0, "okay": 0, "not-good": 0 },
+            "by_mailbox": by_mailbox,
+            "by_tag": [],
+            "by_agent": [],
+            "by_team": [],
+            "daily_new": [],
+            "by_channel": [],
+            "channel_metrics": [],
+            "mailbox_comparison": [],
+            "source": ["local"],
+        })),
+    )
 }
 
 /// GET /api/analytics/ai — AI run analytics.
@@ -186,18 +189,21 @@ pub async fn ai_analytics(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         0.0
     };
-    Json(json!({
-        "tickets_analyzed": total,
-        "analysis_success_rate": analysis_success_rate,
-        "draft_count": draft_count,
-        "draft_accepted": draft_accepted,
-        "draft_rejected": draft_rejected,
-        "draft_edit_rate": draft_edit_rate,
-        "verification_warnings": 0,
-        "unsupported_claim_rate": 0,
-        "common_failure_patterns": [],
-        "source": "local",
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "tickets_analyzed": total,
+            "analysis_success_rate": analysis_success_rate,
+            "draft_count": draft_count,
+            "draft_accepted": draft_accepted,
+            "draft_rejected": draft_rejected,
+            "draft_edit_rate": draft_edit_rate,
+            "verification_warnings": 0,
+            "unsupported_claim_rate": 0,
+            "common_failure_patterns": [],
+            "source": "local",
+        })),
+    )
 }
 
 /// GET /api/reports/sla
@@ -254,28 +260,31 @@ pub async fn sla_report(
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({
-        "range": {
-            "from": from.to_rfc3339(),
-            "to": now.to_rfc3339(),
-        },
-        "mailboxes": mailboxes,
-        "unconfigured_mailboxes": unconfigured_mailboxes,
-        "source": ["local"],
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "range": {
+                "from": from.to_rfc3339(),
+                "to": now.to_rfc3339(),
+            },
+            "mailboxes": mailboxes,
+            "unconfigured_mailboxes": unconfigured_mailboxes,
+            "source": ["local"],
+        })),
+    )
 }
 
 pub async fn why_contacting(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"reasons": []}))
+    (StatusCode::OK, Json(json!({"reasons": []})))
 }
 pub async fn top_questions(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"questions": []}))
+    (StatusCode::OK, Json(json!({"questions": []})))
 }
 pub async fn doc_gaps(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"gaps": []}))
+    (StatusCode::OK, Json(json!({"gaps": []})))
 }
 pub async fn answer_reuse(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"reuse": []}))
+    (StatusCode::OK, Json(json!({"reuse": []})))
 }
 pub async fn issue_radar(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -287,42 +296,54 @@ pub async fn issue_radar(State(state): State<AppState>) -> impl IntoResponse {
                 "active_clusters": snapshot.active_clusters,
                 "active_incidents": snapshot.active_incidents,
             })];
-            Json(json!({"alerts": alerts}))
+            (StatusCode::OK, Json(json!({"alerts": alerts})))
         }
-        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
     }
 }
 pub async fn metric_definitions(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"definitions": []}))
+    (StatusCode::OK, Json(json!({"definitions": []})))
 }
 pub async fn release_correlation(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"correlations": []}))
+    (StatusCode::OK, Json(json!({"correlations": []})))
 }
 pub async fn release_events(
     State(state): State<AppState>,
     Json(_body): Json<Value>,
 ) -> impl IntoResponse {
-    Json(json!({"ok": true}))
+    (StatusCode::OK, Json(json!({"ok": true})))
 }
 pub async fn helpscout_report(
     State(state): State<AppState>,
     axum::extract::Path(_key): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    Json(json!({"data": []}))
+    (StatusCode::OK, Json(json!({"data": []})))
 }
 pub async fn narrative(
     State(state): State<AppState>,
     Json(_body): Json<Value>,
 ) -> impl IntoResponse {
-    Json(json!({"narrative": "Not implemented."}))
+    (
+        StatusCode::OK,
+        Json(json!({"narrative": "Not implemented."})),
+    )
 }
 pub async fn effectiveness(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"effectiveness": []}))
+    (StatusCode::OK, Json(json!({"effectiveness": []})))
 }
 pub async fn report_catalog(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::reports::get_health_facts(&conn, 7) {
-        Ok(facts) => Json(serde_json::to_value(&facts).unwrap_or(json!({}))),
-        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
+        Ok(facts) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&facts).unwrap_or(json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
     }
 }

@@ -30,10 +30,14 @@ pub async fn list_customers(
                 .filter_map(|c| serde_json::to_value(c).ok())
                 .collect();
             let total = items.len() as i64;
-            Json(json!({"customers": items, "total": total, "page": page}))
+            (
+                StatusCode::OK,
+                Json(json!({"customers": items, "total": total, "page": page})),
+            )
         }
-        Err(e) => Json(
-            json!({"_status": 500, "message": e.to_string(), "customers": [], "total": 0, "page": page}),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string(), "customers": [], "total": 0, "page": page})),
         ),
     }
 }
@@ -42,9 +46,18 @@ pub async fn list_customers(
 pub async fn get_customer(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::customers::get_customer(&conn, id) {
-        Ok(Some(c)) => Json(serde_json::to_value(&c).unwrap_or(json!({}))),
-        Ok(None) => Json(json!({"_status": 404, "message": "Customer not found."})),
-        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
+        Ok(Some(c)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&c).unwrap_or(json!({}))),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "Customer not found."})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
     }
 }
 
@@ -60,9 +73,12 @@ pub async fn customer_timeline(
                 .iter()
                 .filter_map(|e| serde_json::to_value(e).ok())
                 .collect();
-            Json(json!({"timeline": items}))
+            (StatusCode::OK, Json(json!({"timeline": items})))
         }
-        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
     }
 }
 
@@ -71,7 +87,7 @@ pub async fn customer_support_health(
     State(_state): State<AppState>,
     Path(_id): Path<i64>,
 ) -> impl IntoResponse {
-    Json(json!({"health": "unknown"}))
+    (StatusCode::OK, Json(json!({"health": "unknown"})))
 }
 
 /// GET /api/organizations
@@ -104,7 +120,10 @@ pub async fn list_organizations(
             .unwrap_or_default()
         })
         .unwrap_or_default();
-    Json(json!({"organizations": orgs, "total": orgs.len() as i64}))
+    (
+        StatusCode::OK,
+        Json(json!({"organizations": orgs, "total": orgs.len() as i64})),
+    )
 }
 
 /// GET /api/organizations/:id
@@ -115,7 +134,10 @@ pub async fn get_organization(
     // The port doesn't have a separate organizations table; return a 404
     // matching the reference's response shape.
     let _ = id;
-    Json(json!({"_status": 404, "message": "Organization not found."}))
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"message": "Organization not found."})),
+    )
 }
 
 /// GET /api/organizations/:id/timeline
@@ -123,7 +145,7 @@ pub async fn organization_timeline(
     State(_state): State<AppState>,
     Path(_id): Path<i64>,
 ) -> impl IntoResponse {
-    Json(json!({"timeline": []}))
+    (StatusCode::OK, Json(json!({"timeline": []})))
 }
 
 /// GET /api/organizations/:id/support-health
@@ -131,10 +153,13 @@ pub async fn organization_support_health(
     State(_state): State<AppState>,
     Path(_id): Path<i64>,
 ) -> impl IntoResponse {
-    Json(json!({"health": "unknown"}))
+    (StatusCode::OK, Json(json!({"health": "unknown"})))
 }
 
 /// POST /api/timeline/rebuild
 pub async fn timeline_rebuild(State(_state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"ok": true, "message": "Timeline rebuild queued."}))
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "message": "Timeline rebuild queued."})),
+    )
 }

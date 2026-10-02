@@ -148,25 +148,31 @@ pub async fn db_stats(State(state): State<AppState>) -> impl IntoResponse {
         )
         .unwrap_or(0);
 
-    Json(json!({
-        "path": db_path.display().to_string(),
-        "size_bytes": size,
-        "tables": table_count,
-        "wal": true,
-        "migrations": crate::migrations::latest_version(),
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "path": db_path.display().to_string(),
+            "size_bytes": size,
+            "tables": table_count,
+            "wal": true,
+            "migrations": crate::migrations::latest_version(),
+        })),
+    )
 }
 
 /// GET /api/system/capabilities — capability matrix.
 pub async fn capabilities() -> impl IntoResponse {
-    Json(json!({
-        "matrix": [],
-        "summary": {
-            "implemented": 0,
-            "total": 0,
-            "tested": 0,
-        }
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "matrix": [],
+            "summary": {
+                "implemented": 0,
+                "total": 0,
+                "tested": 0,
+            }
+        })),
+    )
 }
 
 /// GET /api/system/tables — table stats.
@@ -191,7 +197,7 @@ pub async fn table_stats(State(state): State<AppState>) -> impl IntoResponse {
             Err(_) => Vec::new(),
         };
 
-    Json(json!({"tables": tables}))
+    (StatusCode::OK, Json(json!({"tables": tables})))
 }
 
 /// GET /api/onboarding — onboarding state.
@@ -229,15 +235,18 @@ pub async fn onboarding(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         "new"
     };
-    Json(json!({
-        "step": if first_run { "complete" } else { "welcome" },
-        "completed": first_run,
-        "demo_mode": state.demo_mode,
-        "conversations": conv_count,
-        "hs_configured": hs_configured > 0,
-        "hs_authenticated": hs_configured > 0,
-        "sync_state": sync_state,
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "step": if first_run { "complete" } else { "welcome" },
+            "completed": first_run,
+            "demo_mode": state.demo_mode,
+            "conversations": conv_count,
+            "hs_configured": hs_configured > 0,
+            "hs_authenticated": hs_configured > 0,
+            "sync_state": sync_state,
+        })),
+    )
 }
 
 /// POST /api/onboarding/step — set onboarding step.
@@ -251,14 +260,17 @@ pub async fn onboarding_step(
         .unwrap_or("welcome");
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::settings::set_string(&conn, "onboarding_step", step);
-    Json(json!({"ok": true}))
+    (StatusCode::OK, Json(json!({"ok": true})))
 }
 
 /// POST /api/onboarding/complete — mark onboarding done.
 pub async fn onboarding_complete(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::settings::mark_first_run_done(&conn);
-    Json(json!({"ok": true, "message": "Onboarding complete."}))
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "message": "Onboarding complete."})),
+    )
 }
 
 /// POST /api/demo/enable — enable demo mode.
@@ -266,10 +278,13 @@ pub async fn demo_enable(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = crate::settings::set_bool(&conn, "demo_mode", true);
     let _ = crate::settings::mark_first_run_done(&conn);
-    Json(json!({
-        "ok": true,
-        "message": "Demo mode active with a simulated Help Scout account. Run the initial sync from Sync Health to populate the demo database."
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "message": "Demo mode active with a simulated Help Scout account. Run the initial sync from Sync Health to populate the demo database."
+        })),
+    )
 }
 
 /// POST /api/demo/simulate-incoming — simulate an incoming conversation (demo mode only).
@@ -278,7 +293,10 @@ pub async fn demo_simulate_incoming(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !state.demo_mode {
-        return Json(json!({"_status": 200, "ok": false, "message": "Not in demo mode."}));
+        return (
+            StatusCode::OK,
+            Json(json!({"ok": false, "message": "Not in demo mode."})),
+        );
     }
 
     let subject = body
@@ -314,8 +332,9 @@ pub async fn demo_simulate_incoming(
     );
 
     if result.is_err() {
-        return Json(
-            json!({"_status": 500, "ok": false, "message": "Failed to create conversation."}),
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": "Failed to create conversation."})),
         );
     }
     // Fetch the inserted row's identity fields for the live event.
@@ -354,10 +373,13 @@ pub async fn demo_simulate_incoming(
         );
     }
 
-    Json(json!({
-        "ok": true,
-        "message": "Simulated incoming conversation. It will appear after refreshing."
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "message": "Simulated incoming conversation. It will appear after refreshing."
+        })),
+    )
 }
 
 /// POST /api/demo/simulate-rating — simulate a CSAT rating (demo mode only).
@@ -366,7 +388,10 @@ pub async fn demo_simulate_rating(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !state.demo_mode {
-        return Json(json!({"_status": 200, "ok": false, "message": "Not in demo mode."}));
+        return (
+            StatusCode::OK,
+            Json(json!({"ok": false, "message": "Not in demo mode."})),
+        );
     }
 
     let conversation_id = body.get("conversationRemoteId").and_then(|v| v.as_i64());
@@ -377,8 +402,11 @@ pub async fn demo_simulate_rating(
     let _comments = body.get("comments").and_then(|v| v.as_str()).unwrap_or("");
 
     if conversation_id.is_none() {
-        return Json(
-            json!({"_status": 422, "error": "ValidationError", "message": "conversationRemoteId is required."}),
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(
+                json!({"error": "ValidationError", "message": "conversationRemoteId is required."}),
+            ),
         );
     }
 
@@ -413,11 +441,14 @@ pub async fn demo_simulate_rating(
     );
     crate::http::event_bus::notify_ratings_refreshed(&state.bus, 1, 1);
 
-    Json(json!({
-        "ok": true,
-        "message": format!("Simulated a {rating} rating on conversation #{conv_id}."),
-        "rating_id": rating_id,
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "message": format!("Simulated a {rating} rating on conversation #{conv_id}."),
+            "rating_id": rating_id,
+        })),
+    )
 }
 
 /// POST /api/demo/simulate-webhook — simulate a webhook push (demo mode only).
@@ -433,7 +464,10 @@ pub async fn demo_simulate_webhook(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     if !state.demo_mode {
-        return Json(json!({"_status": 200, "ok": false, "message": "Not in demo mode."}));
+        return (
+            StatusCode::OK,
+            Json(json!({"ok": false, "message": "Not in demo mode."})),
+        );
     }
 
     let event = body
@@ -477,28 +511,40 @@ pub async fn demo_simulate_webhook(
 
     let event_id = format!("demo_wh_{}", chrono::Utc::now().timestamp_millis());
     match result {
-        crate::webhook_handler::WebhookProcessResult::Accepted { row_id } => Json(json!({
-            "ok": true,
-            "message": format!("{event} pushed through the webhook pipeline."),
-            "remoteId": remote_id,
-            "event_id": event_id,
-        })),
-        crate::webhook_handler::WebhookProcessResult::Duplicate { .. } => Json(json!({
-            "ok": true,
-            "message": format!("{event} was a duplicate (already processed)."),
-            "remoteId": remote_id,
-            "event_id": event_id,
-            "duplicate": true,
-        })),
-        crate::webhook_handler::WebhookProcessResult::SignatureInvalid => Json(json!({
-            "ok": false,
-            "message": "Signature verification failed for simulated webhook event.",
-            "event_id": event_id,
-        })),
-        crate::webhook_handler::WebhookProcessResult::BadRequest => Json(json!({
-            "ok": false,
-            "message": "Simulated webhook payload was rejected.",
-            "event_id": event_id,
-        })),
+        crate::webhook_handler::WebhookProcessResult::Accepted { row_id } => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "message": format!("{event} pushed through the webhook pipeline."),
+                "remoteId": remote_id,
+                "event_id": event_id,
+            })),
+        ),
+        crate::webhook_handler::WebhookProcessResult::Duplicate { .. } => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "message": format!("{event} was a duplicate (already processed)."),
+                "remoteId": remote_id,
+                "event_id": event_id,
+                "duplicate": true,
+            })),
+        ),
+        crate::webhook_handler::WebhookProcessResult::SignatureInvalid => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": false,
+                "message": "Signature verification failed for simulated webhook event.",
+                "event_id": event_id,
+            })),
+        ),
+        crate::webhook_handler::WebhookProcessResult::BadRequest => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": false,
+                "message": "Simulated webhook payload was rejected.",
+                "event_id": event_id,
+            })),
+        ),
     }
 }

@@ -58,26 +58,29 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         })
     }
 
-    Json(json!({
-        "sync_interval_minutes": get_i64(&map, "sync_interval_minutes", 5),
-        "api_concurrency": get_i64(&map, "api_concurrency", 2),
-        "ai_enabled": get_bool(&map, "ai_enabled", true),
-        "automatic_analysis_enabled": get_bool(&map, "automatic_analysis_enabled", true),
-        "automatic_note_enabled": get_bool(&map, "automatic_note_enabled", false),
-        "automatic_draft_enabled": get_bool(&map, "automatic_draft_enabled", false),
-        "automation_enabled": get_bool(&map, "automation_enabled", false),
-        "automation_write_actions_enabled": get_bool(&map, "automation_write_actions_enabled", false),
-        "qdrant_enabled": get_bool(&map, "qdrant_enabled", true),
-        "attachment_auto_download": get_bool(&map, "attachment_auto_download", true),
-        "automatic_reply_sending": get_bool(&map, "automatic_reply_sending", false),
-        "retention_days": get_opt_i64(&map, "retention_days"),
-        "backup_interval_hours": get_i64(&map, "backup_interval_hours", 24),
-        "log_level": get_str(&map, "log_level", "info"),
-        "display_timezone": get_str(&map, "display_timezone", "system"),
-        "redaction_enabled": get_bool(&map, "redaction_enabled", true),
-        "ai_evaluation_mode": get_bool(&map, "ai_evaluation_mode", false),
-        "agent_language": get_str(&map, "agent_language", "en"),
-    }))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "sync_interval_minutes": get_i64(&map, "sync_interval_minutes", 5),
+            "api_concurrency": get_i64(&map, "api_concurrency", 2),
+            "ai_enabled": get_bool(&map, "ai_enabled", true),
+            "automatic_analysis_enabled": get_bool(&map, "automatic_analysis_enabled", true),
+            "automatic_note_enabled": get_bool(&map, "automatic_note_enabled", false),
+            "automatic_draft_enabled": get_bool(&map, "automatic_draft_enabled", false),
+            "automation_enabled": get_bool(&map, "automation_enabled", false),
+            "automation_write_actions_enabled": get_bool(&map, "automation_write_actions_enabled", false),
+            "qdrant_enabled": get_bool(&map, "qdrant_enabled", true),
+            "attachment_auto_download": get_bool(&map, "attachment_auto_download", true),
+            "automatic_reply_sending": get_bool(&map, "automatic_reply_sending", false),
+            "retention_days": get_opt_i64(&map, "retention_days"),
+            "backup_interval_hours": get_i64(&map, "backup_interval_hours", 24),
+            "log_level": get_str(&map, "log_level", "info"),
+            "display_timezone": get_str(&map, "display_timezone", "system"),
+            "redaction_enabled": get_bool(&map, "redaction_enabled", true),
+            "ai_evaluation_mode": get_bool(&map, "ai_evaluation_mode", false),
+            "agent_language": get_str(&map, "agent_language", "en"),
+        })),
+    )
 }
 
 /// PATCH /api/settings — update settings.
@@ -95,15 +98,21 @@ pub async fn update_settings(
             let _ = crate::settings::set_string(&conn, key, &val_str);
         }
     }
-    Json(json!({"ok": true}))
+    (StatusCode::OK, Json(json!({"ok": true})))
 }
 
 /// GET /api/settings/lmstudio
 pub async fn get_lmstudio(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::ai_center::get_ai_status(&conn) {
-        Ok(status) => Json(serde_json::to_value(&status).unwrap_or(json!({}))),
-        Err(e) => Json(json!({"_status": 500, "message": e.to_string()})),
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&status).unwrap_or(json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
     }
 }
 
@@ -129,13 +138,16 @@ pub async fn update_lmstudio(
             .unwrap_or(384) as usize;
         let _ = crate::ai_center::set_embedding_model(&conn, model, dim);
     }
-    Json(json!({"ok": true}))
+    (StatusCode::OK, Json(json!({"ok": true})))
 }
 
 /// POST /api/settings/lmstudio/test
 pub async fn test_lmstudio(State(_state): State<AppState>) -> impl IntoResponse {
-    Json(
-        json!({"connected": false, "models": [], "error": "LM Studio test not implemented in HTTP API yet."}),
+    (
+        StatusCode::OK,
+        Json(
+            json!({"connected": false, "models": [], "error": "LM Studio test not implemented in HTTP API yet."}),
+        ),
     )
 }
 
@@ -147,7 +159,10 @@ pub async fn get_qdrant(State(state): State<AppState>) -> impl IntoResponse {
         .ok()
         .flatten()
         .unwrap_or_default();
-    Json(json!({"enabled": enabled, "url": url}))
+    (
+        StatusCode::OK,
+        Json(json!({"enabled": enabled, "url": url})),
+    )
 }
 
 /// PATCH /api/settings/qdrant
@@ -162,7 +177,7 @@ pub async fn update_qdrant(
     if let Some(url) = body.get("url").and_then(|v| v.as_str()) {
         let _ = crate::settings::set_string(&conn, "qdrant_url", url);
     }
-    Json(json!({"ok": true}))
+    (StatusCode::OK, Json(json!({"ok": true})))
 }
 
 /// GET /api/settings/business-hours
@@ -178,7 +193,7 @@ pub async fn get_business_hours(State(state): State<AppState>) -> impl IntoRespo
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
-    Json(json!({"business_hours": hours}))
+    (StatusCode::OK, Json(json!({"business_hours": hours})))
 }
 
 /// PUT /api/settings/business-hours/:mailboxId
@@ -193,7 +208,7 @@ pub async fn set_business_hours(
         "INSERT OR REPLACE INTO sla_configs (mailbox_id, config_json) VALUES (?1, ?2)",
         rusqlite::params![mailbox_id, config],
     );
-    Json(json!({"ok": true}))
+    (StatusCode::OK, Json(json!({"ok": true})))
 }
 
 /// DELETE /api/settings/business-hours/:mailboxId
@@ -206,5 +221,5 @@ pub async fn delete_business_hours(
         "DELETE FROM sla_configs WHERE mailbox_id = ?1",
         rusqlite::params![mailbox_id],
     );
-    Json(json!({"ok": true}))
+    (StatusCode::OK, Json(json!({"ok": true})))
 }
