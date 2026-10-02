@@ -1,12 +1,13 @@
 //! Sync routes — mirrors src/server/routes/sync.ts
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use crate::audit::AuditEntry;
 
 /// GET /api/sync/status — mirrors reference's response shape.
 pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
@@ -403,5 +404,362 @@ pub async fn encrypted_import(
     (
         StatusCode::OK,
         Json(serde_json::to_value(result).unwrap_or(Value::Null)),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// OAuth flow (reference routes/sync.ts:269-385)
+// ---------------------------------------------------------------------------
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn oauth_fail_page(
+    message: &str,
+) -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    let html: &'static str = Box::leak(
+        format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>SupportOS - connection not completed</title>\
+<style>body{{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#1f2933}}h1{{font-size:1.2rem}}p{{line-height:1.5;color:#52606d}}</style></head>\
+<body><h1>Help Scout connection not completed</h1><p>{message}</p>\
+<p>Return to SupportOS Settings and try again, or use \"Connect with Client Credentials\".</p></body></html>"
+        )
+        .into_boxed_str(),
+    );
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html")],
+        html,
+    )
+}
+
+/// Whether Help Scout client credentials are configured (the reference reads
+/// env config; the port persists them in application_settings).
+fn hs_credentials(conn: &rusqlite::Connection) -> (String, String) {
+    (
+        crate::settings::get_string(conn, "helpscout_client_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        crate::settings::get_string(conn, "helpscout_client_secret")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+    )
+}
+
+/// GET /api/oauth/authorize-url — begin the browser OAuth flow (demo mode:
+/// `{demo_mode: true, message}`).
+pub async fn oauth_authorize_url(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    if state.demo_mode {
+        return (
+            StatusCode::OK,
+            Json(
+                json!({ "demo_mode": true, "message": "Demo mode is active - OAuth is not needed." }),
+            ),
+        );
+    }
+    let (client_id, _) = hs_credentials(&conn);
+    if client_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "ok": false, "message": "HELPSCOUT_CLIENT_ID and HELPSCOUT_CLIENT_SECRET must be set in .env first." }),
+            ),
+        );
+    }
+    // Reference: 16 random bytes hex + stored as JSON in application_settings.
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let state_token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = crate::settings::set_json(&conn, "oauth_state", &state_token);
+    let url = format!(
+        "https://secure.helpscout.net/authentication/authorizeClientApplication?client_id={}&state={}",
+        client_id, state_token
+    );
+    (StatusCode::OK, Json(json!({ "url": url })))
+}
+
+/// POST /api/oauth/client-credentials — connect with client credentials.
+pub async fn oauth_client_credentials(State(state): State<AppState>) -> impl IntoResponse {
+    let (client_id, client_secret) = {
+        let conn = state.conn_lock();
+        if state.demo_mode {
+            return (StatusCode::OK, Json(json!({ "demo_mode": true })));
+        }
+        hs_credentials(&conn)
+    };
+    if client_id.is_empty() || client_secret.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "ok": false, "message": "HELPSCOUT_CLIENT_ID and HELPSCOUT_CLIENT_SECRET must be set in .env first." }),
+            ),
+        );
+    }
+    // Exchange client credentials for a token (POST /v2/oauth2/token).
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let Ok(client) = client else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "message": "could not build HTTP client" })),
+        );
+    };
+    let resp = client
+        .post("https://api.helpscout.net/v2/oauth2/token")
+        .json(&serde_json::json!({
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(body) => {
+                let token = crate::oauth::OAuthToken {
+                    access_token: body["access_token"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    refresh_token: body["refresh_token"].as_str().map(String::from),
+                    expires_in: body["expires_in"].as_u64(),
+                    token_type: body["token_type"].as_str().unwrap_or("bearer").to_string(),
+                    scope: body["scope"].as_str().map(String::from),
+                };
+                let conn = state.conn_lock();
+                if token.access_token.is_empty()
+                    || crate::oauth::store_token(&conn, &token).is_err()
+                {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(
+                            json!({ "ok": false, "message": "Token response was missing an access token." }),
+                        ),
+                    );
+                }
+                let _ = crate::audit::audit(
+                    &conn,
+                    &crate::audit::AuditEntry {
+                        actor: "user",
+                        action: "helpscout_connected".into(),
+                        remote_operation: Some("POST /v2/oauth2/token".into()),
+                        ..AuditEntry::user("helpscout_connected")
+                    },
+                );
+                (
+                    StatusCode::OK,
+                    Json(json!({ "ok": true, "message": "Connected to Help Scout." })),
+                )
+            }
+            Err(e) => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "ok": false, "message": e.to_string() })),
+            ),
+        },
+        Ok(r) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "message": format!("Help Scout returned {}", r.status()) })),
+        ),
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "message": e.to_string() })),
+        ),
+    }
+}
+
+/// GET /api/oauth/status — connection status (demo mode shape:
+/// `{configured:false, authenticated:true, demo_mode:true, expires_at:null, me:null}`).
+pub async fn oauth_status(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    if state.demo_mode {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "configured": false,
+                "authenticated": true,
+                "demo_mode": true,
+                "expires_at": Value::Null,
+                "me": Value::Null,
+            })),
+        );
+    }
+    let (client_id, _) = hs_credentials(&conn);
+    let authenticated = crate::oauth::has_token(&conn).unwrap_or(false);
+    let expires_at: Option<String> = conn
+        .query_row(
+            "SELECT expires_at FROM oauth_tokens WHERE id = 1 AND revoked = 0",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "configured": !client_id.is_empty(),
+            "authenticated": authenticated,
+            "demo_mode": false,
+            "expires_at": expires_at,
+            "me": Value::Null,
+        })),
+    )
+}
+
+/// POST /api/oauth/disconnect — revoke + preserve local data.
+pub async fn oauth_disconnect(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn_lock();
+    let _ = crate::oauth::delete_token(&conn);
+    let _ = crate::audit::audit(
+        &conn,
+        &crate::audit::AuditEntry::user("helpscout_disconnected"),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "message": "Disconnected. Local data is fully preserved." })),
+    )
+}
+
+/// GET /oauth/callback — completes the browser OAuth code flow; verifies the
+/// single-use state parameter; returns styled HTML pages like the reference.
+pub async fn oauth_callback(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let (client_id, client_secret, code) = {
+        let conn = state.conn_lock();
+        if state.demo_mode {
+            return oauth_fail_page("Demo mode is active - OAuth is not needed.");
+        }
+        if let Some(error) = params.get("error") {
+            let desc = params
+                .get("error_description")
+                .map(|d| format!(" - {}", escape_html(d)))
+                .unwrap_or_default();
+            return oauth_fail_page(&format!(
+                "Help Scout returned an error: {}{}",
+                escape_html(error),
+                desc
+            ));
+        }
+        let (code, q_state) = match (params.get("code"), params.get("state")) {
+            (Some(c), Some(st)) => (c.clone(), st.clone()),
+            _ => {
+                return oauth_fail_page(
+                    "The callback is missing its authorization code or state parameter.",
+                )
+            }
+        };
+        let stored: Option<String> = crate::settings::get_string(&conn, "oauth_state")
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str(&v).ok());
+        // Single-use: clear the stored state immediately after reading it.
+        let _ = conn.execute(
+            "DELETE FROM application_settings WHERE key = 'oauth_state'",
+            [],
+        );
+        match stored {
+            Some(stored) if stored == q_state => {}
+            _ => {
+                return oauth_fail_page("The state parameter did not match the authorization request (it may have expired or been reused). For safety the code was not exchanged.")
+            }
+        }
+        let creds = hs_credentials(&conn);
+        (creds.0, creds.1, code)
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+    let Ok(client) = client else {
+        return oauth_fail_page(
+            "Exchanging the authorization code failed: could not build HTTP client.",
+        );
+    };
+    let resp = client
+        .post("https://api.helpscout.net/v2/oauth2/token")
+        .json(&serde_json::json!({
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+        }))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(body) => {
+                let token = crate::oauth::OAuthToken {
+                    access_token: body["access_token"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    refresh_token: body["refresh_token"].as_str().map(String::from),
+                    expires_in: body["expires_in"].as_u64(),
+                    token_type: body["token_type"].as_str().unwrap_or("bearer").to_string(),
+                    scope: body["scope"].as_str().map(String::from),
+                };
+                let conn = state.conn_lock();
+                if token.access_token.is_empty()
+                    || crate::oauth::store_token(&conn, &token).is_err()
+                {
+                    return oauth_fail_page("Exchanging the authorization code failed: token response was missing an access token.");
+                }
+                let _ = crate::audit::audit(
+                    &conn,
+                    &crate::audit::AuditEntry {
+                        actor: "user",
+                        action: "helpscout_connected".into(),
+                        remote_operation: Some("GET /oauth/callback (code exchange)".into()),
+                        ..AuditEntry::user("helpscout_connected")
+                    },
+                );
+                oauth_success_page()
+            }
+            Err(e) => oauth_fail_page(&format!(
+                "Exchanging the authorization code failed: {}",
+                escape_html(&e.to_string())
+            )),
+        },
+        Ok(r) => oauth_fail_page(&format!(
+            "Exchanging the authorization code failed: Help Scout returned {}",
+            r.status()
+        )),
+        Err(e) => oauth_fail_page(&format!(
+            "Exchanging the authorization code failed: {}",
+            escape_html(&e.to_string())
+        )),
+    }
+}
+
+fn oauth_success_page() -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    let html: &'static str = Box::leak(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>SupportOS - connected</title>\
+<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;color:#1f2933}}h1{font-size:1.2rem}}p{{line-height:1.5;color:#52606d}}</style></head>\
+<body><h1>Connected to Help Scout</h1><p>You can close this tab and return to SupportOS. Reload the Settings page to see the connection status.</p></body></html>"
+            .to_string()
+            .into_boxed_str(),
+    );
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html")],
+        html,
     )
 }

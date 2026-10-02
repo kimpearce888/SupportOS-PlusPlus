@@ -439,6 +439,21 @@ impl HttpServer {
                 "/api/sync/encrypted/import",
                 post(routes::sync::encrypted_import),
             )
+            // OAuth flow (reference routes/sync.ts:269-385)
+            .route(
+                "/api/oauth/authorize-url",
+                get(routes::sync::oauth_authorize_url),
+            )
+            .route(
+                "/api/oauth/client-credentials",
+                post(routes::sync::oauth_client_credentials),
+            )
+            .route("/api/oauth/status", get(routes::sync::oauth_status))
+            .route(
+                "/api/oauth/disconnect",
+                post(routes::sync::oauth_disconnect),
+            )
+            .route("/oauth/callback", get(routes::sync::oauth_callback))
             // Audit log + application errors + backups
             .route("/api/audit", get(routes::system::audit_log))
             .route("/api/errors", get(routes::system::errors))
