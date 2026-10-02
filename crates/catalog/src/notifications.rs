@@ -66,19 +66,24 @@ impl NotificationType {
 
     /// Whether the type is enabled by default for new users.
     #[must_use]
+    /// The reference enables ALL 15 types by default
+    /// (NOTIFICATION_TYPE_DEFAULT_ENABLED in src/shared/collaboration.ts).
     pub fn default_enabled(self) -> bool {
-        !matches!(self, Self::CampaignReply | Self::CustomerEvent)
+        true
     }
 
     /// Severity bucket for sorting in the UI.
     #[must_use]
+    /// Severity per type — the exact reference
+    /// NOTIFICATION_SEVERITY_BY_TYPE map.
     pub fn severity(self) -> &'static str {
         match self {
-            Self::SlaBreach | Self::SyncFailure | Self::JobFailure => "critical",
+            Self::SlaBreach | Self::SyncFailure => "critical",
             Self::SlaRisk
+            | Self::AutomationApproval
             | Self::AiEscalation
             | Self::IssueSpike
-            | Self::KnownIssueDetected
+            | Self::JobFailure
             | Self::IncidentUpdate => "warning",
             _ => "info",
         }
@@ -95,9 +100,34 @@ mod tests {
     }
 
     #[test]
-    fn default_enabled_is_sane() {
-        // High-signal types are on by default; campaign_reply stays opt-in.
-        assert!(NotificationType::SlaBreach.default_enabled());
-        assert!(!NotificationType::CampaignReply.default_enabled());
+    fn default_enabled_matches_reference() {
+        // The reference enables ALL types by default.
+        for t in NotificationType::ALL {
+            assert!(t.default_enabled(), "{t:?} must be default-enabled");
+        }
+    }
+
+    #[test]
+    fn severity_matches_reference_map() {
+        let expected = [
+            (NotificationType::CustomerReplied, "info"),
+            (NotificationType::TicketAssigned, "info"),
+            (NotificationType::Mentioned, "info"),
+            (NotificationType::TeamMentioned, "info"),
+            (NotificationType::SlaRisk, "warning"),
+            (NotificationType::SlaBreach, "critical"),
+            (NotificationType::AutomationApproval, "warning"),
+            (NotificationType::AiEscalation, "warning"),
+            (NotificationType::KnownIssueDetected, "info"),
+            (NotificationType::IssueSpike, "warning"),
+            (NotificationType::CampaignReply, "info"),
+            (NotificationType::SyncFailure, "critical"),
+            (NotificationType::JobFailure, "warning"),
+            (NotificationType::CustomerEvent, "info"),
+            (NotificationType::IncidentUpdate, "warning"),
+        ];
+        for (t, sev) in expected {
+            assert_eq!(t.severity(), sev, "{t:?} severity mismatch");
+        }
     }
 }

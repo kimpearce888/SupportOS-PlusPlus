@@ -107,7 +107,7 @@ pub async fn workload(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or_default();
     let unassigned: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE assignee_user_id IS NULL AND status = 'active'",
+            "SELECT COUNT(*) FROM conversations WHERE assignee_id IS NULL AND status = 'active'",
             [],
             |r| r.get(0),
         )
@@ -124,7 +124,7 @@ pub async fn workload(State(state): State<AppState>) -> impl IntoResponse {
             "weights": {}
         },
         "method_notes": [
-            "Agent workloads aggregated from conversations.assignee_user_id (active status only).",
+            "Agent workloads aggregated from conversations.assignee_id (active status only).",
             "Team workloads aggregated from conversations where mailbox_id maps to a team."
         ]
     }))

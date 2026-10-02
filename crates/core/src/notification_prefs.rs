@@ -256,11 +256,11 @@ mod tests {
     #[test]
     fn set_user_preference_round_trips() {
         let conn = fresh_db();
-        let t = NotificationType::CampaignReply; // default = disabled
+        let t = NotificationType::CampaignReply; // ALL types default-enabled (reference)
         assert_eq!(
             get_user_preference(&conn, 42, t).unwrap(),
-            NotificationPreference::Disabled,
-            "campaign_reply default is disabled"
+            NotificationPreference::Enabled,
+            "all notification types are default-enabled (reference)"
         );
 
         set_user_preference(&conn, 42, t, NotificationPreference::Enabled).unwrap();

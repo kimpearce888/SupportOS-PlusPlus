@@ -100,35 +100,31 @@ pub async fn status(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or_default();
     let queued: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'queued'",
+            "SELECT COUNT(*) FROM jobs WHERE state = 'pending'",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
     let active: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'running'",
+            "SELECT COUNT(*) FROM jobs WHERE state = 'claimed'",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
     let completed: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'completed'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM jobs WHERE state = 'done'", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
     let failed: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'failed'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM jobs WHERE state = 'dead'", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
     let dispatched: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state IN ('dispatched', 'running', 'completed', 'failed')",
+            "SELECT COUNT(*) FROM jobs WHERE state IN ('claimed', 'done', 'dead')",
             [],
             |r| r.get(0),
         )
@@ -211,31 +207,27 @@ pub async fn queue(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let queued: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'queued'",
+            "SELECT COUNT(*) FROM jobs WHERE state = 'pending'",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
     let failed: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'failed'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM jobs WHERE state = 'dead'", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
     let running: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'running'",
+            "SELECT COUNT(*) FROM jobs WHERE state = 'claimed'",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
     let completed: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM jobs WHERE state = 'completed'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM jobs WHERE state = 'done'", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
     // List recent jobs (last 50).
     let jobs: Vec<Value> = conn

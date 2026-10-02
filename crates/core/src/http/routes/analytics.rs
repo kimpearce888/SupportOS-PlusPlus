@@ -69,7 +69,7 @@ pub async fn dashboard(
         .unwrap_or(0);
     let unassigned: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE assignee_user_id IS NULL AND status = 'active'",
+            "SELECT COUNT(*) FROM conversations WHERE assignee_id IS NULL AND status = 'active'",
             [],
             |r| r.get(0),
         )
@@ -83,7 +83,7 @@ pub async fn dashboard(
         .unwrap_or(0);
     let replies_sent: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM conversation_threads WHERE type = 'reply'",
+            "SELECT COUNT(*) FROM conversation_threads WHERE thread_type = 'reply'",
             [],
             |r| r.get(0),
         )
@@ -153,7 +153,7 @@ pub async fn ai_analytics(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or(0);
     let successful: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM ai_runs WHERE result_json IS NOT NULL",
+            "SELECT COUNT(*) FROM ai_runs WHERE response_json IS NOT NULL",
             [],
             |r| r.get(0),
         )

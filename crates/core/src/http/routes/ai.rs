@@ -238,7 +238,7 @@ pub async fn ai_analytics(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or(0);
     let successful: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM ai_runs WHERE result_json IS NOT NULL",
+            "SELECT COUNT(*) FROM ai_runs WHERE response_json IS NOT NULL",
             [],
             |r| r.get(0),
         )

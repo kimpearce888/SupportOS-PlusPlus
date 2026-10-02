@@ -64,40 +64,91 @@ pub async fn mark_all_read(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({"ok": true}))
 }
 
-/// GET /api/notifications/prefs
-pub async fn list_prefs(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let prefs: Vec<Value> = conn
-        .prepare("SELECT type, enabled FROM notification_prefs ORDER BY type")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({"type": r.get::<_, String>(0)?, "enabled": r.get::<_, bool>(1)?}))
+/// Build the full prefs list (all catalog types, enabled falling back to the
+/// default when unset) — the exact reference `listPrefs()` shape.
+fn build_prefs(conn: &rusqlite::Connection) -> Vec<Value> {
+    use spp_catalog::NotificationType;
+    NotificationType::ALL
+        .iter()
+        .map(|t| {
+            let key = format!("notifications.{}.enabled", t.as_str());
+            let enabled = crate::settings::get_bool(conn, &key, t.default_enabled())
+                .unwrap_or_else(|_| t.default_enabled());
+            json!({
+                "type": t.as_str(),
+                "enabled": enabled,
+                "default_enabled": t.default_enabled(),
             })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
         })
-        .unwrap_or_default();
-    Json(json!({"prefs": prefs}))
+        .collect()
 }
 
-/// PUT /api/notifications/prefs/:type
+/// GET /api/notifications/prefs — `{prefs: [{type, enabled, default_enabled}]}`
+/// for ALL 15 types (reference `notificationRepo.listPrefs`).
+pub async fn list_prefs(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    Json(json!({"prefs": build_prefs(&conn)}))
+}
+
+/// PUT /api/notifications/prefs/:type — validate + set + return full list.
+///
+/// Reference contract: 422 with a Fastify-style envelope for an unknown type
+/// or a malformed body; success returns the updated `{prefs: [...]}` list.
 pub async fn set_pref(
     State(state): State<AppState>,
     Path(notif_type): Path<String>,
-    Json(body): Json<Value>,
+    body: Option<Json<Value>>,
 ) -> impl IntoResponse {
-    let enabled = body
-        .get("enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    use axum::http::StatusCode;
+    use spp_catalog::NotificationType;
+
+    // Validate the type against the closed vocabulary.
+    let valid = NotificationType::ALL
+        .iter()
+        .any(|t| t.as_str() == notif_type);
+    if !valid {
+        let names: Vec<&str> = NotificationType::ALL.iter().map(|t| t.as_str()).collect();
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": format!("type must be one of: {}.", names.join(", ")),
+            })),
+        );
+    }
+
+    // Validate the body: must be exactly {enabled: boolean}.
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Body must be { enabled: boolean }.",
+            })),
+        );
+    };
+    let Some(enabled) = body.get("enabled").and_then(|v| v.as_bool()) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Body must be { enabled: boolean }.",
+            })),
+        );
+    };
+
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO notification_prefs (type, enabled) VALUES (?1, ?2)",
-        rusqlite::params![notif_type, enabled],
-    );
-    Json(json!({"ok": true}))
+    let key = format!("notifications.{notif_type}.enabled");
+    if let Err(e) = crate::settings::set_bool(&conn, &key, enabled) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"_status": 500, "message": e.to_string()})),
+        );
+    }
+    (StatusCode::OK, Json(json!({"prefs": build_prefs(&conn)})))
 }
 
 /// GET /api/notifications/mentions
