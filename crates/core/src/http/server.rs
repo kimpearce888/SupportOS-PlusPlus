@@ -18,17 +18,29 @@ use tower_http::trace::TraceLayer;
 
 use crate::error::Result;
 
+use super::rate_limit::RateLimiter;
 use super::routes;
+use super::EventBus;
 
 /// Shared application state for all HTTP handlers.
-/// This wraps the SQLite connection + config, similar to the reference's AppContext.
+/// This wraps the SQLite connection + config + event bus + rate limiter,
+/// similar to the reference's AppContext + EventEmitter + mutationHits map.
 #[derive(Clone)]
 pub struct AppState {
+    /// Shared SQLite connection (rusqlite is not Sync alone, so we wrap in Mutex).
     pub conn: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    /// Application data directory (where the SQLite DB lives).
     pub data_dir: std::path::PathBuf,
+    /// Port the HTTP server binds to.
     pub port: u16,
+    /// Host the HTTP server binds to (always 127.0.0.1).
     pub host: String,
+    /// Whether demo mode is enabled (mock Help Scout data).
     pub demo_mode: bool,
+    /// Real-time event bus — pushes LiveEvents to all connected SSE clients.
+    pub bus: EventBus,
+    /// Mutation rate limiter — 300 writes/min per IP, mirrors the reference.
+    pub limiter: RateLimiter,
 }
 
 /// The HTTP server. Owns the bound socket address.
@@ -54,6 +66,7 @@ impl HttpServer {
     /// Build the axum Router with all routes.
     pub fn build_router(&self) -> Router {
         let state = self.state.clone();
+        let limiter = self.state.limiter.clone();
 
         // DNS-rebinding guard: reject requests with non-loopback Host headers.
         // This matches the reference's isLoopbackHostHeader check.
@@ -74,6 +87,33 @@ impl HttpServer {
                     .unwrap();
                 }
                 next.run(req).await
+            },
+        );
+
+        // Mutation rate limiter — mirrors the reference's `mutationHits` map:
+        //   - 300 mutations / 60s / client IP
+        //   - GET / HEAD / OPTIONS unmetered
+        //   - `/api/webhooks/helpscout` exempt (HMAC-authenticated + deduped)
+        //   - Keyed on socket remoteAddress (NOT X-Forwarded-For, which is spoofable)
+        //   - 429 with `retry-after` header + JSON error body on overflow.
+        let rate_limit = axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let limiter = limiter.clone();
+                async move {
+                    let method = req.method().clone();
+                    let path = req.uri().path().to_string();
+                    // Key on the socket address (constant for localhost users).
+                    // The ConnectInfo extractor gives us this for free.
+                    let key = req
+                        .extensions()
+                        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                        .map(|ci| ci.ip().to_string())
+                        .unwrap_or_else(|| "local".to_string());
+                    if let Err(retry_after) = limiter.check(&method, &path, &key) {
+                        return RateLimiter::too_many_requests_response(retry_after);
+                    }
+                    next.run(req).await
+                }
             },
         );
 
@@ -691,12 +731,18 @@ impl HttpServer {
             .with_state(state)
             .layer(cors)
             .layer(TraceLayer::new_for_http())
+            .layer(rate_limit)
             .layer(dns_guard)
     }
 
     /// Run the server forever.
     pub async fn serve(self) -> std::io::Result<()> {
-        let app = self.build_router();
+        // into_make_service_with_connect_info lets the rate-limit layer
+        // read the client's socket address via ConnectInfo<SocketAddr>.
+        // (Mirrors the reference's `request.socket.remoteAddress`.)
+        let app = self
+            .build_router()
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
         let listener = TcpListener::bind(self.addr).await?;
         tracing::info!(addr = %self.addr, "HTTP API server bound");
         axum::serve(listener, app).await?;

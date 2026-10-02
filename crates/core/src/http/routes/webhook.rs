@@ -74,5 +74,13 @@ pub async fn handle(
     }
 
     // Acknowledge fast — sync job runs asynchronously.
-    Json(json!({"received": true, "duplicate": false, "event_type": event_type}))
+    // Emit a `WebhookReceived` event so any connected SSE clients
+    // (browser tabs watching the Sync Health page) refresh in real time.
+    let event_id = event_hash.clone();
+    drop(conn); // release the mutex before emitting
+    crate::http::event_bus::notify_webhook(&state.bus, &event_id);
+
+    Json(
+        json!({"received": true, "duplicate": false, "event_type": event_type, "event_id": event_id}),
+    )
 }

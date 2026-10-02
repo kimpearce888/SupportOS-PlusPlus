@@ -82,15 +82,20 @@ pub async fn reply(
         );
     }
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    match crate::inbox::reply_to_conversation(
+    let result = crate::inbox::reply_to_conversation(
         &mut conn,
         id,
         body_text.to_string(),
         "user".to_string(),
         None,
-    ) {
+    );
+    drop(conn);
+    match result {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
+            if ok {
+                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+            }
             Json(json!({"ok": ok, "message": "Reply sent."}))
         }
         Err(e) => Json(
@@ -107,15 +112,20 @@ pub async fn note(
 ) -> impl IntoResponse {
     let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    match crate::inbox::add_note(
+    let result = crate::inbox::add_note(
         &mut conn,
         id,
         body_text.to_string(),
         "user".to_string(),
         None,
-    ) {
+    );
+    drop(conn);
+    match result {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
+            if ok {
+                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+            }
             Json(json!({"ok": ok}))
         }
         Err(e) => Json(
@@ -135,15 +145,20 @@ pub async fn status(
         .and_then(|v| v.as_str())
         .unwrap_or("active");
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    match crate::inbox::change_status(
+    let result = crate::inbox::change_status(
         &mut conn,
         id,
         new_status.to_string(),
         "user".to_string(),
         None,
-    ) {
+    );
+    drop(conn);
+    match result {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
+            if ok {
+                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+            }
             Json(json!({"ok": ok}))
         }
         Err(e) => Json(
@@ -160,9 +175,14 @@ pub async fn assign(
 ) -> impl IntoResponse {
     let assignee = body.get("assigneeLocalId").and_then(|v| v.as_i64());
     let mut conn = state.conn.lock().expect("mutex poisoned");
-    match crate::inbox::assign(&mut conn, id, assignee, "user".to_string(), None) {
+    let result = crate::inbox::assign(&mut conn, id, assignee, "user".to_string(), None);
+    drop(conn);
+    match result {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
+            if ok {
+                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+            }
             Json(json!({"ok": ok}))
         }
         Err(e) => Json(
@@ -193,11 +213,18 @@ pub async fn priority(
     match execute(&mut conn, &op) {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
+            drop(conn);
+            if ok {
+                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+            }
             Json(json!({"ok": ok}))
         }
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
-        ),
+        Err(e) => {
+            drop(conn);
+            Json(
+                json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+            )
+        }
     }
 }
 
@@ -209,12 +236,20 @@ pub async fn subject(
 ) -> impl IntoResponse {
     let new_subject = body.get("subject").and_then(|v| v.as_str()).unwrap_or("");
     let conn = state.conn.lock().expect("mutex poisoned");
-    match conn.execute(
+    let result = conn.execute(
         "UPDATE conversations SET subject = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE remote_id = ?2",
         rusqlite::params![new_subject, id],
-    ) {
+    );
+    let updated = result.as_ref().map(|rows| *rows > 0).unwrap_or(false);
+    drop(conn);
+    if updated {
+        crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+    }
+    match result {
         Ok(rows) => Json(json!({"ok": rows > 0})),
-        Err(e) => Json(json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()})),
+        Err(e) => Json(
+            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+        ),
     }
 }
 
@@ -236,11 +271,18 @@ pub async fn set_state(
     match execute(&mut conn, &op) {
         Ok(result) => {
             let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
+            drop(conn);
+            if ok {
+                crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
+            }
             Json(json!({"ok": ok}))
         }
-        Err(e) => Json(
-            json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
-        ),
+        Err(e) => {
+            drop(conn);
+            Json(
+                json!({"_status": 500, "statusCode": 500, "error": "InternalError", "message": e.to_string()}),
+            )
+        }
     }
 }
 

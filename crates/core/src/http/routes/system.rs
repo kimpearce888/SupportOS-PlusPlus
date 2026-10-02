@@ -214,6 +214,11 @@ pub async fn demo_simulate_incoming(
             json!({"_status": 500, "ok": false, "message": "Failed to create conversation."}),
         );
     }
+    drop(conn);
+
+    // Push a real-time SyncUpdated event so connected SSE clients
+    // refresh their inbox view immediately.
+    crate::http::event_bus::notify_sync(&state.bus, "conversations", 1);
 
     Json(json!({
         "ok": true,
@@ -243,9 +248,31 @@ pub async fn demo_simulate_rating(
         );
     }
 
+    let conv_id = conversation_id.unwrap();
+    let rating_id = format!("demo_r_{}", chrono::Utc::now().timestamp_millis());
+    let rating_num: u32 = match rating {
+        "great" => 5,
+        "okay" => 3,
+        "bad" => 1,
+        _ => 0,
+    };
+
+    // Persist the simulated rating so the analytics dashboard sees it.
+    {
+        let conn = state.conn.lock().expect("mutex poisoned");
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO csat_ratings (id, conversation_id, rating, comments, created_at) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params![rating_id, conv_id, rating_num, comments],
+        );
+    }
+
+    // Push a RatingArrived event so the Reports / Customers pages refresh.
+    crate::http::event_bus::notify_rating(&state.bus, &rating_id, rating_num);
+
     Json(json!({
         "ok": true,
-        "message": format!("Simulated a {rating} rating on conversation #{conversation_id:?}.")
+        "message": format!("Simulated a {rating} rating on conversation #{conv_id}."),
+        "rating_id": rating_id,
     }))
 }
 
@@ -267,9 +294,25 @@ pub async fn demo_simulate_webhook(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
+    let event_id = format!("demo_wh_{}", chrono::Utc::now().timestamp_millis());
+
+    // Persist the simulated webhook event (dedup by hash, same as real webhooks).
+    {
+        let conn = state.conn.lock().expect("mutex poisoned");
+        let payload = serde_json::to_string(&body).unwrap_or_else(|_| "{}".into());
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO webhook_events (id, event_type, payload, received_at) VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params![event_id, event, payload],
+        );
+    }
+
+    // Push a WebhookReceived event so the Sync Health page refreshes.
+    crate::http::event_bus::notify_webhook(&state.bus, &event_id);
+
     Json(json!({
         "ok": true,
         "message": format!("{event} pushed through the webhook pipeline."),
         "remoteId": remote_id,
+        "event_id": event_id,
     }))
 }

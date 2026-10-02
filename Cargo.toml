@@ -67,7 +67,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # SSE streaming
 futures-util = "0.3"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 crc32fast = "1.4"
 
 # URL parsing (for SSRF guard in connectors)

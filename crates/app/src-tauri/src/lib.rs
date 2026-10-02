@@ -102,6 +102,8 @@ pub fn run() {
         port: http_port,
         host: "127.0.0.1".to_string(),
         demo_mode,
+        bus: spp_core::http::EventBus::default(),
+        limiter: spp_core::http::RateLimiter::new(),
     };
 
     let http_server = spp_core::http::HttpServer::new(http_state);
@@ -267,6 +269,8 @@ fn launch_without_db() {
         port: http_port,
         host: "127.0.0.1".to_string(),
         demo_mode,
+        bus: spp_core::http::EventBus::default(),
+        limiter: spp_core::http::RateLimiter::new(),
     };
 
     let http_server = spp_core::http::HttpServer::new(http_state);
