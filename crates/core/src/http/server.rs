@@ -55,6 +55,28 @@ impl HttpServer {
     pub fn build_router(&self) -> Router {
         let state = self.state.clone();
 
+        // DNS-rebinding guard: reject requests with non-loopback Host headers.
+        // This matches the reference's isLoopbackHostHeader check.
+        let dns_guard = axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let host = req
+                    .headers()
+                    .get(axum::http::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("");
+                if !is_loopback_host(host) {
+                    return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::FORBIDDEN)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"statusCode":403,"error":"Forbidden","message":"SupportOS is a local application: requests with non-loopback Host headers are refused (DNS-rebinding guard)."}"#,
+                    ))
+                    .unwrap();
+                }
+                next.run(req).await
+            },
+        );
+
         // CORS: localhost-only (matching the reference's allowedOrigins).
         let cors = CorsLayer::new()
             .allow_origin([
@@ -669,6 +691,7 @@ impl HttpServer {
             .with_state(state)
             .layer(cors)
             .layer(TraceLayer::new_for_http())
+            .layer(dns_guard)
     }
 
     /// Run the server forever.
@@ -679,4 +702,23 @@ impl HttpServer {
         axum::serve(listener, app).await?;
         Ok(())
     }
+}
+
+/// Check if a Host header is a loopback address.
+/// Matches the reference's isLoopbackHostHeader function.
+fn is_loopback_host(host: &str) -> bool {
+    if host.is_empty() {
+        return true; // HTTP/1.0-style requests carry no Host
+    }
+    let mut h = host.to_lowercase();
+    // Strip optional :port without breaking IPv6 literals ([::1]:3000).
+    if !h.ends_with(']') {
+        if let Some(idx) = h.rfind(':') {
+            if idx > 0 && h[idx + 1..].chars().all(|c| c.is_ascii_digit()) {
+                h.truncate(idx);
+            }
+        }
+    }
+    h = h.trim_start_matches('[').trim_end_matches(']').to_string();
+    h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "::ffff:127.0.0.1"
 }

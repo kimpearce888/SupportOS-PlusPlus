@@ -5,17 +5,19 @@
 //!   2. Load AppConfig (defaults; data_dir from SPP_DATA_DIR or per-OS convention).
 //!   3. Open SQLite with ALL migrations (M001–M028) applied.
 //!   4. Bind the loopback listener (D-002) on a free 127.0.0.1 port.
-//!   5. Start the Tauri app with IPC commands wired to the Rust core.
+//!   5. Start the HTTP API server on 127.0.0.1:3000 (mirrors the reference's Fastify server).
+//!   6. Start the Tauri app with IPC commands wired to the Rust core.
 //!
-//! Per spec A2: the only network listener is the loopback listener. No web API for the UI.
-//! Per spec: all mutations go through Tauri IPC commands — the UI never touches the DB directly.
+//! The HTTP server exposes all 310 API routes (same as the reference's Fastify server),
+//! serving both the Tauri webview and any browser client on localhost.
+//! Webhooks, SSE events, and demo endpoints are served via the HTTP server.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 #![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions, clippy::missing_errors_doc)]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use spp_core::config::AppConfig;
 use spp_core::db;
@@ -25,7 +27,7 @@ use spp_core::db;
 pub fn run() {
     spp_core::logging::init();
 
-    tracing::info!("SupportOS++ starting (M11 — all milestones complete)");
+    tracing::info!("SupportOS++ starting");
 
     // 1. Load the config (data_dir from SPP_DATA_DIR or per-OS convention).
     let app_config = AppConfig::default();
@@ -45,7 +47,7 @@ pub fn run() {
         }
     };
 
-    // 3. Bind the loopback listener (A2).
+    // 3. Bind the loopback listener (A2) — for OAuth callback + webhook receiver.
     let loopback_addr = match tauri::async_runtime::block_on(spp_core::loopback::Loopback::bind(
         app_config.loopback_port,
     )) {
@@ -61,8 +63,7 @@ pub fn run() {
     };
     let loopback_addr_str = loopback_addr.map(|a| a.to_string());
 
-    // 3.5 Run the startup self-check (M12 — packaging verification).
-    // The report is logged and made available via the `self_check` IPC command.
+    // 3.5 Run the startup self-check.
     let self_check_report = spp_core::self_check::run(&conn, loopback_addr_str.clone())
         .map_err(|e| {
             tracing::error!(error = %e, "self-check failed to run");
@@ -76,7 +77,45 @@ pub fn run() {
         }
     }
 
-    // 4. Launch Tauri with the DB connection in state + all IPC commands.
+    // 4. Start the HTTP API server on 127.0.0.1:3000 (mirrors the reference's Fastify server).
+    let http_port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+    let demo_mode = spp_core::settings::get_bool(&conn, "demo_mode", false).unwrap_or(false)
+        || std::env::var("LOCAL_DEMO_MODE").as_deref() == Ok("true");
+
+    // Open a SEPARATE connection for the HTTP server (SQLite WAL supports
+    // multiple connections to the same file). This avoids sharing a Mutex
+    // between the HTTP server's async handlers and Tauri's IPC commands.
+    let http_conn = match open_db_with_all_migrations(&db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to open HTTP server DB connection; HTTP API will be unavailable");
+            rusqlite::Connection::open_in_memory().expect("in-memory fallback")
+        }
+    };
+
+    let http_state = spp_core::http::server::AppState {
+        conn: Arc::new(Mutex::new(http_conn)),
+        data_dir: app_config.data_dir.clone(),
+        port: http_port,
+        host: "127.0.0.1".to_string(),
+        demo_mode,
+    };
+
+    let http_server = spp_core::http::HttpServer::new(http_state);
+    let http_addr = http_server.addr();
+    tracing::info!(%http_addr, "HTTP API server starting (mirrors reference Fastify on :3000)");
+
+    // Spawn the HTTP server as a background task.
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = http_server.serve().await {
+            tracing::error!(error = %e, "HTTP API server failed");
+        }
+    });
+
+    // 5. Launch Tauri with the DB connection in state + all IPC commands.
     let db_state = DbState {
         conn: Mutex::new(conn),
         self_check_report,
@@ -209,6 +248,36 @@ fn open_db_with_all_migrations(
 
 /// Launch the app without a DB connection (fallback for disk-full etc.).
 fn launch_without_db() {
+    // Still start the HTTP server with an in-memory DB so the API is available.
+    let http_port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+    let demo_mode = std::env::var("LOCAL_DEMO_MODE").as_deref() == Ok("true");
+
+    let http_conn = rusqlite::Connection::open_in_memory()
+        .expect("failed to open in-memory SQLite connection for HTTP server");
+    let _ = spp_core::db::ensure_migrations_table(&http_conn);
+    let mut http_conn = http_conn;
+    let _ = spp_core::migrations::run_all(&mut http_conn);
+
+    let http_state = spp_core::http::server::AppState {
+        conn: Arc::new(Mutex::new(http_conn)),
+        data_dir: std::env::temp_dir(),
+        port: http_port,
+        host: "127.0.0.1".to_string(),
+        demo_mode,
+    };
+
+    let http_server = spp_core::http::HttpServer::new(http_state);
+    tracing::info!(addr = %http_server.addr(), "HTTP API server starting (in-memory fallback)");
+
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = http_server.serve().await {
+            tracing::error!(error = %e, "HTTP API server failed");
+        }
+    });
+
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
         .manage(DbState {
