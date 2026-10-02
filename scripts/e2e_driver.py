@@ -208,18 +208,18 @@ def main():
         sys.exit(1)
 
     # Create a WebDriver session.
-    # tauri-driver expects the "alwaysMatch" capabilities format.
-    # The browserName must be "wry" (Tauri's webview runtime) on Linux.
+    # tauri-driver on Linux proxies to WebKitWebDriver (WebKit2GTK's WebDriver).
+    # The capabilities format is per the WebDriver spec. tauri-driver accepts
+    # an empty alwaysMatch (it will use the default WebKitWebDriver).
+    # We also pass the app binary via the "moz:firefoxOptions" trick — no,
+    # tauri-driver uses its own. Actually, tauri-driver expects NO browserName
+    # and it connects to the already-running app window via the webview.
     cap_result = webdriver_request(
         "POST",
         "/session",
         {
             "capabilities": {
-                "alwaysMatch": {
-                    "browserName": "wry",
-                    "browserVersion": "2",
-                    "platformName": "linux",
-                }
+                "alwaysMatch": {}
             }
         },
     )
