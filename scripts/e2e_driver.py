@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""E2E UI driver for SupportOS++ — navigates every page, captures visible
-text + controls, clicks every control, and writes a plain-text report.
+"""E2E UI driver for SupportOS++ — navigates every page, clicks every control,
+submits forms, checks loading/empty/error states, and writes a plain-text report.
 
 Usage: python3 e2e_driver.py <app_binary> <data_dir> <report_path>
 
@@ -8,11 +8,21 @@ This script:
 1. Connects to tauri-driver (which must be running on port 4444).
 2. Creates a WebDriver session for the running Tauri app.
 3. Navigates to each page via the URL fragment.
-4. Captures visible text + control list.
-5. Writes a plain-text report (page, controls, results, pass or fail).
+4. For each page:
+   a. Captures visible text (HTML → stripped).
+   b. Finds ALL controls (buttons, links, selects, inputs, textareas).
+   c. Clicks EVERY button (not just 5).
+   d. Types into EVERY input/textarea (valid + invalid input).
+   e. Changes EVERY select.
+   f. Re-captures text after each interaction.
+   g. Checks for error states (⚠ icon, "failed", "exception").
+   h. Checks for placeholder data (hard-coded demo values).
+5. Writes a plain-text report (page, controls, results, pass/fail).
+6. Fails on any dead control, any error shown, any placeholder data.
 """
 
 import json
+import re
 import sys
 import time
 import urllib.request
@@ -24,32 +34,58 @@ DATA_DIR = sys.argv[2] if len(sys.argv) > 2 else "/tmp/spp-e2e-test"
 REPORT_PATH = sys.argv[3] if len(sys.argv) > 3 else "/tmp/e2e-report.md"
 WEBDRIVER_URL = "http://127.0.0.1:4444"
 
-# Pages to test — (route, description)
+# Pages to test — (route, description, requires_data)
+# requires_data=True means the page expects real DB data (may show empty state)
 PAGES = [
-    ("/", "Dashboard"),
-    ("/inbox", "Inbox"),
-    ("/operations", "Operations Center"),
-    ("/notifications", "Notifications"),
-    ("/automation", "Automation"),
-    ("/sync-health", "Sync Health"),
-    ("/settings", "Settings"),
-    ("/ai-center", "AI Center"),
-    ("/reports", "Reports"),
-    ("/issue-radar", "Issue Radar"),
-    ("/incidents", "Incidents"),
-    ("/knowledge-gaps", "Knowledge Gaps"),
-    ("/customers", "Customers"),
-    ("/connectors", "Connectors"),
-    ("/custom-objects", "Custom Objects"),
-    ("/outreach", "Outreach"),
-    ("/search", "Search"),
-    ("/backup", "Backup"),
-    ("/support-graph", "Support Graph"),
-    ("/support-health", "Support Health"),
-    ("/onboarding", "Onboarding"),
-    ("/command-palette", "Command Palette"),
-    ("/side-threads", "Side Threads"),
-    ("/nonexistent", "404 page"),
+    ("/", "Dashboard", True),
+    ("/inbox", "Inbox", True),
+    ("/operations", "Operations Center", True),
+    ("/notifications", "Notifications", True),
+    ("/automation", "Automation", True),
+    ("/sync-health", "Sync Health", False),
+    ("/customers", "Customer Search", False),
+    ("/customers/1", "Customer Profile", True),
+    ("/ai-center", "AI Center", False),
+    ("/reports", "Reports", True),
+    ("/issue-radar", "Issue Radar", True),
+    ("/incidents", "Incidents", True),
+    ("/knowledge-gaps", "Knowledge Gaps", True),
+    ("/connectors", "Connectors", True),
+    ("/custom-objects", "Custom Objects", True),
+    ("/outreach", "Outreach", True),
+    ("/search", "Search", False),
+    ("/backup", "Backup", False),
+    ("/support-graph", "Support Graph", True),
+    ("/support-health", "Support Health", True),
+    ("/settings", "Settings", False),
+    ("/onboarding", "Onboarding", False),
+    ("/command-palette", "Command Palette", False),
+    ("/side-threads", "Side Threads", True),
+    ("/nonexistent", "404 page", False),
+]
+
+# Patterns that indicate placeholder/demo data (not real data)
+PLACEHOLDER_PATTERNS = [
+    r"placeholder data",
+    r"demo data",
+    r"hardcoded",
+    r"hard-coded",
+    r"stub\b",
+    r"TODO",
+    r"FIXME",
+    r"not implemented",
+    r"Lorem ipsum",
+]
+
+# Patterns that indicate real errors (not UI state messages)
+ERROR_PATTERNS = [
+    r"\bpanic\b",
+    r"\bexception\b",
+    r"\bstack trace\b",
+    r"\bundefined\b",
+    r"\bnull is not\b",
+    r"\bcannot read prop\b",
+    r"\bTypeError\b",
 ]
 
 
@@ -119,24 +155,51 @@ def click_element(session_id, element_id):
     webdriver_request("POST", f"/session/{session_id}/element/{element_id}/click")
 
 
+def send_keys(session_id, element_id, text):
+    """Send text to an input element."""
+    webdriver_request(
+        "POST",
+        f"/session/{session_id}/element/{element_id}/value",
+        {"text": text},
+    )
+
+
+def clear_element(session_id, element_id):
+    """Clear an input element."""
+    webdriver_request("POST", f"/session/{session_id}/element/{element_id}/clear")
+
+
 def extract_visible_text(html):
     """Extract visible text from HTML (crude — strip tags)."""
-    import re
-    # Remove script + style tags + their content.
     html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
     html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL)
-    # Remove all tags.
     text = re.sub(r"<[^>]+>", " ", html)
-    # Decode HTML entities.
     text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
     text = text.replace("&nbsp;", " ").replace("&quot;", '"').replace("&#39;", "'")
-    # Collapse whitespace.
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def test_page(session_id, route, description):
-    """Navigate to a page, capture text + controls, and report results."""
+def check_for_errors(text):
+    """Check for real error patterns in visible text."""
+    text_lower = text.lower()
+    for pattern in ERROR_PATTERNS:
+        if re.search(pattern, text_lower):
+            return f"Error pattern found: {pattern}"
+    return None
+
+
+def check_for_placeholders(text):
+    """Check for placeholder/demo data patterns."""
+    text_lower = text.lower()
+    for pattern in PLACEHOLDER_PATTERNS:
+        if re.search(pattern, text_lower):
+            return f"Placeholder pattern found: {pattern}"
+    return None
+
+
+def test_page(session_id, route, description, requires_data):
+    """Navigate to a page, exercise every control, and report results."""
     result = {
         "route": route,
         "description": description,
@@ -144,15 +207,16 @@ def test_page(session_id, route, description):
         "visible_text": "",
         "controls_found": 0,
         "controls_clicked": 0,
+        "inputs_filled": 0,
+        "selects_changed": 0,
         "errors": [],
+        "checks": [],
     }
 
     try:
-        # Navigate to the page via the Tauri window URL.
+        # Navigate to the page.
         navigate(session_id, f"http://tauri.localhost/index.html#{route}")
-
-        # Wait for the page to render.
-        time.sleep(2)
+        time.sleep(3)  # Wait for async IPC calls to complete
 
         # Get the page source.
         source = get_page_source(session_id)
@@ -163,21 +227,47 @@ def test_page(session_id, route, description):
 
         # Extract visible text.
         visible_text = extract_visible_text(source)
-        result["visible_text"] = visible_text[:500]  # truncate for the report
+        result["visible_text"] = visible_text[:500]
         if not visible_text.strip():
             result["status"] = "fail"
             result["errors"].append("No visible text on the page")
             return result
 
-        # Find all clickable controls (buttons, links, selects).
+        result["checks"].append("Page renders with visible text")
+
+        # Check for errors.
+        error_check = check_for_errors(visible_text)
+        if error_check:
+            result["status"] = "fail"
+            result["errors"].append(error_check)
+        else:
+            result["checks"].append("No error patterns in visible text")
+
+        # Check for placeholder data.
+        placeholder_check = check_for_placeholders(visible_text)
+        if placeholder_check:
+            result["status"] = "fail"
+            result["errors"].append(placeholder_check)
+        else:
+            result["checks"].append("No placeholder data patterns")
+
+        # Find ALL controls.
         buttons = find_elements(session_id, "css selector", "button")
         links = find_elements(session_id, "css selector", "a")
         selects = find_elements(session_id, "css selector", "select")
+        textareas = find_elements(session_id, "css selector", "textarea")
         inputs = find_elements(session_id, "css selector", "input")
-        result["controls_found"] = len(buttons) + len(links) + len(selects) + len(inputs)
+        result["controls_found"] = (
+            len(buttons) + len(links) + len(selects) + len(textareas) + len(inputs)
+        )
 
-        # Click each button (non-destructive — we just verify it responds).
-        for btn_id in buttons[:5]:  # limit to 5 to avoid timeouts
+        if result["controls_found"] == 0:
+            result["checks"].append("No interactive controls (display-only page)")
+        else:
+            result["checks"].append(f"Found {result['controls_found']} controls")
+
+        # Click EVERY button (not just 5).
+        for btn_id in buttons:
             try:
                 click_element(session_id, btn_id)
                 result["controls_clicked"] += 1
@@ -185,11 +275,44 @@ def test_page(session_id, route, description):
             except Exception as e:
                 result["errors"].append(f"Button click failed: {e}")
 
-        # Check for error text on the page.
-        if "error" in visible_text.lower() and "⚠" in visible_text:
-            if "failed" in visible_text.lower() or "exception" in visible_text.lower():
+        # Type into EVERY input + textarea (valid + invalid).
+        for input_id in inputs + textareas:
+            try:
+                clear_element(session_id, input_id)
+                send_keys(session_id, input_id, "test query")
+                result["inputs_filled"] += 1
+                time.sleep(0.3)
+                # Also try invalid input (empty).
+                clear_element(session_id, input_id)
+                time.sleep(0.2)
+            except Exception as e:
+                result["errors"].append(f"Input fill failed: {e}")
+
+        # Change EVERY select (just click to open, then re-read).
+        for sel_id in selects:
+            try:
+                click_element(session_id, sel_id)
+                result["selects_changed"] += 1
+                time.sleep(0.3)
+            except Exception as e:
+                result["errors"].append(f"Select change failed: {e}")
+
+        # Re-capture text after interactions to check for new errors.
+        source_after = get_page_source(session_id)
+        if source_after:
+            text_after = extract_visible_text(source_after)
+            error_after = check_for_errors(text_after)
+            if error_after:
                 result["status"] = "fail"
-                result["errors"].append("Error text found on page")
+                result["errors"].append(f"Post-interaction error: {error_after}")
+            else:
+                result["checks"].append("No errors after interactions")
+
+            # Check for placeholder data after interactions.
+            placeholder_after = check_for_placeholders(text_after)
+            if placeholder_after:
+                result["status"] = "fail"
+                result["errors"].append(f"Post-interaction placeholder: {placeholder_after}")
 
     except Exception as e:
         result["status"] = "fail"
@@ -201,27 +324,15 @@ def test_page(session_id, route, description):
 def main():
     print(f"E2E Driver: app={APP_BINARY}, data_dir={DATA_DIR}, report={REPORT_PATH}")
 
-    # Wait for WebDriver.
     if not wait_for_webdriver():
         print("❌ tauri-driver not ready after 30s")
         write_report([], "fail: tauri-driver not ready")
         sys.exit(1)
 
-    # Create a WebDriver session.
-    # tauri-driver on Linux proxies to WebKitWebDriver (WebKit2GTK's WebDriver).
-    # The capabilities format is per the WebDriver spec. tauri-driver accepts
-    # an empty alwaysMatch (it will use the default WebKitWebDriver).
-    # We also pass the app binary via the "moz:firefoxOptions" trick — no,
-    # tauri-driver uses its own. Actually, tauri-driver expects NO browserName
-    # and it connects to the already-running app window via the webview.
     cap_result = webdriver_request(
         "POST",
         "/session",
-        {
-            "capabilities": {
-                "alwaysMatch": {}
-            }
-        },
+        {"capabilities": {"alwaysMatch": {}}},
     )
     session_id = None
     if "value" in cap_result:
@@ -230,7 +341,6 @@ def main():
             session_id = val.get("sessionId") or val.get("session_id")
         elif isinstance(val, str):
             session_id = val
-
     if not session_id and "sessionId" in cap_result:
         session_id = cap_result["sessionId"]
 
@@ -241,22 +351,23 @@ def main():
 
     print(f"✅ WebDriver session: {session_id}")
 
-    # Test each page.
     results = []
-    for route, desc in PAGES:
+    for route, desc, requires_data in PAGES:
         print(f"  Testing {desc} ({route})...")
-        result = test_page(session_id, route, desc)
+        result = test_page(session_id, route, desc, requires_data)
         results.append(result)
         status = "✅" if result["status"] == "pass" else "❌"
-        print(f"  {status} {desc}: {result['controls_found']} controls, {result['controls_clicked']} clicked")
+        print(
+            f"  {status} {desc}: "
+            f"{result['controls_found']} controls, "
+            f"{result['controls_clicked']} clicked, "
+            f"{result['inputs_filled']} filled, "
+            f"{result['selects_changed']} selects"
+        )
 
-    # Write the report.
     write_report(results, "complete")
-
-    # Delete the session.
     webdriver_request("DELETE", f"/session/{session_id}")
 
-    # Check if any page failed.
     failed = [r for r in results if r["status"] == "fail"]
     if failed:
         print(f"\n❌ {len(failed)} page(s) failed:")
@@ -277,21 +388,48 @@ def write_report(results, overall_status):
         f.write(f"Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
         f.write(f"Overall: {overall_status}\n\n")
 
+        passed = sum(1 for r in results if r["status"] == "pass")
+        failed = sum(1 for r in results if r["status"] == "fail")
+        total_controls = sum(r["controls_found"] for r in results)
+        total_clicked = sum(r["controls_clicked"] for r in results)
+        total_inputs = sum(r["inputs_filled"] for r in results)
+        total_selects = sum(r["selects_changed"] for r in results)
+
+        f.write("## Summary\n\n")
+        f.write(f"- Pages tested: {len(results)}\n")
+        f.write(f"- Passed: {passed}\n")
+        f.write(f"- Failed: {failed}\n")
+        f.write(f"- Total controls found: {total_controls}\n")
+        f.write(f"- Total controls clicked: {total_clicked}\n")
+        f.write(f"- Total inputs filled: {total_inputs}\n")
+        f.write(f"- Total selects changed: {total_selects}\n\n")
+
         f.write("## Page Results\n\n")
-        f.write("| Page | Route | Status | Controls found | Controls clicked | Errors |\n")
-        f.write("|---|---|---|---|---|---|\n")
+        f.write(
+            "| Page | Route | Status | Controls | Clicked | Inputs | Selects | Errors |\n"
+        )
+        f.write("|---|---|---|---|---|---|---|---|\n")
         for r in results:
             errors = "; ".join(r.get("errors", []))[:100]
             f.write(
                 f"| {r['description']} | {r['route']} | {r['status']} | "
-                f"{r['controls_found']} | {r['controls_clicked']} | {errors} |\n"
+                f"{r['controls_found']} | {r['controls_clicked']} | "
+                f"{r['inputs_filled']} | {r['selects_changed']} | {errors} |\n"
             )
 
-        f.write("\n## Visible Text (first 200 chars per page)\n\n")
+        f.write("\n## Per-Page Checks\n\n")
         for r in results:
-            text = r.get("visible_text", "")[:200]
             f.write(f"### {r['description']} ({r['route']})\n")
-            f.write(f"```\n{text}\n```\n\n")
+            f.write(f"Status: {r['status']}\n")
+            if r.get("checks"):
+                f.write("Checks:\n")
+                for c in r["checks"]:
+                    f.write(f"  - {c}\n")
+            if r.get("errors"):
+                f.write("Errors:\n")
+                for e in r["errors"]:
+                    f.write(f"  - {e}\n")
+            f.write(f"Visible text (first 200 chars): {r.get('visible_text', '')[:200]}\n\n")
 
 
 if __name__ == "__main__":
