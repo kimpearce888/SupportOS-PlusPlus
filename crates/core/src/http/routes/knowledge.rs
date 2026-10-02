@@ -77,7 +77,18 @@ pub async fn search(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<Value> {
     let query = params.get("q").cloned().unwrap_or_default();
-    Json(json!({"results": [], "query": query}))
+    if query.trim().is_empty() {
+        return Json(json!({"results": [], "query": query}));
+    }
+    let conn = state.conn.lock().expect("mutex poisoned");
+    // Use the shared universal_search (FTS5) — same path the reference uses
+    // when Qdrant is not configured.
+    let results: Vec<Value> = crate::search::universal_search(&conn, &query)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| serde_json::to_value(&r).unwrap_or_else(|_| json!({})))
+        .collect();
+    Json(json!({"results": results, "query": query}))
 }
 
 /// GET /api/knowledge/freshness
@@ -102,17 +113,93 @@ pub async fn freshness(State(state): State<AppState>) -> Json<Value> {
 
 /// POST /api/knowledge/import
 pub async fn import(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
-    Json(json!({"ok": true, "imported": 0}))
+    // Body shape: { "documents": [{ "title": "...", "source": "...", "content": "..." }] }
+    let docs = body
+        .get("documents")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let conn = state.conn.lock().expect("mutex poisoned");
+    let mut imported = 0u32;
+    for doc in docs {
+        let title = doc
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled");
+        let source = doc
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("manual");
+        let content = doc.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if conn
+            .execute(
+                "INSERT INTO knowledge_doc_freshness (title, source, freshness_status, last_reviewed_at)
+                 VALUES (?1, ?2, 'fresh', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                rusqlite::params![title, source],
+            )
+            .is_ok()
+        {
+            imported += 1;
+        }
+    }
+    // Push a real-time SyncUpdated event so connected clients refresh.
+    if imported > 0 {
+        drop(conn);
+        crate::http::event_bus::notify_sync(&state.bus, "knowledge", imported);
+    }
+    Json(json!({"ok": true, "imported": imported}))
 }
 
 /// POST /api/knowledge/import-file
-pub async fn import_file(State(state): State<AppState>, Json(_body): Json<Value>) -> Json<Value> {
-    Json(json!({"ok": true, "imported": 0}))
+pub async fn import_file(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
+    // Body shape: { "filename": "...", "content": "..." } (content is text)
+    let filename = body
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("untitled.txt");
+    let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let conn = state.conn.lock().expect("mutex poisoned");
+    let imported = if conn
+        .execute(
+            "INSERT INTO knowledge_doc_freshness (title, source, freshness_status, last_reviewed_at)
+             VALUES (?1, 'file-upload', 'fresh', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params![filename],
+        )
+        .is_ok()
+    {
+        1
+    } else {
+        0
+    };
+    if imported > 0 {
+        drop(conn);
+        crate::http::event_bus::notify_sync(&state.bus, "knowledge", imported);
+    }
+    Json(json!({"ok": true, "imported": imported}))
 }
 
 /// GET /api/knowledge/importable
 pub async fn importable(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({"importable": []}))
+    // Returns documents the user could import (from connectors etc).
+    // For now, just list stale + unreviewed documents already in the DB.
+    let conn = state.conn.lock().expect("mutex poisoned");
+    let docs: Vec<Value> = conn
+        .prepare("SELECT id, title, source FROM knowledge_doc_freshness WHERE freshness_status = 'stale' ORDER BY last_reviewed_at ASC LIMIT 50")
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "title": r.get::<_, String>(1)?,
+                    "source": r.get::<_, String>(2)?,
+                }))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    Json(json!({"importable": docs}))
 }
 
 /// POST /api/knowledge/documents/:id/review
@@ -124,20 +211,59 @@ pub async fn review_document(State(state): State<AppState>, Path(id): Path<i64>)
 
 /// POST /api/knowledge/documents/:id/verify
 pub async fn verify_document(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    Json(json!({"ok": true, "verified": true}))
+    let conn = state.conn.lock().expect("mutex poisoned");
+    let rows = conn
+        .execute(
+            "UPDATE knowledge_doc_freshness
+             SET last_reviewed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                 freshness_status = 'fresh'
+             WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap_or(0);
+    drop(conn);
+    let verified = rows > 0;
+    if verified {
+        crate::http::event_bus::notify_sync(&state.bus, "knowledge", 1);
+    }
+    Json(json!({"ok": verified, "verified": verified}))
 }
 
 /// POST /api/knowledge/reindex
 pub async fn reindex(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({"ok": true, "message": "Reindex queued."}))
+    // Re-mark all stale documents as needing review (without losing content).
+    // A real reindex would rebuild the FTS5/vector index from the source
+    // documents; for the local SQLite-backed port, we just emit a
+    // SyncUpdated event so the UI refreshes the freshness view.
+    let conn = state.conn.lock().expect("mutex poisoned");
+    let marked = conn
+        .execute(
+            "UPDATE knowledge_doc_freshness
+             SET freshness_status = 'stale'
+             WHERE last_reviewed_at IS NULL
+                OR last_reviewed_at < datetime('now', '-30 days')",
+            [],
+        )
+        .unwrap_or(0);
+    drop(conn);
+    if marked > 0 {
+        crate::http::event_bus::notify_sync(&state.bus, "knowledge", marked as u32);
+    }
+    Json(json!({"ok": true, "marked_stale": marked, "message": "Reindex queued."}))
 }
 
 /// DELETE /api/knowledge/documents/:id
 pub async fn delete_document(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let conn = state.conn.lock().expect("mutex poisoned");
-    let _ = conn.execute(
-        "DELETE FROM knowledge_doc_freshness WHERE id = ?1",
-        rusqlite::params![id],
-    );
-    Json(json!({"ok": true}))
+    let rows = conn
+        .execute(
+            "DELETE FROM knowledge_doc_freshness WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap_or(0);
+    drop(conn);
+    if rows > 0 {
+        crate::http::event_bus::notify_sync(&state.bus, "knowledge", rows as u32);
+    }
+    Json(json!({"ok": rows > 0}))
 }

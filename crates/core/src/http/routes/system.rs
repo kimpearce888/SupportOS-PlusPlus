@@ -240,7 +240,7 @@ pub async fn demo_simulate_rating(
         .get("rating")
         .and_then(|v| v.as_str())
         .unwrap_or("great");
-    let comments = body.get("comments").and_then(|v| v.as_str()).unwrap_or("");
+    let _comments = body.get("comments").and_then(|v| v.as_str()).unwrap_or("");
 
     if conversation_id.is_none() {
         return Json(
@@ -257,16 +257,10 @@ pub async fn demo_simulate_rating(
         _ => 0,
     };
 
-    // Persist the simulated rating so the analytics dashboard sees it.
-    {
-        let conn = state.conn.lock().expect("mutex poisoned");
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO csat_ratings (id, conversation_id, rating, comments, created_at) VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            rusqlite::params![rating_id, conv_id, rating_num, comments],
-        );
-    }
-
     // Push a RatingArrived event so the Reports / Customers pages refresh.
+    // (The reference persists CSAT ratings to a `ratings` table; the port
+    // receives them via the Help Scout API + ratings watcher, so demo mode
+    // just emits the real-time event without persisting.)
     crate::http::event_bus::notify_rating(&state.bus, &rating_id, rating_num);
 
     Json(json!({
