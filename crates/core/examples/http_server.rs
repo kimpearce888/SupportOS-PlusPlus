@@ -70,8 +70,7 @@ async fn main() -> std::io::Result<()> {
     let _ = spp_core::settings::mark_first_run_done(&conn);
     let _ = spp_core::settings::set_bool(&conn, "demo_mode", true);
 
-    let demo_mode = spp_core::settings::get_bool(&conn, "demo_mode", false)
-        .unwrap_or(true);
+    let demo_mode = spp_core::settings::get_bool(&conn, "demo_mode", false).unwrap_or(true);
 
     let state = AppState {
         conn: Arc::new(Mutex::new(conn)),
