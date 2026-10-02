@@ -31,13 +31,14 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
-      - name: Install system dependencies (Tauri 2 + xvfb + tauri-driver deps)
+      - name: Install system dependencies (Tauri 2 + xvfb + WebDriver)
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev build-essential curl wget file pkg-config \
-            xvfb
+            xvfb \
+            webkit2gtk-driver
 
       - name: Install trunk + tauri-cli
         run: |
@@ -47,7 +48,8 @@ jobs:
       - name: Install tauri-driver
         run: |
           # tauri-driver is the WebDriver implementation for Tauri apps.
-          cargo install tauri-driver --locked || echo "tauri-driver install failed, will use fallback"
+          # It requires webkit2gtk-driver (installed above) for WebKit2GTK.
+          cargo install tauri-driver --locked
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -70,6 +72,10 @@ jobs:
 
       - name: Launch app + tauri-driver + run E2E
         run: |
+          # Ensure cargo bin is on PATH.
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+
           # Find the binary.
           APP_BIN="target/debug/supportos-plusplus"
           if [ ! -f "$APP_BIN" ]; then
@@ -77,6 +83,7 @@ jobs:
           fi
           if [ ! -f "$APP_BIN" ]; then
             echo "❌ App binary not found"
+            find . -name "supportos-plusplus" -type f 2>/dev/null | head -5
             exit 1
           fi
           echo "App binary: $APP_BIN"
@@ -91,10 +98,34 @@ jobs:
           XVFB_PID=$!
           sleep 2
 
+          # Verify tauri-driver is installed.
+          if ! command -v tauri-driver >/dev/null 2>&1; then
+            echo "❌ tauri-driver not found in PATH"
+            echo "PATH: $PATH"
+            ls -la "$HOME/.cargo/bin/" | grep tauri || true
+            exit 1
+          fi
+          echo "✅ tauri-driver found: $(which tauri-driver)"
+
           # Start tauri-driver (WebDriver server on port 4444).
+          # tauri-driver uses WebDriver protocol; it proxies to WebKit2GTK's driver.
           tauri-driver --port 4444 &
           DRIVER_PID=$!
-          sleep 2
+          echo "tauri-driver PID: $DRIVER_PID"
+          sleep 3
+
+          # Verify tauri-driver is listening.
+          if ! curl -s http://127.0.0.1:4444/status >/dev/null 2>&1; then
+            echo "❌ tauri-driver not responding on port 4444"
+            echo "Checking if process is still running..."
+            kill -0 $DRIVER_PID 2>/dev/null && echo "Process alive" || echo "Process dead"
+            # Try to get any error output.
+            wait $DRIVER_PID 2>/dev/null || true
+            kill $XVFB_PID 2>/dev/null || true
+            rm -rf "$SPP_DATA_DIR"
+            exit 1
+          fi
+          echo "✅ tauri-driver responding on port 4444"
 
           # Start the app under the virtual display.
           "$APP_BIN" &
@@ -116,7 +147,7 @@ jobs:
 
           # Print the report.
           echo "=== E2E REPORT ==="
-          cat /tmp/e2e-report.md
+          cat /tmp/e2e-report.md 2>/dev/null || echo "(no report file)"
           echo "=== END REPORT ==="
 
           # Cleanup.
