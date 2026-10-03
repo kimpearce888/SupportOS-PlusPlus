@@ -29,12 +29,17 @@ pub fn ReportsPage() -> impl IntoView {
         loading.set(true);
         error_msg.set(None);
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({
+            let body = serde_json::json!({
                 "metric": metric,
                 "dimension": dimension,
                 "days_back": days,
             });
-            match crate::ipc::invoke::<serde_json::Value>("report_build", &args).await {
+            match crate::api::post_json::<serde_json::Value>(
+                "/api/reports/builder/run",
+                Some(&body),
+            )
+            .await
+            {
                 Ok(data) => {
                     result.set(Some(data));
                     loading.set(false);

@@ -15,13 +15,14 @@ pub struct DashboardKpis {
     pub new_conversations: u32,
     pub closed_conversations: u32,
     pub active_conversations: u32,
-    pub customer_waiting: u32,
+    pub pending_conversations: u32,
+    pub unassigned: u32,
+    pub backlog: u32,
     pub avg_first_response_minutes: Option<f64>,
     pub avg_resolution_minutes: Option<f64>,
-    pub sla_breach_count: u32,
 }
 
-/// The dashboard page. Fetches metrics from `dashboard_metrics` IPC on mount.
+/// The dashboard page. Fetches metrics from `GET /api/analytics/dashboard`.
 #[component]
 pub fn DashboardPage() -> impl IntoView {
     let kpis = create_rw_signal(DashboardKpis::default());
@@ -33,40 +34,40 @@ pub fn DashboardPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "mailbox_id": null, "days_back": 7 });
-            match crate::ipc::invoke::<serde_json::Value>("dashboard_metrics", &args).await {
+            match crate::api::get_json::<serde_json::Value>("/api/analytics/dashboard?daysBack=7")
+                .await
+            {
                 Ok(data) => {
+                    let active = data
+                        .get("active_conversations")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let pending = data
+                        .get("pending_conversations")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    let closed = data
+                        .get("closed_conversations")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
                     kpis.set(DashboardKpis {
-                        total_conversations: data
-                            .get("total_conversations")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32,
+                        total_conversations: active + pending + closed,
                         new_conversations: data
                             .get("new_conversations")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as u32,
-                        closed_conversations: data
-                            .get("closed_conversations")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32,
-                        active_conversations: data
-                            .get("active_conversations")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32,
-                        customer_waiting: data
-                            .get("customer_waiting")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32,
+                        closed_conversations: closed,
+                        active_conversations: active,
+                        pending_conversations: pending,
+                        unassigned: data.get("unassigned").and_then(|v| v.as_u64()).unwrap_or(0)
+                            as u32,
+                        backlog: data.get("backlog").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                         avg_first_response_minutes: data
-                            .get("avg_first_response_minutes")
+                            .get("first_response_time_avg_min")
                             .and_then(|v| v.as_f64()),
                         avg_resolution_minutes: data
-                            .get("avg_resolution_minutes")
+                            .get("resolution_time_avg_min")
                             .and_then(|v| v.as_f64()),
-                        sla_breach_count: data
-                            .get("sla_breach_count")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32,
                     });
                     loading.set(false);
                 }
@@ -110,8 +111,9 @@ pub fn DashboardPage() -> impl IntoView {
                         <KpiCard label="New (7d)" value={move || kpis.get().new_conversations.to_string()} />
                         <KpiCard label="Active" value={move || kpis.get().active_conversations.to_string()} />
                         <KpiCard label="Closed" value={move || kpis.get().closed_conversations.to_string()} />
-                        <KpiCard label="Customer waiting" value={move || kpis.get().customer_waiting.to_string()} />
-                        <KpiCard label="SLA breaches" value={move || kpis.get().sla_breach_count.to_string()} />
+                        <KpiCard label="Pending" value={move || kpis.get().pending_conversations.to_string()} />
+                        <KpiCard label="Unassigned" value={move || kpis.get().unassigned.to_string()} />
+                        <KpiCard label="Backlog" value={move || kpis.get().backlog.to_string()} />
                         <KpiCard
                             label="Avg first response (min)"
                             value={move || kpis.get().avg_first_response_minutes

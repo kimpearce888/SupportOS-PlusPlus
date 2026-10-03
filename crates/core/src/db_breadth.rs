@@ -1198,7 +1198,7 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    /// The full boot chain, as the probe/conformance harnesses run it:
+    /// The full boot chain, as the app bootstrap runs it:
     /// base migrations + M003..M039, then M040.
     fn full_chain() -> Connection {
         let f = NamedTempFile::new()

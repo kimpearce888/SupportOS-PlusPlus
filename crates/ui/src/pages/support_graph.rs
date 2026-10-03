@@ -10,7 +10,7 @@ use crate::components::state_view::{EmptyState, LoadingState};
 #[component]
 pub fn SupportGraphPage() -> impl IntoView {
     let nodes = create_rw_signal(Vec::<serde_json::Value>::new());
-    let selected_node_id = create_rw_signal(None::<i64>);
+    let selected_node = create_rw_signal(None::<(String, i64)>);
     let neighbors = create_rw_signal(Vec::<serde_json::Value>::new());
     let loading = create_rw_signal(true);
     let error_msg = create_rw_signal(None::<String>);
@@ -20,9 +20,15 @@ pub fn SupportGraphPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "limit": 100 });
-            match crate::ipc::invoke::<Vec<serde_json::Value>>("graph_nodes_list", &args).await {
-                Ok(items) => {
+            // GET /api/graph/search (empty query lists the first nodes, LIKE
+            // the reference GraphExplorer's search endpoint).
+            match crate::api::get_json::<serde_json::Value>("/api/graph/search?q=").await {
+                Ok(data) => {
+                    let items = data
+                        .get("results")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     nodes.set(items);
                     loading.set(false);
                 }
@@ -37,12 +43,17 @@ pub fn SupportGraphPage() -> impl IntoView {
     create_effect(move |_| {
         let neighbors = neighbors;
         let error_msg = error_msg;
-        if let Some(nid) = selected_node_id.get() {
+        if let Some((kind, nid)) = selected_node.get() {
             wasm_bindgen_futures::spawn_local(async move {
-                let args = serde_json::json!({ "node_id": nid });
-                match crate::ipc::invoke::<Vec<serde_json::Value>>("graph_neighbors", &args).await {
-                    Ok(items) => {
-                        neighbors.set(items);
+                let path = format!("/api/graph/neighbors/{kind}/{nid}");
+                match crate::api::get_json::<serde_json::Value>(&path).await {
+                    Ok(data) => {
+                        neighbors.set(
+                            data.get("neighbors")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default(),
+                        );
                     }
                     Err(e) => {
                         error_msg.set(Some(e));
@@ -94,16 +105,19 @@ pub fn SupportGraphPage() -> impl IntoView {
                                         let id = n.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
                                         let kind = n.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                         let label = n.get("label").and_then(|v| v.as_str()).unwrap_or("(no label)").to_string();
-                                        let is_selected = move || selected_node_id.get() == Some(id);
+                                        let kind_for_click = kind.clone();
+                                        let kind_for_badge = kind.clone();
+                                        let is_selected =
+                                            move || selected_node.get() == Some((kind.clone(), id));
                                         view! {
                                             <li
                                                 class="spp-graph__node"
                                                 class:is-selected=is_selected
                                                 on:click=move |_| {
-                                                    selected_node_id.set(Some(id));
+                                                    selected_node.set(Some((kind_for_click.clone(), id)));
                                                 }
                                             >
-                                                <span class="spp-badge spp-badge--status">{kind.clone()}</span>
+                                                <span class="spp-badge spp-badge--status">{kind_for_badge}</span>
                                                 <span class="spp-graph__node-label">{label}</span>
                                                 <span class="spp-graph__node-id">{"#"}{id.to_string()}</span>
                                             </li>
@@ -116,7 +130,7 @@ pub fn SupportGraphPage() -> impl IntoView {
 
                     <main class="spp-graph__neighbors">
                         <Show
-                            when=move || selected_node_id.get().is_some()
+                            when=move || selected_node.get().is_some()
                             fallback=|| {
                                 view! {
                                     <EmptyState message="Select a node to view its neighbors." />

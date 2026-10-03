@@ -23,24 +23,32 @@ pub fn OutreachPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let seg_result = crate::ipc::invoke::<Vec<serde_json::Value>>(
-                "segments_list",
-                &serde_json::json!({}),
-            )
-            .await;
-            let camp_result = crate::ipc::invoke::<Vec<serde_json::Value>>(
-                "campaigns_list",
-                &serde_json::json!({}),
-            )
-            .await;
-            let dnc_result =
-                crate::ipc::invoke::<Vec<serde_json::Value>>("dnc_list", &serde_json::json!({}))
-                    .await;
+            // The three reference list endpoints, fetched in parallel order.
+            let seg_result =
+                crate::api::get_json::<serde_json::Value>("/api/outreach/segments").await;
+            let camp_result =
+                crate::api::get_json::<serde_json::Value>("/api/outreach/campaigns").await;
+            let dnc_result = crate::api::get_json::<serde_json::Value>("/api/outreach/dnc").await;
             match (seg_result, camp_result, dnc_result) {
                 (Ok(s), Ok(c), Ok(d)) => {
-                    segments.set(s);
-                    campaigns.set(c);
-                    dnc.set(d);
+                    segments.set(
+                        s.get("segments")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    campaigns.set(
+                        c.get("campaigns")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    dnc.set(
+                        d.get("dnc")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
                     loading.set(false);
                 }
                 (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {

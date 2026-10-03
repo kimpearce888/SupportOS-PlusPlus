@@ -1,17 +1,14 @@
-//! Automation page — the `/automation` route (M4-T11).
+//! Automation page — the `/automation` route.
 //!
-//! Per spec M4: "Team operations: Operations Center, workload and capacity,
-//! Notification Center, mentions, side threads, automation."
-//!
-//! This page shows:
-//! 1. The rules list (CRUD: name, trigger, action, enabled toggle).
-//! 2. The approval queue (pending items with approve/reject actions).
+//! Reference contract (Automation.tsx): `GET /api/automation/rules` returns
+//! `{rules, runs, risk_tiers, automation_enabled}`; the page shows the rules
+//! list plus the action-safety-tier summary. Approvals are not a separate
+//! queue in the reference — higher-risk actions park in the sync job flow.
 //!
 //! Per KNOWN PITFALLS: every view has loading, empty, and error states.
-//! Per A12: closed vocabularies are single-source-of-truth — the trigger
-//! and action enums come from `spp_core::automation` (mirrored here as
-//! `TriggerView` / `ActionView` for `'static` Leptos lifetimes).
-
+/// Per A12: closed vocabularies are single-source-of-truth — the trigger
+/// and action enums come from `spp_core::automation` (mirrored here as
+/// `TriggerView` / `ActionView` for `'static` Leptos lifetimes).
 use leptos::*;
 
 use crate::components::state_view::EmptyState;
@@ -30,25 +27,6 @@ pub struct AutomationRuleView {
     pub action: ActionView,
     /// Whether the rule is enabled.
     pub enabled: bool,
-}
-
-/// A UI-side automation approval. Mirrors
-/// `spp_core::automation::AutomationApproval`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AutomationApprovalView {
-    /// The row id.
-    pub id: i64,
-    /// The rule that proposed this action.
-    pub rule_id: i64,
-    /// The conversation the action targets.
-    pub conversation_id: i64,
-    /// The proposed action (mirrored enum). Parsed from
-    /// `proposed_action_json` by the Tauri shell before sending to the UI.
-    pub proposed_action: ActionView,
-    /// The approval status: 'pending', 'approved', or 'rejected'.
-    pub status: String,
-    /// When the approval row was created (ISO-8601 UTC).
-    pub created_at: String,
 }
 
 /// The UI-side mirror of `spp_core::automation::Trigger`.
@@ -154,73 +132,45 @@ impl ActionView {
 
 /// The Automation page component.
 ///
-/// Wired to `automation_list_rules` + `automation_list_pending` IPC.
+/// Wired to `GET /api/automation/rules`.
 #[component]
 pub fn AutomationPage() -> impl IntoView {
     let rules = create_rw_signal(Vec::<AutomationRuleView>::new());
-    let approvals = create_rw_signal(Vec::<AutomationApprovalView>::new());
+    let automation_enabled = create_rw_signal(None::<bool>);
+    let risk_tier_note = create_rw_signal(String::new());
     let loading = create_rw_signal(true);
+    let error_msg = create_rw_signal(None::<String>);
 
     create_effect(move |_| {
         let rules = rules;
-        let approvals = approvals;
+        let automation_enabled = automation_enabled;
+        let risk_tier_note = risk_tier_note;
         let loading = loading;
+        let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({});
-            // Fetch rules.
-            if let Ok(data) =
-                crate::ipc::invoke::<serde_json::Value>("automation_list_rules", &args).await
-            {
-                if let Some(arr) = data.as_array() {
-                    let views: Vec<AutomationRuleView> = arr
-                        .iter()
-                        .filter_map(|r| {
-                            let id = r.get("id")?.as_i64()?;
-                            let name = r.get("name")?.as_str()?.to_string();
-                            let enabled =
-                                r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                            Some(AutomationRuleView {
-                                id,
-                                name,
-                                trigger: TriggerView::SlaRisk,
-                                action: ActionView::SendNote {
-                                    body: String::new(),
-                                },
-                                enabled,
-                            })
-                        })
-                        .collect();
+            match crate::api::get_json::<serde_json::Value>("/api/automation/rules").await {
+                Ok(data) => {
+                    let views: Vec<AutomationRuleView> = data
+                        .get("rules")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(parse_rule_view).collect())
+                        .unwrap_or_default();
                     rules.set(views);
+                    automation_enabled
+                        .set(data.get("automation_enabled").and_then(|v| v.as_bool()));
+                    risk_tier_note.set(
+                        data.pointer("/risk_tiers/note")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                    loading.set(false);
+                }
+                Err(e) => {
+                    error_msg.set(Some(e));
+                    loading.set(false);
                 }
             }
-            // Fetch pending approvals.
-            if let Ok(data) =
-                crate::ipc::invoke::<serde_json::Value>("automation_list_pending", &args).await
-            {
-                if let Some(arr) = data.as_array() {
-                    let views: Vec<AutomationApprovalView> = arr
-                        .iter()
-                        .filter_map(|a| {
-                            let id = a.get("id")?.as_i64()?;
-                            let rule_id = a.get("rule_id")?.as_i64()?;
-                            let conversation_id = a.get("conversation_id")?.as_i64()?;
-                            let created_at = a.get("created_at")?.as_str()?.to_string();
-                            Some(AutomationApprovalView {
-                                id,
-                                rule_id,
-                                conversation_id,
-                                proposed_action: ActionView::SendNote {
-                                    body: String::new(),
-                                },
-                                status: "pending".into(),
-                                created_at,
-                            })
-                        })
-                        .collect();
-                    approvals.set(views);
-                }
-            }
-            loading.set(false);
         });
     });
 
@@ -233,19 +183,26 @@ pub fn AutomationPage() -> impl IntoView {
                 "low-impact actions (add tag, send note) execute directly."
             </p>
 
-            // ── Approval queue ──
-            <section class="spp-automation-approvals">
-                <h3 class="spp-automation-approvals__title">"Approval queue"</h3>
-                <Show
-                    when=move || !approvals.get().is_empty()
-                    fallback=move || {
-                        view! {
-                            <EmptyState message="No pending approvals. High-impact automation actions will appear here for review." />
-                        }
+            <Show when=move || error_msg.get().is_some() fallback=|| ()>
+                <div class="spp-state spp-state--error">
+                    <span class="spp-state__icon" aria-hidden="true">"⚠"</span>
+                    <p class="spp-state__body">{move || error_msg.get().unwrap_or_default()}</p>
+                </div>
+            </Show>
+
+            <section class="spp-automation-summary">
+                <div class="spp-rule-card__row">
+                    <span class="spp-rule-card__label">"Automation:"</span>
+                    <span class="spp-badge">
+                        {move || if automation_enabled.get().unwrap_or(false) { "✅ enabled" } else { "❌ disabled" }}
+                    </span>
+                </div>
+                {move || {
+                    let note = risk_tier_note.get();
+                    if note.is_empty() { ().into_view() } else {
+                        view! { <p class="spp-page__subtitle">{note}</p> }.into_view()
                     }
-                >
-                    <ApprovalQueue approvals=approvals.get() />
-                </Show>
+                }}
             </section>
 
             // ── Rules list ──
@@ -262,56 +219,6 @@ pub fn AutomationPage() -> impl IntoView {
                     <RulesList rules=rules.get() />
                 </Show>
             </section>
-        </div>
-    }
-}
-
-/// The approval queue — a list of pending approvals with approve/reject buttons.
-#[component]
-fn ApprovalQueue(approvals: Vec<AutomationApprovalView>) -> impl IntoView {
-    let rows_fragment = leptos::Fragment::new(
-        approvals
-            .iter()
-            .map(|a| {
-                view! {
-                    <ApprovalRow approval=a.clone() />
-                }
-                .into_view()
-            })
-            .collect::<Vec<_>>(),
-    );
-    view! {
-        <div class="spp-automation-queue">
-            {rows_fragment.clone()}
-        </div>
-    }
-}
-
-/// A single approval row.
-#[component]
-fn ApprovalRow(approval: AutomationApprovalView) -> impl IntoView {
-    let action_label = approval.proposed_action.label();
-    let requires_approval = approval.proposed_action.requires_approval();
-    let conv_id = approval.conversation_id;
-    let created_at = approval.created_at.clone();
-
-    view! {
-        <div class="spp-approval-row">
-            <div class="spp-approval-row__header">
-                <span class="spp-approval-row__action">{action_label}</span>
-                <span class="spp-approval-row__conv">"Conversation #" {conv_id} </span>
-                <span class="spp-approval-row__time">{created_at}</span>
-            </div>
-            <Show when=move || requires_approval fallback=|| ().into_view()>
-                <div class="spp-approval-row__actions">
-                    <button class="spp-approval-row__approve" type="button">
-                        "Approve"
-                    </button>
-                    <button class="spp-approval-row__reject" type="button">
-                        "Reject"
-                    </button>
-                </div>
-            </Show>
         </div>
     }
 }
@@ -383,6 +290,79 @@ fn RuleCard(rule: AutomationRuleView) -> impl IntoView {
     }
 }
 
+/// Parse one rule from the `GET /api/automation/rules` payload into the
+/// UI view (the core enums serialize as `{"kind": "..."}`-tagged objects).
+fn parse_rule_view(r: &serde_json::Value) -> Option<AutomationRuleView> {
+    let id = r.get("id")?.as_i64()?;
+    let name = r.get("name")?.as_str()?.to_string();
+    let enabled = r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    let trigger = match r.get("trigger")?.get("kind")?.as_str()? {
+        "status_changed" => TriggerView::StatusChanged {
+            from_status: r
+                .pointer("/trigger/from_status")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            to_status: r
+                .pointer("/trigger/to_status")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
+        "tag_added" => TriggerView::TagAdded {
+            tag: r
+                .pointer("/trigger/tag")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "sla_risk" => TriggerView::SlaRisk,
+        _ => return None,
+    };
+    let action = match r.get("action")?.get("kind")?.as_str()? {
+        "assign" => ActionView::Assign {
+            assignee_remote_id: r
+                .pointer("/action/assignee_remote_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default(),
+        },
+        "add_tag" => ActionView::AddTag {
+            tag: r
+                .pointer("/action/tag")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "send_note" => ActionView::SendNote {
+            body: r
+                .pointer("/action/body")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "change_status" => ActionView::ChangeStatus {
+            new_status: r
+                .pointer("/action/new_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "set_priority" => ActionView::SetPriority {
+            new_priority: r
+                .pointer("/action/new_priority")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        _ => return None,
+    };
+    Some(AutomationRuleView {
+        id,
+        name,
+        trigger,
+        action,
+        enabled,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,19 +376,6 @@ mod tests {
                 body: "Heads up".into(),
             },
             enabled,
-        }
-    }
-
-    fn sample_approval(id: i64, rule_id: i64, conv_id: i64) -> AutomationApprovalView {
-        AutomationApprovalView {
-            id,
-            rule_id,
-            conversation_id: conv_id,
-            proposed_action: ActionView::Assign {
-                assignee_remote_id: 42,
-            },
-            status: "pending".into(),
-            created_at: "2026-10-01T10:00:00Z".into(),
         }
     }
 
@@ -549,12 +516,6 @@ mod tests {
         assert!(rules.is_empty());
     }
 
-    #[test]
-    fn empty_approvals_renders_empty_state() {
-        let approvals: Vec<AutomationApprovalView> = Vec::new();
-        assert!(approvals.is_empty());
-    }
-
     // ---- Construction -------------------------------------------------------
 
     #[test]
@@ -566,11 +527,25 @@ mod tests {
     }
 
     #[test]
-    fn automation_approval_view_can_be_constructed() {
-        let a = sample_approval(1, 7, 1001);
-        assert_eq!(a.id, 1);
-        assert_eq!(a.rule_id, 7);
-        assert_eq!(a.conversation_id, 1001);
-        assert_eq!(a.status, "pending");
+    fn parse_rule_view_reads_kind_tagged_enums() {
+        let payload = serde_json::json!({
+            "id": 3, "name": "Escalate", "enabled": true,
+            "trigger": {"kind": "sla_risk"},
+            "action": {"kind": "change_status", "new_status": "pending"}
+        });
+        let v = parse_rule_view(&payload).expect("parses");
+        assert_eq!(v.trigger.label(), "SLA at risk");
+        assert_eq!(v.action.label(), "Set status: pending");
+        assert!(v.action.requires_approval());
+    }
+
+    #[test]
+    fn parse_rule_view_rejects_unknown_kinds() {
+        let payload = serde_json::json!({
+            "id": 4, "name": "Bad", "enabled": false,
+            "trigger": {"kind": "nope"},
+            "action": {"kind": "add_tag", "tag": "x"}
+        });
+        assert!(parse_rule_view(&payload).is_none());
     }
 }

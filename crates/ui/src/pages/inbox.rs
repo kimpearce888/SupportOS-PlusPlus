@@ -19,6 +19,20 @@ use leptos::*;
 
 use crate::components::state_view::{EmptyState, LoadingState};
 
+/// Percent-encode a query value (the query-string subset that needs it).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The conversation list item — matches the Rust `ConversationListItem`.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationListItem {
@@ -152,19 +166,22 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         // Read sse_refresh so the effect re-runs when it changes.
         let _ = sse_refresh.get();
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({
-                "filters": {
-                    "status": current_filters.status,
-                    "mailbox_id": current_filters.mailbox_id,
-                    "priority": current_filters.priority,
-                    "query": current_filters.query,
-                    "limit": 50,
-                }
-            });
-            match crate::ipc::invoke::<serde_json::Value>("inbox_list_conversations", &args).await {
+            // GET /api/conversations — the reference list endpoint. The view
+            // param carries the status filter; q the text filter.
+            let mut path = String::from("/api/conversations?pageSize=50");
+            if let Some(status) = current_filters.status {
+                path.push_str(&format!("&view={status}"));
+            }
+            if let Some(priority) = current_filters.priority {
+                path.push_str(&format!("&priority={priority}"));
+            }
+            if let Some(q) = current_filters.query {
+                path.push_str(&format!("&q={}", urlencode(&q)));
+            }
+            match crate::api::get_json::<serde_json::Value>(&path).await {
                 Ok(data) => {
                     let items = data
-                        .get("items")
+                        .get("conversations")
                         .and_then(|v| v.as_array())
                         .map(|arr| {
                             arr.iter()
@@ -190,11 +207,13 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     create_effect(move |_| {
         let saved_views = saved_views;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({});
-            match crate::ipc::invoke::<Vec<serde_json::Value>>("inbox_list_saved_views", &args)
-                .await
-            {
-                Ok(arr) => {
+            match crate::api::get_json::<serde_json::Value>("/api/inbox-views").await {
+                Ok(payload) => {
+                    let arr = payload
+                        .get("views")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     let views: Vec<SavedView> = arr
                         .iter()
                         .map(|v| SavedView {
@@ -226,24 +245,20 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
             detail_loading.set(true);
             detail_error.set(None);
             wasm_bindgen_futures::spawn_local(async move {
-                let args = serde_json::json!({ "conversation_id": id });
-                match crate::ipc::invoke::<Option<serde_json::Value>>(
-                    "inbox_get_conversation",
-                    &args,
-                )
-                .await
-                {
-                    Ok(Some(data)) => {
+                let path = format!("/api/conversations/{id}");
+                match crate::api::get_json::<serde_json::Value>(&path).await {
+                    Ok(data) => {
                         detail.set(Some(parse_conversation_detail(&data)));
                         detail_loading.set(false);
                     }
-                    Ok(None) => {
-                        detail_error.set(Some("Conversation not found".to_string()));
-                        detail.set(None);
-                        detail_loading.set(false);
-                    }
                     Err(e) => {
-                        detail_error.set(Some(e));
+                        // A 404 from the API means the conversation is gone.
+                        let msg = if e.contains("404") {
+                            "Conversation not found".to_string()
+                        } else {
+                            e
+                        };
+                        detail_error.set(Some(msg));
                         detail.set(None);
                         detail_loading.set(false);
                     }
@@ -271,22 +286,18 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
             }
         };
 
-        let cmd = match mode {
-            ComposerMode::Reply => "inbox_reply",
-            ComposerMode::Note => "inbox_add_note",
+        let sub_path = match mode {
+            ComposerMode::Reply => "reply",
+            ComposerMode::Note => "note",
         };
-        let args = serde_json::json!({
-            "conversation_remote_id": conv_remote_id,
-            "body": body,
-            "actor_type": "user",
-            "actor_id": null,
-        });
+        let path = format!("/api/conversations/{conv_remote_id}/{sub_path}");
+        let body_payload = serde_json::json!({ "body": body });
         let composer_success = composer_success;
         let composer_error = composer_error;
         let composer_body = composer_body;
         let selected_id = selected_id;
         wasm_bindgen_futures::spawn_local(async move {
-            match crate::ipc::invoke::<serde_json::Value>(cmd, &args).await {
+            match crate::api::post_json::<serde_json::Value>(&path, Some(&body_payload)).await {
                 Ok(result) => {
                     if result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                         let msg = result
@@ -322,16 +333,12 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     let change_status = move |new_status: String| {
         let conv_remote_id = detail.with(|d| d.as_ref().map(|d| d.remote_id));
         if let Some(conv_remote_id) = conv_remote_id {
-            let args = serde_json::json!({
-                "conversation_remote_id": conv_remote_id,
-                "new_status": new_status,
-                "actor_type": "user",
-                "actor_id": null,
-            });
             let detail_error = detail_error;
             let selected_id = selected_id;
             wasm_bindgen_futures::spawn_local(async move {
-                match crate::ipc::invoke::<serde_json::Value>("inbox_change_status", &args).await {
+                let path = format!("/api/conversations/{conv_remote_id}/status");
+                let payload = serde_json::json!({ "status": new_status });
+                match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
                     Ok(result) => {
                         if !result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                             let reason = result
@@ -359,16 +366,12 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     let assign_to = move |assignee_id: Option<i64>| {
         let conv_remote_id = detail.with(|d| d.as_ref().map(|d| d.remote_id));
         if let Some(conv_remote_id) = conv_remote_id {
-            let args = serde_json::json!({
-                "conversation_remote_id": conv_remote_id,
-                "assignee_local_id": assignee_id,
-                "actor_type": "user",
-                "actor_id": null,
-            });
             let detail_error = detail_error;
             let selected_id = selected_id;
             wasm_bindgen_futures::spawn_local(async move {
-                match crate::ipc::invoke::<serde_json::Value>("inbox_assign", &args).await {
+                let path = format!("/api/conversations/{conv_remote_id}/assign");
+                let payload = serde_json::json!({ "assigneeLocalId": assignee_id });
+                match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
                     Ok(result) => {
                         if !result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                             let reason = result
@@ -561,16 +564,14 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                 for id in ids {
                                     if let Some(item) = convs.iter().find(|c| c.id == id) {
                                         let remote_id = item.remote_id;
-                                        let args = serde_json::json!({
-                                            "conversation_remote_id": remote_id,
-                                            "new_status": "closed",
-                                            "actor_type": "user",
-                                            "actor_id": null,
-                                        });
                                         wasm_bindgen_futures::spawn_local(async move {
-                                            let _ = crate::ipc::invoke::<serde_json::Value>(
-                                                "inbox_change_status",
-                                                &args,
+                                            let path =
+                                                format!("/api/conversations/{remote_id}/status");
+                                            let payload =
+                                                serde_json::json!({ "status": "closed" });
+                                            let _ = crate::api::post_json::<serde_json::Value>(
+                                                &path,
+                                                Some(&payload),
                                             )
                                             .await;
                                         });

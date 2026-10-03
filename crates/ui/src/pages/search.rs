@@ -27,9 +27,14 @@ pub fn SearchPage() -> impl IntoView {
         error_msg.set(None);
         has_searched.set(true);
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "query": q });
-            match crate::ipc::invoke::<Vec<serde_json::Value>>("universal_search", &args).await {
-                Ok(r) => {
+            let body = serde_json::json!({ "query": q });
+            match crate::api::post_json::<serde_json::Value>("/api/search", Some(&body)).await {
+                Ok(data) => {
+                    let r = data
+                        .get("hits")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     results.set(r);
                     loading.set(false);
                 }
@@ -93,8 +98,8 @@ pub fn SearchPage() -> impl IntoView {
                     <ul class="spp-search__results">
                         {move || results.with(|items| {
                             items.iter().map(|r| {
-                                let resource_type = r.get("resource_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let remote_id = r.get("remote_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                                let resource_type = r.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let remote_id = r.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
                                 let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let snippet = r.get("snippet").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 view! {

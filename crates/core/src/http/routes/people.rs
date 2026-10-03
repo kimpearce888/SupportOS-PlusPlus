@@ -46,10 +46,29 @@ pub async fn list_customers(
 pub async fn get_customer(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::customers::get_customer(&conn, id) {
-        Ok(Some(c)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&c).unwrap_or(json!({}))),
-        ),
+        Ok(Some(c)) => {
+            // Reference CustomerDetailData: the customer payload carries the
+            // recent conversations (50, newest first) alongside the record.
+            let conversations = crate::inbox::list_conversations(
+                &conn,
+                &crate::inbox::InboxFilters {
+                    customer_id: Some(id),
+                    ..Default::default()
+                },
+            )
+            .map(|(items, _)| {
+                items
+                    .iter()
+                    .filter_map(|i| serde_json::to_value(i).ok())
+                    .collect::<Vec<Value>>()
+            })
+            .unwrap_or_default();
+            let mut payload = serde_json::to_value(&c).unwrap_or(json!({}));
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("conversations".to_string(), Value::Array(conversations));
+            }
+            (StatusCode::OK, Json(payload))
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"message": "Customer not found."})),

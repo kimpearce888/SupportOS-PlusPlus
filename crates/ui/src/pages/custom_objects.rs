@@ -21,11 +21,13 @@ pub fn CustomObjectsPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({});
-            match crate::ipc::invoke::<Vec<serde_json::Value>>("custom_object_types_list", &args)
-                .await
-            {
-                Ok(items) => {
+            match crate::api::get_json::<serde_json::Value>("/api/custom-objects/types").await {
+                Ok(data) => {
+                    let items = data
+                        .get("types")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     types.set(items);
                     loading.set(false);
                 }
@@ -42,14 +44,14 @@ pub fn CustomObjectsPage() -> impl IntoView {
         let error_msg = error_msg;
         if let Some(tid) = selected_type_id.get() {
             wasm_bindgen_futures::spawn_local(async move {
-                let args = serde_json::json!({ "type_id": tid });
-                match crate::ipc::invoke::<Vec<serde_json::Value>>(
-                    "custom_object_fields_list",
-                    &args,
-                )
-                .await
-                {
-                    Ok(items) => {
+                let path = format!("/api/custom-objects/types/{tid}");
+                match crate::api::get_json::<serde_json::Value>(&path).await {
+                    Ok(data) => {
+                        let items = data
+                            .get("fields")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
                         fields.set(items);
                     }
                     Err(e) => {

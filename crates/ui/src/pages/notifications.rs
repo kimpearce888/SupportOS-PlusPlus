@@ -155,11 +155,15 @@ pub fn NotificationsPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "user_id": 1, "limit": 50 });
-            match crate::ipc::invoke::<serde_json::Value>("notifications_list_unread", &args).await
+            match crate::api::get_json::<serde_json::Value>("/api/notifications?userId=1&limit=50")
+                .await
             {
                 Ok(data) => {
-                    let list = data.as_array().cloned().unwrap_or_default();
+                    let list = data
+                        .get("notifications")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     let views: Vec<NotificationView> = list
                         .into_iter()
                         .filter_map(|n| {

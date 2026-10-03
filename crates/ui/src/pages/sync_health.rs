@@ -81,13 +81,26 @@ pub fn SyncHealthPage() -> impl IntoView {
         let state = state;
         let loading = loading;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({});
-            match crate::ipc::invoke::<serde_json::Value>("sync_health_state", &args).await {
+            match crate::api::get_json::<serde_json::Value>("/api/sync/status").await {
                 Ok(data) => {
-                    let push_state = data
-                        .get("webhook_push_state")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("not_configured");
+                    // Derive the push state from the webhook stats block the
+                    // same way the reference SyncHealth banner does: events
+                    // received -> receiving; else sync runs -> registered.
+                    let events = data
+                        .pointer("/webhook/events/total")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let runs = data
+                        .pointer("/last_success/id")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let push_state = if events > 0 {
+                        "receiving"
+                    } else if runs > 0 {
+                        "registered"
+                    } else {
+                        "not_configured"
+                    };
                     let new_state = match push_state {
                         "receiving" => WebhookPushState::Receiving,
                         "registered" => WebhookPushState::Registered,
@@ -98,7 +111,7 @@ pub fn SyncHealthPage() -> impl IntoView {
                     loading.set(false);
                 }
                 Err(_) => {
-                    // If IPC fails (e.g. in browser without Tauri), show NotConfigured.
+                    // If the API is unreachable, show NotConfigured.
                     state.set(WebhookPushState::NotConfigured);
                     loading.set(false);
                 }

@@ -22,9 +22,24 @@ pub fn IncidentsPage() -> impl IntoView {
         let error_msg = error_msg;
         let current_status = status_filter.get();
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "status": current_status });
-            match crate::ipc::invoke::<Vec<serde_json::Value>>("incidents_list", &args).await {
-                Ok(items) => {
+            match crate::api::get_json::<serde_json::Value>("/api/incidents").await {
+                Ok(data) => {
+                    let items = data
+                        .get("incidents")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    // The HTTP list returns all incidents; apply the status
+                    // filter client-side (None = all).
+                    let items = match &current_status {
+                        Some(want) => items
+                            .into_iter()
+                            .filter(|i| {
+                                i.get("status").and_then(|v| v.as_str()) == Some(want.as_str())
+                            })
+                            .collect(),
+                        None => items,
+                    };
                     incidents.set(items);
                     loading.set(false);
                     error_msg.set(None);

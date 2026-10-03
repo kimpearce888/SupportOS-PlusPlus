@@ -12,6 +12,20 @@ use leptos::*;
 
 use crate::components::state_view::{EmptyState, LoadingState};
 
+/// Percent-encode a query value (the query-string subset that needs it).
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The customer profile page.
 #[component]
 pub fn CustomerProfilePage(customer_id: i64) -> impl IntoView {
@@ -28,22 +42,35 @@ pub fn CustomerProfilePage(customer_id: i64) -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "customer_id": customer_id });
-            let cust_result =
-                crate::ipc::invoke::<Option<serde_json::Value>>("customer_get", &args).await;
-            let convs_result =
-                crate::ipc::invoke::<Vec<serde_json::Value>>("customer_conversations", &args).await;
+            // Reference CustomerDetailData: GET /api/customers/:id returns the
+            // customer with its recent conversations; the timeline comes from
+            // GET /api/customers/:id/timeline.
+            let detail_path = format!("/api/customers/{customer_id}");
+            let cust_result = crate::api::get_json::<serde_json::Value>(&detail_path).await;
             let tl_result =
-                crate::ipc::invoke::<Vec<serde_json::Value>>("customer_timeline", &args).await;
+                crate::api::get_json::<serde_json::Value>(&format!("{detail_path}/timeline")).await;
 
-            match (cust_result, convs_result, tl_result) {
-                (Ok(c), Ok(cv), Ok(tl)) => {
-                    customer.set(c);
+            match (cust_result, tl_result) {
+                (Ok(mut c), Ok(tl)) => {
+                    let cv = c
+                        .get("conversations")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(obj) = c.as_object_mut() {
+                        obj.remove("conversations");
+                    }
+                    customer.set(Some(c));
                     conversations.set(cv);
-                    timeline.set(tl);
+                    timeline.set(
+                        tl.get("timeline")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
                     loading.set(false);
                 }
-                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                (Err(e), _) | (_, Err(e)) => {
                     error_msg.set(Some(e));
                     loading.set(false);
                 }
@@ -222,9 +249,14 @@ pub fn CustomerSearchPage() -> impl IntoView {
         loading.set(true);
         error_msg.set(None);
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "query": q, "limit": 20 });
-            match crate::ipc::invoke::<Vec<serde_json::Value>>("customer_search", &args).await {
-                Ok(r) => {
+            let path = format!("/api/customers?q={}&limit=20", urlencode(&q));
+            match crate::api::get_json::<serde_json::Value>(&path).await {
+                Ok(data) => {
+                    let r = data
+                        .get("customers")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     results.set(r);
                     loading.set(false);
                 }

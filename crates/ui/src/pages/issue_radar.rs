@@ -22,10 +22,16 @@ pub fn IssueRadarPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({});
-            match crate::ipc::invoke::<serde_json::Value>("issue_radar_snapshot", &args).await {
+            // GET /api/reports/issue-radar wraps the snapshot in {alerts: [...]}.
+            match crate::api::get_json::<serde_json::Value>("/api/reports/issue-radar").await {
                 Ok(data) => {
-                    snapshot.set(data);
+                    let snap = data
+                        .get("alerts")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .cloned()
+                        .unwrap_or(data);
+                    snapshot.set(snap);
                     loading.set(false);
                 }
                 Err(e) => {

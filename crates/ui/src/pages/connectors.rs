@@ -18,9 +18,13 @@ pub fn ConnectorsPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({});
-            match crate::ipc::invoke::<Vec<serde_json::Value>>("connectors_list", &args).await {
-                Ok(items) => {
+            match crate::api::get_json::<serde_json::Value>("/api/connectors").await {
+                Ok(data) => {
+                    let items = data
+                        .get("connectors")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     connectors.set(items);
                     loading.set(false);
                 }

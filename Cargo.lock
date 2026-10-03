@@ -6463,16 +6463,11 @@ name = "supportos-plusplus-app"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
- "serde",
- "serde_json",
  "supportos-plusplus-core",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
- "tempfile",
- "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

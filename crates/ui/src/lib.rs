@@ -26,7 +26,6 @@ use leptos_router::*;
 
 pub mod api;
 pub mod components;
-pub mod ipc;
 pub mod layout;
 pub mod pages;
 pub mod shortcuts;
