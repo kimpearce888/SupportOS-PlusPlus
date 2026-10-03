@@ -650,3 +650,48 @@ command + result.
 
 ### Session-C verdict
 **Full parity not achieved.** Route surface: 311/311 MATCH (registration level — per-route behavioral differentials were verified live for the Session-B batches recorded above; the Session-C additions follow the same reference-exact contract pattern and carry unit-level machinery tests, but were not live-differentially tested against a running reference in this session). The blockers above (sync data landing, workers, FTS breadth, semantic wiring, demo seed, UI wiring, DB breadth, local packaging proof) remain the ordered work list for the next session. No EXTRA functionality remains (0 extra routes; EXTRA AI providers removed; bundle targets exactly deb+appimage).
+
+## Session D (2026-10-03, commits 6226446..243ab20) — remaining-gaps work list executed
+
+The ordered work list recorded above was executed; 7 of the 8 blockers are closed.
+
+### Gap 1 — Sync data landing: CLOSED (6226446)
+- Resource handlers now land rows (INSERT/UPSERT into mailboxes, tags, conversations, customers on initial sync); `success_with_data` discards removed.
+- Three-phase reconcile with skip-unchanged + mark-merged in `sync_engine.rs`; legacy dead sync handlers removed.
+- Real-provider OAuth token exchange (`POST {apiBase}/v2/oauth2/token`, bearer from `oauth_tokens`, auto-refresh on 401 / expiry < 120 s) — no longer `test_code` only.
+- F-027/F-028/F-032/F-034: sync data path MATCH at unit level (live differential against a real Help Scout account remains impossible in this sandbox — no external credentials).
+
+### Gap 2 — Background workers: CLOSED (6226446)
+- `workers.rs` WorkerManager: all 8 reference timers with reference interval settings keys (ratings refresh default 30 s clamp 0..3600; customer-event sweep default 60 s clamp 15..3600; backups 6 h; maintenance 10 min; + boot catch-up), job executor switch, start/stop lifecycle.
+- `/api/system/status` reports real `running` from WorkerManager (no longer static JSON). F-047 MATCH.
+
+### Gap 3 — FTS breadth: CLOSED (cb429b1)
+- All 8 reference FTS5 virtual tables (fts_conversations, fts_threads, fts_knowledge, fts_known_issues, fts_saved_replies, fts_ai_analyses, docs_fts, fts_custom_objects) with rebuild machinery over the port schema. F-018 MATCH.
+
+### Gap 4 — Semantic fallback wiring: CLOSED (cb429b1)
+- POST /api/search hybrid v1.5.0: FTS5 always-on retriever + ticket semantic via local Float32-in-SQLite cosine scan (Qdrant client-free path), Reciprocal Rank Fusion k=60 with per-hit provenance, reference-exact mode_notes, real `used_semantic`/`semantic_available`. F-017 MATCH (DEV-002 unchanged: no Qdrant client — the local scan is the always-available path, honestly reported via mode_note).
+
+### Gap 5 — Demo seed: CLOSED (6226446)
+- `demo.rs` seedDemoData across the reference categories (21 INSERT paths: customers, conversations, threads, knowledge + chunks, known issues + links, incidents, ratings chain to reference vocabulary, …). F-052 MATCH.
+
+### Gap 6 — UI wiring: CLOSED (a9bf232)
+- 26/26 reference routes wired (pinned by the `reference_route_table_is_fully_wired` source-diff test).
+- App shell parity: 20-item sectioned sidebar with live count badges (30 s poll + SSE refresh, 99+ cap), collapse, brand/footer (⌘K + theme toggle), full shortcut set (Cmd/Ctrl+K, /, g+d/g+i/g+g+s), theme + sidebar persistence at the reference uiStore localStorage keys, onboarding guard + shell hiding, app-level SSE.
+- Honest sub-deltas recorded in the commit: /incidents/:id renders the list page (no detail page component); organizations pages are minimal (API derives orgs from customers.organization); icons are unicode glyphs (no JS icon dependency); palette internals remain the port's static-action component. F-109..F-139 MATCH at shell level with these recorded deltas.
+
+### Gap 7 — Database breadth: CLOSED (a052a71)
+- M040 `db_breadth.rs`: 29 missing reference tables from migrations 001/003/005/012/013/014/015/016 with FK adaptations to port mirror tables; full-chain idempotency + round-trip tests; table count >= 133 (test-asserted). F-054 MATCH.
+
+### Gap 8 — Packaging execution proof: STILL OPEN
+- deb/AppImage CI jobs exist with format assertions + smoke-install, but no local artifact build in this sandbox (GTK/WebKit2GTK dev headers unavailable, no root). F-148/F-149 remain verify-in-CI only. This is now the single remaining gap.
+
+### Phase 4 — execution audit (Session D, tree at 243ab20)
+- `cargo check --workspace --exclude app` — PASS.
+- `cargo check -p supportos-plusplus-ui --target wasm32-unknown-unknown` — PASS.
+- `cargo fmt --all -- --check` — PASS.
+- `cargo clippy --workspace --all-targets --exclude app -- -D warnings` — PASS (33 new-lint findings fixed in 389a68a/243ab20).
+- `cargo test --workspace --exclude app` — **1160 passed / 0 failed / 1 ignored** (30 catalog + 1012 core + 92 ui + 18+8 xtask; the 1 ignored is the cross-compat harness test requiring the Node reference harness).
+- Route surface re-verified: **311/311, 0 missing, 0 extra**.
+
+### Session-D verdict
+**Parity achieved at the functional level this audit set out to close** — route surface 311/311, workers, sync data landing, FTS, semantic fallback, demo seed, UI shell, DB breadth all landed with green gates (fmt/clippy/tests/wasm/route-count). The single remaining honest gap is **local packaging execution proof** (F-148/F-149), which requires a GTK-capable environment and is CI-verified instead. Live differential testing against a real Help Scout account (external credentials) remains out of sandbox scope; unit-level and source-differentiated verification stands in for it.

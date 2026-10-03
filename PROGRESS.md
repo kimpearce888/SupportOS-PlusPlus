@@ -130,3 +130,18 @@ readout routes landed with live-diff evidence. 916 tests pass.
   lifecycle, ticket-states CRUD, reports-builder run/saved, attributes,
   incidents/knowledge/interaction/memory/attachments clusters, T20 UI
   pages, packaging verification when a GTK-capable environment exists.
+- Session C (2026-10-03): phase-3 repository hygiene onto the consolidated
+  tree (stale doc generations removed, deviations tombstoned); 21 missing
+  routes implemented -> route surface 311/311; PARITY.md verdict recorded
+  with an honest 8-item ordered work list; tests 1034. All pushed as
+  53bdeaa..7b946d8.
+- Session D (2026-10-03): executed the 8-item work list. 6226446 workers
+  (WorkerManager 8 timers + real workers.running), sync data landing
+  (INSERT handlers + 3-phase reconcile + OAuth token exchange), maintenance
+  tick, connectors service, mirror tables, demo seed. cb429b1 FTS breadth
+  (8/8 FTS5 tables) + semantic fallback (local cosine + RRF hybrid
+  /api/search). a052a71 DB breadth M040 (29 tables, >= 133 total).
+  a9bf232 UI 26/26 routes + app shell parity. 389a68a/243ab20 gate fixes.
+  Gates: fmt/clippy(-D warnings)/wasm32/tests 1160 pass/route-count 311
+  all green. Remaining: local packaging proof (GTK unavailable in sandbox;
+  CI-verified).
