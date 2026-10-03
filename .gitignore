@@ -30,3 +30,11 @@ Thumbs.db
 
 # Crash dumps
 *.dmp
+
+# Working notes (task protocol)
+.work/
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
