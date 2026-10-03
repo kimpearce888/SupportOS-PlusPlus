@@ -1052,7 +1052,10 @@ impl HelpScoutProvider for RealHelpScoutProvider {
 
     async fn get_rating(&self, rating_id: i64) -> Result<Option<HsRating>> {
         // GET /v2/ratings/:id — 404 maps to None like the reference.
-        let raw = match self.request(&format!("/v2/ratings/{rating_id}"), "GET", None).await {
+        let raw = match self
+            .request(&format!("/v2/ratings/{rating_id}"), "GET", None)
+            .await
+        {
             Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
@@ -1075,8 +1078,14 @@ impl HelpScoutProvider for RealHelpScoutProvider {
             remote_id: raw.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
             conversation_id: raw.get("conversationId").and_then(|v| v.as_i64()),
             thread_id: raw.get("threadId").and_then(|v| v.as_i64()),
-            rating: raw.get("rating").and_then(|v| v.as_str()).map(str::to_string),
-            comment: raw.get("comments").and_then(|v| v.as_str()).map(str::to_string),
+            rating: raw
+                .get("rating")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            comment: raw
+                .get("comments")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             customer_id: customer.get("id").and_then(|v| v.as_i64()),
             customer_name,
             user_id: raw.get("userId").and_then(|v| v.as_i64()).or_else(|| {
@@ -1084,7 +1093,10 @@ impl HelpScoutProvider for RealHelpScoutProvider {
                     .and_then(|u| u.get("id"))
                     .and_then(|v| v.as_i64())
             }),
-            created_at: raw.get("createdAt").and_then(|v| v.as_str()).map(str::to_string),
+            created_at: raw
+                .get("createdAt")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         }))
     }
 

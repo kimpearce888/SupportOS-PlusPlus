@@ -188,12 +188,7 @@ pub fn apply_m039(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "known_issues", "feature", "TEXT")?;
     add_column_if_missing(conn, "known_issues", "known_cause", "TEXT")?;
     add_column_if_missing(conn, "known_issues", "workaround", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "known_issues",
-        "customer_safe_explanation",
-        "TEXT",
-    )?;
+    add_column_if_missing(conn, "known_issues", "customer_safe_explanation", "TEXT")?;
     add_column_if_missing(conn, "known_issues", "internal_explanation", "TEXT")?;
     add_column_if_missing(
         conn,
@@ -217,7 +212,10 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
         .filter_map(|r| r.ok())
         .any(|c| c == column);
     if !exists {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
     }
     Ok(())
 }

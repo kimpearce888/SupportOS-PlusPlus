@@ -1093,11 +1093,7 @@ impl SyncEngine {
     /// Public wrapper so the worker job executor can run single-resource
     /// syncs (`sync_tags`, `sync_user_statuses`, ...) through the same
     /// reference switch the coordinator uses.
-    pub async fn run_resource(
-        &self,
-        resource: &str,
-        initial: bool,
-    ) -> Result<ResourceSyncResult> {
+    pub async fn run_resource(&self, resource: &str, initial: bool) -> Result<ResourceSyncResult> {
         self.sync_resource(resource, initial).await
     }
 
@@ -1353,15 +1349,13 @@ impl SyncEngine {
                 for r in &ratings {
                     let (inserted, conv_local, conv_number, customer_local) = {
                         let conn = self.lock();
-                        let conv_local = r
-                            .conversation_id
-                            .and_then(|id| {
-                                if id > 0 {
-                                    conversation_local_id(&conn, id)
-                                } else {
-                                    None
-                                }
-                            });
+                        let conv_local = r.conversation_id.and_then(|id| {
+                            if id > 0 {
+                                conversation_local_id(&conn, id)
+                            } else {
+                                None
+                            }
+                        });
                         let conv_number = conv_local.and_then(|local| {
                             conn.query_row(
                                 "SELECT number FROM conversations WHERE id = ?1",
@@ -1370,18 +1364,20 @@ impl SyncEngine {
                             )
                             .ok()
                         });
-                        let customer_local = r
-                            .customer_id
-                            .and_then(|id| {
-                                if id > 0 {
-                                    local_id(&conn, "customers", id)
-                                } else {
-                                    None
-                                }
-                            });
-                        let user_local = r
-                            .user_id
-                            .and_then(|id| if id > 0 { local_id(&conn, "users", id) } else { None });
+                        let customer_local = r.customer_id.and_then(|id| {
+                            if id > 0 {
+                                local_id(&conn, "customers", id)
+                            } else {
+                                None
+                            }
+                        });
+                        let user_local = r.user_id.and_then(|id| {
+                            if id > 0 {
+                                local_id(&conn, "users", id)
+                            } else {
+                                None
+                            }
+                        });
                         let n = conn.execute(
                             "INSERT INTO ratings (remote_id, conversation_id, rating, comments,
                                  customer_local_id, user_local_id, remote_created_at, last_synced_at)

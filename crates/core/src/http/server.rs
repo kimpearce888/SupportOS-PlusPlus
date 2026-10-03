@@ -1168,10 +1168,18 @@ impl HttpServer {
     pub async fn serve(mut self) -> std::io::Result<()> {
         // 9. background workers (spec #99: start them before the listener).
         //    Jobs survive restarts; timers never block request handling.
-        let provider: Arc<dyn crate::helpscout::HelpScoutProvider> = match self.state.provider_kind.as_str() {
-            "real" => self.state.real.clone().map(|r| r as Arc<dyn crate::helpscout::HelpScoutProvider>).unwrap_or_else(|| Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())),
-            _ => Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo()),
-        };
+        let provider: Arc<dyn crate::helpscout::HelpScoutProvider> =
+            match self.state.provider_kind.as_str() {
+                "real" => self
+                    .state
+                    .real
+                    .clone()
+                    .map(|r| r as Arc<dyn crate::helpscout::HelpScoutProvider>)
+                    .unwrap_or_else(|| {
+                        Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+                    }),
+                _ => Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo()),
+            };
         let manager = crate::workers::start_workers(
             self.state.conn.clone(),
             self.state.sync.clone(),
@@ -1198,7 +1206,13 @@ impl HttpServer {
                             return;
                         }
                         let c = conn.lock().unwrap_or_else(|p| p.into_inner());
-                        let _ = crate::jobs::enqueue_on(&c, "embeddings", "embed_knowledge_chunks", "{}", 4);
+                        let _ = crate::jobs::enqueue_on(
+                            &c,
+                            "embeddings",
+                            "embed_knowledge_chunks",
+                            "{}",
+                            4,
+                        );
                         let seeded = crate::demo::seed_demo_data(&c);
                         if seeded {
                             let _ = crate::settings::set_string(&c, "demo_data_loaded", "true");
