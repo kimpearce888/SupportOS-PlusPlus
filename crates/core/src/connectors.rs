@@ -51,23 +51,43 @@ pub fn apply_m038(conn: &Connection) -> Result<()> {
             ON connector_rows (connector_id);",
     )?;
     let _ = add_column_if_missing(conn, "connectors", "auth", "TEXT NOT NULL DEFAULT '{}'");
-    let _ = add_column_if_missing(conn, "connectors", "refresh_method", "TEXT NOT NULL DEFAULT 'manual'");
     let _ = add_column_if_missing(
+        conn,
+        "connectors",
+        "refresh_method",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    );
+    add_column_if_missing(
         conn,
         "connectors",
         "refresh_seconds",
         "INTEGER NOT NULL DEFAULT 300",
     )?;
-    let _ = add_column_if_missing(conn, "connectors", "allowed_ai", "INTEGER NOT NULL DEFAULT 0")?;
-    let _ = add_column_if_missing(conn, "connectors", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    let _ = add_column_if_missing(conn, "connectors", "schema_json", "TEXT")?;
-    let _ = add_column_if_missing(conn, "connectors", "last_sync_at", "TEXT")?;
-    let _ = add_column_if_missing(conn, "connectors", "last_sync_status", "TEXT")?;
-    let _ = add_column_if_missing(conn, "connectors", "last_sync_error", "TEXT")?;
-    let _ = add_column_if_missing(conn, "connectors", "last_sync_rows", "INTEGER")?;
-    let _ = add_column_if_missing(conn, "connectors", "health", "TEXT NOT NULL DEFAULT 'never'")?;
-    let _ = add_column_if_missing(conn, "connectors", "updated_at", "TEXT")?;
-    let _ = add_column_if_missing(conn, "connectors", "provenance", "TEXT NOT NULL DEFAULT 'local_ui'");
+    add_column_if_missing(
+        conn,
+        "connectors",
+        "allowed_ai",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "connectors", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "connectors", "schema_json", "TEXT")?;
+    add_column_if_missing(conn, "connectors", "last_sync_at", "TEXT")?;
+    add_column_if_missing(conn, "connectors", "last_sync_status", "TEXT")?;
+    add_column_if_missing(conn, "connectors", "last_sync_error", "TEXT")?;
+    add_column_if_missing(conn, "connectors", "last_sync_rows", "INTEGER")?;
+    add_column_if_missing(
+        conn,
+        "connectors",
+        "health",
+        "TEXT NOT NULL DEFAULT 'never'",
+    )?;
+    add_column_if_missing(conn, "connectors", "updated_at", "TEXT")?;
+    let _ = add_column_if_missing(
+        conn,
+        "connectors",
+        "provenance",
+        "TEXT NOT NULL DEFAULT 'local_ui'",
+    );
     let _ = conn.execute("UPDATE app_state SET schema_version = 38 WHERE id = 1", []);
     Ok(())
 }
@@ -79,7 +99,10 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
         .filter_map(|r| r.ok())
         .any(|c| c == column);
     if !exists {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
     }
     Ok(())
 }
@@ -212,6 +235,7 @@ pub fn redacted(conn: &Connection, record: &Value) -> Value {
 }
 
 /// Create a connector (duplicate names are rejected like the reference).
+#[allow(clippy::too_many_arguments)] // mirrors the reference connector creation fields
 pub fn create(
     conn: &Connection,
     name: &str,
@@ -223,9 +247,11 @@ pub fn create(
     allowed_ai: bool,
 ) -> Result<Value> {
     let exists: Option<i64> = conn
-        .query_row("SELECT 1 FROM connectors WHERE name = ?1", params![name], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT 1 FROM connectors WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
         .ok();
     if exists.is_some() {
         return Err(Error::Config(format!(
@@ -269,18 +295,27 @@ pub fn patch(conn: &Connection, id: i64, changes: &Value) -> Result<Option<Value
                 )));
             }
         }
-        conn.execute("UPDATE connectors SET name = ?1 WHERE id = ?2", params![name, id])?;
+        conn.execute(
+            "UPDATE connectors SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
     }
     if let Some(config) = changes.get("config") {
         conn.execute(
             "UPDATE connectors SET config_json = ?1 WHERE id = ?2",
-            params![serde_json::to_string(config).unwrap_or_else(|_| "{}".into()), id],
+            params![
+                serde_json::to_string(config).unwrap_or_else(|_| "{}".into()),
+                id
+            ],
         )?;
     }
     if let Some(auth) = changes.get("auth") {
         conn.execute(
             "UPDATE connectors SET auth = ?1 WHERE id = ?2",
-            params![serde_json::to_string(auth).unwrap_or_else(|_| "{}".into()), id],
+            params![
+                serde_json::to_string(auth).unwrap_or_else(|_| "{}".into()),
+                id
+            ],
         )?;
     }
     if let Some(rm) = changes.get("refreshMethod").and_then(|v| v.as_str()) {
@@ -311,7 +346,10 @@ pub fn patch(conn: &Connection, id: i64, changes: &Value) -> Result<Option<Value
 }
 
 pub fn delete(conn: &Connection, id: i64) -> Result<bool> {
-    conn.execute("DELETE FROM connector_rows WHERE connector_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM connector_rows WHERE connector_id = ?1",
+        params![id],
+    )?;
     let n = conn.execute("DELETE FROM connectors WHERE id = ?1", params![id])?;
     Ok(n > 0)
 }
@@ -383,13 +421,7 @@ pub fn due_for_refresh(conn: &Connection) -> Result<Vec<i64>> {
     )?;
     let rows: Vec<(i64, i64, String, i64, Option<String>)> = stmt
         .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-            ))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -405,7 +437,7 @@ pub fn due_for_refresh(conn: &Connection) -> Result<Vec<i64>> {
             }
             match last_sync_at {
                 None => true,
-                Some(at) => match parse_sqlite_ts(&at) {
+                Some(at) => match parse_sqlite_ts(at) {
                     Some(ts) => now - ts >= *seconds,
                     None => true,
                 },
@@ -673,8 +705,8 @@ async fn fetch_rows(connector: &Value, data_dir: &Path) -> Result<Vec<Normalized
         "local_json" => {
             let file = config.get("file").and_then(|v| v.as_str()).unwrap_or("");
             let abs = jail_resolve(data_dir, file)?;
-            let stat = std::fs::metadata(&abs)
-                .map_err(|e| Error::Config(format!("file error: {e}")))?;
+            let stat =
+                std::fs::metadata(&abs).map_err(|e| Error::Config(format!("file error: {e}")))?;
             if stat.len() > HTTP_MAX_BYTES {
                 return Err(Error::Config(format!(
                     "file too large ({}MB > 10MB cap)",
@@ -690,8 +722,8 @@ async fn fetch_rows(connector: &Value, data_dir: &Path) -> Result<Vec<Normalized
         "csv" => {
             let file = config.get("file").and_then(|v| v.as_str()).unwrap_or("");
             let abs = jail_resolve(data_dir, file)?;
-            let stat = std::fs::metadata(&abs)
-                .map_err(|e| Error::Config(format!("file error: {e}")))?;
+            let stat =
+                std::fs::metadata(&abs).map_err(|e| Error::Config(format!("file error: {e}")))?;
             if stat.len() > HTTP_MAX_BYTES {
                 return Err(Error::Config(format!(
                     "file too large ({}MB > 10MB cap)",
@@ -708,27 +740,28 @@ async fn fetch_rows(connector: &Value, data_dir: &Path) -> Result<Vec<Normalized
             let table = config.get("table").and_then(|v| v.as_str()).unwrap_or("");
             let abs = jail_resolve(data_dir, file)?;
             let valid = !table.is_empty()
-                && table.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
                 && table
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic())
+                && table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
             if !valid {
                 return Err(Error::Config("invalid table name".into()));
             }
-            let sqlite = Connection::open_with_flags(
-                &abs,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .map_err(|e| Error::Config(format!("sqlite open: {e}")))?;
+            let sqlite =
+                Connection::open_with_flags(&abs, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(|e| Error::Config(format!("sqlite open: {e}")))?;
             let count: i64 = sqlite
-                .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| r.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+                    r.get(0)
+                })
                 .map_err(|e| Error::Config(format!("sqlite read: {e}")))?;
             let limit = count.min(MAX_ROWS_PER_CONNECTOR as i64);
-            let mut stmt = sqlite.prepare(&format!(
-                "SELECT * FROM \"{table}\" LIMIT {limit}"
-            ))?;
+            let mut stmt = sqlite.prepare(&format!("SELECT * FROM \"{table}\" LIMIT {limit}"))?;
             let col_count = stmt.column_count();
-            let names: Vec<String> = (0..col_count).filter_map(|i| stmt.column_name(i).ok().map(str::to_string)).collect();
+            let names: Vec<String> = (0..col_count)
+                .filter_map(|i| stmt.column_name(i).ok().map(str::to_string))
+                .collect();
             let rows: Vec<Value> = stmt
                 .query_map([], |row| {
                     let mut obj = Map::new();
@@ -784,7 +817,10 @@ async fn fetch_rows(connector: &Value, data_dir: &Path) -> Result<Vec<Normalized
                 .await
                 .map_err(|e| Error::Config(format!("http: {e}")))?;
             if !response.status().is_success() {
-                return Err(Error::Config(format!("HTTP {}", response.status().as_u16())));
+                return Err(Error::Config(format!(
+                    "HTTP {}",
+                    response.status().as_u16()
+                )));
             }
             if let Some(len) = response.content_length() {
                 if len > HTTP_MAX_BYTES {
@@ -803,7 +839,11 @@ async fn fetch_rows(connector: &Value, data_dir: &Path) -> Result<Vec<Normalized
             // Hard byte cap even when content-length lies.
             let mut body: Vec<u8> = Vec::new();
             let mut stream = response;
-            while let Some(chunk) = stream.chunk().await.map_err(|e| Error::Config(format!("read: {e}")))? {
+            while let Some(chunk) = stream
+                .chunk()
+                .await
+                .map_err(|e| Error::Config(format!("read: {e}")))?
+            {
                 if body.len() + chunk.len() > HTTP_MAX_BYTES as usize {
                     return Err(Error::Config(
                         "response exceeded the 10MB cap mid-stream".into(),
@@ -813,7 +853,8 @@ async fn fetch_rows(connector: &Value, data_dir: &Path) -> Result<Vec<Normalized
             }
             let body_text = String::from_utf8_lossy(&body).to_string();
             let trimmed = body_text.trim_start();
-            if content_type.contains("json") || trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if content_type.contains("json") || trimmed.starts_with('{') || trimmed.starts_with('[')
+            {
                 let payload: Value = serde_json::from_str(&body_text)
                     .map_err(|e| Error::Config(format!("invalid JSON: {e}")))?;
                 normalize_rows(payload, key_column.as_deref(), "the JSON response")
@@ -823,7 +864,11 @@ async fn fetch_rows(connector: &Value, data_dir: &Path) -> Result<Vec<Normalized
             } else {
                 Err(Error::Config(format!(
                     "unsupported content type: {}",
-                    if content_type.is_empty() { "(none)" } else { &content_type }
+                    if content_type.is_empty() {
+                        "(none)"
+                    } else {
+                        &content_type
+                    }
                 )))
             }
         }
@@ -869,7 +914,7 @@ pub fn parse_csv(text: &str, max_rows: usize) -> Vec<Value> {
                 }
                 record.push(std::mem::take(&mut field));
                 records.push(std::mem::take(&mut record));
-                if records.len() >= max_rows + 1 {
+                if records.len() > max_rows {
                     break;
                 }
             }
@@ -890,12 +935,19 @@ pub fn parse_csv(text: &str, max_rows: usize) -> Vec<Value> {
     let Some(headers) = records.first() else {
         return Vec::new();
     };
-    let headers: Vec<&str> = headers.iter().map(|h| h.trim()).filter(|h| !h.is_empty()).collect();
+    let headers: Vec<&str> = headers
+        .iter()
+        .map(|h| h.trim())
+        .filter(|h| !h.is_empty())
+        .collect();
     let mut rows = Vec::new();
     for rec in records.iter().take(max_rows + 1).skip(1) {
         let mut obj = Map::new();
         for (idx, h) in headers.iter().enumerate() {
-            obj.insert((*h).to_string(), json!(rec.get(idx).map(String::as_str).unwrap_or("")));
+            obj.insert(
+                (*h).to_string(),
+                json!(rec.get(idx).map(String::as_str).unwrap_or("")),
+            );
         }
         if !obj.is_empty() {
             rows.push(Value::Object(obj));
@@ -935,8 +987,8 @@ fn normalize_rows(
         }
         _ => {
             return Err(Error::Config(format!(
-                "{source_label} must be an array of objects (or {{ data: [...] }} / {{ rows: [...] }})"
-            )))
+            "{source_label} must be an array of objects (or {{ data: [...] }} / {{ rows: [...] }})"
+        )))
         }
     };
     let list: Vec<Value> = list.into_iter().take(MAX_ROWS_PER_CONNECTOR).collect();
@@ -1023,12 +1075,18 @@ pub fn search_for_ai(
     let Some(connector) = record else {
         return json!({ "error": "Connector not found" });
     };
-    let allowed = connector.get("allowed_ai").and_then(|v| v.as_i64()).unwrap_or(0);
+    let allowed = connector
+        .get("allowed_ai")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     if allowed == 0 {
         let name = connector.get("name").and_then(|v| v.as_str()).unwrap_or("");
         return json!({ "error": format!("Connector \"{name}\" is not marked as AI-visible. Data stays private to the UI.") });
     }
-    let enabled = connector.get("enabled").and_then(|v| v.as_i64()).unwrap_or(0);
+    let enabled = connector
+        .get("enabled")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     if enabled == 0 {
         let name = connector.get("name").and_then(|v| v.as_str()).unwrap_or("");
         return json!({ "error": format!("Connector \"{name}\" is disabled.") });
@@ -1073,9 +1131,9 @@ pub fn search_for_ai(
 
 /// Names of AI-visible connectors (for the honest tool description).
 pub fn ai_visible_connector_names(conn: &Connection) -> Vec<String> {
-    let mut stmt = match conn.prepare(
-        "SELECT name FROM connectors WHERE allowed_ai = 1 AND enabled = 1 ORDER BY name",
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT name FROM connectors WHERE allowed_ai = 1 AND enabled = 1 ORDER BY name")
+    {
         Ok(stmt) => stmt,
         Err(_) => return Vec::new(),
     };
@@ -1157,11 +1215,25 @@ mod tests {
         .unwrap();
         let id = created.get("id").and_then(|v| v.as_i64()).unwrap();
         // Duplicate name is rejected.
-        assert!(create(&conn, "CRM export", "csv", &json!({}), &json!({}), "manual", 300, false).is_err());
+        assert!(create(
+            &conn,
+            "CRM export",
+            "csv",
+            &json!({}),
+            &json!({}),
+            "manual",
+            300,
+            false
+        )
+        .is_err());
         // Patch + redaction.
-        let patched = patch(&conn, id, &json!({"refreshMethod": "interval", "refreshSeconds": 60}))
-            .unwrap()
-            .unwrap();
+        let patched = patch(
+            &conn,
+            id,
+            &json!({"refreshMethod": "interval", "refreshSeconds": 60}),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(patched.get("refresh_method"), Some(&json!("interval")));
         let redacted_record = redacted(&conn, &patched);
         assert_eq!(redacted_record.get("row_count"), Some(&json!(0)));
@@ -1181,7 +1253,8 @@ mod tests {
         let file = connectors_dir.join("rows.json");
         std::fs::write(
             &file,
-            serde_json::to_string(&[json!({"id": "a", "v": 1}), json!({"id": "b", "v": 2})]).unwrap(),
+            serde_json::to_string(&[json!({"id": "a", "v": 1}), json!({"id": "b", "v": 2})])
+                .unwrap(),
         )
         .unwrap();
         let data_dir = dir.path().to_path_buf();
@@ -1224,7 +1297,9 @@ mod tests {
     async fn refresh_missing_connector_is_error_health() {
         let conn = fresh_db();
         let shared = Arc::new(Mutex::new(conn));
-        let result = refresh(&shared, 999, &crate::config::default_data_dir()).await.unwrap();
+        let result = refresh(&shared, 999, &crate::config::default_data_dir())
+            .await
+            .unwrap();
         assert!(!result.ok);
         assert_eq!(result.error.as_deref(), Some("connector not found"));
     }

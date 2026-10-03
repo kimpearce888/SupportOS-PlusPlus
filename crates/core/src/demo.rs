@@ -306,15 +306,17 @@ fn upsert_document(
         rusqlite::params![id],
     )
     .ok();
-    let mut index = 0i64;
-    for chunk in content.split("\n\n").filter(|p| !p.trim().is_empty()) {
+    for (index, chunk) in content
+        .split("\n\n")
+        .filter(|p| !p.trim().is_empty())
+        .enumerate()
+    {
         conn.execute(
             "INSERT INTO knowledge_chunks (document_id, chunk_index, content)
              VALUES (?1, ?2, ?3)",
-            rusqlite::params![id, index, chunk],
+            rusqlite::params![id, index as i64, chunk],
         )
         .ok();
-        index += 1;
     }
     conn.execute(
         "UPDATE knowledge_documents SET last_indexed_at = datetime('now') WHERE id = ?1",
@@ -355,7 +357,7 @@ fn create_known_issue(conn: &Connection, ki: KnownIssueSeed<'_>) -> i64 {
                     ki.provenance,
                 ],
             )
-            .unwrap_or_else(|_| 0);
+            .unwrap_or(0);
             conn.last_insert_rowid()
         }
     };
@@ -395,7 +397,10 @@ fn save_analysis(
     conn.execute(
         "INSERT INTO ai_runs (input_hash, prompt_version, model, response_json)
          VALUES (?1, 'ticket_analysis_v1', 'demo_seed', ?2)",
-        rusqlite::params![input_hash, serde_json::to_string(analysis).unwrap_or_default()],
+        rusqlite::params![
+            input_hash,
+            serde_json::to_string(analysis).unwrap_or_default()
+        ],
     )
     .ok();
     let run_id = conn.last_insert_rowid();
@@ -473,7 +478,10 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
     for (sid, title, content, visibility) in &docs {
         upsert_document(conn, *sid, title, content, visibility);
     }
-    tracing::info!(count = docs.len(), "Seeded knowledge documents (customer-safe + internal-only)");
+    tracing::info!(
+        count = docs.len(),
+        "Seeded knowledge documents (customer-safe + internal-only)"
+    );
 
     // ---------------- Known issues ----------------
     let timezone_conv = by_number(5001);
@@ -516,13 +524,11 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
     let tz_convs: Vec<i64> = convs
         .iter()
         .filter(|c| {
-            c.subject
-                .as_deref()
-                .is_some_and(|s| {
-                    s.to_lowercase().contains("timezone")
-                        || s.to_lowercase().contains("hour")
-                        || s.to_lowercase().contains("reminder")
-                })
+            c.subject.as_deref().is_some_and(|s| {
+                s.to_lowercase().contains("timezone")
+                    || s.to_lowercase().contains("hour")
+                    || s.to_lowercase().contains("reminder")
+            })
         })
         .map(|c| c.id)
         .collect();
@@ -549,7 +555,10 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
         .filter(|c| {
             c.subject.as_deref().is_some_and(|s| {
                 let s = s.to_lowercase();
-                s.contains("card") || s.contains("invoice") || s.contains("vat") || s.contains("payment")
+                s.contains("card")
+                    || s.contains("invoice")
+                    || s.contains("vat")
+                    || s.contains("payment")
             })
         })
         .map(|c| c.id)
@@ -578,66 +587,82 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
     // ---------------- Sample AI analyses (marked ai_generated, demo provenance) ----------------
     let mut seeded_analyses = 0;
     let samples: Vec<(i64, serde_json::Value, Vec<serde_json::Value>)> = vec![
-        (5001, serde_json::json!({
-            "intent": "bug_report",
-            "primary_question": "How can the daily dispatch report schedule be made to follow the Santiago timezone after the DST change?",
-            "customer_goal": "Receive the daily dispatch report at 8 AM Chilean time, every day of the year.",
-            "product": "Reports", "feature": "Schedules", "problem_type": "defect",
-            "requested_action": "Fix the schedule to follow the workspace timezone, or provide steps to correct it.",
-            "urgency": "high", "sentiment": "negative",
-            "known_issue_candidate": "Schedules keep previous DST offset after a clock change",
-            "issue_cluster_candidate": "timezone schedules",
-            "summary": "A VIP operations customer in Chile reports that a daily scheduled report fires at 3 AM local time after a DST change. Re-saving the schedule fixed one report; a second one remains offset. This matches an identified known issue about schedule re-anchoring.",
-            "confidence": "high"
-        }), vec![
-            serde_json::json!({"source_type": "conversation", "source_id": by_number(5003).map(|c| c.id).unwrap_or(0), "title": "#5003 Timezone for scheduled exports", "relevance": 0.9, "visibility": "internal_only"}),
-            serde_json::json!({"source_type": "known_issue", "source_id": ki1, "title": "Schedules keep previous DST offset", "relevance": 0.95, "visibility": "uncertain"}),
-            serde_json::json!({"source_type": "knowledge_document", "source_id": doc_id_by_title(conn, "Timezones and scheduled reports"), "title": "Timezones and scheduled reports", "relevance": 0.9, "visibility": "customer_safe"}),
-        ]),
-        (5006, serde_json::json!({
-            "intent": "bug_report",
-            "primary_question": "Why did the Slack integration stop posting updates and when will it be fixed?",
-            "customer_goal": "Restore Slack alerting for their ops channel.",
-            "product": "Integrations", "feature": "Slack", "problem_type": "defect",
-            "requested_action": "Fix the integration urgently; they use it for alerting.",
-            "urgency": "critical", "sentiment": "frustrated",
-            "known_issue_candidate": "Slack integration stops posting after Slack token rotation",
-            "issue_cluster_candidate": "slack integration auth",
-            "summary": "A customer reports the Slack integration stopped posting updates, with log ID INT-88231. This matches a known engineering issue (Slack token rotation). Escalation note exists; customer-facing wording must stay generic.",
-            "confidence": "high"
-        }), vec![
-            serde_json::json!({"source_type": "known_issue", "source_id": ki2, "title": "Slack integration stops posting", "relevance": 0.95, "visibility": "uncertain"}),
-            serde_json::json!({"source_type": "knowledge_document", "source_id": doc_id_by_title(conn, "Slack integration 401 runbook (ENG-4471)"), "title": "Slack integration 401 runbook", "relevance": 0.9, "visibility": "internal_only"}),
-        ]),
-        (5004, serde_json::json!({
-            "intent": "question",
-            "primary_question": "Why is the invitation email for a new teammate not arriving?",
-            "customer_goal": "Get their teammate onboarded.",
-            "product": "Accounts", "feature": "Invitations", "problem_type": "configuration",
-            "requested_action": "Resend or fix the invitation delivery.",
-            "urgency": "normal", "sentiment": "neutral",
-            "known_issue_candidate": null,
-            "issue_cluster_candidate": "invite delivery",
-            "missing_information": ["Confirmation whether the re-sent invite arrived"],
-            "summary": "Invitations to brightpathedu.org are bouncing with a provider policy rejection. An internal note documents the whitelist fix and the re-send; awaiting customer confirmation.",
-            "confidence": "medium"
-        }), vec![
-            serde_json::json!({"source_type": "knowledge_document", "source_id": doc_id_by_title(conn, "Inviting teammates"), "title": "Inviting teammates", "relevance": 0.8, "visibility": "customer_safe"}),
-        ]),
-        (5007, serde_json::json!({
-            "intent": "billing",
-            "primary_question": "Can the failed card payment be retried?",
-            "customer_goal": "Restore the subscription to active.",
-            "product": "Billing", "feature": "Payments", "problem_type": "billing",
-            "requested_action": "Retry the charge on their valid card.",
-            "urgency": "high", "sentiment": "negative",
-            "known_issue_candidate": null,
-            "issue_cluster_candidate": "billing payment issues",
-            "summary": "Subscription shows past-due but the bank reports no charge attempt - the invoice likely entered a retry backoff. The documented self-service path is updating the card and clicking Retry payment.",
-            "confidence": "high"
-        }), vec![
-            serde_json::json!({"source_type": "knowledge_document", "source_id": doc_id_by_title(conn, "Updating your payment method"), "title": "Updating your payment method", "relevance": 0.9, "visibility": "customer_safe"}),
-        ]),
+        (
+            5001,
+            serde_json::json!({
+                "intent": "bug_report",
+                "primary_question": "How can the daily dispatch report schedule be made to follow the Santiago timezone after the DST change?",
+                "customer_goal": "Receive the daily dispatch report at 8 AM Chilean time, every day of the year.",
+                "product": "Reports", "feature": "Schedules", "problem_type": "defect",
+                "requested_action": "Fix the schedule to follow the workspace timezone, or provide steps to correct it.",
+                "urgency": "high", "sentiment": "negative",
+                "known_issue_candidate": "Schedules keep previous DST offset after a clock change",
+                "issue_cluster_candidate": "timezone schedules",
+                "summary": "A VIP operations customer in Chile reports that a daily scheduled report fires at 3 AM local time after a DST change. Re-saving the schedule fixed one report; a second one remains offset. This matches an identified known issue about schedule re-anchoring.",
+                "confidence": "high"
+            }),
+            vec![
+                serde_json::json!({"source_type": "conversation", "source_id": by_number(5003).map(|c| c.id).unwrap_or(0), "title": "#5003 Timezone for scheduled exports", "relevance": 0.9, "visibility": "internal_only"}),
+                serde_json::json!({"source_type": "known_issue", "source_id": ki1, "title": "Schedules keep previous DST offset", "relevance": 0.95, "visibility": "uncertain"}),
+                serde_json::json!({"source_type": "knowledge_document", "source_id": doc_id_by_title(conn, "Timezones and scheduled reports"), "title": "Timezones and scheduled reports", "relevance": 0.9, "visibility": "customer_safe"}),
+            ],
+        ),
+        (
+            5006,
+            serde_json::json!({
+                "intent": "bug_report",
+                "primary_question": "Why did the Slack integration stop posting updates and when will it be fixed?",
+                "customer_goal": "Restore Slack alerting for their ops channel.",
+                "product": "Integrations", "feature": "Slack", "problem_type": "defect",
+                "requested_action": "Fix the integration urgently; they use it for alerting.",
+                "urgency": "critical", "sentiment": "frustrated",
+                "known_issue_candidate": "Slack integration stops posting after Slack token rotation",
+                "issue_cluster_candidate": "slack integration auth",
+                "summary": "A customer reports the Slack integration stopped posting updates, with log ID INT-88231. This matches a known engineering issue (Slack token rotation). Escalation note exists; customer-facing wording must stay generic.",
+                "confidence": "high"
+            }),
+            vec![
+                serde_json::json!({"source_type": "known_issue", "source_id": ki2, "title": "Slack integration stops posting", "relevance": 0.95, "visibility": "uncertain"}),
+                serde_json::json!({"source_type": "knowledge_document", "source_id": doc_id_by_title(conn, "Slack integration 401 runbook (ENG-4471)"), "title": "Slack integration 401 runbook", "relevance": 0.9, "visibility": "internal_only"}),
+            ],
+        ),
+        (
+            5004,
+            serde_json::json!({
+                "intent": "question",
+                "primary_question": "Why is the invitation email for a new teammate not arriving?",
+                "customer_goal": "Get their teammate onboarded.",
+                "product": "Accounts", "feature": "Invitations", "problem_type": "configuration",
+                "requested_action": "Resend or fix the invitation delivery.",
+                "urgency": "normal", "sentiment": "neutral",
+                "known_issue_candidate": null,
+                "issue_cluster_candidate": "invite delivery",
+                "missing_information": ["Confirmation whether the re-sent invite arrived"],
+                "summary": "Invitations to brightpathedu.org are bouncing with a provider policy rejection. An internal note documents the whitelist fix and the re-send; awaiting customer confirmation.",
+                "confidence": "medium"
+            }),
+            vec![
+                serde_json::json!({"source_type": "knowledge_document", "source_id": doc_id_by_title(conn, "Inviting teammates"), "title": "Inviting teammates", "relevance": 0.8, "visibility": "customer_safe"}),
+            ],
+        ),
+        (
+            5007,
+            serde_json::json!({
+                "intent": "billing",
+                "primary_question": "Can the failed card payment be retried?",
+                "customer_goal": "Restore the subscription to active.",
+                "product": "Billing", "feature": "Payments", "problem_type": "billing",
+                "requested_action": "Retry the charge on their valid card.",
+                "urgency": "high", "sentiment": "negative",
+                "known_issue_candidate": null,
+                "issue_cluster_candidate": "billing payment issues",
+                "summary": "Subscription shows past-due but the bank reports no charge attempt - the invoice likely entered a retry backoff. The documented self-service path is updating the card and clicking Retry payment.",
+                "confidence": "high"
+            }),
+            vec![
+                serde_json::json!({"source_type": "knowledge_document", "source_id": doc_id_by_title(conn, "Updating your payment method"), "title": "Updating your payment method", "relevance": 0.9, "visibility": "customer_safe"}),
+            ],
+        ),
     ];
     for (number, analysis, sources) in &samples {
         if let Some(conv) = by_number(*number) {
@@ -645,7 +670,10 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
             seeded_analyses += 1;
         }
     }
-    tracing::info!(count = seeded_analyses, "Seeded sample AI analyses (marked ai_generated)");
+    tracing::info!(
+        count = seeded_analyses,
+        "Seeded sample AI analyses (marked ai_generated)"
+    );
 
     // A REPEATED question across two conversations (gap-engine input).
     let repeated_question = "How do I connect my own custom domain to my workspace?";
@@ -717,7 +745,11 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
     // ---------------- Incidents ----------------
     let slack_convs: Vec<i64> = convs
         .iter()
-        .filter(|c| c.subject.as_deref().is_some_and(|s| s.to_lowercase().contains("slack")))
+        .filter(|c| {
+            c.subject
+                .as_deref()
+                .is_some_and(|s| s.to_lowercase().contains("slack"))
+        })
         .map(|c| c.id)
         .collect();
     let tz_convs_all: Vec<i64> = convs
@@ -725,7 +757,10 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
         .filter(|c| {
             c.subject.as_deref().is_some_and(|s| {
                 let s = s.to_lowercase();
-                s.contains("timezone") || s.contains("hour") || s.contains("reminder") || s.contains("schedule")
+                s.contains("timezone")
+                    || s.contains("hour")
+                    || s.contains("reminder")
+                    || s.contains("schedule")
             })
         })
         .map(|c| c.id)
@@ -835,9 +870,24 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
             .unwrap_or(0);
         if existing == 0 {
             let candidates: Vec<(&str, serde_json::Value, Option<i64>, Option<i64>)> = vec![
-                ("Andes Logistics", serde_json::json!({"plan_tier": "enterprise", "mrr": 4800, "renewal_date": "2026-03-01", "csm": "Priya Nair"}), org_id_by_name("Andes Logistics"), by_number(5001).and_then(|c| c.customer_id)),
-                ("Bright Path Education", serde_json::json!({"plan_tier": "starter", "mrr": 240, "renewal_date": "2025-12-15", "csm": "Marcus Chen"}), org_id_by_name("Bright Path Education"), by_number(5004).and_then(|c| c.customer_id)),
-                ("Harbor Fitness", serde_json::json!({"plan_tier": "growth", "mrr": 990, "renewal_date": "2026-01-10", "csm": "Sofia Reyes"}), org_id_by_name("Harbor Fitness"), by_number(5005).and_then(|c| c.customer_id)),
+                (
+                    "Andes Logistics",
+                    serde_json::json!({"plan_tier": "enterprise", "mrr": 4800, "renewal_date": "2026-03-01", "csm": "Priya Nair"}),
+                    org_id_by_name("Andes Logistics"),
+                    by_number(5001).and_then(|c| c.customer_id),
+                ),
+                (
+                    "Bright Path Education",
+                    serde_json::json!({"plan_tier": "starter", "mrr": 240, "renewal_date": "2025-12-15", "csm": "Marcus Chen"}),
+                    org_id_by_name("Bright Path Education"),
+                    by_number(5004).and_then(|c| c.customer_id),
+                ),
+                (
+                    "Harbor Fitness",
+                    serde_json::json!({"plan_tier": "growth", "mrr": 990, "renewal_date": "2026-01-10", "csm": "Sofia Reyes"}),
+                    org_id_by_name("Harbor Fitness"),
+                    by_number(5005).and_then(|c| c.customer_id),
+                ),
             ];
             for (title, properties, org, customer) in candidates {
                 if customer.is_none() && org.is_none() {
@@ -845,7 +895,11 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
                 }
                 conn.execute(
                     "INSERT INTO custom_objects (type_id, title, data_json) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![type_id, title, serde_json::to_string(&properties).unwrap_or_default()],
+                    rusqlite::params![
+                        type_id,
+                        title,
+                        serde_json::to_string(&properties).unwrap_or_default()
+                    ],
                 )
                 .ok();
                 let object_id = conn.last_insert_rowid();
@@ -879,16 +933,30 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
             .unwrap_or(0);
         if existing == 0 {
             let slack_incident: Option<i64> = conn
-                .query_row("SELECT id FROM incidents WHERE code = 'INC-001'", [], |r| r.get(0))
+                .query_row("SELECT id FROM incidents WHERE code = 'INC-001'", [], |r| {
+                    r.get(0)
+                })
                 .ok();
             let releases = vec![
-                ("v4.12.0 production", serde_json::json!({"version": "v4.12.0", "environment": "production", "status": "degraded"}), slack_incident),
-                ("v4.11.2 production", serde_json::json!({"version": "v4.11.2", "environment": "production", "status": "healthy"}), None),
+                (
+                    "v4.12.0 production",
+                    serde_json::json!({"version": "v4.12.0", "environment": "production", "status": "degraded"}),
+                    slack_incident,
+                ),
+                (
+                    "v4.11.2 production",
+                    serde_json::json!({"version": "v4.11.2", "environment": "production", "status": "healthy"}),
+                    None,
+                ),
             ];
             for (title, properties, incident) in releases {
                 conn.execute(
                     "INSERT INTO custom_objects (type_id, title, data_json) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![type_id, title, serde_json::to_string(&properties).unwrap_or_default()],
+                    rusqlite::params![
+                        type_id,
+                        title,
+                        serde_json::to_string(&properties).unwrap_or_default()
+                    ],
                 )
                 .ok();
                 let object_id = conn.last_insert_rowid();
@@ -904,7 +972,10 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
             }
         }
     }
-    tracing::info!(count = object_count, "Seeded custom objects (accounts + deployments)");
+    tracing::info!(
+        count = object_count,
+        "Seeded custom objects (accounts + deployments)"
+    );
 
     // ---------------- Connector (Product releases, AI-visible) ----------------
     {
@@ -916,7 +987,12 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
             {"version": "v4.11.2", "channel": "production", "notes": "Scheduling engine patch"},
             {"version": "v4.10.0", "channel": "production", "notes": "Billing retry backoff fix"}
         ]);
-        if std::fs::write(&release_file, serde_json::to_string_pretty(&releases).unwrap_or_default()).is_ok() {
+        if std::fs::write(
+            &release_file,
+            serde_json::to_string_pretty(&releases).unwrap_or_default(),
+        )
+        .is_ok()
+        {
             let exists: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM connectors WHERE name = 'Product releases'",
@@ -935,7 +1011,10 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
                     3600,
                     true,
                 ) {
-                    tracing::info!(id = connector.get("id").and_then(|v| v.as_i64()).unwrap_or(0), "Seeded 1 local JSON connector (Product releases, AI-visible)");
+                    tracing::info!(
+                        id = connector.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+                        "Seeded 1 local JSON connector (Product releases, AI-visible)"
+                    );
                 }
             }
         }
@@ -980,7 +1059,8 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
             rusqlite::params![serde_json::to_string(&serde_json::json!({
                 "metric": "conversations", "dimension": "day", "dateFrom": from, "dateTo": to,
                 "comparison": "previous_period", "filters": {}, "sort": "dimension_asc", "limit": 40
-            })).unwrap_or_default()],
+            }))
+            .unwrap_or_default()],
         )
         .ok();
         tracing::info!("Seeded 1 saved report definition (conversations per day)");
@@ -992,10 +1072,14 @@ pub fn seed_demo_data(conn: &Connection) -> bool {
         Err(e) => tracing::warn!(error = %e, "Demo products seed skipped"),
     }
     let inc_a: Option<i64> = conn
-        .query_row("SELECT id FROM incidents WHERE code = 'INC-001'", [], |r| r.get(0))
+        .query_row("SELECT id FROM incidents WHERE code = 'INC-001'", [], |r| {
+            r.get(0)
+        })
         .ok();
     let inc_b: Option<i64> = conn
-        .query_row("SELECT id FROM incidents WHERE code = 'INC-002'", [], |r| r.get(0))
+        .query_row("SELECT id FROM incidents WHERE code = 'INC-002'", [], |r| {
+            r.get(0)
+        })
         .ok();
     if let (Some(inc_a), Some(inc_b)) = (inc_a, inc_b) {
         conn.execute(

@@ -197,9 +197,6 @@ pub fn upsert_customer(conn: &Connection, c: &HsCustomer) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpscout::FakeHelpScoutProvider;
-    use crate::runner::{JobRegistry, Runner};
-    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     fn fresh_db() -> Connection {
@@ -399,5 +396,4 @@ mod tests {
         assert_eq!(name, "General Support");
         assert_eq!(email, Some("new@example.com".into()));
     }
-
 }

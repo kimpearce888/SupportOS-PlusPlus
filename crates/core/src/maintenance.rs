@@ -44,7 +44,10 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
         .filter_map(|r| r.ok())
         .any(|c| c == column);
     if !exists {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])?;
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
     }
     Ok(())
 }
@@ -94,7 +97,10 @@ pub fn compute_trends(conn: &Connection) -> Result<()> {
         } else {
             "stable"
         };
-        tx.execute("UPDATE issue_clusters SET trend = ?1 WHERE id = ?2", rusqlite::params![trend, id])?;
+        tx.execute(
+            "UPDATE issue_clusters SET trend = ?1 WHERE id = ?2",
+            rusqlite::params![trend, id],
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -218,7 +224,7 @@ mod tests {
 
     #[test]
     fn products_registry_only_adds() {
-        let mut conn = fresh_db();
+        let conn = fresh_db();
         conn.execute(
             "INSERT INTO known_issues (name, product) VALUES ('KI', 'Widget')",
             [],
@@ -241,7 +247,7 @@ mod tests {
 
     #[test]
     fn trends_recompute_rising_new_stable() {
-        let mut conn = fresh_db();
+        let conn = fresh_db();
         conn.execute(
             "INSERT INTO customers (remote_id, first_name) VALUES (1, 'A')",
             [],
@@ -271,7 +277,9 @@ mod tests {
         // the reference switch order; only clusters without enough recent
         // volume stay 'new'.
         let trend: String = conn
-            .query_row("SELECT trend FROM issue_clusters WHERE id = 1", [], |r| r.get(0))
+            .query_row("SELECT trend FROM issue_clusters WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(trend, "rising");
         // first_seen within 14 days -> 'new' regardless (reference rule order).
@@ -285,7 +293,9 @@ mod tests {
         // reference's per-cluster switch has no 'new' branch for recent=0
         // (the blanket pre-update is always overridden by the loop).
         let trend2: String = conn
-            .query_row("SELECT trend FROM issue_clusters WHERE id = 2", [], |r| r.get(0))
+            .query_row("SELECT trend FROM issue_clusters WHERE id = 2", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(trend2, "stable");
     }

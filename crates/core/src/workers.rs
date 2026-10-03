@@ -106,7 +106,11 @@ impl WorkerManager {
             let conn = self.lock();
             match jobs::recover_stale_jobs(&conn) {
                 Ok(n) if n > 0 => {
-                    tracing::info!(count = n, operation = "recover", "Recovered stale jobs after restart");
+                    tracing::info!(
+                        count = n,
+                        operation = "recover",
+                        "Recovered stale jobs after restart"
+                    );
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "stale-job recovery failed"),
@@ -114,7 +118,11 @@ impl WorkerManager {
             // Recover webhook events persisted but never processed.
             let drained = crate::webhook_handler::drain_pending(&conn);
             if drained > 0 {
-                tracing::info!(count = drained, operation = "webhook_drain", "Drained pending webhook events after restart");
+                tracing::info!(
+                    count = drained,
+                    operation = "webhook_drain",
+                    "Drained pending webhook events after restart"
+                );
             }
         }
 
@@ -148,14 +156,23 @@ impl WorkerManager {
                     this.auto_sync().await;
                 }
             });
-            tracing::info!(operation = "start", sync_interval_minutes = raw, "worker auto-sync timer armed");
+            tracing::info!(
+                operation = "start",
+                sync_interval_minutes = raw,
+                "worker auto-sync timer armed"
+            );
         }
         // 3. Real-time ratings refresh (0 disables).
         {
             let seconds = {
                 let conn = self.lock();
-                crate::settings::get_i64(&conn, "ratings_refresh_seconds", RATINGS_REFRESH_DEFAULT_SECONDS).unwrap_or(RATINGS_REFRESH_DEFAULT_SECONDS)
-                    .clamp(0, 3600)
+                crate::settings::get_i64(
+                    &conn,
+                    "ratings_refresh_seconds",
+                    RATINGS_REFRESH_DEFAULT_SECONDS,
+                )
+                .unwrap_or(RATINGS_REFRESH_DEFAULT_SECONDS)
+                .clamp(0, 3600)
             };
             if seconds > 0 {
                 let this = self.clone();
@@ -208,7 +225,9 @@ impl WorkerManager {
         {
             let seconds = {
                 let conn = self.lock();
-                crate::settings::get_i64(&conn, "notification_sweep_seconds", 15).unwrap_or(15).clamp(5, 3600)
+                crate::settings::get_i64(&conn, "notification_sweep_seconds", 15)
+                    .unwrap_or(15)
+                    .clamp(5, 3600)
             };
             self.notification_sweep_tick();
             let this = self.clone();
@@ -226,7 +245,9 @@ impl WorkerManager {
         {
             let seconds = {
                 let conn = self.lock();
-                crate::settings::get_i64(&conn, "customer_event_sweep_seconds", 60).unwrap_or(60).clamp(15, 3600)
+                crate::settings::get_i64(&conn, "customer_event_sweep_seconds", 60)
+                    .unwrap_or(60)
+                    .clamp(15, 3600)
             };
             self.customer_event_sweep_tick();
             let this = self.clone();
@@ -272,9 +293,7 @@ impl WorkerManager {
     /// One bounded pass over the job queues (≤10 claims; never blocks on
     /// stuck jobs).
     pub async fn tick(&self) {
-        if self.stopped.load(Ordering::SeqCst)
-            || self.processing.swap(true, Ordering::SeqCst)
-        {
+        if self.stopped.load(Ordering::SeqCst) || self.processing.swap(true, Ordering::SeqCst) {
             return;
         }
         for _ in 0..10 {
@@ -323,9 +342,13 @@ impl WorkerManager {
             for r in &ratings {
                 let (inserted, conv_local, conv_number, customer_local) = {
                     let conn = self.lock();
-                    let conv_local = r
-                        .conversation_id
-                        .and_then(|id| if id > 0 { crate::sync_engine::conversation_local_id(&conn, id) } else { None });
+                    let conv_local = r.conversation_id.and_then(|id| {
+                        if id > 0 {
+                            crate::sync_engine::conversation_local_id(&conn, id)
+                        } else {
+                            None
+                        }
+                    });
                     let conv_number = conv_local.and_then(|local| {
                         conn.query_row(
                             "SELECT number FROM conversations WHERE id = ?1",
@@ -334,12 +357,20 @@ impl WorkerManager {
                         )
                         .ok()
                     });
-                    let customer_local = r
-                        .customer_id
-                        .and_then(|id| if id > 0 { crate::sync_engine::local_id(&conn, "customers", id) } else { None });
-                    let user_local = r
-                        .user_id
-                        .and_then(|id| if id > 0 { crate::sync_engine::local_id(&conn, "users", id) } else { None });
+                    let customer_local = r.customer_id.and_then(|id| {
+                        if id > 0 {
+                            crate::sync_engine::local_id(&conn, "customers", id)
+                        } else {
+                            None
+                        }
+                    });
+                    let user_local = r.user_id.and_then(|id| {
+                        if id > 0 {
+                            crate::sync_engine::local_id(&conn, "users", id)
+                        } else {
+                            None
+                        }
+                    });
                     (
                         upsert_rating_row(&conn, r, conv_local, customer_local, user_local)?,
                         conv_local,
@@ -390,9 +421,7 @@ impl WorkerManager {
         let data_dir = self.data_dir.clone();
         let bus = self.bus.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = conn
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut conn = conn.lock().unwrap_or_else(|p| p.into_inner());
             crate::maintenance::compute_trends(&conn)?;
             // v2.2.0: deterministic products registry refresh — never breaks
             // maintenance.
@@ -402,7 +431,8 @@ impl WorkerManager {
             let _ = crate::notification_sweep::sweep_once(&mut conn);
             // v1.6.0 audit fix: actually honor backup_interval_hours and
             // prune to the newest 20.
-            let backup_hours = crate::settings::get_i64(&conn, "backup_interval_hours", 24).unwrap_or(24);
+            let backup_hours =
+                crate::settings::get_i64(&conn, "backup_interval_hours", 24).unwrap_or(24);
             if backup_hours > 0 {
                 let backups_dir = data_dir.join("backups");
                 let backups = crate::backup_service::list_backups(&backups_dir);
@@ -413,15 +443,12 @@ impl WorkerManager {
                         let created = b
                             .get("created_at")
                             .and_then(|v| v.as_str())
-                            .map(parse_iso_to_unix)
-                            .flatten();
+                            .and_then(parse_iso_to_unix);
                         match created {
-                            Some(ts) => {
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs() as i64 - ts >= backup_hours * 3600)
-                                    .unwrap_or(true)
-                            }
+                            Some(ts) => std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64 - ts >= backup_hours * 3600)
+                                .unwrap_or(true),
                             None => true,
                         }
                     }
@@ -471,7 +498,9 @@ impl WorkerManager {
                 );
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, operation = "notification_sweep", "Notification sweep failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, operation = "notification_sweep", "Notification sweep failed")
+            }
         }
         self.sweeping_notifications.store(false, Ordering::SeqCst);
     }
@@ -493,7 +522,9 @@ impl WorkerManager {
                 );
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, operation = "customer_event_sweep", "Customer event sweep failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, operation = "customer_event_sweep", "Customer event sweep failed")
+            }
         }
         self.sweeping_customer_events.store(false, Ordering::SeqCst);
     }
@@ -507,8 +538,7 @@ impl WorkerManager {
         }
         let due: Vec<i64> = {
             let conn = self.lock();
-            crate::connectors::due_for_refresh(&conn)
-                .unwrap_or_default()
+            crate::connectors::due_for_refresh(&conn).unwrap_or_default()
         };
         let data_dir = self.data_dir.clone();
         for id in due {
@@ -539,7 +569,8 @@ impl WorkerManager {
     /// unknown kinds fail permanently (`Unknown job type`).
     async fn execute_job(&self, job_id: i64, kind: &str, payload: &str) {
         let started = std::time::Instant::now();
-        let payload: serde_json::Value = serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
+        let payload: serde_json::Value =
+            serde_json::from_str(payload).unwrap_or(serde_json::Value::Null);
         let num = |key: &str| -> Option<i64> {
             payload.get(key).and_then(|v| v.as_i64()).or_else(|| {
                 payload
@@ -742,7 +773,8 @@ impl WorkerManager {
         let conn = self.lock();
         // v2.2.0: products registry over the fresh mirror.
         let _ = crate::maintenance::refresh_products(&conn);
-        let auto_download = crate::settings::get_i64(&conn, "attachment_auto_download", 1).unwrap_or(1) != 0;
+        let auto_download =
+            crate::settings::get_i64(&conn, "attachment_auto_download", 1).unwrap_or(1) != 0;
         let _ = jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 2);
         // v1.5.0: semantic ticket search over the fresh mirror.
         let _ = jobs::enqueue_on(&conn, "embeddings", "embed_conversation_chunks", "{}", 2);
