@@ -104,12 +104,16 @@ pub enum ComposerMode {
 }
 
 /// The inbox page — 3-pane layout.
+///
+/// `conversation_id` is set on the `/inbox/conversation/:id` route (the
+/// reference's `useParams` id drives the initial selection; the reference
+/// keeps both routes on the same page component).
 #[component]
-pub fn InboxPage() -> impl IntoView {
+pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl IntoView {
     let conversations = create_rw_signal(Vec::<ConversationListItem>::new());
     let total = create_rw_signal(0u32);
     let filters = create_rw_signal(InboxFilters::default());
-    let selected_id = create_rw_signal(None::<i64>);
+    let selected_id = create_rw_signal(conversation_id);
     let detail = create_rw_signal(None::<ConversationDetail>);
     let detail_loading = create_rw_signal(false);
     let detail_error = create_rw_signal(None::<String>);

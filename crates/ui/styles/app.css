@@ -11,9 +11,13 @@
 
 :root {
   /* ─── Color tokens ────────────────────────────────────────────────────── */
-  /* Dark theme by default (the reference's screenshots are dark). */
+  /* Dark theme is the fallback (`:root`) token set; the persisted theme is
+     applied as `data-theme` on <html> before the first render — light users
+     get the [data-theme="light"] overrides below (reference parity). */
   --spp-bg: #0e1116;
   --spp-bg-elevated: #161b22;
+  --spp-bg-sunken: #0b0e13;
+  --spp-bg-hover: #20262e;
   --spp-bg-overlay: rgba(0, 0, 0, 0.55);
   --spp-fg: #e6edf3;
   --spp-fg-muted: #8b949e;
@@ -21,6 +25,7 @@
   --spp-accent: #4f9cf9;
   --spp-accent-hover: #6cb0ff;
   --spp-accent-pressed: #3a86e0;
+  --spp-accent-soft: rgba(79, 156, 249, 0.16);
   --spp-border: #2a2f37;
   --spp-border-subtle: #1c2128;
 
@@ -72,6 +77,34 @@
   --spp-ease: cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+/* ─── Light theme (reference global.css :root palette) ────────────────── */
+/* Selected by the persisted `supportos-theme` uiStore value via
+   document.documentElement[data-theme="light"]; applied at boot before the
+   first render. */
+[data-theme="light"] {
+  --spp-bg: #f5f6f8;
+  --spp-bg-elevated: #ffffff;
+  --spp-bg-sunken: #eceef1;
+  --spp-bg-hover: #f0f2f5;
+  --spp-bg-overlay: rgba(29, 39, 51, 0.45);
+  --spp-fg: #1d2733;
+  --spp-fg-muted: #52606f;
+  --spp-fg-subtle: #7b8794;
+  --spp-accent: #2c5ff2;
+  --spp-accent-hover: #1f4bd6;
+  --spp-accent-pressed: #1a41b8;
+  --spp-accent-soft: #e8eefd;
+  --spp-border: #d8dde3;
+  --spp-border-subtle: #eceef1;
+  --spp-info: #1f6feb;
+  --spp-warning: #b26a00;
+  --spp-critical: #c4322b;
+  --spp-success: #178f4d;
+  --spp-shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.1);
+  --spp-shadow-md: 0 4px 12px rgba(16, 24, 40, 0.12);
+  --spp-shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.16);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -95,32 +128,69 @@ body {
   flex-direction: column;
 }
 
-/* ─── Layout shell ──────────────────────────────────────────────────────── */
-.spp-shell {
+/* ─── App shell: sidebar + main area (reference App.tsx parity) ────────── */
+.spp-app-shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.spp-app-effects {
+  display: none;
+}
+
+.spp-sidebar {
+  width: 208px;
+  flex-shrink: 0;
+  background: var(--spp-bg-elevated);
+  border-right: 1px solid var(--spp-border);
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  padding: var(--spp-space-2);
+  overflow-y: auto;
 }
 
-.spp-topbar {
+.spp-sidebar--collapsed {
+  width: 52px;
+}
+
+.spp-sidebar__brand {
   display: flex;
   align-items: center;
-  gap: var(--spp-space-3);
-  padding: var(--spp-space-3) var(--spp-space-5);
-  border-bottom: 1px solid var(--spp-border);
-  background: var(--spp-bg-elevated);
-}
-
-.spp-topbar__title {
+  gap: var(--spp-space-2);
+  padding: var(--spp-space-1) var(--spp-space-2) var(--spp-space-3);
+  font-weight: 700;
   font-size: var(--spp-text-lg);
-  font-weight: 600;
-  margin: 0;
+  color: var(--spp-fg);
 }
 
-.spp-topbar__version {
-  font-size: var(--spp-text-xs);
-  color: var(--spp-fg-muted);
-  font-family: var(--spp-font-mono);
+.spp-sidebar__logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: var(--spp-accent);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 800;
+  flex-shrink: 0;
+}
+
+.spp-sidebar__brand-name {
+  white-space: nowrap;
+}
+
+.spp-sidebar__collapse {
+  margin-left: auto;
+}
+
+.spp-main-area {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .spp-main {
@@ -128,8 +198,8 @@ body {
   padding: var(--spp-space-6) var(--spp-space-5);
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
+  align-items: stretch;
+  justify-content: flex-start;
 }
 
 .spp-footer {
@@ -139,6 +209,64 @@ body {
   font-size: var(--spp-text-xs);
   text-align: center;
   background: var(--spp-bg-elevated);
+}
+
+/* ─── Sidebar footer: Command (⌘K) + theme toggle ─────────────────────── */
+.spp-sidebar__footer {
+  margin-top: auto;
+  padding: var(--spp-space-2) var(--spp-space-1);
+  border-top: 1px solid var(--spp-border);
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-2);
+}
+
+.spp-sidebar__footer-button {
+  width: 100%;
+  justify-content: flex-start;
+}
+
+/* Keyboard hint chip (reference .kbd). */
+.spp-kbd {
+  font-family: var(--spp-font-mono);
+  font-size: 10px;
+  background: var(--spp-bg-sunken);
+  border: 1px solid var(--spp-border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--spp-fg-muted);
+}
+
+/* Fixed shortcut legend (reference .shortcut-bar); hidden on narrow viewports. */
+.spp-shortcut-bar {
+  position: fixed;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: 20px;
+  padding: var(--spp-space-1) var(--spp-space-3);
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+  box-shadow: var(--spp-shadow-md);
+  display: flex;
+  gap: var(--spp-space-2);
+  z-index: 500;
+  pointer-events: none;
+}
+
+.spp-shortcut-bar .spp-kbd {
+  margin-right: 2px;
+}
+
+@media (max-width: 1100px) {
+  .spp-shortcut-bar {
+    display: none;
+  }
 }
 
 /* ─── State views (loading / empty / error) ────────────────────────────── */
@@ -235,18 +363,33 @@ body {
   background: var(--spp-bg-elevated);
 }
 
-/* ─── Navigation ───────────────────────────────────────────────────────── */
+/* ─── Navigation (sidebar items, reference .nav-item) ──────────────────── */
 .spp-nav {
   display: flex;
-  gap: var(--spp-space-1);
-  margin-left: auto;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+}
+
+/* Section label (Directory / Intelligence / Operations). */
+.spp-nav__section {
+  font-size: var(--spp-text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--spp-fg-muted);
+  padding: var(--spp-space-3) var(--spp-space-2) var(--spp-space-1);
+  margin: 0;
 }
 
 .spp-nav__link {
-  padding: var(--spp-space-2) var(--spp-space-3);
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+  padding: 7px var(--spp-space-2);
   color: var(--spp-fg-muted);
   text-decoration: none;
   font-size: var(--spp-text-sm);
+  font-weight: 500;
   border-radius: var(--spp-radius-md);
   transition: color var(--spp-duration-fast) var(--spp-ease),
     background var(--spp-duration-fast) var(--spp-ease);
@@ -254,12 +397,206 @@ body {
 
 .spp-nav__link:hover {
   color: var(--spp-fg);
-  background: var(--spp-bg-elevated);
+  background: var(--spp-bg-hover);
+  text-decoration: none;
 }
 
 .spp-nav__link--active {
-  color: var(--spp-fg);
+  color: var(--spp-accent);
+  background: var(--spp-accent-soft);
+}
+
+.spp-nav__icon {
+  width: 17px;
+  text-align: center;
+  flex-shrink: 0;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.spp-nav__label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Right-aligned count badge (Inbox active / Notifications unread). */
+.spp-nav__count {
+  margin-left: auto;
+  background: var(--spp-bg-sunken);
+  color: var(--spp-fg-muted);
+  border-radius: 10px;
+  padding: 1px 7px;
+  font-size: var(--spp-text-xs);
+  font-weight: 600;
+}
+
+/* Collapsed sidebar: icons only (reference .sidebar.collapsed — the brand
+   spans hide, the PanelLeft toggle button stays so the user can re-expand). */
+.spp-sidebar--collapsed .spp-sidebar__brand-name,
+.spp-sidebar--collapsed .spp-sidebar__logo,
+.spp-sidebar--collapsed .spp-nav__label,
+.spp-sidebar--collapsed .spp-nav__section,
+.spp-sidebar--collapsed .spp-nav__count {
+  display: none;
+}
+
+.spp-sidebar--collapsed .spp-nav__link {
+  justify-content: center;
+  padding: var(--spp-space-2) 0;
+}
+
+.spp-sidebar--collapsed .spp-sidebar__footer-button {
+  justify-content: center;
+  padding: var(--spp-space-2) 0;
+}
+
+/* ─── Shared page primitives (tables, inputs, cards, stat rows) ────────── */
+.spp-button--small {
+  padding: var(--spp-space-1) var(--spp-space-2);
+  font-size: var(--spp-text-xs);
+  gap: var(--spp-space-1);
+}
+
+.spp-input {
   background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-md);
+  color: var(--spp-fg);
+  font-size: var(--spp-text-sm);
+  padding: var(--spp-space-2) var(--spp-space-3);
+  min-width: 220px;
+}
+
+.spp-input:focus-visible {
+  outline: 2px solid var(--spp-accent);
+  outline-offset: 1px;
+}
+
+.spp-page__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--spp-space-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--spp-space-4);
+}
+
+.spp-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-lg);
+  font-size: var(--spp-text-sm);
+}
+
+.spp-table th {
+  text-align: left;
+  font-size: var(--spp-text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--spp-fg-muted);
+  padding: var(--spp-space-2) var(--spp-space-3);
+  border-bottom: 1px solid var(--spp-border);
+}
+
+.spp-table td {
+  padding: var(--spp-space-2) var(--spp-space-3);
+  border-bottom: 1px solid var(--spp-border-subtle);
+}
+
+.spp-table__row--clickable {
+  cursor: pointer;
+}
+
+.spp-table__row--clickable:hover td {
+  background: var(--spp-bg-hover);
+}
+
+.spp-table__link {
+  color: var(--spp-fg);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.spp-table__link:hover {
+  color: var(--spp-accent);
+}
+
+.spp-table__cell-muted {
+  color: var(--spp-fg-muted);
+}
+
+.spp-card {
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-lg);
+  padding: var(--spp-space-6);
+}
+
+.spp-card__title {
+  margin: 0 0 var(--spp-space-2) 0;
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+}
+
+.spp-docs__stats {
+  display: flex;
+  gap: var(--spp-space-8);
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-lg);
+  padding: var(--spp-space-6);
+  margin-bottom: var(--spp-space-4);
+}
+
+.spp-docs__stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-1);
+}
+
+.spp-docs__stat-value {
+  font-size: var(--spp-text-xl);
+  font-weight: 700;
+  color: var(--spp-fg);
+}
+
+.spp-docs__stat-label {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.spp-docs__collections {
+  margin-bottom: var(--spp-space-4);
+}
+
+.spp-docs__collections h3 {
+  margin: 0 0 var(--spp-space-2) 0;
+  font-size: var(--spp-text-md);
+}
+
+.spp-docs__collection-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spp-space-2);
+}
+
+.spp-docs__collection {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-full);
+  padding: var(--spp-space-1) var(--spp-space-3);
+  font-size: var(--spp-text-sm);
 }
 
 /* ─── Not-found ──────────────────────────────────────────────────────── */

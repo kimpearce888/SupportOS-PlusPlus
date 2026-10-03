@@ -1,7 +1,7 @@
 //! App pages (routes). Each page is a Leptos component.
 //!
-//! Per M1-T08 + M4-T11: routes are `/`, `/operations`, `/notifications`,
-//! `/automation`, `/settings`, `/sync-health`, `/inbox`, and a not-found fallback.
+//! The route table mirrors the reference `App.tsx` exactly (26 routes incl.
+//! the 404); see `lib.rs` for the wiring.
 
 pub mod ai_center;
 pub mod automation;
@@ -11,14 +11,17 @@ pub mod connectors;
 pub mod custom_objects;
 pub mod customers;
 pub mod dashboard;
+pub mod docs;
 pub mod inbox;
 pub mod incidents;
 pub mod issue_radar;
+pub mod knowledge;
 pub mod knowledge_gaps;
 pub mod not_found;
 pub mod notifications;
 pub mod onboarding;
 pub mod operations;
+pub mod organizations;
 pub mod outreach;
 pub mod reports;
 pub mod search;
@@ -36,14 +39,17 @@ pub use connectors::ConnectorsPage;
 pub use custom_objects::CustomObjectsPage;
 pub use customers::{CustomerProfilePage, CustomerSearchPage};
 pub use dashboard::DashboardPage;
+pub use docs::DocsPage;
 pub use inbox::InboxPage;
 pub use incidents::IncidentsPage;
 pub use issue_radar::IssueRadarPage;
+pub use knowledge::KnowledgePage;
 pub use knowledge_gaps::KnowledgeGapsPage;
 pub use not_found::NotFoundPage;
 pub use notifications::NotificationsPage;
 pub use onboarding::OnboardingPage;
 pub use operations::OperationsPage;
+pub use organizations::{OrganizationDetailPage, OrganizationsPage};
 pub use outreach::OutreachPage;
 pub use reports::ReportsPage;
 pub use search::SearchPage;

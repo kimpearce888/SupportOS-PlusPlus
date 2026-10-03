@@ -101,20 +101,6 @@ pub type EventHandler = Box<dyn Fn(&LiveEvent) + Send + Sync + 'static>;
 /// is forwarded to all subscribers.
 static SUBSCRIBERS: Mutex<Vec<EventHandler>> = Mutex::new(Vec::new());
 
-/// The absolute API base for the SSE URL. Default `http://127.0.0.1:3000`
-/// (the app's loopback server); override with `localStorage['spp.api_base']`.
-fn api_base() -> String {
-    let window = web_sys::window();
-    if let Some(w) = &window {
-        if let Ok(Some(v)) = w.local_storage() {
-            if let Ok(Some(base)) = v.get_item("spp.api_base") {
-                return base.trim_end_matches('/').to_string();
-            }
-        }
-    }
-    "http://127.0.0.1:3000".to_string()
-}
-
 /// Subscribe to live events from the server.
 ///
 /// Returns an unsubscribe function (a `Box<dyn FnOnce() -> Result<(), String>>`)
@@ -158,7 +144,8 @@ fn ensure_source() -> Result<(), String> {
         // Absolute URL: the WASM bundle is served from the Tauri asset origin
         // (or the Trunk dev server on :1420), NOT from the Axum API server,
         // so a relative `/api/events` would resolve to the wrong origin.
-        let url = format!("{}/api/events", api_base());
+        // Shared base from `crate::api` (localStorage override 'spp.api_base').
+        let url = format!("{}/api/events", crate::api::api_base());
         let event_source = web_sys::EventSource::new(&url)
             .map_err(|e| format!("EventSource::new({url}) failed: {e:?}"))?;
 
