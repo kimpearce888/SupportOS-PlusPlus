@@ -1,7 +1,10 @@
 //! Onboarding wizard page — first-run setup.
 //!
-//! Per spec M2: "first-run onboarding." Per A10: demo mode offer.
-//! Calls `first_run_state` IPC to read/write the first-run flag.
+//! Reference contract (Onboarding.tsx): reads `GET /api/onboarding`
+//! (`completed` flag), completes via `POST /api/onboarding/complete`, or
+//! enables demo mode via `POST /api/demo/enable` (which also marks the
+//! first run done and kicks the initial sync in the reference; the port
+//! rewire keeps the same two endpoints).
 //! On completion it flips the app-wide onboarding state (so the shell guard
 //! sees `completed=true` immediately, like the reference's optimistic
 //! `setQueryData`) and returns the user to the dashboard.
@@ -27,9 +30,12 @@ pub fn OnboardingPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "demo_mode": null });
-            match crate::ipc::invoke::<bool>("first_run_state", &args).await {
-                Ok(done) => {
+            match crate::api::get_json::<serde_json::Value>("/api/onboarding").await {
+                Ok(data) => {
+                    let done = data
+                        .get("completed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     first_run_done.set(Some(done));
                     if let Some(ui) = ui {
                         ui.onboarding_completed.set(Some(done));
@@ -49,10 +55,15 @@ pub fn OnboardingPage() -> impl IntoView {
         let error_msg = error_msg;
         let first_run_done = first_run_done;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "demo_mode": demo });
-            match crate::ipc::invoke::<bool>("first_run_state", &args).await {
-                Ok(done) => {
-                    first_run_done.set(Some(done));
+            // Reference endpoints: demo -> /api/demo/enable, plain -> /api/onboarding/complete.
+            let result = if demo {
+                crate::api::post_json::<serde_json::Value>("/api/demo/enable", None).await
+            } else {
+                crate::api::post_json::<serde_json::Value>("/api/onboarding/complete", None).await
+            };
+            match result {
+                Ok(_) => {
+                    first_run_done.set(Some(true));
                     // Optimistically flip the app-wide state BEFORE anything
                     // else runs, so the guard does not bounce the user back
                     // with stale `completed=false` data (reference v1.6.0

@@ -67,6 +67,64 @@ pub async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     serde_json::from_str(&text).map_err(|e| format!("GET {path}: invalid JSON: {e}"))
 }
 
+/// POST `path` with an optional JSON body and parse the JSON response.
+pub async fn post_json<T: DeserializeOwned>(
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<T, String> {
+    request_json::<T>("POST", path, body).await
+}
+
+/// PATCH `path` with a JSON body and parse the JSON response.
+pub async fn patch_json<T: DeserializeOwned>(
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<T, String> {
+    request_json::<T>("PATCH", path, Some(body)).await
+}
+
+async fn request_json<T: DeserializeOwned>(
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<T, String> {
+    use wasm_bindgen::JsValue;
+
+    let window = web_sys::window().ok_or("no window")?;
+    let url = url_for(path);
+    let init = web_sys::RequestInit::new();
+    init.set_method(method);
+    if let Some(body) = body {
+        init.set_headers(&{
+            let headers = web_sys::Headers::new()
+                .map_err(|e| format!("{method} {path}: headers failed: {e:?}"))?;
+            headers
+                .set("Content-Type", "application/json")
+                .map_err(|e| format!("{method} {path}: headers failed: {e:?}"))?;
+            headers.into()
+        });
+        init.set_body(&JsValue::from_str(&body.to_string()));
+    }
+    let response = JsFuture::from(window.fetch_with_str_and_init(&url, &init))
+        .await
+        .map_err(|e| format!("{method} {path} failed: {e:?}"))?;
+    let response: web_sys::Response = response
+        .dyn_into()
+        .map_err(|_| format!("{method} {path}: fetch did not return a Response"))?;
+    if !response.ok() {
+        return Err(format!("{method} {path} -> HTTP {}", response.status()));
+    }
+    let text_promise = response
+        .text()
+        .map_err(|e| format!("{method} {path}: body read failed: {e:?}"))?;
+    let text = JsFuture::from(text_promise)
+        .await
+        .map_err(|e| format!("{method} {path}: body read failed: {e:?}"))?
+        .as_string()
+        .ok_or_else(|| format!("{method} {path}: body is not UTF-8 text"))?;
+    serde_json::from_str(&text).map_err(|e| format!("{method} {path}: invalid JSON: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

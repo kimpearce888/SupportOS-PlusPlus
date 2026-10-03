@@ -5,9 +5,8 @@
 //!
 //! This page is the team-ops hub: 16 tiles grouped by severity
 //! (critical / warning / info), each tile linking to the filtered inbox
-//! (`/inbox?view=<tile>&scope=<mailbox>`). Tiles whose data source ships
-//! in a later milestone (M6/M7/M9) display a "Not yet available" badge
-//! with a tooltip naming the milestone.
+//! (`/inbox?view=<tile>&scope=<mailbox>`). Tiles report
+//! `{key, count, available}` exactly like the reference snapshot.
 //!
 //! Per KNOWN PITFALLS: every view has loading, empty, and error states.
 //! Per A12: closed vocabularies are single-source-of-truth — the 16 tiles
@@ -46,11 +45,8 @@ pub enum TileCountView {
         /// The number of items the tile counts.
         count: u32,
     },
-    /// The tile's data source ships in a later milestone.
-    NotAvailable {
-        /// The milestone number that wires this tile (4/6/7/9).
-        milestone: u8,
-    },
+    /// The tile's data is not available (reference: `available: false`).
+    NotAvailable,
 }
 
 impl TileCountView {
@@ -59,7 +55,7 @@ impl TileCountView {
     pub fn label(self) -> String {
         match self {
             Self::Available { count } => count.to_string(),
-            Self::NotAvailable { milestone } => format!("M{milestone}"),
+            Self::NotAvailable => "\u{2013}".to_string(),
         }
     }
 
@@ -202,8 +198,9 @@ pub fn OperationsPage() -> impl IntoView {
         let loading = loading;
         let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
-            let args = serde_json::json!({ "mailbox_id": null });
-            match crate::ipc::invoke::<serde_json::Value>("operations_snapshot", &args).await {
+            // GET /api/operations/center (reference hook useOperationsCenter):
+            // { generated_at, mailbox_scope, tiles: [{key, label, count, available}], ... }
+            match crate::api::get_json::<serde_json::Value>("/api/operations/center").await {
                 Ok(data) => {
                     let tiles = data
                         .get("tiles")
@@ -211,25 +208,25 @@ pub fn OperationsPage() -> impl IntoView {
                         .map(|arr| {
                             arr.iter()
                                 .filter_map(|entry| {
-                                    let id = entry.get("0")?.as_str()?;
-                                    let count_obj = entry.get("1")?;
-                                    let kind = count_obj.get("kind")?.as_str()?;
-                                    if kind == "available" {
-                                        let count = count_obj.get("count")?.as_u64()? as u32;
-                                        Some((id.to_string(), TileCountView::Available { count }))
+                                    let id = entry.get("key")?.as_str()?;
+                                    let tile = if entry
+                                        .get("available")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false)
+                                    {
+                                        let count = entry
+                                            .get("count")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            as u32;
+                                        TileCountView::Available { count }
                                     } else {
-                                        let milestone = count_obj.get("milestone")?.as_u64()? as u8;
-                                        Some((
-                                            id.to_string(),
-                                            TileCountView::NotAvailable { milestone },
-                                        ))
-                                    }
-                                })
-                                .filter_map(|(id_str, count)| {
-                                    // Match the string back to the enum variant.
-                                    for tile in OperationsTileKey::ALL {
-                                        if tile.as_str() == id_str {
-                                            return Some((tile, count));
+                                        TileCountView::NotAvailable
+                                    };
+                                    // Match the key back to the enum variant.
+                                    for key in OperationsTileKey::ALL {
+                                        if key.as_str() == id {
+                                            return Some((key, tile));
                                         }
                                     }
                                     None
@@ -240,7 +237,11 @@ pub fn OperationsPage() -> impl IntoView {
                     snapshot.set(OperationsSnapshotView {
                         tiles,
                         mailbox_id: None,
-                        built_at: String::new(),
+                        built_at: data
+                            .get("generated_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                     });
                     loading.set(false);
                 }
@@ -490,16 +491,16 @@ mod tests {
     }
 
     #[test]
-    fn tile_count_view_not_available_label_shows_milestone() {
-        let c = TileCountView::NotAvailable { milestone: 7 };
-        assert_eq!(c.label(), "M7");
+    fn tile_count_view_not_available_label_is_dash() {
+        let c = TileCountView::NotAvailable;
+        assert_eq!(c.label(), "\u{2013}");
         assert!(c.is_not_available());
     }
 
     #[test]
     fn tile_count_view_badge_class_uses_severity_for_available() {
-        // Critical tile (sla_breached) — but it's stubbed, so badge should be muted.
-        let c = TileCountView::NotAvailable { milestone: 7 };
+        // Critical tile (sla_breached) — but it's unavailable, so badge should be muted.
+        let c = TileCountView::NotAvailable;
         assert_eq!(
             c.badge_class_suffix(OperationsTileKey::SlaBreached),
             "muted"
