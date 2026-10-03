@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "SupportOS++ developer entry point: dev/test/lint/package/audit."
+description = "SupportOS++ developer entry point: dev/test/lint/package."
 
 [lib]
 name = "spp_xtask"
@@ -14,10 +14,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "xtask"
 path = "src/bin/xtask.rs"
-
-[[bin]]
-name = "audit"
-path = "src/bin/audit.rs"
 
 [[bin]]
 name = "e2e"

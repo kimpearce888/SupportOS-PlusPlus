@@ -1,14 +1,13 @@
 //! `cargo xtask` — the single developer entry point for SupportOS++.
 //!
 //! Subcommands (the cargo equivalents of the reference's package.json
-//! scripts — dev/test/lint/package + the black-box audit):
+//! scripts — dev/test/lint/package):
 //!   - `dev`        Run the Tauri app in dev mode (Tauri + Leptos trunk serve)
 //!   - `trunk-serve` Internal: serve the Leptos UI on 127.0.0.1:1420 (called by tauri.conf.json beforeDevCommand)
 //!   - `trunk-build` Internal: build the Leptos UI into ../ui/dist (called by tauri.conf.json beforeBuildCommand)
 //!   - `test`       Run all unit + integration tests across the workspace
 //!   - `lint`       rustfmt --check + clippy -D warnings
 //!   - `package`    Build installers for the host OS (tauri build)
-//!   - `audit`      Run the black-box audit binary against a packaged app
 
 use std::process::Command;
 
@@ -35,12 +34,6 @@ enum Cmd {
     Lint,
     /// Build installers for the host OS via Tauri.
     Package,
-    /// Black-box audit of a packaged app (reference scripts/audit-phase1.mjs counterpart).
-    Audit {
-        /// Path to a packaged app to audit.
-        #[arg(long)]
-        app: String,
-    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,7 +45,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Test => run_tests(),
         Cmd::Lint => run_lint(),
         Cmd::Package => run_package(),
-        Cmd::Audit { app } => run_audit(&app),
     }
 }
 
@@ -141,23 +133,5 @@ fn run_package() -> anyhow::Result<()> {
         .current_dir(tauri_dir)
         .status()?;
     anyhow::ensure!(status.success(), "cargo tauri build failed");
-    Ok(())
-}
-
-fn run_audit(app: &str) -> anyhow::Result<()> {
-    // The audit binary lives in the same crate; re-run it as a child process.
-    // Using the build artefact avoids re-compilation.
-    let exe = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("could not locate current exe: {e}"))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("exe has no parent dir"))?;
-    let audit_path = dir.join("audit");
-    if !audit_path.exists() {
-        eprintln!("audit: binary not built; run `cargo build -p supportos-plusplus-xtask --bin audit` first");
-        std::process::exit(1);
-    }
-    let status = Command::new(&audit_path).arg("--app").arg(app).status()?;
-    anyhow::ensure!(status.success(), "audit binary exited with non-zero status");
     Ok(())
 }

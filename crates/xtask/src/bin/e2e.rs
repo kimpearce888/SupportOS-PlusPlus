@@ -11,9 +11,9 @@
 //!       [--webdriver http://127.0.0.1:4444] [--report /tmp/e2e-report.md] \
 //!       [--app-binary PATH] [--data-dir PATH]
 //!
-//! Prerequisites (see .github/workflows/e2e.yml):
+//! Prerequisites:
 //!   - tauri-driver listening on the WebDriver URL
-//!   - the app already running (launched by CI under xvfb)
+//!   - the app already running (e.g. under xvfb on a headless machine)
 
 use std::fmt::Write as _;
 use std::path::PathBuf;

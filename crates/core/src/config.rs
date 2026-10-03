@@ -91,7 +91,7 @@ impl HelpScoutConfig {
 ///
 /// - Linux: `${XDG_DATA_HOME:-~/.local/share}/supportos-plusplus`
 ///
-/// The port is Linux-only (DEV-006): no Windows/macOS branches exist.
+/// The port is Linux-only: no Windows/macOS branches exist.
 /// Overridable via `SPP_DATA_DIR` for tests and dev.
 pub fn default_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SPP_DATA_DIR") {

@@ -1,18 +1,16 @@
-//! Headless demo-mode boot smoke test (M1-T09).
+//! Headless demo-mode boot smoke test.
 //!
 //! Boots the SupportOS++ foundation (logging + config + DB with migrations +
 //! loopback listener + catalog) in demo mode against a throwaway DB, then
 //! verifies the boot-critical invariants hold. It does NOT launch a Tauri
-//! window (that needs a display server not available on CI); the actual GUI
-//! launch is verified separately by `cargo xtask package` + the manual
-//! verification checklist in `docs/MANUAL-VERIFICATION.md`.
+//! window (that needs a display server); the actual GUI launch is verified
+//! separately by `cargo tauri build` + the e2e driver.
 
 // The core crate's [lib] name is "spp_core" (see crates/core/Cargo.toml),
 // which is the extern crate name. Rust 2021 makes `extern crate` implicit,
 // so no `use` statement is needed — `spp_core::...` just works.
 //
-// Port is Linux-only (DEV-006): headless boot smoke runs on the Linux CI matrix.
-#![cfg(target_os = "linux")]
+// The port is Linux-only: the headless boot smoke runs on Linux.
 
 /// Boot the foundation in demo mode against a throwaway DB and verify the
 /// boot-critical invariants. This is the "headless demo-mode boot" the spec
