@@ -451,10 +451,12 @@ fn save_analysis(
 /// Seed the demo intelligence layer (reference `seedDemoData`). Safety:
 /// never mix demo data with production data — refuses to run unless demo
 /// mode is on. Returns whether the seed ran.
-pub fn seed_demo_data(conn: &Connection) -> bool {
-    // Safety: never mix demo data with production data.
+pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
+    // Safety: never mix demo data with production data. The caller passes the
+    // EFFECTIVE demo flag (settings `demo_mode` OR the LOCAL_DEMO_MODE env
+    // override that selected the fake provider) — the reference seeds
+    // whenever the provider is fake and the DB is empty (index.ts).
     let demo_loaded = settings::get_bool(conn, "demo_data_loaded", false).unwrap_or(false);
-    let demo_mode = is_demo_mode(conn);
     if !demo_loaded && !demo_mode {
         tracing::warn!(
             "Refusing to seed demo data: this does not look like a demo database. Demo data must stay separate from production data."

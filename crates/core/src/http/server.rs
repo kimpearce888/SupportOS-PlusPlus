@@ -1224,6 +1224,10 @@ impl HttpServer {
             if conversation_count == 0 {
                 if let Some(engine) = self.state.sync.clone() {
                     let conn = self.state.conn.clone();
+                    // The effective demo flag (settings OR env override) — the
+                    // seed guard must not re-derive it from settings alone, or
+                    // an env-configured demo boot would refuse to seed.
+                    let demo_mode = self.state.demo_mode;
                     tokio::spawn(async move {
                         if let Err(e) = engine.initial_sync().await {
                             tracing::warn!(error = %e, "Demo initial sync failed");
@@ -1237,7 +1241,7 @@ impl HttpServer {
                             "{}",
                             4,
                         );
-                        let seeded = crate::demo::seed_demo_data(&c);
+                        let seeded = crate::demo::seed_demo_data(&c, demo_mode);
                         if seeded {
                             let _ = crate::settings::set_string(&c, "demo_data_loaded", "true");
                         }
