@@ -266,23 +266,24 @@ pub trait VectorStore: Send + Sync {
 
 // ─── In-memory adapter (Fake) ─────────────────────────────────────────────
 
-/// An in-memory VectorStore implementation — the Fake adapter for tests +
-/// demo mode. Backed by a `HashMap` of collection name → (dim, points).
-///
-/// Per spec A12: "no mocks in real mode (the Fake provider exists only for
-/// demo mode and tests)." This adapter is the VectorStore equivalent of the
-/// `FakeHelpScoutProvider` from M2.
+/// An in-memory VectorStore implementation — the cfg(test) double for the
+/// VectorStore contract (deviation D2: production uses the embedded Qdrant
+/// adapter; this Fake exists only for tests and is removed in the final
+/// strip). Backed by a `HashMap` of collection name → (dim, points).
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct InMemoryVectorStore {
     collections: std::sync::Mutex<HashMap<String, InMemoryCollection>>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct InMemoryCollection {
     dense_dim: Option<usize>,
     points: Vec<Point>,
 }
 
+#[cfg(test)]
 impl InMemoryVectorStore {
     /// Create a new empty in-memory store.
     #[must_use]
@@ -291,6 +292,7 @@ impl InMemoryVectorStore {
     }
 }
 
+#[cfg(test)]
 impl VectorStore for InMemoryVectorStore {
     fn create_collection(&self, name: &str, dense_dim: Option<usize>) -> Result<()> {
         let mut collections = self.collections.lock().expect("mutex poisoned");
@@ -477,6 +479,7 @@ impl VectorStore for InMemoryVectorStore {
 
 /// Cosine similarity: dot(a, b) / (|a| * |b|). Range [-1.0, 1.0].
 /// Returns 0.0 if either vector is zero-length.
+#[cfg(test)]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
