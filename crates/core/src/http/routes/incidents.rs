@@ -20,9 +20,257 @@ pub async fn list(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"incidents": items, "total": total}))
 }
 
-/// POST /api/incidents
-pub async fn create(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
-    Json(json!({"ok": true, "message": "Incident creation not yet implemented via HTTP."}))
+/// POST /api/incidents — create a manual incident (reference incidents.ts:31).
+///
+/// incidentCreateSchema: title (1..200 after trim), status/severity enums
+/// with defaults investigating/sev3, nullable bounded text fields, and up to
+/// 500 conversation ids. Violations are 400 BadRequest with the joined
+/// issue messages (reference zod formatting, capped at 300 chars).
+pub async fn create(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let mut issues: Vec<String> = Vec::new();
+
+    let title = match body.get("title") {
+        Some(Value::String(t)) => {
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                issues.push("Title is required.".to_string());
+                None
+            } else if trimmed.chars().count() > 200 {
+                issues.push("Title must be at most 200 characters.".to_string());
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        _ => {
+            issues.push("Title is required.".to_string());
+            None
+        }
+    };
+    let status = match body.get("status") {
+        None | Some(Value::Null) => Some("investigating".to_string()),
+        Some(Value::String(s)) => {
+            if INCIDENT_STATUSES.contains(&s.as_str()) {
+                Some(s.clone())
+            } else {
+                issues.push(format!(
+                    "Invalid enum value. Expected 'investigating' | 'identified' | 'fix_in_progress' | 'monitoring' | 'resolved', received '{s}'."
+                ));
+                None
+            }
+        }
+        Some(_) => {
+            issues.push("Expected string, received non-string.".to_string());
+            None
+        }
+    };
+    let severity = match body.get("severity") {
+        None | Some(Value::Null) => Some("sev3".to_string()),
+        Some(Value::String(s)) => {
+            if INCIDENT_SEVERITIES.contains(&s.as_str()) {
+                Some(s.clone())
+            } else {
+                issues.push(format!(
+                    "Invalid enum value. Expected 'sev1' | 'sev2' | 'sev3' | 'sev4', received '{s}'."
+                ));
+                None
+            }
+        }
+        Some(_) => {
+            issues.push("Expected string, received non-string.".to_string());
+            None
+        }
+    };
+
+    fn bounded_text(
+        body: &Value,
+        key: &str,
+        max: usize,
+        issues: &mut Vec<String>,
+    ) -> Option<Option<String>> {
+        match body.get(key) {
+            None | Some(Value::Null) => Some(None),
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.chars().count() > max {
+                    issues.push(format!("{key} must be at most {max} characters."));
+                    None
+                } else {
+                    Some(Some(trimmed.to_string()))
+                }
+            }
+            Some(_) => {
+                issues.push(format!("Expected string, received non-string for {key}."));
+                None
+            }
+        }
+    }
+    let owner_user_local_id = match body.get("ownerUserId") {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::Number(n)) if n.as_i64().is_some_and(|v| v > 0) => Some(n.as_i64()),
+        Some(_) => {
+            issues.push("ownerUserId must be a positive integer or null.".to_string());
+            None
+        }
+    };
+    let product = bounded_text(&body, "product", 120, &mut issues);
+    let feature = bounded_text(&body, "feature", 120, &mut issues);
+    let description = bounded_text(&body, "description", 4000, &mut issues);
+    let internal_explanation = bounded_text(&body, "internalExplanation", 8000, &mut issues);
+    let customer_safe_explanation =
+        bounded_text(&body, "customerSafeExplanation", 8000, &mut issues);
+    let known_cause = bounded_text(&body, "knownCause", 4000, &mut issues);
+    let workaround = bounded_text(&body, "workaround", 4000, &mut issues);
+    let resolution = bounded_text(&body, "resolution", 4000, &mut issues);
+    let started_at = match body.get("startedAt") {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => {
+            // isoDateish: a parseable date string or null.
+            if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+                Some(Some(s.clone()))
+            } else {
+                issues.push("startedAt must be an ISO 8601 date string or null.".to_string());
+                None
+            }
+        }
+        Some(_) => {
+            issues.push("startedAt must be a string or null.".to_string());
+            None
+        }
+    };
+    let conversation_ids: Option<Vec<i64>> = match body.get("conversationIds") {
+        None => Some(Vec::new()),
+        Some(Value::Array(arr)) => {
+            if arr.len() > 500 {
+                issues.push("conversationIds must contain at most 500 items.".to_string());
+                None
+            } else {
+                let mut ids = Vec::with_capacity(arr.len());
+                let mut ok = true;
+                for v in arr {
+                    match v.as_i64() {
+                        Some(id) if id > 0 => ids.push(id),
+                        _ => {
+                            issues.push(
+                                "conversationIds must contain positive integers.".to_string(),
+                            );
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    Some(ids)
+                } else {
+                    None
+                }
+            }
+        }
+        Some(_) => {
+            issues.push("conversationIds must be an array.".to_string());
+            None
+        }
+    };
+
+    if !issues.is_empty() {
+        let message: String = issues.join("; ");
+        let message = message.chars().take(300).collect::<String>();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"statusCode": 400, "error": "BadRequest", "message": message})),
+        )
+            .into_response();
+    }
+
+    let (
+        title,
+        status,
+        severity,
+        owner_user_local_id,
+        product,
+        feature,
+        description,
+        internal_explanation,
+        customer_safe_explanation,
+        known_cause,
+        workaround,
+        resolution,
+        started_at,
+        conversation_ids,
+    ) = (
+        title.unwrap(),
+        status.unwrap(),
+        severity.unwrap(),
+        owner_user_local_id.flatten(),
+        product.flatten(),
+        feature.flatten(),
+        description.flatten(),
+        internal_explanation.flatten(),
+        customer_safe_explanation.flatten(),
+        known_cause.flatten(),
+        workaround.flatten(),
+        resolution.flatten(),
+        started_at.flatten(),
+        conversation_ids.unwrap_or_default(),
+    );
+
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Conversation ids are validated against the mirror before insert
+    // (reference: only existing, non-deleted conversations are linked).
+    let mut valid_ids = Vec::with_capacity(conversation_ids.len());
+    for id in &conversation_ids {
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .ok();
+        if exists.is_some() {
+            valid_ids.push(*id);
+        }
+    }
+
+    let incident = crate::intelligence_features::ManualIncident {
+        title,
+        status,
+        severity,
+        owner_user_local_id,
+        product,
+        feature,
+        description,
+        internal_explanation,
+        customer_safe_explanation,
+        known_cause,
+        workaround,
+        resolution,
+        started_at,
+        conversation_ids: valid_ids,
+    };
+    match crate::intelligence_features::create_manual_incident(&conn, &incident) {
+        Ok(id) => {
+            let incident_json =
+                crate::intelligence_features::incident_row_json(&conn, id).unwrap_or(json!({}));
+            let _ = crate::audit::audit(
+                &conn,
+                &crate::audit::AuditEntry::user("incident_created").with_after_state(json!({
+                    "id": id,
+                    "code": incident_json.get("code"),
+                    "title": incident_json.get("title"),
+                })),
+            );
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "incident": incident_json})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"ok": false, "message": format!("Could not create incident: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/incidents/:id
@@ -483,4 +731,128 @@ pub async fn delete_ref(
         Json(json!({"ok": true, "message": "Reference removed."})),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use rusqlite::{params, Connection};
+    use std::sync::{Arc, Mutex};
+
+    fn fresh_db() -> Connection {
+        let f = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::db::ensure_migrations_table(&conn).unwrap();
+        crate::migrations::run_all(&mut conn).unwrap();
+        crate::intelligence::apply_m014(&conn).unwrap();
+        crate::intelligence_features::apply_m015_to_m019(&conn).unwrap();
+        crate::intelligence_features::apply_m035(&conn).unwrap();
+        conn
+    }
+
+    fn make_state() -> AppState {
+        let conn = fresh_db();
+        AppState {
+            conn: Arc::new(Mutex::new(conn)),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            port: 3000,
+            host: "127.0.0.1".into(),
+            demo_mode: false,
+            bus: crate::http::EventBus::new(64),
+            limiter: crate::http::RateLimiter::new(),
+            sync: None,
+            real: None,
+            provider_kind: "fake".into(),
+            workers: None,
+        }
+    }
+
+    async fn body_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn create_requires_title() {
+        let state = make_state();
+        let (status, body) = body_json(
+            create(
+                State(state),
+                Json(json!({"status": "investigating", "severity": "sev3"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "BadRequest");
+        assert!(body["message"].as_str().unwrap().contains("Title"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_bad_status_enum() {
+        let state = make_state();
+        let (status, body) = body_json(
+            create(
+                State(state),
+                Json(json!({"title": "Down", "status": "explode"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid enum value"));
+    }
+
+    #[tokio::test]
+    async fn create_inserts_with_defaults_and_links_valid_conversations() {
+        let state = make_state();
+        {
+            let conn = state.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id)
+                 VALUES (1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let (status, body) = body_json(
+            create(
+                State(state),
+                Json(json!({
+                    "title": "  Checkout down  ",
+                    "conversationIds": [1, 999],
+                    "product": " Billing ",
+                    "startedAt": "2026-10-01T00:00:00Z"
+                })),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        let incident = &body["incident"];
+        assert_eq!(incident["title"], "Checkout down"); // trimmed
+        assert_eq!(incident["status"], "investigating"); // default
+        assert_eq!(incident["severity"], "sev3"); // default
+        assert!(incident["code"].as_str().unwrap().starts_with("INC-"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_non_string_title() {
+        let state = make_state();
+        let (status, _) = body_json(create(State(state), Json(json!({"title": 42}))).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }

@@ -590,6 +590,15 @@ pub fn apply_m035(conn: &Connection) -> Result<()> {
     // Reference 014 columns the legacy table lacked (PRAGMA-guarded).
     add_column_if_missing(conn, "incidents", "title", "TEXT")?;
     add_column_if_missing(conn, "incidents", "code", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "owner_user_local_id", "INTEGER")?;
+    add_column_if_missing(conn, "incidents", "product", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "feature", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "internal_explanation", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "customer_safe_explanation", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "known_cause", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "workaround", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "resolution", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "started_at", "TEXT")?;
     add_column_if_missing(conn, "issue_clusters", "known_issue_id", "INTEGER")?;
     // Reference 003 customer_memories.source ('ai' default; 'human' rows
     // are the only ones a human may delete).
@@ -672,6 +681,85 @@ pub fn create_incident_from_source(
     )?;
     let id = conn.last_insert_rowid();
     for conv_id in conversation_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id, linked_by)
+             VALUES (?1, ?2, 'human')",
+            params![id, conv_id],
+        )?;
+    }
+    Ok(id)
+}
+
+/// A fully-specified manual incident (the reference incidentCreateSchema
+/// payload, already defaulted + validated by the route).
+#[derive(Debug, Clone)]
+pub struct ManualIncident {
+    /// Trimmed title, 1..200 chars.
+    pub title: String,
+    /// One of the 5 reference statuses.
+    pub status: String,
+    /// One of the 4 reference severities.
+    pub severity: String,
+    /// Optional owner (users.id).
+    pub owner_user_local_id: Option<i64>,
+    /// Optional product label.
+    pub product: Option<String>,
+    /// Optional feature label.
+    pub feature: Option<String>,
+    /// Optional public description (<= 4000).
+    pub description: Option<String>,
+    /// Optional internal explanation (<= 8000).
+    pub internal_explanation: Option<String>,
+    /// Optional customer-safe explanation (<= 8000).
+    pub customer_safe_explanation: Option<String>,
+    /// Optional known cause (<= 4000).
+    pub known_cause: Option<String>,
+    /// Optional workaround (<= 4000).
+    pub workaround: Option<String>,
+    /// Optional resolution (<= 4000).
+    pub resolution: Option<String>,
+    /// Optional ISO start timestamp.
+    pub started_at: Option<String>,
+    /// Conversation ids to link (already validated against the mirror).
+    pub conversation_ids: Vec<i64>,
+}
+
+/// Create a manual incident with the full reference 014 field set
+/// (reference incidentService.create with source='manual').
+pub fn create_manual_incident(conn: &Connection, inc: &ManualIncident) -> Result<i64> {
+    let code = next_incident_code(conn);
+    let resolved_at = if inc.status == "resolved" {
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "INSERT INTO incidents (known_issue_id, status, severity, source, title, code, resolved_at,
+             owner_user_local_id, product, feature, description, internal_explanation,
+             customer_safe_explanation, known_cause, workaround, resolution, started_at)
+         VALUES (NULL, ?1, ?2, 'manual', ?3, ?4, {resolved_at}, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+    );
+    conn.execute(
+        &sql,
+        params![
+            inc.status,
+            inc.severity,
+            inc.title,
+            code,
+            inc.owner_user_local_id,
+            inc.product,
+            inc.feature,
+            inc.description,
+            inc.internal_explanation,
+            inc.customer_safe_explanation,
+            inc.known_cause,
+            inc.workaround,
+            inc.resolution,
+            inc.started_at,
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    for conv_id in &inc.conversation_ids {
         conn.execute(
             "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id, linked_by)
              VALUES (?1, ?2, 'human')",
