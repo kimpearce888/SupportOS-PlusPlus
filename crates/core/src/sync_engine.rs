@@ -436,10 +436,13 @@ fn upsert_doc_article(
 }
 
 fn upsert_thread(conn: &Connection, conversation_local: i64, t: &HsThread) -> Result<()> {
+    // The local thread rows carry LOCAL actor ids (reference threadToSummary
+    // joins `users WHERE id = ?`), so remote ids resolve through the mirror —
+    // same mapping upsert_conversation applies to the assignee.
     let (actor_type, actor_id) = if let Some(cid) = t.created_by_customer_id {
-        ("customer", cid)
+        ("customer", local_id(conn, "customers", cid).unwrap_or(cid))
     } else if let Some(uid) = t.created_by_user_id {
-        ("user", uid)
+        ("user", local_id(conn, "users", uid).unwrap_or(uid))
     } else {
         ("system", 0)
     };
@@ -519,6 +522,15 @@ impl SyncEngine {
     pub fn with_bus(mut self, bus: crate::http::EventBus) -> Self {
         self.bus = Some(bus);
         self
+    }
+
+    /// The provider this engine syncs from (fake world in demo mode, the
+    /// HTTP client in real mode). The write pipeline uses the SAME provider
+    /// so a demo-mode mutation and the following single-conversation refresh
+    /// observe one world (reference AppContext binds ops + coordinator to one
+    /// provider instance).
+    pub fn provider(&self) -> &Arc<dyn HelpScoutProvider> {
+        &self.provider
     }
 
     /// Whether a sync is currently running (coordinator.running).
@@ -1075,8 +1087,10 @@ impl SyncEngine {
                 Ok(true)
             }
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("merged into") || msg.contains("-> 404") {
+                let merged_or_gone = crate::helpscout_real::hs_status(&e) == Some(301)
+                    || crate::helpscout_real::hs_status(&e) == Some(404)
+                    || e.to_string().contains("merged into");
+                if merged_or_gone {
                     let conn = self.lock();
                     soft_delete_by_remote_id(&conn, remote_id)?;
                     Ok(true)

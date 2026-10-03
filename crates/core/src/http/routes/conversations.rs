@@ -105,361 +105,563 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> impl Int
     }
 }
 
-/// POST /api/conversations/:id/reply
+/// POST /api/conversations/:id/reply (conversations.ts:343) — the sendReply
+/// write pipeline: Zod parse (replyRequestSchema, conversationId injected
+/// from :id) → ops.sendReply. Not-connected maps to 503; every other
+/// ok:false is 422.
 pub async fn reply(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    if body_text.trim().is_empty() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(
-                json!({"statusCode": 422, "error": "ValidationError", "message": "Reply body cannot be empty."}),
-            ),
-        );
-    }
-    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Safety invariant (operations.ts sendReply): eval mode blocks EVERY
-    // remote write — replies included.
-    if let Some(msg) = eval_mode_blocked(&conn) {
-        drop(conn);
-        return eval_rejected(msg);
-    }
-    let result = crate::inbox::reply_to_conversation(
-        &mut conn,
-        id,
-        body_text.to_string(),
-        "user".to_string(),
-        None,
-    );
-    drop(conn);
-    match result {
-        Ok(result) => {
-            let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
-            if ok {
-                crate::http::event_bus::notify_conversation_updated(
-                    &state.bus,
-                    &crate::events::ConversationUpdatedEvent {
-                        conversation_id: Some(id),
-                        conversation_number: None,
-                        mailbox_id: None,
-                        subject: None,
-                        reason: "sync".into(),
-                        at: chrono::Utc::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                            .to_string(),
-                    },
-                );
-            }
-            (
-                StatusCode::OK,
-                Json(json!({"ok": ok, "message": "Reply sent."})),
-            )
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
-        ),
-    }
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let (text, draft, cc, bcc, status_after, assign_to) = match parse_reply_body(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    crate::conversation_ops::op_send_reply(
+        &state,
+        crate::conversation_ops::ReplyInput {
+            conversation_id,
+            text,
+            draft,
+            cc,
+            bcc,
+            status_after,
+            assign_to,
+        },
+    )
+    .await
 }
 
-/// POST /api/conversations/:id/note
+/// POST /api/conversations/:id/note (conversations.ts:354) — the addNote
+/// write pipeline (noteRequestSchema).
 pub async fn note(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Safety invariant (operations.ts addNote): eval mode blocks notes too.
-    if let Some(msg) = eval_mode_blocked(&conn) {
-        drop(conn);
-        return eval_rejected(msg);
-    }
-    let result = crate::inbox::add_note(
-        &mut conn,
-        id,
-        body_text.to_string(),
-        "user".to_string(),
-        None,
-    );
-    drop(conn);
-    match result {
-        Ok(result) => {
-            let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
-            if ok {
-                crate::http::event_bus::notify_conversation_updated(
-                    &state.bus,
-                    &crate::events::ConversationUpdatedEvent {
-                        conversation_id: Some(id),
-                        conversation_number: None,
-                        mailbox_id: None,
-                        subject: None,
-                        reason: "sync".into(),
-                        at: chrono::Utc::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                            .to_string(),
-                    },
-                );
-            }
-            (StatusCode::OK, Json(json!({"ok": ok})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
-        ),
-    }
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let text = match parse_text_min1(&body, "text") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    crate::conversation_ops::op_add_note(&state, conversation_id, &text, false).await
 }
 
-/// POST /api/conversations/:id/status
+/// POST /api/conversations/:id/status (conversations.ts:362) — the
+/// changeStatus write pipeline (statusRequestSchema).
 pub async fn status(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let new_status = body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("active");
-    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Safety invariant (operations.ts changeStatus): eval mode blocks status
-    // changes.
-    if let Some(msg) = eval_mode_blocked(&conn) {
-        drop(conn);
-        return eval_rejected(msg);
-    }
-    let result = crate::inbox::change_status(
-        &mut conn,
-        id,
-        new_status.to_string(),
-        "user".to_string(),
-        None,
-    );
-    drop(conn);
-    match result {
-        Ok(result) => {
-            let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
-            if ok {
-                crate::http::event_bus::notify_conversation_updated(
-                    &state.bus,
-                    &crate::events::ConversationUpdatedEvent {
-                        conversation_id: Some(id),
-                        conversation_number: None,
-                        mailbox_id: None,
-                        subject: None,
-                        reason: "sync".into(),
-                        at: chrono::Utc::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                            .to_string(),
-                    },
-                );
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    const STATUSES: [&str; 4] = ["active", "closed", "pending", "spam"];
+    let new_status = match body.get("status") {
+        Some(Value::String(s)) => {
+            if !STATUSES.contains(&s.as_str()) {
+                return zod_422("status", &zod_enum_message(&STATUSES, s));
             }
-            (StatusCode::OK, Json(json!({"ok": ok})))
+            s.clone()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
-        ),
-    }
+        None | Some(Value::Null) => return zod_422("status", "Required"),
+        Some(v) => {
+            return zod_422(
+                "status",
+                &format!("Expected string, received {}", zod_type_name(v)),
+            )
+        }
+    };
+    crate::conversation_ops::op_change_status(&state, conversation_id, &new_status).await
 }
 
-/// POST /api/conversations/:id/assign
+/// POST /api/conversations/:id/assign (conversations.ts:370) — the assign
+/// write pipeline (assignRequestSchema; userId is a REMOTE id, nullable).
 pub async fn assign(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let assignee = body.get("assigneeLocalId").and_then(|v| v.as_i64());
-    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Safety invariant (operations.ts assignTo): eval mode blocks assignments.
-    if let Some(msg) = eval_mode_blocked(&conn) {
-        drop(conn);
-        return eval_rejected(msg);
-    }
-    let result = crate::inbox::assign(&mut conn, id, assignee, "user".to_string(), None);
-    drop(conn);
-    match result {
-        Ok(result) => {
-            let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
-            if ok {
-                crate::http::event_bus::notify_conversation_updated(
-                    &state.bus,
-                    &crate::events::ConversationUpdatedEvent {
-                        conversation_id: Some(id),
-                        conversation_number: None,
-                        mailbox_id: None,
-                        subject: None,
-                        reason: "sync".into(),
-                        at: chrono::Utc::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                            .to_string(),
-                    },
-                );
-            }
-            (StatusCode::OK, Json(json!({"ok": ok})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
-        ),
-    }
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let user_id = match parse_required_nullable_int(&body, "userId") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    crate::conversation_ops::op_assign(&state, conversation_id, user_id).await
 }
 
-/// POST /api/conversations/:id/priority
+/// POST /api/conversations/:id/priority (conversations.ts:279) — the
+/// reference setPriority: a LOCAL SupportOS write (the optional Help Scout
+/// custom-field mapping defaults OFF, so no eval gate on this path — the
+/// gate only guards the remote-write branch we never take by default).
 pub async fn priority(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let priority = body
-        .get("priority")
-        .and_then(|v| v.as_str())
-        .unwrap_or("normal");
-    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Safety invariant: eval mode blocks every remote write, priority
-    // changes included.
-    if let Some(msg) = eval_mode_blocked(&conn) {
-        drop(conn);
-        return eval_rejected(msg);
-    }
-    use crate::ticket_ops::{execute, TicketOperation};
-    let op = TicketOperation::SetPriority {
-        conversation_remote_id: id,
-        new_priority: crate::ticket_states::TicketPriority::parse(priority)
-            .unwrap_or(crate::ticket_states::TicketPriority::Normal),
-        actor_type: "user".to_string(),
-        actor_id: None,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
-    match execute(&mut conn, &op) {
-        Ok(result) => {
-            let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
-            drop(conn);
-            if ok {
-                crate::http::event_bus::notify_conversation_updated(
-                    &state.bus,
-                    &crate::events::ConversationUpdatedEvent {
-                        conversation_id: Some(id),
-                        conversation_number: None,
-                        mailbox_id: None,
-                        subject: None,
-                        reason: "sync".into(),
-                        at: chrono::Utc::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                            .to_string(),
-                    },
-                );
+    const PRIORITIES: [&str; 5] = ["none", "low", "medium", "high", "urgent"];
+    let priority_str = match body.get("priority") {
+        Some(Value::String(s)) => {
+            if !PRIORITIES.contains(&s.as_str()) {
+                return zod_422("priority", &zod_enum_message(&PRIORITIES, s));
             }
-            (StatusCode::OK, Json(json!({"ok": ok})))
+            s.clone()
         }
-        Err(e) => {
-            drop(conn);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()}),
-                ),
+        None | Some(Value::Null) => return zod_422("priority", "Required"),
+        Some(v) => {
+            return zod_422(
+                "priority",
+                &format!("Expected string, received {}", zod_type_name(v)),
             )
         }
+    };
+    let mut conn = state.conn_lock();
+    let Some(conv) = crate::conversation_ops::conv_full_by_local_id(&conn, conversation_id) else {
+        return rejected("Conversation not found locally.");
+    };
+    let previous: Option<String> = conn
+        .query_row(
+            "SELECT supportos_priority FROM conversations WHERE id = ?1",
+            rusqlite::params![conv.id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // Local write + transition record (one transaction, like the reference).
+    if let Ok(tx) = conn.transaction() {
+        let _ = tx.execute(
+            "UPDATE conversations SET supportos_priority = ?1 WHERE id = ?2",
+            rusqlite::params![priority_str, conv.id],
+        );
+        let _ = tx.execute(
+            "INSERT OR IGNORE INTO activity_events (conversation_id, event_type,
+                 actor_type, actor_id, occurred_at, source, metadata, dedup_key)
+             VALUES (?1, 'priority_changed', 'user', NULL, ?2, 'local', ?3,
+                 'priority_changed:' || ?1 || ':' || ?2)",
+            rusqlite::params![
+                conv.id,
+                at,
+                json!({ "previous": previous, "next": priority_str, "hs_field_synced": false })
+                    .to_string()
+            ],
+        );
+        let _ = tx.commit();
     }
+    let _ = crate::jobs::audit(
+        &conn,
+        "user",
+        "priority_changed",
+        Some(conv.id),
+        Some(&json!({ "priority": previous }).to_string()),
+        Some(&json!({ "priority": priority_str, "hs_field_synced": false }).to_string()),
+        None,
+        None,
+        false,
+    );
+    drop(conn);
+    crate::http::event_bus::notify_conversation_updated(
+        &state.bus,
+        &crate::events::ConversationUpdatedEvent {
+            conversation_id: Some(conv.id),
+            conversation_number: None,
+            mailbox_id: None,
+            subject: None,
+            reason: "sync".into(),
+            at: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        },
+    );
+    ok_result(
+        &format!("Priority set to {priority_str}."),
+        Some(json!({ "priority": priority_str, "hs_field_synced": false })),
+    )
 }
 
-/// POST /api/conversations/:id/subject — edit subject.
+/// POST /api/conversations/:id/subject (conversations.ts:378) — the
+/// changeSubject write pipeline (subjectRequestSchema).
 pub async fn subject(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let new_subject = body.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Safety invariant: eval mode blocks subject edits (remote write).
-    if let Some(msg) = eval_mode_blocked(&conn) {
-        drop(conn);
-        return eval_rejected(msg);
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let new_subject = match parse_text_min1(&body, "subject") {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    crate::conversation_ops::op_change_subject(&state, conversation_id, &new_subject).await
+}
+
+/// POST /api/conversations/:id/state (conversations.ts:287) — set the
+/// SupportOS custom ticket state (setStateRequestSchema: stateId int
+/// positive nullable, reason string max 500 optional). Purely local:
+/// transition history + activity event + audit.
+pub async fn set_state(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // stateId: z.number().int().positive().nullable()
+    let state_id: Option<i64> = match body.get("stateId") {
+        None => return zod_422("stateId", "Required"),
+        Some(Value::Null) => None,
+        Some(v) => match zod_int_value(v) {
+            Ok(n) if n > 0 => Some(n),
+            Ok(_) => return zod_422("stateId", "Number must be greater than 0"),
+            Err(m) => return zod_422("stateId", &m),
+        },
+    };
+    // reason: z.string().max(500).optional()
+    let reason: Option<String> = match body.get("reason") {
+        None => None,
+        Some(Value::String(s)) => {
+            if s.chars().count() > 500 {
+                return zod_422("reason", "String must contain at most 500 character(s)");
+            }
+            Some(s.clone())
+        }
+        Some(Value::Null) => return zod_422("reason", "Expected string, received null"),
+        Some(v) => {
+            return zod_422(
+                "reason",
+                &format!("Expected string, received {}", zod_type_name(v)),
+            )
+        }
+    };
+    let mut conn = state.conn_lock();
+    let Some(conv) = crate::conversation_ops::conv_full_by_local_id(&conn, conversation_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found locally."
+            })),
+        )
+            .into_response();
+    };
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT supportos_state_id FROM conversations WHERE id = ?1",
+            rusqlite::params![conv.id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let state_name: Option<String> = match state_id {
+        Some(sid) => conn
+            .query_row(
+                "SELECT name FROM ticket_states WHERE id = ?1",
+                rusqlite::params![sid],
+                |r| r.get(0),
+            )
+            .ok(),
+        None => None,
+    };
+    if state_id.is_some() && state_name.is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "ok": false,
+                "message": "State not found.",
+                "previousStateId": current,
+            })),
+        )
+            .into_response();
     }
-    let result = conn.execute(
-        "UPDATE conversations SET subject = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE remote_id = ?2",
-        rusqlite::params![new_subject, id],
+    if current == state_id {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "message": "Conversation already in this state.",
+                "previousStateId": current,
+            })),
+        )
+            .into_response();
+    }
+    let occurred_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if let Ok(tx) = conn.transaction() {
+        tx.execute(
+            "INSERT INTO state_transitions (conversation_id, previous_state_id,
+                 new_state_id, actor_type, actor_local_id, reason, occurred_at, source)
+             VALUES (?1, ?2, ?3, 'user', NULL, ?4, ?5, 'local')",
+            rusqlite::params![conv.id, current, state_id, reason, occurred_at],
+        )
+        .ok();
+        let transition_rowid = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE conversations SET supportos_state_id = ?1 WHERE id = ?2",
+            rusqlite::params![state_id, conv.id],
+        )
+        .ok();
+        // Activity entry: dedup key carries the TRANSITION rowid so two
+        // changes in the same millisecond stay distinct.
+        tx.execute(
+            "INSERT OR IGNORE INTO activity_events (conversation_id, event_type,
+                 actor_type, actor_id, occurred_at, source, metadata, dedup_key)
+             VALUES (?1, 'ticket_state_changed', 'user', NULL, ?2, 'local', ?3,
+                 'ticket_state_changed:' || ?1 || ':' || ?4)",
+            rusqlite::params![
+                conv.id,
+                occurred_at,
+                json!({
+                    "previous_state_id": current,
+                    "new_state_id": state_id,
+                    "reason": reason,
+                })
+                .to_string(),
+                transition_rowid
+            ],
+        )
+        .ok();
+        tx.commit().ok();
+    }
+    let _ = crate::jobs::audit(
+        &conn,
+        "user",
+        "ticket_state_changed",
+        Some(conv.id),
+        Some(&json!({ "state_id": current }).to_string()),
+        Some(&json!({ "state_id": state_id, "reason": reason }).to_string()),
+        None,
+        None,
+        false,
     );
-    let updated = result.as_ref().map(|rows| *rows > 0).unwrap_or(false);
     drop(conn);
-    if updated {
-        crate::http::event_bus::notify_conversation_updated(
-            &state.bus,
-            &crate::events::ConversationUpdatedEvent {
-                conversation_id: Some(id),
-                conversation_number: None,
-                mailbox_id: None,
-                subject: None,
-                reason: "sync".into(),
-                at: chrono::Utc::now()
-                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .to_string(),
-            },
-        );
+    crate::http::event_bus::notify_conversation_updated(
+        &state.bus,
+        &crate::events::ConversationUpdatedEvent {
+            conversation_id: Some(conv.id),
+            conversation_number: None,
+            mailbox_id: None,
+            subject: None,
+            reason: "sync".into(),
+            at: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        },
+    );
+    let message = match (&state_name, state_id) {
+        (Some(name), _) => format!("State set to {name}."),
+        (None, Some(_)) => "State set.".to_string(),
+        (None, None) => "State cleared.".to_string(),
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "message": message,
+            "previousStateId": current,
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Zod request parsers (schemas.ts:302-336, activity.ts:379-386)
+// ---------------------------------------------------------------------------
+
+/// Zod v3's `z.string().email()` check. The upstream regex uses two
+/// look-aheads the `regex` crate does not support, so they are checked
+/// directly: (1) the address must not start with '.', (2) no two
+/// consecutive dots anywhere.
+const ZOD_EMAIL_RE: &str =
+    r"^([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$";
+
+fn zod_email_ok(email: &str) -> bool {
+    if email.starts_with('.') || email.contains("..") {
+        return false;
     }
-    match result {
-        Ok(rows) => (StatusCode::OK, Json(json!({"ok": rows > 0}))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()})),
-        ),
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(ZOD_EMAIL_RE).expect("static email regex"))
+        .is_match(email)
+}
+
+/// The JSON type name Zod reports in `Expected T, received X` messages.
+fn zod_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "boolean",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Null => "null",
     }
 }
 
-/// POST /api/conversations/:id/state — set custom ticket state.
-pub async fn set_state(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let new_state = body.get("state").and_then(|v| v.as_str()).unwrap_or("");
-    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Safety invariant: eval mode blocks custom-state changes (status
-    // family).
-    if let Some(msg) = eval_mode_blocked(&conn) {
-        drop(conn);
-        return eval_rejected(msg);
+/// `z.number().int()` on an already-extracted value.
+fn zod_int_value(v: &Value) -> std::result::Result<i64, String> {
+    if let Some(f) = v.as_f64() {
+        if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            return Ok(f as i64);
+        }
+        return Err("Expected integer, received float".into());
     }
-    use crate::ticket_ops::{execute, TicketOperation};
-    let op = TicketOperation::SetTicketState {
-        conversation_remote_id: id,
-        new_state: new_state.to_string(),
-        actor_type: "user".to_string(),
-        actor_id: None,
-    };
-    match execute(&mut conn, &op) {
-        Ok(result) => {
-            let ok = matches!(result, crate::ticket_ops::OperationResult::Success { .. });
-            drop(conn);
-            if ok {
-                crate::http::event_bus::notify_conversation_updated(
-                    &state.bus,
-                    &crate::events::ConversationUpdatedEvent {
-                        conversation_id: Some(id),
-                        conversation_number: None,
-                        mailbox_id: None,
-                        subject: None,
-                        reason: "sync".into(),
-                        at: chrono::Utc::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                            .to_string(),
-                    },
-                );
+    Err(format!("Expected number, received {}", zod_type_name(v)))
+}
+
+/// `z.string().min(1)`.
+fn parse_text_min1(body: &Value, field: &str) -> Result<String, Response> {
+    match crate::conversation_ops::zod_string_msg(body, field) {
+        Ok(t) if t.is_empty() => Err(zod_422(
+            field,
+            "String must contain at least 1 character(s)",
+        )),
+        Ok(t) => Ok(t),
+        Err(m) => Err(zod_422(field, &m)),
+    }
+}
+
+/// `z.array(z.string().email()).default([])` — the default applies to a
+/// MISSING key only; null is a type error.
+fn parse_email_array(body: &Value, field: &str) -> Result<Vec<String>, Response> {
+    match body.get(field) {
+        None => Ok(vec![]),
+        Some(Value::Null) => Err(zod_422(field, "Expected array, received null")),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, v) in items.iter().enumerate() {
+                let Some(s) = v.as_str() else {
+                    return Err(zod_422(
+                        &format!("{field}[{i}]"),
+                        &format!("Expected string, received {}", zod_type_name(v)),
+                    ));
+                };
+                if !zod_email_ok(s) {
+                    return Err(zod_422(&format!("{field}[{i}]"), "Invalid email"));
+                }
+                out.push(s.to_string());
             }
-            (StatusCode::OK, Json(json!({"ok": ok})))
+            Ok(out)
         }
-        Err(e) => {
-            drop(conn);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()}),
-                ),
-            )
+        Some(v) => Err(zod_422(
+            field,
+            &format!("Expected array, received {}", zod_type_name(v)),
+        )),
+    }
+}
+
+/// `z.number().int().nullish()`.
+fn parse_optional_int(body: &Value, field: &str) -> Result<Option<i64>, Response> {
+    match body.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => zod_int_value(v).map(Some).map_err(|m| zod_422(field, &m)),
+    }
+}
+
+/// `z.number().int().nullable()` — required key, null allowed.
+fn parse_required_nullable_int(body: &Value, field: &str) -> Result<Option<i64>, Response> {
+    match body.get(field) {
+        None => Err(zod_422(field, "Required")),
+        Some(Value::Null) => Ok(None),
+        Some(v) => zod_int_value(v).map(Some).map_err(|m| zod_422(field, &m)),
+    }
+}
+
+/// replyRequestSchema (schemas.ts:302) minus conversationId (injected from
+/// the path by the handler): text min 1, draft default false, cc/bcc email
+/// arrays default [], statusAfter enum nullish, assignTo int nullish,
+/// attachmentIds int array default [] (validated only — sendReply never
+/// forwards attachments to the provider).
+fn parse_reply_body(
+    body: &Value,
+) -> Result<
+    (
+        String,
+        bool,
+        Vec<String>,
+        Vec<String>,
+        Option<String>,
+        Option<i64>,
+    ),
+    Response,
+> {
+    let text = parse_text_min1(body, "text")?;
+    let draft = match body.get("draft") {
+        None => false,
+        Some(Value::Null) => return Err(zod_422("draft", "Expected boolean, received null")),
+        Some(_) => match crate::conversation_ops::zod_bool_msg(body, "draft") {
+            Ok(b) => b,
+            Err(m) => return Err(zod_422("draft", &m)),
+        },
+    };
+    let cc = parse_email_array(body, "cc")?;
+    let bcc = parse_email_array(body, "bcc")?;
+    const STATUS_AFTER: [&str; 6] = [
+        "active",
+        "closed",
+        "pending",
+        "spam",
+        "open",
+        "inbox_predefined",
+    ];
+    let status_after = match body.get("statusAfter") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            if !STATUS_AFTER.contains(&s.as_str()) {
+                return Err(zod_422("statusAfter", &zod_enum_message(&STATUS_AFTER, s)));
+            }
+            Some(s.clone())
+        }
+        Some(v) => {
+            return Err(zod_422(
+                "statusAfter",
+                &format!("Expected string, received {}", zod_type_name(v)),
+            ))
+        }
+    };
+    let assign_to = parse_optional_int(body, "assignTo")?;
+    match body.get("attachmentIds") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for (i, v) in items.iter().enumerate() {
+                if let Err(m) = zod_int_value(v) {
+                    return Err(zod_422(&format!("attachmentIds[{i}]"), &m));
+                }
+            }
+        }
+        Some(v) => {
+            return Err(zod_422(
+                "attachmentIds",
+                &format!("Expected array, received {}", zod_type_name(v)),
+            ))
         }
     }
+    Ok((text, draft, cc, bcc, status_after, assign_to))
 }
 
 /// GET /api/conversations/:id/events — activity events for a conversation.
@@ -852,7 +1054,7 @@ pub async fn webhook_configs(State(state): State<AppState>) -> impl IntoResponse
 // ---------------------------------------------------------------------------
 
 use crate::conversation_ops::{
-    conv_by_local_id, eval_mode_blocked, js_number, op_bulk_action, op_delete_schedule,
+    conv_by_local_id, eval_mode_blocked, js_number, ok_result, op_bulk_action, op_delete_schedule,
     op_move_to_inbox, op_publish_schedule, op_run_workflow, op_schedule_reply, op_snooze,
     op_unsnooze, op_update_custom_fields, op_update_tags, rejected, zod_422, zod_422_multi,
     zod_bool_msg, zod_enum_message, zod_int_msg, zod_string_msg,
@@ -1518,6 +1720,53 @@ mod tests {
         }
     }
 
+    /// A state wired the way the real app wires it: one fake provider shared
+    /// by the sync engine and the ops (demo mode), with the demo world
+    /// mirrored into the DB so conversations exist locally.
+    async fn make_pipeline_state() -> AppState {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("pipeline.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        let http_conn = Arc::new(Mutex::new(conn));
+        let bus = crate::http::EventBus::new(64);
+        let provider = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+            as Arc<dyn crate::helpscout::HelpScoutProvider>;
+        let sync = Arc::new(
+            crate::sync_engine::SyncEngine::new(http_conn.clone(), provider).with_bus(bus.clone()),
+        );
+        sync.initial_sync().await.expect("demo initial sync");
+        AppState {
+            conn: http_conn,
+            data_dir: tmp.path().to_path_buf(),
+            port: 3000,
+            host: "127.0.0.1".into(),
+            demo_mode: true,
+            bus,
+            limiter: crate::http::RateLimiter::new(),
+            sync: Some(sync),
+            real: None,
+            provider_kind: "fake".into(),
+            workers: None,
+            qdrant: std::sync::Arc::new(crate::vectorstore_qdrant::EmbeddedQdrant::new(
+                "/tmp/spp-test-qdrant",
+                "http://127.0.0.1:6333",
+                false,
+            )),
+        }
+    }
+
+    /// (local id, remote id) of the first mirrored conversation.
+    fn first_conversation(state: &AppState) -> (i64, i64) {
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT id, remote_id FROM conversations ORDER BY id LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
     async fn body_json(response: Response) -> (StatusCode, Value) {
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -1528,107 +1777,700 @@ mod tests {
     }
 
     /// Safety invariant (operations.ts evalModeBlocked): with evaluation mode
-    /// ON, EVERY remote write is blocked — the five previously-ungated routes
-    /// (reply/note/status/assign/subject) must reject with the exact message
-    /// BEFORE touching the conversation.
+    /// ON, every REMOTE write route rejects with its exact reference message
+    /// BEFORE touching the provider. Note: addNote checks the conversation
+    /// BEFORE the eval flag (reference order), so it needs a real row.
     #[tokio::test]
     async fn eval_mode_blocks_reply_note_status_assign_subject() {
-        let state = make_state();
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
         {
             let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
             crate::settings::set_bool(&conn, "ai_evaluation_mode", true).unwrap();
         }
 
-        let r1 = body_json(
-            reply(
-                State(state.clone()),
-                Path(1),
-                Json(json!({"body": "hello"})),
-            )
-            .await
-            .into_response(),
-        )
-        .await;
-        let r2 = body_json(
-            note(State(state.clone()), Path(1), Json(json!({"body": "note"})))
+        let cases: Vec<(&str, Response)> = vec![
+            (
+                "reply",
+                reply(
+                    State(state.clone()),
+                    Path(id.to_string()),
+                    Some(Json(json!({"text": "hello"}))),
+                )
                 .await
                 .into_response(),
-        )
-        .await;
-        let r3 = body_json(
-            status(
-                State(state.clone()),
-                Path(1),
-                Json(json!({"status": "closed"})),
-            )
-            .await
-            .into_response(),
-        )
-        .await;
-        let r4 = body_json(
-            assign(
-                State(state.clone()),
-                Path(1),
-                Json(json!({"assigneeLocalId": 2})),
-            )
-            .await
-            .into_response(),
-        )
-        .await;
-        let r5 = body_json(
-            subject(
-                State(state.clone()),
-                Path(1),
-                Json(json!({"subject": "new"})),
-            )
-            .await
-            .into_response(),
-        )
-        .await;
-
-        for (name, (code, body)) in [
-            ("reply", r1),
-            ("note", r2),
-            ("status", r3),
-            ("assign", r4),
-            ("subject", r5),
-        ] {
+            ),
+            (
+                "note",
+                note(
+                    State(state.clone()),
+                    Path(id.to_string()),
+                    Some(Json(json!({"text": "note"}))),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "status",
+                status(
+                    State(state.clone()),
+                    Path(id.to_string()),
+                    Some(Json(json!({"status": "closed"}))),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "assign",
+                assign(
+                    State(state.clone()),
+                    Path(id.to_string()),
+                    Some(Json(json!({"userId": 2}))),
+                )
+                .await
+                .into_response(),
+            ),
+            (
+                "subject",
+                subject(
+                    State(state.clone()),
+                    Path(id.to_string()),
+                    Some(Json(json!({"subject": "new"}))),
+                )
+                .await
+                .into_response(),
+            ),
+        ];
+        // The reference messages differ per op (operations.ts).
+        let expected = [
+            "AI evaluation mode is ON: no replies, notes, status changes or other updates are sent to Help Scout.",
+            "AI evaluation mode is ON: no notes, replies or status changes are sent to Help Scout.",
+            "AI evaluation mode is ON: status changes are disabled.",
+            "AI evaluation mode is ON: no replies, notes, status changes or other updates are sent to Help Scout.",
+            "AI evaluation mode is ON: no replies, notes, status changes or other updates are sent to Help Scout.",
+        ];
+        for ((name, resp), msg) in cases.into_iter().zip(expected.iter()) {
+            let (code, body) = body_json(resp).await;
             assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{name} must 422");
             assert_eq!(body["ok"], json!(false), "{name} must be ok:false");
-            assert_eq!(
-                body["message"],
-                json!("AI evaluation mode is ON: no replies, notes, status changes or other updates are sent to Help Scout."),
-                "{name} must carry the reference message"
-            );
+            assert_eq!(&body["message"], &json!(msg), "{name} message");
         }
+        // Nothing was written: no jobs, no threads beyond the seeded ones.
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let jobs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM outbound_jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(jobs, 0, "eval mode must not create outbound jobs");
     }
 
-    /// With evaluation mode OFF the gate is silent — the request proceeds
-    /// into the pipeline (which handles the missing conversation its own
-    /// way; the 422 shape for that path is the write-pipeline port's scope).
+    /// The five routes return the reference 422 `{ok:false}` envelope for a
+    /// missing conversation — never a 500 (the old defect).
     #[tokio::test]
-    async fn eval_mode_off_reply_still_works() {
+    async fn missing_conversation_is_422_not_500() {
         let state = make_state();
         let (code, body) = body_json(
             reply(
                 State(state.clone()),
-                Path(999),
-                Json(json!({"body": "hello"})),
+                Path("999".into()),
+                Some(Json(json!({"text": "hello"}))),
             )
             .await
             .into_response(),
         )
         .await;
-        let msg = body["message"].as_str().unwrap_or("");
-        assert_ne!(
-            msg,
-            "AI evaluation mode is ON: no replies, notes, status changes or other updates are sent to Help Scout.",
-            "the gate must not fire when evaluation mode is off"
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["message"], json!("Conversation not found locally."));
+
+        for resp in [
+            note(
+                State(state.clone()),
+                Path("999".into()),
+                Some(Json(json!({"text": "n"}))),
+            )
+            .await
+            .into_response(),
+            status(
+                State(state.clone()),
+                Path("999".into()),
+                Some(Json(json!({"status": "closed"}))),
+            )
+            .await
+            .into_response(),
+            assign(
+                State(state.clone()),
+                Path("999".into()),
+                Some(Json(json!({"userId": 1}))),
+            )
+            .await
+            .into_response(),
+            subject(
+                State(state.clone()),
+                Path("999".into()),
+                Some(Json(json!({"subject": "s"}))),
+            )
+            .await
+            .into_response(),
+        ] {
+            let (code, body) = body_json(resp).await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(body["message"], json!("Conversation not found locally."));
+        }
+    }
+
+    /// Real mode without a connected token: the reply route answers 503 with
+    /// the reference message (only the reply route maps not-connected to 503).
+    #[tokio::test]
+    async fn not_connected_reply_is_503() {
+        let state = make_state();
+        {
+            let mut s = state;
+            s.provider_kind = "real".into();
+            let (code, body) = body_json(
+                reply(
+                    State(s),
+                    Path("1".into()),
+                    Some(Json(json!({"text": "hello"}))),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["ok"], json!(false));
+            assert_eq!(
+                body["message"],
+                json!("Help Scout is not connected. Remote actions are disabled - connect Help Scout in Settings first.")
+            );
+        }
+    }
+
+    /// Zod contracts: replyRequestSchema / statusRequestSchema /
+    /// assignRequestSchema produce the reference 422 issues.
+    #[tokio::test]
+    async fn zod_validation_shapes() {
+        let state = make_state();
+        // empty text
+        let (code, body) = body_json(
+            reply(
+                State(state.clone()),
+                Path("1".into()),
+                Some(Json(json!({"text": ""}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["message"],
+            json!("Invalid request (text): String must contain at least 1 character(s)")
         );
-        assert_ne!(
-            code,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "no eval 422 when evaluation mode is off"
+        // invalid email in cc
+        let (code, _body) = body_json(
+            reply(
+                State(state.clone()),
+                Path("1".into()),
+                Some(Json(json!({"text": "hi", "cc": ["notanemail"]}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        // bad status enum
+        let (code, body) = body_json(
+            status(
+                State(state.clone()),
+                Path("1".into()),
+                Some(Json(json!({"status": "resolved"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["message"],
+            json!("Invalid request (status): Invalid enum value. Expected 'active' | 'closed' | 'pending' | 'spam', received 'resolved'")
         );
+        // assign without the required userId key
+        let (code, body) = body_json(
+            assign(
+                State(state.clone()),
+                Path("1".into()),
+                Some(Json(json!({}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["message"], json!("Invalid request (userId): Required"));
+    }
+
+    /// sendReply happy path in demo mode: provider write (the world) →
+    /// single-conversation refresh → audit + idempotency-keyed job. The
+    /// thread must appear in GET detail and carry the demo agent as actor.
+    #[tokio::test]
+    async fn reply_full_pipeline_demo() {
+        let state = make_pipeline_state().await;
+        let (id, remote) = first_conversation(&state);
+        let (code, body) = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "Hello from the pipeline"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body: {body}");
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["message"], json!("Reply sent successfully."));
+        let thread_remote_id = body["data"]["threadRemoteId"].as_i64().unwrap();
+        assert!(thread_remote_id > 0);
+
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // Thread visible locally with the right shape.
+        let (kind, body_text, actor_type): (String, String, String) = conn
+            .query_row(
+                "SELECT thread_type, body, actor_type FROM conversation_threads
+                  WHERE remote_id = ?1",
+                rusqlite::params![thread_remote_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "reply");
+        assert_eq!(body_text, "Hello from the pipeline");
+        assert_eq!(actor_type, "user");
+        // Job confirmed with the sha256 idempotency key.
+        let (kind, status, key): (String, String, String) = conn
+            .query_row(
+                "SELECT kind, status, idempotency_key FROM outbound_jobs
+                  WHERE idempotency_key IS NOT NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "create_reply");
+        assert_eq!(status, "confirmed");
+        assert!(
+            key.starts_with(&format!("reply:{remote}:send:")),
+            "key: {key}"
+        );
+        // Audit row.
+        let (action, job_id_set): (String, i64) = conn
+            .query_row(
+                "SELECT action, COALESCE(job_id, 0) FROM audit_log
+                  WHERE action = 'reply_sent' AND conversation_id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, "reply_sent");
+        assert!(job_id_set > 0);
+        // No phantom "[reply sent: ...]" note (the old double-write).
+        let phantoms: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_threads WHERE body LIKE '[reply sent:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phantoms, 0);
+    }
+
+    /// Duplicate-send protection: the same non-draft text twice is rejected;
+    /// draft-then-send of the same text is the normal flow and allowed.
+    #[tokio::test]
+    async fn reply_idempotency() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        let first = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "Once only"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(first.0, StatusCode::OK);
+        let second = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "Once only"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(second.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(second.1["message"], json!("This exact reply was already sent (duplicate-send protection). Check the conversation history before sending again."));
+        // draft then send of the same text is NOT a duplicate.
+        let draft = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "Draft me", "draft": true}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(draft.0, StatusCode::OK);
+        assert_eq!(draft.1["message"], json!("Draft saved to Help Scout."));
+        let send = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "Draft me"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(send.0, StatusCode::OK);
+        assert_eq!(send.1["message"], json!("Reply sent successfully."));
+    }
+
+    /// addNote: thread lands with type note, job confirmed, audit actor user.
+    #[tokio::test]
+    async fn note_full_pipeline_demo() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        let (code, body) = body_json(
+            note(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "Internal observation"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["message"], json!("Internal note added."));
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (kind, status): (String, String) = conn
+            .query_row(
+                "SELECT kind, status FROM outbound_jobs WHERE kind = 'create_note'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "create_note");
+        assert_eq!(status, "confirmed");
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'note_added'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    /// changeStatus: closing stamps closed_at atomically; audit records
+    /// before/after; the world and the local row agree afterwards.
+    #[tokio::test]
+    async fn status_close_stamps_closed_at() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        let (code, body) = body_json(
+            status(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"status": "closed"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["message"], json!("Status changed to closed."));
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (st, closed): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, closed_at FROM conversations WHERE id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(st, "closed");
+        assert!(closed.is_some(), "closed_at must be stamped");
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'status_changed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 1);
+        // No phantom system thread ("Status changed to: ...").
+        let phantoms: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_threads
+                  WHERE thread_type = 'system' AND body LIKE 'Status changed to:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phantoms, 0);
+    }
+
+    /// assign: a REMOTE user id resolves through the mirror to the local
+    /// assignee; null unassigns. Both messages match the reference.
+    #[tokio::test]
+    async fn assign_resolves_remote_user_and_unassigns() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        let remote_user: i64 = {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT remote_id FROM users WHERE remote_id IS NOT NULL ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (code, body) = body_json(
+            assign(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"userId": remote_user}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["message"], json!("Conversation assigned."));
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let assigned: Option<i64> = conn
+            .query_row(
+                "SELECT assignee_id FROM conversations WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(assigned.is_some(), "assignee resolved through the mirror");
+        drop(conn);
+        let (code, body) = body_json(
+            assign(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"userId": null}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["message"], json!("Conversation unassigned."));
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let assigned: Option<i64> = conn
+            .query_row(
+                "SELECT assignee_id FROM conversations WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(assigned.is_none());
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'assignment_changed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 2);
+    }
+
+    /// changeSubject: local row updated, audit written, reference message.
+    #[tokio::test]
+    async fn subject_updates_and_audits() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        let (code, body) = body_json(
+            subject(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"subject": "Updated by pipeline"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["message"], json!("Subject updated."));
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let subject: String = conn
+            .query_row(
+                "SELECT subject FROM conversations WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(subject, "Updated by pipeline");
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'subject_changed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    /// setPriority: local write, no eval gate (the HS mapping defaults off),
+    /// reference message + data, audit + activity event.
+    #[tokio::test]
+    async fn priority_local_write_reference_shape() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        // Eval mode ON must NOT block the local priority write.
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::settings::set_bool(&conn, "ai_evaluation_mode", true).unwrap();
+        }
+        let (code, body) = body_json(
+            priority(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"priority": "high"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["message"], json!("Priority set to high."));
+        assert_eq!(
+            body["data"],
+            json!({ "priority": "high", "hs_field_synced": false })
+        );
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let p: String = conn
+            .query_row(
+                "SELECT supportos_priority FROM conversations WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p, "high");
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM activity_events WHERE event_type = 'priority_changed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'priority_changed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    /// set_state: stateId-based transition with history + activity + audit.
+    #[tokio::test]
+    async fn state_transition_by_id() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        let state_row: (i64, String) = {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT id, name FROM ticket_states ORDER BY sort_order LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let (code, body) = body_json(
+            set_state(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"stateId": state_row.0, "reason": "triaged"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(
+            body["message"],
+            json!(format!("State set to {}.", state_row.1))
+        );
+        assert_eq!(body["previousStateId"], json!(null));
+        // Idempotent same-state request.
+        let (code, body) = body_json(
+            set_state(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"stateId": state_row.0}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            body["message"],
+            json!("Conversation already in this state.")
+        );
+        // Unknown state id.
+        let (code, body) = body_json(
+            set_state(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"stateId": 999_999}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["message"], json!("State not found."));
+        // Clearing.
+        let (code, body) = body_json(
+            set_state(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"stateId": null}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["message"], json!("State cleared."));
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let transitions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM state_transitions WHERE conversation_id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(transitions, 2, "set + clear (the same-state one skipped)");
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'ticket_state_changed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 2);
     }
 }

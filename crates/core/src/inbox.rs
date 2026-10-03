@@ -1,4 +1,4 @@
-//! Inbox module — list + filter + thread + reply + note + status + assignment.
+//! Inbox module — list + filter + thread reads.
 //!
 //! Per spec M3: "inbox." Per A11: the inbox is the main ticket view.
 //! Per KNOWN PITFALLS: "every view has loading, empty and error states."
@@ -8,25 +8,18 @@
 //!   assignee, priority).
 //! - `get_conversation` — full conversation details + thread (activity events
 //!   + customer messages + replies + notes).
-//! - `reply_to_conversation` — add a reply to the thread (creates an
-//!   activity event of type `reply`).
-//! - `add_note` — add an internal note (delegates to `ticket_ops::execute`
-//!   with `TicketOperation::AddNote`).
-//! - `change_status` — change the conversation status (delegates to
-//!   `ticket_ops::execute` with `TicketOperation::ChangeStatus`).
-//! - `assign` — assign to a user (delegates to `ticket_ops::execute`).
 //! - `list_saved_views` / `apply_saved_view` — list + apply saved views
 //!   (delegates to `saved_views`).
 //!
-//! All mutations go through `ticket_ops::execute` (the write-protection
-//! pipeline, M3-T05). Reads use parameterized SQL — no string interpolation.
+//! Mutations live in `conversation_ops` (the write-protection pipeline,
+//! operations.ts parity). Reads use parameterized SQL — no string
+//! interpolation.
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::saved_views::{self, SavedView};
-use crate::ticket_ops::{self, OperationResult, TicketOperation};
 
 /// Apply the M028 migration: `conversation_threads` table.
 /// Stores customer messages, replies, notes, and system events.
@@ -362,191 +355,6 @@ pub fn get_conversation(
     Ok(Some(detail))
 }
 
-// ─── Mutations (all go through ticket_ops::execute) ──────────────────────
-
-/// Add a reply to a conversation. This inserts a `reply` thread entry AND
-/// records an activity event.
-pub fn reply_to_conversation(
-    conn: &mut Connection,
-    conversation_remote_id: i64,
-    body: String,
-    actor_type: String,
-    actor_id: Option<i64>,
-) -> Result<OperationResult> {
-    // Validate non-empty body.
-    let body_trimmed = body.trim();
-    if body_trimmed.is_empty() {
-        return Ok(OperationResult::Rejected {
-            reason: "Reply body cannot be empty".to_string(),
-        });
-    }
-
-    // First add the thread entry inside a transaction.
-    let tx = conn.transaction()?;
-    let conversation_id: i64 = tx
-        .query_row(
-            "SELECT id FROM conversations WHERE remote_id = ?",
-            params![conversation_remote_id],
-            |r| r.get(0),
-        )
-        .map_err(|_| Error::Config(format!("conversation {conversation_remote_id} not found")))?;
-    tx.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id)
-         VALUES (?1, 'reply', ?2, ?3, ?4)",
-        params![conversation_id, body, actor_type, actor_id],
-    )?;
-    tx.execute(
-        "UPDATE conversations SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE remote_id = ?1",
-        params![conversation_remote_id],
-    )?;
-    tx.commit()?;
-
-    // Then record the activity event via the write-protection pipeline.
-    // Note: ticket_ops::AddNote is for internal notes; for replies we use a
-    // lighter-weight direct thread insert (above) + the conversation table
-    // update is what ticket_ops would do. The pipeline is reserved for
-    // status/assign/priority/state changes.
-    let _ = ticket_ops::execute(
-        conn,
-        &TicketOperation::AddNote {
-            conversation_remote_id,
-            body: format!("[reply sent: {body_trimmed}]"),
-            actor_type,
-            actor_id,
-        },
-    );
-
-    Ok(OperationResult::Success {
-        message: "Reply added".to_string(),
-    })
-}
-
-/// Add an internal note to a conversation. Delegates to ticket_ops.
-pub fn add_note(
-    conn: &mut Connection,
-    conversation_remote_id: i64,
-    body: String,
-    actor_type: String,
-    actor_id: Option<i64>,
-) -> Result<OperationResult> {
-    let result = ticket_ops::execute(
-        conn,
-        &TicketOperation::AddNote {
-            conversation_remote_id,
-            body: body.clone(),
-            actor_type: actor_type.clone(),
-            actor_id,
-        },
-    )?;
-
-    // If the note was accepted, also insert a thread entry.
-    if let OperationResult::Success { .. } = &result {
-        let tx = conn.transaction()?;
-        let conversation_id: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM conversations WHERE remote_id = ?",
-                params![conversation_remote_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(cid) = conversation_id {
-            tx.execute(
-                "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id)
-                 VALUES (?1, 'note', ?2, ?3, ?4)",
-                params![cid, body, actor_type, actor_id],
-            )?;
-            tx.commit()?;
-        }
-    }
-
-    Ok(result)
-}
-
-/// Change the conversation status (active/pending/closed). Delegates to ticket_ops.
-pub fn change_status(
-    conn: &mut Connection,
-    conversation_remote_id: i64,
-    new_status: String,
-    actor_type: String,
-    actor_id: Option<i64>,
-) -> Result<OperationResult> {
-    let result = ticket_ops::execute(
-        conn,
-        &TicketOperation::ChangeStatus {
-            conversation_remote_id,
-            new_status: new_status.clone(),
-            actor_type: actor_type.clone(),
-            actor_id,
-        },
-    )?;
-
-    // Record a system thread entry.
-    if let OperationResult::Success { .. } = &result {
-        let tx = conn.transaction()?;
-        let conversation_id: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM conversations WHERE remote_id = ?",
-                params![conversation_remote_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(cid) = conversation_id {
-            tx.execute(
-                "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id)
-                 VALUES (?1, 'system', ?2, ?3, ?4)",
-                params![cid, format!("Status changed to: {new_status}"), actor_type, actor_id],
-            )?;
-            tx.commit()?;
-        }
-    }
-
-    Ok(result)
-}
-
-/// Assign the conversation to a user. Delegates to ticket_ops.
-pub fn assign(
-    conn: &mut Connection,
-    conversation_remote_id: i64,
-    assignee_local_id: Option<i64>,
-    actor_type: String,
-    actor_id: Option<i64>,
-) -> Result<OperationResult> {
-    let result = ticket_ops::execute(
-        conn,
-        &TicketOperation::Assign {
-            conversation_remote_id,
-            assignee_local_id,
-            actor_type: actor_type.clone(),
-            actor_id,
-        },
-    )?;
-
-    if let OperationResult::Success { .. } = &result {
-        let tx = conn.transaction()?;
-        let conversation_id: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM conversations WHERE remote_id = ?",
-                params![conversation_remote_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(cid) = conversation_id {
-            let body = match assignee_local_id {
-                Some(uid) => format!("Assigned to user {uid}"),
-                None => "Unassigned".to_string(),
-            };
-            tx.execute(
-                "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id)
-                 VALUES (?1, 'system', ?2, ?3, ?4)",
-                params![cid, body, actor_type, actor_id],
-            )?;
-            tx.commit()?;
-        }
-    }
-
-    Ok(result)
-}
-
 // ─── Saved views ─────────────────────────────────────────────────────────
 
 /// List all saved views.
@@ -739,107 +547,6 @@ mod tests {
         let conn = fresh_db();
         let result = get_conversation(&conn, 99999).unwrap();
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn reply_to_conversation_adds_thread_entry() {
-        let mut conn = fresh_db();
-        seed_test_data(&mut conn);
-        let result = reply_to_conversation(
-            &mut conn,
-            1001,
-            "Hello from the agent".to_string(),
-            "user".to_string(),
-            Some(1),
-        )
-        .unwrap();
-        assert!(matches!(result, OperationResult::Success { .. }));
-
-        // Verify the thread entry was added.
-        let detail = get_conversation(&conn, 1).unwrap().unwrap();
-        let reply = detail
-            .thread
-            .iter()
-            .find(|t| t.thread_type == "reply")
-            .expect("reply thread entry should exist");
-        assert_eq!(reply.body.as_deref(), Some("Hello from the agent"));
-    }
-
-    #[test]
-    fn reply_to_conversation_rejects_empty_body() {
-        let mut conn = fresh_db();
-        seed_test_data(&mut conn);
-        let result = reply_to_conversation(
-            &mut conn,
-            1001,
-            "   ".to_string(),
-            "user".to_string(),
-            Some(1),
-        )
-        .unwrap();
-        assert!(matches!(result, OperationResult::Rejected { .. }));
-    }
-
-    #[test]
-    fn add_note_creates_thread_entry_and_activity_event() {
-        let mut conn = fresh_db();
-        seed_test_data(&mut conn);
-        let result = add_note(
-            &mut conn,
-            1001,
-            "Internal note".to_string(),
-            "user".to_string(),
-            Some(1),
-        )
-        .unwrap();
-        assert!(matches!(result, OperationResult::Success { .. }));
-
-        let detail = get_conversation(&conn, 1).unwrap().unwrap();
-        let note = detail
-            .thread
-            .iter()
-            .find(|t| t.thread_type == "note")
-            .expect("note thread entry should exist");
-        assert_eq!(note.body.as_deref(), Some("Internal note"));
-    }
-
-    #[test]
-    fn change_status_records_system_thread_entry() {
-        let mut conn = fresh_db();
-        seed_test_data(&mut conn);
-        let result = change_status(
-            &mut conn,
-            1001,
-            "closed".to_string(),
-            "user".to_string(),
-            Some(1),
-        )
-        .unwrap();
-        assert!(matches!(result, OperationResult::Success { .. }));
-
-        let detail = get_conversation(&conn, 1).unwrap().unwrap();
-        let sys = detail
-            .thread
-            .iter()
-            .find(|t| t.thread_type == "system")
-            .expect("system thread entry should exist");
-        assert!(sys
-            .body
-            .as_deref()
-            .unwrap()
-            .contains("Status changed to: closed"));
-    }
-
-    #[test]
-    fn assign_records_system_thread_entry() {
-        let mut conn = fresh_db();
-        seed_test_data(&mut conn);
-        let result = assign(&mut conn, 1001, Some(1), "user".to_string(), Some(2)).unwrap();
-        assert!(matches!(result, OperationResult::Success { .. }));
-
-        let detail = get_conversation(&conn, 1).unwrap().unwrap();
-        assert!(detail.thread.iter().any(|t| t.thread_type == "system"
-            && t.body.as_deref().unwrap().contains("Assigned to user 1")));
     }
 
     #[test]

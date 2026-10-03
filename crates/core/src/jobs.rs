@@ -467,10 +467,41 @@ pub fn audit(
     remote_result: Option<&str>,
     ai_involvement: bool,
 ) -> Result<()> {
+    audit_entry(
+        conn,
+        actor,
+        action,
+        conversation_id,
+        before_state,
+        after_state,
+        remote_operation,
+        remote_result,
+        ai_involvement,
+        None,
+        None,
+    )
+}
+
+/// `audit(entry)` with the job/correlation columns the write pipeline fills
+/// (jobRepo.ts audit: job_id + correlation_id).
+#[allow(clippy::too_many_arguments)]
+pub fn audit_entry(
+    conn: &Connection,
+    actor: &str,
+    action: &str,
+    conversation_id: Option<i64>,
+    before_state: Option<&str>,
+    after_state: Option<&str>,
+    remote_operation: Option<&str>,
+    remote_result: Option<&str>,
+    ai_involvement: bool,
+    job_id: Option<i64>,
+    correlation_id: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO audit_log (timestamp, actor, action, conversation_id, before_state,
-             after_state, remote_operation, remote_result, ai_involvement)
-         VALUES (datetime('now'), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             after_state, remote_operation, remote_result, ai_involvement, job_id, correlation_id)
+         VALUES (datetime('now'), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             actor,
             action,
@@ -479,8 +510,32 @@ pub fn audit(
             after_state,
             remote_operation,
             remote_result,
-            i64::from(ai_involvement)
+            i64::from(ai_involvement),
+            job_id,
+            correlation_id
         ],
+    )?;
+    Ok(())
+}
+
+/// `recordOutboundAttempt(jobId, attempt, summary, statusCode, responseBody,
+/// latencyMs)` — jobRepo.ts:196. Summary caps at 500 chars, body at 2000.
+pub fn record_outbound_attempt(
+    conn: &Connection,
+    job_id: i64,
+    attempt: i64,
+    summary: &str,
+    status_code: Option<i64>,
+    response_body: Option<&str>,
+    latency_ms: Option<i64>,
+) -> Result<()> {
+    let summary: String = summary.chars().take(500).collect();
+    let body: Option<String> = response_body.map(|b| b.chars().take(2000).collect());
+    conn.execute(
+        "INSERT INTO outbound_attempts (outbound_job_id, attempt, request_summary,
+             status_code, response_body, latency_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![job_id, attempt, summary, status_code, body, latency_ms],
     )?;
     Ok(())
 }

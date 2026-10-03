@@ -460,9 +460,60 @@ pub trait HelpScoutProvider: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Create a reply thread (fakeProvider.ts:355 / realProvider.ts:323).
+    /// Returns the new thread's remote id.
+    async fn create_reply_thread(&self, input: CreateThreadInput) -> Result<ThreadCreated>;
+
+    /// Create an internal-note thread (fakeProvider.ts:394 /
+    /// realProvider.ts:343).
+    async fn create_note_thread(&self, input: CreateThreadInput) -> Result<ThreadCreated>;
+
+    /// Patch a conversation (fakeProvider.ts updateConversation /
+    /// realProvider.ts:351). `assign_to` uses `Some(None)` for "unassign"
+    /// and `None` for "leave unchanged".
+    async fn update_conversation(
+        &self,
+        conversation_id: i64,
+        patch: ConversationPatch,
+    ) -> Result<bool>;
+
     /// Reset the provider's state (Fake only; Real is a no-op).
     /// Used by tests to get a clean slate.
     fn reset(&self) {}
+}
+
+// ---------------------------------------------------------------------------
+// Write-pipeline inputs (provider.ts CreateReplyInput / ConversationPatch)
+// ---------------------------------------------------------------------------
+
+/// `CreateReplyInput` — the provider reply/note mutation payload.
+#[derive(Debug, Clone)]
+pub struct CreateThreadInput {
+    pub conversation_id: i64,
+    pub text: String,
+    pub draft: bool,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub status_after: Option<String>,
+    pub assign_to: Option<i64>,
+}
+
+/// The provider's thread-creation result shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadCreated {
+    pub thread_id: i64,
+    pub conversation_id: i64,
+}
+
+/// `ConversationPatch` — present fields are written, absent fields are left
+/// alone (JSON-Patch semantics on the real provider).
+#[derive(Debug, Clone, Default)]
+pub struct ConversationPatch {
+    pub subject: Option<String>,
+    pub status: Option<String>,
+    pub mailbox_id: Option<i64>,
+    /// `Some(None)` = unassign, `None` = leave unchanged.
+    pub assign_to: Option<Option<i64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,6 +1255,144 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             .cloned()
             .collect())
     }
+
+    // -----------------------------------------------------------------
+    // Mutations (fakeProvider.ts:355-433 — the demo world behaves like the
+    // remote: writes land here first, then the ops layer persists locally
+    // via the single-conversation refresh, exactly like the reference).
+    // -----------------------------------------------------------------
+
+    async fn create_reply_thread(&self, input: CreateThreadInput) -> Result<ThreadCreated> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let me = world.me.clone();
+        let next_id = world.threads.iter().map(|t| t.remote_id).max().unwrap_or(0) + 1;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == input.conversation_id)
+        else {
+            return Err(not_found_remote("POST"));
+        };
+        let thread = HsThread {
+            remote_id: next_id,
+            conversation_id: input.conversation_id,
+            kind: "reply".into(),
+            status: None,
+            state: Some(if input.draft { "draft" } else { "published" }.into()),
+            body: Some(input.text.clone()),
+            created_by_customer_id: None,
+            created_by_user_id: Some(me.remote_id),
+            assigned_to_id: None,
+            created_at: Some(now.clone()),
+        };
+        world.threads.push(thread);
+        // conv.threadCount / userUpdatedAt analog: updated_at drives the
+        // sync checkpoint, so a mutated conversation is always re-pulled.
+        conv.updated_at = Some(now);
+        if !input.draft {
+            conv.status = match input.status_after.as_deref() {
+                Some("active" | "closed" | "pending" | "spam") => input
+                    .status_after
+                    .clone()
+                    .unwrap_or_else(|| "active".into()),
+                _ => "active".into(),
+            };
+            if let Some(assign_to) = input.assign_to {
+                conv.assignee_id = Some(assign_to);
+            }
+        }
+        Ok(ThreadCreated {
+            thread_id: next_id,
+            conversation_id: input.conversation_id,
+        })
+    }
+
+    async fn create_note_thread(&self, input: CreateThreadInput) -> Result<ThreadCreated> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let me = world.me.clone();
+        let next_id = world.threads.iter().map(|t| t.remote_id).max().unwrap_or(0) + 1;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == input.conversation_id)
+        else {
+            return Err(not_found_remote("POST"));
+        };
+        let thread = HsThread {
+            remote_id: next_id,
+            conversation_id: input.conversation_id,
+            kind: "note".into(),
+            status: None,
+            state: Some("published".into()),
+            body: Some(input.text.clone()),
+            created_by_customer_id: None,
+            created_by_user_id: Some(me.remote_id),
+            assigned_to_id: None,
+            created_at: Some(now.clone()),
+        };
+        world.threads.push(thread);
+        conv.updated_at = Some(now);
+        Ok(ThreadCreated {
+            thread_id: next_id,
+            conversation_id: input.conversation_id,
+        })
+    }
+
+    async fn update_conversation(
+        &self,
+        conversation_id: i64,
+        patch: ConversationPatch,
+    ) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conversation_id)
+        else {
+            return Err(not_found_remote("PATCH"));
+        };
+        if let Some(subject) = patch.subject {
+            conv.subject = Some(subject);
+        }
+        if let Some(status) = patch.status {
+            let closing = status == "closed";
+            conv.status = status;
+            if closing && conv.closed_at.is_none() {
+                conv.closed_at = Some(
+                    chrono::Utc::now()
+                        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(mailbox_id) = patch.mailbox_id {
+            conv.mailbox_id = mailbox_id;
+        }
+        if let Some(assign_to) = patch.assign_to {
+            conv.assignee_id = assign_to;
+        }
+        conv.updated_at =
+            Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        Ok(true)
+    }
+}
+
+/// The fake provider's 404 (fakeProvider.ts throws `new HelpScoutApiError(
+/// 404, 'Conversation not found', friendlyError(404, '', method))`).
+fn not_found_remote(method: &str) -> crate::error::Error {
+    let friendly = crate::helpscout_real::friendly_error(404, "", method);
+    crate::helpscout_real::HsApiError {
+        status_code: 404,
+        message: "Conversation not found".into(),
+        friendly,
+        retryable: false,
+    }
+    .into()
 }
 
 #[cfg(test)]

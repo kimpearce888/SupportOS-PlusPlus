@@ -1191,9 +1191,13 @@ impl HttpServer {
     pub async fn serve(mut self) -> std::io::Result<()> {
         // 9. background workers (spec #99: start them before the listener).
         //    Jobs survive restarts; timers never block request handling.
+        //    The workers share the ENGINE's provider so demo-mode mutations
+        //    through the write pipeline stay visible to worker-driven
+        //    re-syncs (one world, never two).
         let provider: Arc<dyn crate::helpscout::HelpScoutProvider> =
-            match self.state.provider_kind.as_str() {
-                "real" => self
+            match (self.state.sync.as_ref(), self.state.provider_kind.as_str()) {
+                (Some(sync), _) => sync.provider().clone(),
+                (None, "real") => self
                     .state
                     .real
                     .clone()
@@ -1201,7 +1205,7 @@ impl HttpServer {
                     .unwrap_or_else(|| {
                         Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
                     }),
-                _ => Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo()),
+                (None, _) => Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo()),
             };
         let manager = crate::workers::start_workers(
             self.state.conn.clone(),

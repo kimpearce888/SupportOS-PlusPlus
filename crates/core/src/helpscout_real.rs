@@ -22,10 +22,11 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 
 use crate::helpscout::{
-    ConversationQuery, CustomerQuery, HelpScoutProvider, HsBeaconChat, HsConversation, HsCustomer,
-    HsDocArticle, HsDocCategory, HsDocCollection, HsField, HsFieldOption, HsFolder, HsMailbox,
-    HsOrganization, HsPropertyDef, HsRating, HsSavedReply, HsTag, HsTeam, HsThread, HsUser,
-    HsUserStatus, HsWebhookConfig, HsWorkflow, Page,
+    ConversationPatch, ConversationQuery, CreateThreadInput, CustomerQuery, HelpScoutProvider,
+    HsBeaconChat, HsConversation, HsCustomer, HsDocArticle, HsDocCategory, HsDocCollection,
+    HsField, HsFieldOption, HsFolder, HsMailbox, HsOrganization, HsPropertyDef, HsRating,
+    HsSavedReply, HsTag, HsTeam, HsThread, HsUser, HsUserStatus, HsWebhookConfig, HsWorkflow, Page,
+    ThreadCreated,
 };
 
 /// Default Help Scout API base.
@@ -59,7 +60,10 @@ impl std::error::Error for HsApiError {}
 
 impl From<HsApiError> for Error {
     fn from(e: HsApiError) -> Self {
-        Error::Other(format!("Help Scout API {}: {}", e.status_code, e.message).into())
+        // Box the typed error itself (not a pre-formatted string) so callers
+        // can downcast back to `HsApiError` and recover `friendly` + `status_code`
+        // for the write pipeline's response/detail shapes (operations.ts catch).
+        Error::Other(Box::new(e))
     }
 }
 
@@ -1383,6 +1387,105 @@ impl HelpScoutProvider for RealHelpScoutProvider {
             })
             .unwrap_or_default())
     }
+
+    // -----------------------------------------------------------------
+    // Mutations (realProvider.ts:323-375)
+    // -----------------------------------------------------------------
+
+    async fn create_reply_thread(&self, input: CreateThreadInput) -> Result<ThreadCreated> {
+        let mut body = json!({ "text": input.text, "draft": input.draft });
+        if !input.cc.is_empty() {
+            body["cc"] = json!(input.cc);
+        }
+        if !input.bcc.is_empty() {
+            body["bcc"] = json!(input.bcc);
+        }
+        if let Some(status_after) = &input.status_after {
+            body["status"] = json!(status_after);
+        }
+        if let Some(assign_to) = input.assign_to {
+            body["assignTo"] = json!(assign_to);
+        }
+        let res = self
+            .request(
+                &format!("/v2/conversations/{}/reply", input.conversation_id),
+                "POST",
+                Some(body),
+            )
+            .await?;
+        Ok(ThreadCreated {
+            thread_id: res["id"].as_i64().unwrap_or_default(),
+            conversation_id: input.conversation_id,
+        })
+    }
+
+    async fn create_note_thread(&self, input: CreateThreadInput) -> Result<ThreadCreated> {
+        let res = self
+            .request(
+                &format!("/v2/conversations/{}/notes", input.conversation_id),
+                "POST",
+                Some(json!({ "text": input.text })),
+            )
+            .await?;
+        Ok(ThreadCreated {
+            thread_id: res["id"].as_i64().unwrap_or_default(),
+            conversation_id: input.conversation_id,
+        })
+    }
+
+    async fn update_conversation(
+        &self,
+        conversation_id: i64,
+        patch: ConversationPatch,
+    ) -> Result<bool> {
+        // realProvider.ts builds one JSON-Patch operation per present field
+        // and PATCHes them one at a time (PRIORITY.INTERACTIVE).
+        let path = format!("/v2/conversations/{conversation_id}");
+        if let Some(subject) = patch.subject {
+            self.request(
+                &path,
+                "PATCH",
+                Some(json!({ "op": "replace", "path": "/subject", "value": subject })),
+            )
+            .await?;
+        }
+        if let Some(status) = patch.status {
+            self.request(
+                &path,
+                "PATCH",
+                Some(json!({ "op": "replace", "path": "/status", "value": status })),
+            )
+            .await?;
+        }
+        if let Some(mailbox_id) = patch.mailbox_id {
+            self.request(
+                &path,
+                "PATCH",
+                Some(json!({ "op": "move", "path": "/mailboxId", "value": mailbox_id })),
+            )
+            .await?;
+        }
+        match patch.assign_to {
+            Some(None) => {
+                self.request(
+                    &path,
+                    "PATCH",
+                    Some(json!({ "op": "remove", "path": "/assignTo" })),
+                )
+                .await?;
+            }
+            Some(Some(assign_to)) => {
+                self.request(
+                    &path,
+                    "PATCH",
+                    Some(json!({ "op": "replace", "path": "/assignTo", "value": assign_to })),
+                )
+                .await?;
+            }
+            None => {}
+        }
+        Ok(true)
+    }
 }
 
 impl RealHelpScoutProvider {
@@ -1399,7 +1502,27 @@ impl RealHelpScoutProvider {
 
 /// Whether an API error is a 404 (used for Option-returning fetches).
 fn is_not_found(e: &Error) -> bool {
-    e.to_string().contains("-> 404")
+    hs_status(e) == Some(404) || e.to_string().contains("-> 404")
+}
+
+/// The typed Help Scout status code, when the error wraps an `HsApiError`.
+pub fn hs_status(e: &Error) -> Option<u16> {
+    if let Error::Other(b) = e {
+        if let Some(hs) = b.downcast_ref::<HsApiError>() {
+            return Some(hs.status_code);
+        }
+    }
+    None
+}
+
+/// The typed Help Scout error, when present (friendly text + status code
+/// for the write pipeline's response shapes — operations.ts catch blocks).
+pub fn hs_error(e: &Error) -> Option<&HsApiError> {
+    if let Error::Other(b) = e {
+        b.downcast_ref::<HsApiError>()
+    } else {
+        None
+    }
 }
 
 /// Ensure the account='default' row shape exists (legacy id=1 port DBs):

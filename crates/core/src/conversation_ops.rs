@@ -1099,6 +1099,827 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Reply / note / status / assign / subject (operations.ts:69-237)
+//
+// The FULL write pipeline: validate (route) → auth → fresh-read →
+// idempotency → job → provider write → confirm → persist/refresh → audit.
+// Replies are idempotency-keyed and NEVER auto-retried; demo-mode writes go
+// through the same provider boundary as real mode (the fake world IS the
+// remote), then persist via the single-conversation refresh — so the world
+// and the local mirror can never disagree.
+// ---------------------------------------------------------------------------
+
+use std::time::Instant;
+
+use crate::helpscout::{ConversationPatch, CreateThreadInput, HelpScoutProvider};
+
+/// Whether evaluation mode is ON (the shared flag check — each op carries
+/// its own reference message).
+pub fn eval_mode_on(conn: &Connection) -> bool {
+    let on: Option<String> = crate::settings::get_string(conn, "ai_evaluation_mode")
+        .ok()
+        .flatten();
+    matches!(on.as_deref(), Some("1") | Some("true") | Some("on"))
+}
+
+/// Full conversation row the write pipeline needs (fresh read).
+pub struct ConvFull {
+    pub id: i64,
+    pub remote_id: i64,
+    pub status: String,
+    pub subject: Option<String>,
+    pub closed_at: Option<String>,
+    pub assignee_local_id: Option<i64>,
+    pub merged_into_conversation_id: Option<i64>,
+}
+
+/// `getConversationByLocalId` — the ops work on the LOCAL id and require a
+/// remote mapping (operations.ts conv checks).
+pub fn conv_full_by_local_id(conn: &Connection, id: i64) -> Option<ConvFull> {
+    conn.query_row(
+        "SELECT id, remote_id, status, subject, closed_at, assignee_id,
+                merged_into_conversation_id
+           FROM conversations WHERE id = ?1",
+        params![id],
+        |r| {
+            Ok(ConvFull {
+                id: r.get(0)?,
+                remote_id: r.get(1)?,
+                status: r.get(2)?,
+                subject: r.get(3)?,
+                closed_at: r.get(4)?,
+                assignee_local_id: r.get(5)?,
+                merged_into_conversation_id: r.get(6)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// `requireAuth` (operations.ts:48) — demo mode is always "authenticated";
+/// real mode needs a live OAuth token.
+pub const NOT_CONNECTED: &str = "Help Scout is not connected. Remote actions are disabled - connect Help Scout in Settings first.";
+
+pub fn require_auth(conn: &Connection, provider_kind: &str) -> Option<&'static str> {
+    if provider_kind != "real" {
+        return None;
+    }
+    // The token table grew `account` + `revoked` columns for the
+    // reference-shaped store; older DBs only have the id=1 row.
+    let has_cols: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('oauth_tokens')
+              WHERE name IN ('account', 'revoked')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n == 2)
+        .unwrap_or(false);
+    let connected = if has_cols {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM oauth_tokens
+               WHERE (account = 'default' OR id = 1)
+                 AND access_token IS NOT NULL AND access_token != ''
+                 AND COALESCE(revoked, 0) = 0)",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    } else {
+        crate::oauth::has_token(conn).unwrap_or(false)
+    };
+    if connected {
+        None
+    } else {
+        Some(NOT_CONNECTED)
+    }
+}
+
+/// `createOutboundJob(kind, payload, opts)` with the idempotency key
+/// (jobRepo.ts:167). A retry after a FAILED job reuses the same key: the
+/// row is reset instead of hitting the UNIQUE constraint (the reference
+/// crashes there — latent bug, reported).
+pub fn create_outbound_job_keyed(
+    conn: &Connection,
+    kind: &str,
+    payload: &Value,
+    conversation_id: Option<i64>,
+    idempotency_key: Option<&str>,
+) -> i64 {
+    let payload = serde_json::to_string(payload).unwrap_or_else(|_| "{}".into());
+    let res = conn.execute(
+        "INSERT INTO outbound_jobs (kind, conversation_id, thread_id, payload,
+             status, requires_confirmation, idempotency_key, created_at, updated_at)
+         VALUES (?1, ?2, NULL, ?3, 'queued', 0, ?4, datetime('now'), datetime('now'))
+         ON CONFLICT(idempotency_key) DO UPDATE SET
+            kind = excluded.kind, payload = excluded.payload,
+            status = 'queued', error = NULL, remote_result = NULL,
+            attempts = 0, updated_at = datetime('now')",
+        params![kind, conversation_id, payload, idempotency_key],
+    );
+    if res.is_err() {
+        return 0;
+    }
+    // ON CONFLICT(...) DO UPDATE keeps the existing row's id.
+    conn.query_row(
+        "SELECT id FROM outbound_jobs WHERE idempotency_key = ?1",
+        params![idempotency_key],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|_| conn.last_insert_rowid())
+}
+
+/// `sha256(text).digest('hex').slice(0, 24)` — the reply idempotency hash.
+fn sha256_24(text: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    hex(&digest)[..24].to_string()
+}
+
+/// `{ok:false}` with 503 — the reference reply route maps a "not connected"
+/// message to Service Unavailable.
+fn not_connected(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "ok": false, "message": message })),
+    )
+        .into_response()
+}
+
+/// The provider the ops write through (one instance with the sync engine —
+/// reference AppContext binding).
+fn op_provider(
+    state: &crate::http::server::AppState,
+) -> Option<std::sync::Arc<dyn HelpScoutProvider>> {
+    if let Some(sync) = &state.sync {
+        return Some(sync.provider().clone());
+    }
+    state
+        .real
+        .clone()
+        .map(|r| r as std::sync::Arc<dyn HelpScoutProvider>)
+}
+
+/// The message the failure path shows: the friendly Help Scout text when the
+/// error is an API error, else the raw error (operations.ts catch).
+fn failure_message(e: &crate::error::Error) -> String {
+    crate::helpscout_real::hs_error(e)
+        .map(|hs| hs.friendly.clone())
+        .unwrap_or_else(|| e.to_string())
+}
+
+/// `detail` for the failure path: `HTTP {status}` (+ correlation when real).
+fn failure_detail(e: &crate::error::Error) -> Option<String> {
+    crate::helpscout_real::hs_error(e).map(|hs| format!("HTTP {}", hs.status_code))
+}
+
+/// Validated reply request (replyRequestSchema).
+#[derive(Debug, Clone)]
+pub struct ReplyInput {
+    pub conversation_id: i64,
+    pub text: String,
+    pub draft: bool,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub status_after: Option<String>,
+    pub assign_to: Option<i64>,
+}
+
+/// `sendReply` (operations.ts:69).
+pub async fn op_send_reply(state: &crate::http::server::AppState, input: ReplyInput) -> Response {
+    // auth → eval → fresh read → merged guard → idempotency → job
+    let (conv, job_id) = {
+        let conn = state.conn_lock();
+        if let Some(msg) = require_auth(&conn, &state.provider_kind) {
+            return not_connected(msg);
+        }
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        let Some(conv) = conv_full_by_local_id(&conn, input.conversation_id) else {
+            return rejected("Conversation not found locally.");
+        };
+        if conv.merged_into_conversation_id.is_some() {
+            return rejected(
+                "This conversation was merged into another conversation. Open the target conversation to reply.",
+            );
+        }
+        // The draft flag is part of the key: saving a draft of text T and
+        // then SENDING the same text T is the normal draft-then-send flow,
+        // not a duplicate send.
+        let key = format!(
+            "reply:{}:{}:{}",
+            conv.remote_id,
+            if input.draft { "draft" } else { "send" },
+            sha256_24(&input.text)
+        );
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT status FROM outbound_jobs WHERE idempotency_key = ?1",
+                params![&key],
+                |r| r.get(0),
+            )
+            .ok();
+        if existing.is_some_and(|status| status != "failed") {
+            return rejected(
+                "This exact reply was already sent (duplicate-send protection). Check the conversation history before sending again.",
+            );
+        }
+        let job_id = create_outbound_job_keyed(
+            &conn,
+            "create_reply",
+            &json!({
+                "conversationId": input.conversation_id,
+                "text": input.text,
+                "draft": input.draft,
+                "cc": input.cc,
+                "bcc": input.bcc,
+                "statusAfter": input.status_after,
+                "assignTo": input.assign_to,
+            }),
+            Some(conv.id),
+            Some(&key),
+        );
+        set_outbound_status(&conn, job_id, "sending", None);
+        (conv, job_id)
+    };
+
+    let Some(provider) = op_provider(state) else {
+        return internal_error("no provider available");
+    };
+    let started = Instant::now();
+    match provider
+        .create_reply_thread(CreateThreadInput {
+            conversation_id: conv.remote_id,
+            text: input.text.clone(),
+            draft: input.draft,
+            cc: input.cc.clone(),
+            bcc: input.bcc.clone(),
+            status_after: input.status_after.clone(),
+            assign_to: input.assign_to,
+        })
+        .await
+    {
+        Ok(res) => {
+            let elapsed = started.elapsed().as_millis() as i64;
+            {
+                let conn = state.conn_lock();
+                let _ = crate::jobs::record_outbound_attempt(
+                    &conn,
+                    job_id,
+                    1,
+                    &format!("POST reply (draft={})", input.draft),
+                    Some(201),
+                    None,
+                    Some(elapsed),
+                );
+                set_outbound_status_confirmed(
+                    &conn,
+                    job_id,
+                    &json!({ "threadId": res.thread_id, "conversationId": res.conversation_id }),
+                );
+            }
+            // Persist locally after the confirmed remote write (refreshOne).
+            if let Some(sync) = &state.sync {
+                let _ = sync.sync_single_conversation(conv.remote_id).await;
+            }
+            {
+                let conn = state.conn_lock();
+                let _ = crate::jobs::audit_entry(
+                    &conn,
+                    "user",
+                    if input.draft {
+                        "reply_draft_created"
+                    } else {
+                        "reply_sent"
+                    },
+                    Some(conv.id),
+                    Some(&json!({ "status": conv.status }).to_string()),
+                    Some(&json!({ "threadRemoteId": res.thread_id }).to_string()),
+                    Some(&format!("POST /v2/conversations/{}/reply", conv.remote_id)),
+                    Some(
+                        &json!({
+                            "threadId": res.thread_id,
+                            "conversationId": res.conversation_id
+                        })
+                        .to_string(),
+                    ),
+                    false,
+                    Some(job_id),
+                    None,
+                );
+            }
+            emit_conversation_updated(state, conv.id);
+            ok_result(
+                if input.draft {
+                    "Draft saved to Help Scout."
+                } else {
+                    "Reply sent successfully."
+                },
+                Some(json!({ "threadRemoteId": res.thread_id })),
+            )
+        }
+        Err(e) => {
+            let msg = failure_message(&e);
+            let detail = failure_detail(&e);
+            {
+                let conn = state.conn_lock();
+                let _ = crate::jobs::record_outbound_attempt(
+                    &conn,
+                    job_id,
+                    1,
+                    "POST reply",
+                    crate::helpscout_real::hs_status(&e).map(i64::from),
+                    Some(&e.to_string()),
+                    Some(started.elapsed().as_millis() as i64),
+                );
+                set_outbound_status(&conn, job_id, "failed", Some(&msg));
+                let _ = crate::jobs::audit_entry(
+                    &conn,
+                    "user",
+                    "reply_failed",
+                    Some(conv.id),
+                    Some(&json!({ "status": conv.status }).to_string()),
+                    None,
+                    Some(&format!("POST /v2/conversations/{}/reply", conv.remote_id)),
+                    Some(&json!({ "error": msg }).to_string()),
+                    false,
+                    Some(job_id),
+                    None,
+                );
+            }
+            // Replies are NEVER auto-retried: a timeout may still have
+            // delivered the message remotely.
+            let caution = if input.draft {
+                String::new()
+            } else {
+                " The reply may or may not have been delivered - verify in Help Scout before sending again; SupportOS will not automatically resend.".to_string()
+            };
+            let mut body = json!({ "ok": false, "message": format!("{msg}{caution}") });
+            if let Some(d) = detail {
+                body["detail"] = json!(d);
+            }
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        }
+    }
+}
+
+/// `addNote` (operations.ts:133).
+pub async fn op_add_note(
+    state: &crate::http::server::AppState,
+    conversation_id: i64,
+    text: &str,
+    ai_generated: bool,
+) -> Response {
+    let (conv, job_id) = {
+        let conn = state.conn_lock();
+        if let Some(msg) = require_auth(&conn, &state.provider_kind) {
+            return not_connected(msg);
+        }
+        let Some(conv) = conv_full_by_local_id(&conn, conversation_id) else {
+            return rejected("Conversation not found locally.");
+        };
+        if eval_mode_on(&conn) {
+            // operations.ts addNote carries its own eval message.
+            return rejected(
+                "AI evaluation mode is ON: no notes, replies or status changes are sent to Help Scout.",
+            );
+        }
+        let job_id = create_outbound_job_keyed(
+            &conn,
+            "create_note",
+            &json!({ "conversationId": conversation_id, "text": text, "aiGenerated": ai_generated }),
+            Some(conv.id),
+            None,
+        );
+        set_outbound_status(&conn, job_id, "sending", None);
+        (conv, job_id)
+    };
+
+    let Some(provider) = op_provider(state) else {
+        return internal_error("no provider available");
+    };
+    let started = Instant::now();
+    let attempt = provider.create_note_thread(CreateThreadInput {
+        conversation_id: conv.remote_id,
+        text: text.to_string(),
+        draft: false,
+        cc: vec![],
+        bcc: vec![],
+        status_after: None,
+        assign_to: None,
+    });
+    match attempt.await {
+        Ok(res) => {
+            let elapsed = started.elapsed().as_millis() as i64;
+            {
+                let conn = state.conn_lock();
+                let _ = crate::jobs::record_outbound_attempt(
+                    &conn,
+                    job_id,
+                    1,
+                    "POST note",
+                    Some(201),
+                    None,
+                    Some(elapsed),
+                );
+                set_outbound_status_confirmed(
+                    &conn,
+                    job_id,
+                    &json!({ "threadId": res.thread_id, "conversationId": res.conversation_id }),
+                );
+            }
+            if let Some(sync) = &state.sync {
+                let _ = sync.sync_single_conversation(conv.remote_id).await;
+            }
+            {
+                let conn = state.conn_lock();
+                let _ = crate::jobs::audit_entry(
+                    &conn,
+                    if ai_generated { "ai" } else { "user" },
+                    "note_added",
+                    Some(conv.id),
+                    None,
+                    None,
+                    Some(&format!("POST /v2/conversations/{}/notes", conv.remote_id)),
+                    Some(
+                        &json!({
+                            "threadId": res.thread_id,
+                            "conversationId": res.conversation_id
+                        })
+                        .to_string(),
+                    ),
+                    ai_generated,
+                    Some(job_id),
+                    None,
+                );
+            }
+            emit_conversation_updated(state, conv.id);
+            ok_result(
+                "Internal note added.",
+                Some(json!({ "threadRemoteId": res.thread_id })),
+            )
+        }
+        Err(e) => {
+            let msg = failure_message(&e);
+            let detail = failure_detail(&e);
+            {
+                let conn = state.conn_lock();
+                let _ = crate::jobs::record_outbound_attempt(
+                    &conn,
+                    job_id,
+                    1,
+                    "POST note",
+                    crate::helpscout_real::hs_status(&e).map(i64::from),
+                    Some(&e.to_string()),
+                    Some(started.elapsed().as_millis() as i64),
+                );
+                set_outbound_status(&conn, job_id, "failed", Some(&msg));
+            }
+            let mut body = json!({ "ok": false, "message": msg });
+            if let Some(d) = detail {
+                body["detail"] = json!(d);
+            }
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+        }
+    }
+}
+
+/// `changeStatus` (operations.ts:170) — status write + closed_at stamp are
+/// ONE atomic local transaction (v2.2.1 audit fix).
+pub async fn op_change_status(
+    state: &crate::http::server::AppState,
+    conversation_id: i64,
+    status: &str,
+) -> Response {
+    let conv = {
+        let conn = state.conn_lock();
+        if require_auth(&conn, &state.provider_kind).is_some() {
+            // Note/status/assign/subject routes keep 422 for not-connected
+            // (only the reply route maps it to 503).
+            return rejected(NOT_CONNECTED);
+        }
+        if eval_mode_on(&conn) {
+            // operations.ts changeStatus carries its own eval message.
+            return rejected("AI evaluation mode is ON: status changes are disabled.");
+        }
+        let Some(conv) = conv_full_by_local_id(&conn, conversation_id) else {
+            return rejected("Conversation not found locally.");
+        };
+        conv
+    };
+    let Some(provider) = op_provider(state) else {
+        return internal_error("no provider available");
+    };
+    let job_id = {
+        let conn = state.conn_lock();
+        let job_id = create_outbound_job_keyed(
+            &conn,
+            "update_status",
+            &json!({ "conversationId": conversation_id, "status": status }),
+            Some(conv.id),
+            None,
+        );
+        set_outbound_status(&conn, job_id, "sending", None);
+        job_id
+    };
+    match provider
+        .update_conversation(
+            conv.remote_id,
+            ConversationPatch {
+                status: Some(status.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => {
+            let mut conn = state.conn_lock();
+            set_outbound_status(&conn, job_id, "confirmed", None);
+            // Atomic: status write + closed_at stamp together.
+            if let Ok(tx) = conn.transaction() {
+                let _ = tx.execute(
+                    "UPDATE conversations SET status = ?1,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                       WHERE id = ?2",
+                    params![status, conv.id],
+                );
+                if status == "closed" && conv.closed_at.is_none() {
+                    let _ = tx.execute(
+                        "UPDATE conversations SET closed_at = datetime('now') WHERE id = ?1",
+                        params![conv.id],
+                    );
+                }
+                let _ = tx.commit();
+            }
+            let _ = crate::jobs::audit_entry(
+                &conn,
+                "user",
+                "status_changed",
+                Some(conv.id),
+                Some(&json!({ "status": conv.status }).to_string()),
+                Some(&json!({ "status": status }).to_string()),
+                Some(&format!("PATCH /v2/conversations/{}", conv.remote_id)),
+                None,
+                false,
+                Some(job_id),
+                None,
+            );
+            drop(conn);
+            emit_conversation_updated(state, conv.id);
+            ok_result(&format!("Status changed to {status}."), None)
+        }
+        Err(e) => {
+            let msg = failure_message(&e);
+            let conn = state.conn_lock();
+            set_outbound_status(&conn, job_id, "failed", Some(&msg));
+            drop(conn);
+            rejected(&format!("Status was NOT changed. {msg}"))
+        }
+    }
+}
+
+/// `assign` (operations.ts:201) — userId is a REMOTE user/team id (or null
+/// to unassign); the local persist resolves it through the mirror.
+pub async fn op_assign(
+    state: &crate::http::server::AppState,
+    conversation_id: i64,
+    user_id: Option<i64>,
+) -> Response {
+    let conv = {
+        let conn = state.conn_lock();
+        if require_auth(&conn, &state.provider_kind).is_some() {
+            return rejected(NOT_CONNECTED);
+        }
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        let Some(conv) = conv_full_by_local_id(&conn, conversation_id) else {
+            return rejected("Conversation not found locally.");
+        };
+        conv
+    };
+    let Some(provider) = op_provider(state) else {
+        return internal_error("no provider available");
+    };
+    let job_id = {
+        let conn = state.conn_lock();
+        let job_id = create_outbound_job_keyed(
+            &conn,
+            "assign",
+            &json!({ "conversationId": conversation_id, "userId": user_id }),
+            Some(conv.id),
+            None,
+        );
+        set_outbound_status(&conn, job_id, "sending", None);
+        job_id
+    };
+    match provider
+        .update_conversation(
+            conv.remote_id,
+            ConversationPatch {
+                assign_to: Some(user_id),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => {
+            let conn = state.conn_lock();
+            set_outbound_status(&conn, job_id, "confirmed", None);
+            // Resolve the remote id to the local user (or team) row.
+            let local_user: Option<i64> = user_id.and_then(|uid| {
+                conn.query_row(
+                    "SELECT id FROM users WHERE remote_id = ?1",
+                    params![uid],
+                    |r| r.get(0),
+                )
+                .ok()
+            });
+            let local_team: Option<i64> = match (user_id, local_user) {
+                (Some(uid), None) => conn
+                    .query_row(
+                        "SELECT id FROM teams WHERE remote_id = ?1",
+                        params![uid],
+                        |r| r.get(0),
+                    )
+                    .ok(),
+                _ => None,
+            };
+            let resolved = local_user.or(local_team).or(user_id);
+            let _ = conn.execute(
+                "UPDATE conversations SET assignee_id = ?1,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                   WHERE id = ?2",
+                params![resolved, conv.id],
+            );
+            let _ = crate::jobs::audit_entry(
+                &conn,
+                "user",
+                "assignment_changed",
+                Some(conv.id),
+                Some(&json!({ "assignee": conv.assignee_local_id }).to_string()),
+                Some(&json!({ "assignee": user_id }).to_string()),
+                Some(&format!(
+                    "PATCH /v2/conversations/{} /assignTo",
+                    conv.remote_id
+                )),
+                None,
+                false,
+                Some(job_id),
+                None,
+            );
+            drop(conn);
+            emit_conversation_updated(state, conv.id);
+            ok_result(
+                if user_id.is_some() {
+                    "Conversation assigned."
+                } else {
+                    "Conversation unassigned."
+                },
+                None,
+            )
+        }
+        Err(e) => {
+            let msg = failure_message(&e);
+            let conn = state.conn_lock();
+            set_outbound_status(&conn, job_id, "failed", Some(&msg));
+            drop(conn);
+            rejected(&format!("Assignment was NOT changed. {msg}"))
+        }
+    }
+}
+
+/// `changeSubject` (operations.ts:226).
+pub async fn op_change_subject(
+    state: &crate::http::server::AppState,
+    conversation_id: i64,
+    subject: &str,
+) -> Response {
+    let conv = {
+        let conn = state.conn_lock();
+        if require_auth(&conn, &state.provider_kind).is_some() {
+            return rejected(NOT_CONNECTED);
+        }
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        let Some(conv) = conv_full_by_local_id(&conn, conversation_id) else {
+            return rejected("Conversation not found locally.");
+        };
+        conv
+    };
+    let Some(provider) = op_provider(state) else {
+        return internal_error("no provider available");
+    };
+    let job_id = {
+        let conn = state.conn_lock();
+        let job_id = create_outbound_job_keyed(
+            &conn,
+            "update_subject",
+            &json!({ "conversationId": conversation_id, "subject": subject }),
+            Some(conv.id),
+            None,
+        );
+        set_outbound_status(&conn, job_id, "sending", None);
+        job_id
+    };
+    match provider
+        .update_conversation(
+            conv.remote_id,
+            ConversationPatch {
+                subject: Some(subject.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => {
+            let conn = state.conn_lock();
+            set_outbound_status(&conn, job_id, "confirmed", None);
+            let _ = conn.execute(
+                "UPDATE conversations SET subject = ?1,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                   WHERE id = ?2",
+                params![subject, conv.id],
+            );
+            let _ = crate::jobs::audit_entry(
+                &conn,
+                "user",
+                "subject_changed",
+                Some(conv.id),
+                Some(&json!({ "subject": conv.subject }).to_string()),
+                Some(&json!({ "subject": subject }).to_string()),
+                Some(&format!(
+                    "PATCH /v2/conversations/{} /subject",
+                    conv.remote_id
+                )),
+                None,
+                false,
+                Some(job_id),
+                None,
+            );
+            drop(conn);
+            emit_conversation_updated(state, conv.id);
+            ok_result("Subject updated.", None)
+        }
+        Err(e) => {
+            let msg = failure_message(&e);
+            let conn = state.conn_lock();
+            set_outbound_status(&conn, job_id, "failed", Some(&msg));
+            drop(conn);
+            rejected(&format!("Subject was NOT changed. {msg}"))
+        }
+    }
+}
+
+/// `setOutboundStatus(id, status, error?, remoteResult?)` — the confirmed
+/// flavor also persists the remote result JSON.
+fn set_outbound_status_confirmed(conn: &Connection, id: i64, remote_result: &Value) {
+    if id == 0 {
+        return;
+    }
+    let _ = conn.execute(
+        "UPDATE outbound_jobs
+            SET status = 'confirmed', error = NULL, remote_result = ?1,
+                attempts = attempts + 1, updated_at = datetime('now')
+          WHERE id = ?2",
+        params![remote_result.to_string(), id],
+    );
+}
+
+/// Standard 500 (should be unreachable in a wired app).
+fn internal_error(message: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "statusCode": 500,
+            "error": "InternalError",
+            "message": message
+        })),
+    )
+        .into_response()
+}
+
+/// Emit the `conversations` SSE update (the sync coordinator's post-refresh
+/// event — same shape the webhook/worker paths emit).
+fn emit_conversation_updated(state: &crate::http::server::AppState, conversation_local_id: i64) {
+    crate::http::event_bus::notify_conversation_updated(
+        &state.bus,
+        &crate::events::ConversationUpdatedEvent {
+            conversation_id: Some(conversation_local_id),
+            conversation_number: None,
+            mailbox_id: None,
+            subject: None,
+            reason: "sync".into(),
+            at: chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1127,7 +1948,8 @@ mod tests {
                 actor_id INTEGER, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
              CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
                 actor TEXT, action TEXT, conversation_id INTEGER, before_state TEXT,
-                after_state TEXT, remote_operation TEXT, remote_result TEXT, ai_involvement INTEGER);",
+                after_state TEXT, remote_operation TEXT, remote_result TEXT, ai_involvement INTEGER,
+                job_id INTEGER, correlation_id TEXT);",
         )
         .expect("schema");
         // jobs + outbound_jobs via the canonical paths

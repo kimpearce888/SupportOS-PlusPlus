@@ -277,8 +277,10 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
             return;
         }
         let mode = composer_mode.get();
-        let conv_remote_id = detail.with(|d| d.as_ref().map(|d| d.remote_id));
-        let conv_remote_id = match conv_remote_id {
+        // Mutations address the conversation by its LOCAL id (reference
+        // Inbox.tsx uses conversation.id for every write call).
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        let conv_local_id = match conv_local_id {
             Some(id) => id,
             None => {
                 composer_error.set(Some("No conversation selected".to_string()));
@@ -290,8 +292,9 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
             ComposerMode::Reply => "reply",
             ComposerMode::Note => "note",
         };
-        let path = format!("/api/conversations/{conv_remote_id}/{sub_path}");
-        let body_payload = serde_json::json!({ "body": body });
+        let path = format!("/api/conversations/{conv_local_id}/{sub_path}");
+        // replyRequestSchema / noteRequestSchema field name: `text`.
+        let body_payload = serde_json::json!({ "text": body });
         let composer_success = composer_success;
         let composer_error = composer_error;
         let composer_body = composer_body;
@@ -315,7 +318,7 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                         }
                     } else {
                         let reason = result
-                            .get("reason")
+                            .get("message")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Operation rejected")
                             .to_string();
@@ -331,18 +334,18 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
 
     // ── Change status ──────────────────────────────────────────────────
     let change_status = move |new_status: String| {
-        let conv_remote_id = detail.with(|d| d.as_ref().map(|d| d.remote_id));
-        if let Some(conv_remote_id) = conv_remote_id {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        if let Some(conv_local_id) = conv_local_id {
             let detail_error = detail_error;
             let selected_id = selected_id;
             wasm_bindgen_futures::spawn_local(async move {
-                let path = format!("/api/conversations/{conv_remote_id}/status");
+                let path = format!("/api/conversations/{conv_local_id}/status");
                 let payload = serde_json::json!({ "status": new_status });
                 match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
                     Ok(result) => {
                         if !result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                             let reason = result
-                                .get("reason")
+                                .get("message")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Status change rejected");
                             detail_error.set(Some(reason.to_string()));
@@ -364,18 +367,20 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
 
     // ── Assign to user (placeholder — uses user_id=1 for now) ───────────
     let assign_to = move |assignee_id: Option<i64>| {
-        let conv_remote_id = detail.with(|d| d.as_ref().map(|d| d.remote_id));
-        if let Some(conv_remote_id) = conv_remote_id {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        if let Some(conv_local_id) = conv_local_id {
             let detail_error = detail_error;
             let selected_id = selected_id;
             wasm_bindgen_futures::spawn_local(async move {
-                let path = format!("/api/conversations/{conv_remote_id}/assign");
-                let payload = serde_json::json!({ "assigneeLocalId": assignee_id });
+                let path = format!("/api/conversations/{conv_local_id}/assign");
+                // assignRequestSchema: `userId` is the REMOTE user id
+                // (nullable to unassign).
+                let payload = serde_json::json!({ "userId": assignee_id });
                 match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
                     Ok(result) => {
                         if !result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                             let reason = result
-                                .get("reason")
+                                .get("message")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Assignment rejected");
                             detail_error.set(Some(reason.to_string()));
@@ -563,10 +568,10 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                 let convs = conversations.get();
                                 for id in ids {
                                     if let Some(item) = convs.iter().find(|c| c.id == id) {
-                                        let remote_id = item.remote_id;
+                                        let local_id = item.id;
                                         wasm_bindgen_futures::spawn_local(async move {
                                             let path =
-                                                format!("/api/conversations/{remote_id}/status");
+                                                format!("/api/conversations/{local_id}/status");
                                             let payload =
                                                 serde_json::json!({ "status": "closed" });
                                             let _ = crate::api::post_json::<serde_json::Value>(
