@@ -1,91 +1,117 @@
 # SupportOS++
 
-**A local-first, AI-powered support operating system for Help Scout.**
+**The local-first, AI-powered support operating system for your Help Scout mailbox — as a Rust desktop app.**
 
-SupportOS++ is a desktop app that mirrors your Help Scout conversations, customers, and reports locally — then layers AI analysis, automation, and intelligence on top. Everything stays on your machine. No telemetry, no cloud AI, no data egress.
+SupportOS++ mirrors your Help Scout mailbox into a local SQLite database, then
+layers a support workspace on top: fast local search, a real inbox, team
+operations, and optional local AI. Your customer data never leaves your
+machine: no telemetry, no cloud AI, no data egress. The server binds to
+`127.0.0.1` only.
 
----
-
-## Install (3 steps)
-
-1. Download the `.deb` or `.AppImage` from [Releases](https://github.com/kimpearce888/SupportOS-PlusPlus/releases).
-2. Install it (`sudo apt install ./SupportOS++_*.deb`) or just run the `.AppImage`.
-3. Launch **SupportOS++**. On first run, use demo mode — no credentials needed.
-
-**Linux x86_64 only.** The only supported package formats are `.deb` and `.AppImage`. There are no Windows, macOS, or RPM packages, and no plans to add them.
+This repository is a Rust/Tauri 2 port of the TypeScript reference
+[`supportos`](https://github.com/kimpearce888/supportos) (same features, API
+contract, data and safety rules — see *Differences from the reference* below).
 
 ---
 
-## Status: parity audit in progress
+## What you get
 
-SupportOS++ is a Rust/Tauri 2/Leptos port of the TypeScript reference
-[`supportos`](https://github.com/kimpearce888/supportos). A strict
-reference-parity audit is in progress — see **[PARITY.md](PARITY.md)** for
-the canonical F-ID checklist (what matches, what is missing, what differs)
-and PROGRESS.md for current session state. Claims on this page are limited
-to what the audit has actually verified.
+- **A real support inbox** — conversation list, thread view, reply and note
+  composer, status changes, assignment, saved views, bulk close
+- **Universal search** — one query across conversations, threads, customers,
+  knowledge, known issues, saved replies and docs, powered by SQLite FTS5;
+  semantic ticket search via stored Float32 embeddings with a local cosine
+  scan (no vector server needed), fused with Reciprocal Rank Fusion
+- **Team operations** — Operations Center tiles, workload and capacity,
+  notification center with preferences, side threads, automation rules with
+  action-risk tiers
+- **Support intelligence** — issue radar, incidents, SLA and business-hours
+  reporting, a report builder (21 metrics × 14 dimensions), client
+  interaction signals with a fixed behavioral vocabulary
+- **Local AI, optional** — an interactive copilot with a read-only tool
+  allowlist, evidence-backed draft replies, pre-send coaching and customer
+  memory, all against LM Studio on your machine; every bit of it is advisory
+- **Local-first plumbing** — sync engine with per-resource checkpoints and
+  reconciliation, webhooks (HMAC-SHA1, persist-first, hash dedup),
+  SSE live updates, backups and encrypted `.sosync` bundles
 
-**What is real today:**
+Help Scout remains the source of truth — SupportOS++ is the fast, private,
+intelligent layer on top of it.
 
-- Rust workspace: `core` (Axum HTTP server + SQLite/FTS5 business core),
-  `ui` (Leptos/WASM), `app` (Tauri 2 shell), `catalog` (closed vocabularies),
-  `xtask` (dev/test/lint/package/e2e tooling).
-- Loopback HTTP server (127.0.0.1:3000) with mutation rate limiting,
-  Host-header DNS-rebinding guard, and localhost-only CORS.
-- SQLite (bundled, WAL, FTS5) persistence with boot-time migrations.
-- SSE event bus (`/api/events`) wired to conversation/webhook/demo mutations.
-- Demo mode with simulate-incoming / simulate-rating / simulate-webhook endpoints.
-- 900+ cargo tests across the workspace.
+## Safety — trust by design
 
-**What is not yet at reference parity (see PARITY.md for the full list):**
-the Leptos UI routes fewer pages than the reference, several HTTP routes are
-stubbed pending wiring to the engines behind them, the real Help Scout
-provider/OAuth flow and production vector search wiring are incomplete, and
-`.sosync` bundles are not yet byte-compatible with the reference format.
+- Binds `127.0.0.1` only, with a Host-header DNS-rebinding guard and
+  localhost-only CORS
+- OAuth tokens and secrets never reach the webview/browser side
+- Automatic customer-reply sending is permanently OFF; AI is advisory
+- AI evaluation mode blocks every remote write
+- Payment data, tokens and API keys are redacted before AI prompts and logs
+- Untrusted ticket HTML is sanitized before render
+- Write pipeline: validate → auth → fresh-read → merge → write → confirm →
+  persist → audit; idempotent sends, never auto-retried
 
----
+## Install
 
-## Why it was built
+**Linux x86_64 only.** The only supported package formats are `.deb` and
+`.AppImage` (built and smoke-tested in CI on Ubuntu 22.04 and 24.04). There
+are no Windows, macOS or RPM packages.
 
-The reference `supportos` is a TypeScript web app that depends on a cloud database, cloud AI, and a server. We wanted a version that:
+1. Download the `.deb` or `.AppImage` from
+   [Releases](https://github.com/kimpearce888/SupportOS-PlusPlus/releases).
+2. Install it (`sudo apt install ./SupportOS++_*.deb`) or run the
+   `.AppImage`.
+3. Launch **SupportOS++**. On first run choose demo mode — no credentials
+   needed.
 
-- **Stays local.** Your Help Scout data lives on your machine, not in a cloud database. Network traffic goes to Help Scout (for sync), your local AI provider (LM Studio, optional), and user-configured connectors — nothing else.
-- **Works offline.** No internet? The app still works. Sync pauses; everything else continues.
-- **Is auditable.** Every line is Rust. No `node_modules` black box. `cargo audit` checks for known vulnerabilities. The audit record is committed verbatim in `PARITY.md`.
+## Build, run, test
 
-## How it works (simple terms)
-
-1. **Sync.** SupportOS++ talks to the Help Scout API (OAuth 2.0), fetches conversations/customers/mailboxes, and stores them in a local SQLite database (with WAL + FTS5 for fast full-text search). Webhooks push updates in real-time when configured.
-2. **Analyze.** The local AI (if configured — LM Studio at `127.0.0.1:1234`) reads conversations and generates summaries, suggested replies, customer attributes, and coaching tips. AI is advisory only — auto-customer-reply is permanently OFF.
-3. **Organize.** The Operations Center shows 16 tiles of real-time metrics. The Issue Radar surfaces known issues, clusters, and incidents. Reports support 21 metrics × 14 dimensions with previous-period comparison.
-4. **Backup.** Export the entire database (encrypted with AES-256-GCM + scrypt in `.sosync` format). Restore on any machine.
-
-## Key decisions
-
-| Decision | Why | Trade-off |
-|---|---|---|
-| Rust + Tauri 2 | Memory safety, small binaries, no Chromium | Slower compile; Leptos/WASM UI is less mature than React |
-| SQLite (bundled, WAL, FTS5) | No external database; ACID; full-text search built-in | Not a distributed database (single machine) |
-| Linux-only, deb + AppImage only | Project scope decision | No Windows/macOS/RPM packages |
-| AI is advisory, never auto-reply | Spec rule: "Auto-customer-reply is permanently OFF" | Slower than fully automated; safer for support quality |
-| No telemetry, no cloud AI | Privacy-first; all data stays local | No remote monitoring; no GPT-4/Claude integration |
-
-## Development
+Requires Rust (stable), the `wasm32-unknown-unknown` target, Trunk, and the
+Tauri 2 Linux prerequisites (WebKit2GTK 4.1, GTK 3).
 
 ```bash
-./bootstrap.sh        # Linux only: install Rust + system deps, build, launch
-cargo xtask lint      # rustfmt --check + clippy -D warnings
-cargo xtask test      # workspace tests
-cargo xtask package   # tauri build (deb + AppImage)
+git clone https://github.com/kimpearce888/SupportOS-PlusPlus.git
+cd SupportOS-PlusPlus
+
+cargo xtask dev          # tauri dev (UI dev server + shell)
+cargo xtask test         # cargo test --workspace
+cargo xtask lint         # rustfmt --check + clippy -D warnings
+cargo xtask package      # tauri build → deb + AppImage
+cargo xtask audit --app PATH   # black-box audit of a packaged app
 ```
 
-CI (Linux runners only): fmt + clippy + tests + WASM build + Tauri deb/AppImage
-bundle + package smoke tests + WebDriver E2E via tauri-driver + cargo audit.
+The HTTP API server (the Rust counterpart of the reference's Fastify server)
+listens on `127.0.0.1:3000` and serves the webview and any localhost browser
+client — webhooks, OAuth callbacks, SSE (`/api/events`) and the demo
+endpoints included. Demo mode (`LOCAL_DEMO_MODE=true`) runs against a
+simulated Help Scout provider with seeded sample data.
 
-## Credits
+## Differences from the reference
 
-The reference repo is [`supportos`](https://github.com/kimpearce888/supportos) (TypeScript).
+Intentional, owner-approved differences — everything else aims to match the
+reference exactly:
+
+1. **Linux x86_64 only (D1).** The reference ships Windows/macOS/Linux
+   installers; this port builds and verifies `.deb` + `.AppImage` on Linux
+   only, and its code-signing/notarization work is not ported.
+2. **No external vector server (D2 direction).** The reference can use a
+   locally-run Qdrant server for semantic docs search; this port stores
+   Float32 embeddings in SQLite and ranks them with an in-process cosine
+   scan, so semantic search works with zero external services. Keyword
+   (FTS5) search remains fully functional either way.
+
+Language-forced substitutions (no behavioral difference intended): Rust
+crates in place of npm packages, Leptos in place of React, serde in place of
+Zod, Axum in place of Fastify, cargo in place of npm/Vitest.
+
+## Repository layout
+
+- `crates/core` — the HTTP API server + SQLite business core
+- `crates/ui` — the Leptos/WASM client
+- `crates/app` — the Tauri 2 desktop shell (thin launcher: boots the HTTP
+  server and opens a window; no IPC)
+- `crates/catalog` — closed vocabularies shared by core and UI
+- `crates/xtask` — dev/test/lint/package/audit entry points
 
 ## License
 
-MIT. Help Scout is a trademark of Help Scout, Inc. SupportOS++ is an independent, open-source integration and is not affiliated with or endorsed by Help Scout.
+[MIT](LICENSE)
