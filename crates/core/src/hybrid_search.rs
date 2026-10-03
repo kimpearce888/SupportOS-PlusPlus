@@ -116,6 +116,145 @@ pub fn fuse_results_with_k(
     results
 }
 
+// ─── Reference docsSemantic.ts port (v1.4/v1.5 hybrid layer) ───────────────
+//
+// The reference `src/server/search/docsSemantic.ts` is the source of truth:
+// - `cosineSimilarity`: cosine over stored Float32 embeddings, 0 on length
+//   mismatch / empty / zero-norm inputs.
+// - `mergeDocHits`: Reciprocal Rank Fusion of the FTS + semantic result
+//   lists. Both retrievers contribute RANK-based scores only
+//   (`1 / (RRF_K + rank + 1)` where `rank` is the 0-based ARRAY POSITION —
+//   the reference iterates both lists with `forEach((h, i) => ...)`, so the
+//   fused score deliberately ignores the raw cosine/FTS scores: they live on
+//   incommensurable scales). Provenance is preserved per hit in `why`
+//   ('fts' / 'semantic' — insertion-ordered like the reference's Set).
+// - The fused score is rounded to 4 decimals (`Math.round(s*10000)/10000`),
+//   ties break by ascending article id, and the list is truncated to
+//   `limit`.
+
+/// The RRF constant `k` for the docs-style `merge_doc_hits` fusion
+/// (reference `docsSemantic.ts` `RRF_K = 60`).
+pub const DOC_RRF_K: u64 = 60;
+
+/// An FTS hit entering the RRF fusion (reference `FtsDocHit`).
+///
+/// `rank` is the 0-based FTS rank position. Note: like the reference, the
+/// fusion uses the ARRAY POSITION of the hit as its rank — the field is kept
+/// for shape parity with `FtsDocHit`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FtsDocHit {
+    pub article_id: i64,
+    /// FTS rank position, 0-based, ascending relevance.
+    pub rank: usize,
+}
+
+/// A semantic hit entering the RRF fusion (reference `SemanticDocHit`).
+///
+/// `score` is the cosine similarity; the fusion uses the ARRAY POSITION of
+/// the hit (the semantic list is expected pre-sorted by similarity — its
+/// rank IS the signal), the field is kept for shape parity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SemanticDocHit {
+    pub article_id: i64,
+    /// cosine similarity, typically -1..1 (higher = closer).
+    pub score: f32,
+}
+
+/// A fused hit (reference `MergedDocHit`): RRF score + retriever provenance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedDocHit {
+    pub article_id: i64,
+    /// RRF fused score; comparable across retrievers, NOT a cosine value.
+    pub score: f64,
+    /// Which retrievers found the hit, insertion-ordered ('fts' first when
+    /// present, then 'semantic') — mirrors the reference's Set order.
+    pub why: Vec<&'static str>,
+}
+
+/// Reciprocal Rank Fusion of the FTS + semantic result lists
+/// (reference `mergeDocHits`). Pure function — testable without a DB.
+///
+/// Both inputs are rank-ordered lists (best first); each list contributes
+/// `1 / (DOC_RRF_K + position + 1)` per hit. Scores are rounded to 4
+/// decimals, sorted descending (ties by ascending article id), truncated to
+/// `limit`.
+#[must_use]
+pub fn merge_doc_hits(
+    fts: &[FtsDocHit],
+    semantic: &[SemanticDocHit],
+    limit: usize,
+) -> Vec<MergedDocHit> {
+    // Insertion-ordered map: (article_id, fused score, why). The lists are
+    // small (<= 40 FTS + <= 24 semantic in the route), so linear lookup is
+    // fine and keeps the why-order reference-exact.
+    fn entry<'a>(
+        entries: &'a mut Vec<(i64, f64, Vec<&'static str>)>,
+        id: i64,
+    ) -> &'a mut (i64, f64, Vec<&'static str>) {
+        if let Some(pos) = entries.iter().position(|(aid, _, _)| *aid == id) {
+            &mut entries[pos]
+        } else {
+            entries.push((id, 0.0, Vec::new()));
+            entries.last_mut().expect("just pushed")
+        }
+    }
+    let mut entries: Vec<(i64, f64, Vec<&'static str>)> = Vec::new();
+    for (i, h) in fts.iter().enumerate() {
+        let e = entry(&mut entries, h.article_id);
+        e.1 += 1.0 / (DOC_RRF_K as f64 + i as f64 + 1.0);
+        if !e.2.contains(&"fts") {
+            e.2.push("fts");
+        }
+    }
+    for (i, h) in semantic.iter().enumerate() {
+        let e = entry(&mut entries, h.article_id);
+        e.1 += 1.0 / (DOC_RRF_K as f64 + i as f64 + 1.0);
+        if !e.2.contains(&"semantic") {
+            e.2.push("semantic");
+        }
+    }
+    let mut merged: Vec<MergedDocHit> = entries
+        .into_iter()
+        .map(|(article_id, s, why)| MergedDocHit {
+            article_id,
+            // reference: Math.round(v.s * 10000) / 10000
+            score: (s * 10_000.0).round() / 10_000.0,
+            why,
+        })
+        .collect();
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.article_id.cmp(&b.article_id))
+    });
+    merged.truncate(limit);
+    merged
+}
+
+/// Cosine similarity of two equal-length vectors
+/// (reference `docsSemantic.ts` `cosineSimilarity`): 0 when lengths mismatch,
+/// when empty, or when either vector is all-zero. Accumulation runs in f64
+/// to match the reference's JS-number math, narrowing to f32 on return.
+#[must_use]
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f64;
+    let mut na = 0.0_f64;
+    let mut nb = 0.0_f64;
+    for i in 0..a.len() {
+        dot += f64::from(a[i]) * f64::from(b[i]);
+        na += f64::from(a[i]) * f64::from(a[i]);
+        nb += f64::from(b[i]) * f64::from(b[i]);
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    (dot / (na.sqrt() * nb.sqrt())) as f32
+}
+
 /// Run a hybrid search combining dense (VectorStore) + sparse (FTS5) search.
 ///
 /// Per spec: "hybrid search." The dense search uses the VectorStore's
@@ -414,5 +553,166 @@ mod tests {
     #[test]
     fn rrf_k_is_60() {
         assert_eq!(RRF_K, 60);
+    }
+
+    // ---- cosine_similarity (reference docsSemantic.ts) ----------------------
+
+    #[test]
+    fn cosine_identical_vectors_is_one() {
+        let v = [1.0_f32, 2.0, 3.0];
+        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_orthogonal_vectors_is_zero() {
+        let a = [1.0_f32, 0.0, 0.0];
+        let b = [0.0_f32, 1.0, 0.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn cosine_opposite_vectors_is_minus_one() {
+        let a = [1.0_f32, 0.0];
+        let b = [-1.0_f32, 0.0];
+        assert!((cosine_similarity(&a, &b) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_known_value() {
+        // a = [1,2,3], b = [4,5,6] -> 32 / (sqrt(14)*sqrt(77)) ≈ 0.974632
+        let a = [1.0_f32, 2.0, 3.0];
+        let b = [4.0_f32, 5.0, 6.0];
+        let got = cosine_similarity(&a, &b);
+        let expected = 32.0_f64 / (14.0_f64.sqrt() * 77.0_f64.sqrt());
+        assert!((f64::from(got) - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_length_mismatch_is_zero() {
+        let a = [1.0_f32, 2.0];
+        let b = [1.0_f32, 2.0, 3.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn cosine_empty_vectors_is_zero() {
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn cosine_zero_vector_is_zero() {
+        let a = [0.0_f32, 0.0];
+        let b = [1.0_f32, 2.0];
+        assert_eq!(cosine_similarity(&a, &b), 0.0);
+        assert_eq!(cosine_similarity(&b, &a), 0.0);
+    }
+
+    // ---- merge_doc_hits (reference mergeDocHits) -----------------------------
+
+    fn fts_hit(id: i64, rank: usize) -> FtsDocHit {
+        FtsDocHit {
+            article_id: id,
+            rank,
+        }
+    }
+
+    fn sem_hit(id: i64, score: f32) -> SemanticDocHit {
+        SemanticDocHit {
+            article_id: id,
+            score,
+        }
+    }
+
+    #[test]
+    fn merge_doc_hits_empty_inputs() {
+        assert!(merge_doc_hits(&[], &[], 10).is_empty());
+    }
+
+    #[test]
+    fn merge_doc_hits_formula_uses_index_rank() {
+        // Reference: score += 1/(RRF_K + i + 1) with i = array position.
+        // Article 7 at FTS position 0 and semantic position 0:
+        // 1/61 + 1/61 = 2/61 ≈ 0.0328 (rounded to 4 decimals).
+        let merged = merge_doc_hits(&[fts_hit(7, 0)], &[sem_hit(7, 0.99)], 10);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].article_id, 7);
+        let expected = (2.0_f64 / 61.0 * 10_000.0).round() / 10_000.0;
+        assert!(
+            (merged[0].score - expected).abs() < 1e-9,
+            "score={}, expected={expected}",
+            merged[0].score
+        );
+        assert_eq!(merged[0].why, vec!["fts", "semantic"]);
+    }
+
+    #[test]
+    fn merge_doc_hits_overlapping_ranks_first() {
+        // Article 1 is rank 0 in BOTH lists -> fused 2/61.
+        // Article 2 is rank 0 in FTS only -> 1/61. Article 3 rank 0 semantic
+        // only -> 1/61. Tie between 2 and 3 breaks by ascending article id.
+        let fts = [fts_hit(1, 0), fts_hit(2, 1)];
+        let sem = [sem_hit(1, 0.9), sem_hit(3, 0.5)];
+        let merged = merge_doc_hits(&fts, &sem, 10);
+        assert_eq!(merged[0].article_id, 1);
+        assert_eq!(merged[0].why, vec!["fts", "semantic"]);
+        assert_eq!(merged[1].article_id, 2);
+        assert_eq!(merged[1].why, vec!["fts"]);
+        assert_eq!(merged[2].article_id, 3);
+        assert_eq!(merged[2].why, vec!["semantic"]);
+        assert!(merged[0].score > merged[1].score);
+        // Tie: articles 2 and 3 both have 1/61 -> equal scores.
+        assert!((merged[1].score - merged[2].score).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_doc_hits_ignores_raw_scores_uses_positions() {
+        // Raw cosine scores never enter the fused score: two runs with
+        // wildly different raw scores produce IDENTICAL results (rank-based
+        // fusion only — the reference's core RRF property).
+        let m1 = merge_doc_hits(&[], &[sem_hit(1, 0.99), sem_hit(2, 0.01)], 10);
+        let m2 = merge_doc_hits(&[], &[sem_hit(1, 0.50), sem_hit(2, 0.49)], 10);
+        assert_eq!(m1.len(), 2);
+        assert_eq!(m2.len(), 2);
+        for (a, b) in m1.iter().zip(m2.iter()) {
+            assert_eq!(a.article_id, b.article_id);
+            assert_eq!(a.score, b.score);
+            assert_eq!(a.why, b.why);
+        }
+        // Ranks differ -> scores differ (positions drive the fusion).
+        assert!(m1[0].score > m1[1].score);
+        assert!(m1[0].score > 0.0);
+    }
+
+    #[test]
+    fn merge_doc_hits_respects_limit() {
+        let fts: Vec<FtsDocHit> = (0..30).map(|i| fts_hit(i, i as usize)).collect();
+        let sem: Vec<SemanticDocHit> = (100..130).map(|i| sem_hit(i, 0.5)).collect();
+        assert_eq!(merge_doc_hits(&fts, &sem, 40).len(), 40);
+        assert_eq!(merge_doc_hits(&fts, &sem, 5).len(), 5);
+    }
+
+    #[test]
+    fn merge_doc_hits_rounds_to_four_decimals() {
+        // Article 9 at FTS position 0 (1/61) + semantic position 1 (1/62)
+        // = 123/3782 = 0.03252247... -> rounds to 0.0325 (reference
+        // Math.round to 4-decimal precision).
+        let fts = [fts_hit(9, 0)];
+        let sem = [sem_hit(1, 0.9), sem_hit(9, 0.8)];
+        let merged = merge_doc_hits(&fts, &sem, 10);
+        let nine = merged
+            .iter()
+            .find(|m| m.article_id == 9)
+            .expect("9 present");
+        assert_eq!(nine.score, 0.0325);
+    }
+
+    #[test]
+    fn merge_doc_hits_fts_list_processed_first_for_why_order() {
+        // Even when the semantic list is given first at the same article, the
+        // reference processes FTS first, so 'fts' precedes 'semantic'.
+        let sem = [sem_hit(5, 0.9)];
+        let fts = [fts_hit(5, 0)];
+        let merged = merge_doc_hits(&fts, &sem, 10);
+        assert_eq!(merged[0].why, vec!["fts", "semantic"]);
     }
 }
