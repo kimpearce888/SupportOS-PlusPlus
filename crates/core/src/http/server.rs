@@ -251,6 +251,53 @@ impl HttpServer {
                 "/api/conversations/:id/state",
                 post(routes::conversations::set_state),
             )
+            // Conversation write operations (reference conversations.ts:385-477)
+            .route(
+                "/api/conversations/:id/move",
+                post(routes::conversations::move_to_inbox),
+            )
+            .route(
+                "/api/conversations/:id/tags",
+                post(routes::conversations::update_tags_route),
+            )
+            .route(
+                "/api/conversations/:id/fields",
+                post(routes::conversations::update_fields_route),
+            )
+            .route(
+                "/api/conversations/:id/snooze",
+                post(routes::conversations::snooze_route)
+                    .delete(routes::conversations::unsnooze_route),
+            )
+            .route(
+                "/api/conversations/:id/schedule",
+                post(routes::conversations::schedule_route)
+                    .delete(routes::conversations::schedule_delete_route),
+            )
+            .route(
+                "/api/conversations/:id/schedule/publish",
+                post(routes::conversations::schedule_publish_route),
+            )
+            .route(
+                "/api/conversations/bulk",
+                post(routes::conversations::bulk_route),
+            )
+            .route(
+                "/api/conversations/:id/refresh",
+                post(routes::conversations::refresh_route),
+            )
+            .route(
+                "/api/conversations/:id/workflow/:workflowId",
+                post(routes::conversations::workflow_route),
+            )
+            .route(
+                "/api/attachments/:id/download",
+                post(routes::conversations::attachment_download_route),
+            )
+            .route(
+                "/api/attachments/:id/file",
+                get(routes::system::attachment_file),
+            )
             .route(
                 "/api/conversations/:id/events",
                 get(routes::conversations::events),

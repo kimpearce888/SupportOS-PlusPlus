@@ -62,6 +62,7 @@ async fn main() -> std::io::Result<()> {
     let _ = spp_core::data_tools::apply_m026_to_m027(&conn);
     let _ = spp_core::inbox::apply_m028(&conn);
     let _ = spp_core::sync_schema::apply_m029(&conn);
+    let _ = spp_core::conversation_ops::apply_m030(&conn);
     let _ = spp_core::webhook::ensure_webhook_events_table(&conn);
     let _ = spp_core::saved_views::ensure_saved_views_table(&conn);
     let _ = spp_core::oauth_state::ensure_oauth_states_table(&conn);

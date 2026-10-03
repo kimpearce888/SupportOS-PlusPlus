@@ -100,6 +100,10 @@ pub struct HsConversation {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub closed_at: Option<String>,
+    /// Per-conversation tag names (reference conversation shape carries
+    /// `tags: [{name}]`; the port models the names).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// A paginated response page.
@@ -486,6 +490,18 @@ pub struct FakeWorld {
     pub doc_articles: Vec<HsDocArticle>,
 }
 
+/// Reference fakeData.ts `daysAgo(n, hour = 10, minute = 30)`: UTC now
+/// minus `n` days, pinned to HH:MM:00.000Z.
+fn days_ago(n: i64) -> String {
+    let t = chrono::Utc::now() - chrono::Duration::days(n);
+    // Pin to 10:30 UTC like the reference default.
+    let date = t.date_naive();
+    use chrono::TimeZone;
+    chrono::Utc
+        .from_utc_datetime(&date.and_hms_opt(10, 30, 0).unwrap_or_else(|| t.naive_utc()))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 impl FakeWorld {
     /// Build a deterministic demo world with a small set of sample data.
     /// The data is designed to exercise the UI: 2 mailboxes, 3 agents,
@@ -594,70 +610,63 @@ impl FakeWorld {
                 },
             ],
             tags: vec![
-                HsTag {
-                    remote_id: 301,
-                    name: "bug".into(),
-                    slug: Some("bug".into()),
-                    color: Some("#f85149".into()),
-                    ticket_count: Some(3),
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                },
-                HsTag {
-                    remote_id: 302,
-                    name: "feature-request".into(),
-                    slug: Some("feature-request".into()),
-                    color: Some("#4f9cf9".into()),
-                    ticket_count: Some(2),
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                },
-                HsTag {
-                    remote_id: 303,
-                    name: "urgent".into(),
-                    slug: Some("urgent".into()),
-                    color: Some("#d29922".into()),
-                    ticket_count: Some(1),
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                },
-                HsTag {
-                    remote_id: 304,
-                    name: "billing".into(),
-                    slug: Some("billing".into()),
-                    color: Some("#3fb950".into()),
-                    ticket_count: Some(4),
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                },
-                HsTag {
-                    remote_id: 305,
-                    name: "how-to".into(),
-                    slug: Some("how-to".into()),
-                    color: Some("#8b949e".into()),
-                    ticket_count: Some(5),
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                },
+                // Reference fakeData.ts:129-144 — the same 14 tags with the
+                // same remote ids, colors and ticket counts. Dates are
+                // relative (daysAgo) exactly like the reference.
+                HsTag { remote_id: 701, name: "timezone".into(), slug: Some("timezone".into()), color: Some("#37A4FF".into()), ticket_count: Some(6), created_at: Some(days_ago(200)), updated_at: Some(days_ago(2)) },
+                HsTag { remote_id: 702, name: "billing".into(), slug: Some("billing".into()), color: Some("#517EDB".into()), ticket_count: Some(5), created_at: Some(days_ago(200)), updated_at: Some(days_ago(3)) },
+                HsTag { remote_id: 703, name: "integration".into(), slug: Some("integration".into()), color: Some("#517EDB".into()), ticket_count: Some(4), created_at: Some(days_ago(180)), updated_at: Some(days_ago(1)) },
+                HsTag { remote_id: 704, name: "registration".into(), slug: Some("registration".into()), color: Some("#56AF31".into()), ticket_count: Some(3), created_at: Some(days_ago(150)), updated_at: Some(days_ago(5)) },
+                HsTag { remote_id: 705, name: "viewer".into(), slug: Some("viewer".into()), color: Some("#56AF31".into()), ticket_count: Some(3), created_at: Some(days_ago(120)), updated_at: Some(days_ago(4)) },
+                HsTag { remote_id: 706, name: "automation".into(), slug: Some("automation".into()), color: Some("#929499".into()), ticket_count: Some(2), created_at: Some(days_ago(90)), updated_at: Some(days_ago(6)) },
+                HsTag { remote_id: 707, name: "vip".into(), slug: Some("vip".into()), color: Some("#E4BB2F".into()), ticket_count: Some(2), created_at: Some(days_ago(80)), updated_at: Some(days_ago(7)) },
+                HsTag { remote_id: 708, name: "escalated".into(), slug: Some("escalated".into()), color: Some("#DE5B49".into()), ticket_count: Some(2), created_at: Some(days_ago(70)), updated_at: Some(days_ago(2)) },
+                HsTag { remote_id: 709, name: "release-2-4".into(), slug: Some("release-2-4".into()), color: Some("#929499".into()), ticket_count: Some(3), created_at: Some(days_ago(14)), updated_at: Some(days_ago(1)) },
+                HsTag { remote_id: 710, name: "docs-gap".into(), slug: Some("docs-gap".into()), color: Some("#929499".into()), ticket_count: Some(1), created_at: Some(days_ago(30)), updated_at: Some(days_ago(30)) },
+                HsTag { remote_id: 711, name: "api".into(), slug: Some("api".into()), color: Some("#37A4FF".into()), ticket_count: Some(1), created_at: Some(days_ago(60)), updated_at: Some(days_ago(36)) },
+                HsTag { remote_id: 712, name: "sso".into(), slug: Some("sso".into()), color: Some("#517EDB".into()), ticket_count: Some(1), created_at: Some(days_ago(40)), updated_at: Some(days_ago(15)) },
+                HsTag { remote_id: 713, name: "account".into(), slug: Some("account".into()), color: Some("#929499".into()), ticket_count: Some(1), created_at: Some(days_ago(100)), updated_at: Some(days_ago(15)) },
+                HsTag { remote_id: 714, name: "beacon".into(), slug: Some("beacon".into()), color: Some("#37A4FF".into()), ticket_count: Some(6), created_at: Some(days_ago(60)), updated_at: Some(days_ago(1)) },
             ],
             conversations: (1..=10)
-                .map(|i| HsConversation {
-                    remote_id: 1000 + i,
-                    number: 1000 + i,
-                    subject: Some(format!("Conversation #{}", i)),
-                    preview: Some(format!("Preview text for conversation {}", i)),
-                    status: if i % 3 == 0 { "closed" } else { "active" }.into(),
-                    mailbox_id: if i <= 5 { 101 } else { 102 },
-                    assignee_id: Some((i % 3) + 1),
-                    customer_id: 2000 + i,
-                    priority: if i == 1 { Some("urgent".into()) } else { None },
-                    created_at: Some(format!("2026-01-{:02}T00:00:00Z", i)),
-                    updated_at: Some(format!("2026-01-{:02}T12:00:00Z", i)),
-                    closed_at: if i % 3 == 0 {
-                        Some(format!("2026-01-{:02}T18:00:00Z", i))
-                    } else {
-                        None
-                    },
+                .map(|i| {
+                    // Tag sets mirror the reference fakeData.ts scripted
+                    // world (conversation order preserved).
+                    let tags: Vec<String> = match i {
+                        1 => vec!["timezone", "vip"],
+                        2 => vec!["timezone", "release-2-4"],
+                        3 => vec!["timezone"],
+                        4 => vec!["registration"],
+                        5 => vec!["viewer"],
+                        6 => vec!["integration"],
+                        7 => vec!["api"],
+                        8 => vec!["sso", "account"],
+                        9 => vec!["integration", "escalated", "release-2-4"],
+                        10 => vec!["billing"],
+                        _ => vec![],
+                    }
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                    HsConversation {
+                        remote_id: 1000 + i,
+                        number: 1000 + i,
+                        subject: Some(format!("Conversation #{}", i)),
+                        preview: Some(format!("Preview text for conversation {}", i)),
+                        status: if i % 3 == 0 { "closed" } else { "active" }.into(),
+                        mailbox_id: if i <= 5 { 101 } else { 102 },
+                        assignee_id: Some((i % 3) + 1),
+                        customer_id: 2000 + i,
+                        priority: if i == 1 { Some("urgent".into()) } else { None },
+                        created_at: Some(format!("2026-01-{:02}T00:00:00Z", i)),
+                        updated_at: Some(format!("2026-01-{:02}T12:00:00Z", i)),
+                        closed_at: if i % 3 == 0 {
+                            Some(format!("2026-01-{:02}T18:00:00Z", i))
+                        } else {
+                            None
+                        },
+                        tags,
+                    }
                 })
                 .collect(),
             customers: (1..=8)
@@ -1209,10 +1218,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_tags_returns_five() {
+    async fn list_tags_returns_fourteen() {
         let p = provider();
         let tags = p.list_tags().await.unwrap();
-        assert_eq!(tags.len(), 5);
+        assert_eq!(tags.len(), 14);
     }
 
     #[tokio::test]

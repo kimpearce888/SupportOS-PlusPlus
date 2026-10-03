@@ -39,6 +39,7 @@ pub mod backup;
 pub mod backup_service;
 pub mod config;
 pub mod conformance;
+pub mod conversation_ops;
 pub mod copilot;
 pub mod customers;
 pub mod data_tools;

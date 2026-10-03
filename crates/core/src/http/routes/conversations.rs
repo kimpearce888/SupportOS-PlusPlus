@@ -511,16 +511,24 @@ pub async fn list_mailboxes(State(state): State<AppState>) -> impl IntoResponse 
 
 /// GET /api/tags — list all tags (reference data for the UI).
 pub async fn list_tags(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let conn = state.conn_lock();
+    // Reference getTags: id, remote_id, name, slug, color, ticket_count
+    // straight from the synced tags table, ordered by name.
     let tags: Vec<Value> = conn
-        .prepare("SELECT id, name, (SELECT COUNT(*) FROM conversation_tags WHERE tag_id = t.id) AS ticket_count FROM tags t ORDER BY t.name")
+        .prepare(
+            "SELECT id, remote_id, name, slug, color, COALESCE(ticket_count, 0)
+               FROM tags ORDER BY name",
+        )
         .ok()
         .map(|mut stmt| {
             stmt.query_map([], |r| {
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?,
-                    "name": r.get::<_, String>(1)?,
-                    "ticket_count": r.get::<_, i64>(2)?,
+                    "remote_id": r.get::<_, Option<i64>>(1)?,
+                    "name": r.get::<_, String>(2)?,
+                    "slug": r.get::<_, Option<String>>(3)?,
+                    "color": r.get::<_, Option<String>>(4)?,
+                    "ticket_count": r.get::<_, i64>(5)?,
                 }))
             })
             .ok()
@@ -626,4 +634,644 @@ pub async fn webhook_configs(State(state): State<AppState>) -> impl IntoResponse
     let conn = state.conn_lock();
     let list = crate::mirror_readouts::webhook_configs(&conn).unwrap_or_default();
     (StatusCode::OK, Json(list))
+}
+
+// ---------------------------------------------------------------------------
+// Conversation write operations (reference conversations.ts:385-477 — the
+// operations.ts write pipeline: validate → authorize → job → write →
+// confirm → persist → audit). Handlers use JS Number() semantics for :id so
+// non-numeric ids reproduce the reference's Zod 422s instead of Axum 400s.
+// ---------------------------------------------------------------------------
+
+use crate::conversation_ops::{
+    conv_by_local_id, eval_mode_blocked, js_number, op_bulk_action, op_delete_schedule,
+    op_move_to_inbox, op_publish_schedule, op_run_workflow, op_schedule_reply, op_snooze,
+    op_unsnooze, op_update_custom_fields, op_update_tags, rejected, zod_422, zod_422_multi,
+    zod_bool_msg, zod_enum_message, zod_int_msg, zod_string_msg,
+};
+use axum::response::Response;
+
+/// Parse `:id` with JS `Number()` + `z.number().int()` semantics.
+fn path_id(raw: &str) -> Result<i64, Response> {
+    match js_number(raw) {
+        Some(f)
+            if f.is_finite()
+                && f.fract() == 0.0
+                && f >= i64::MIN as f64
+                && f <= i64::MAX as f64 =>
+        {
+            Ok(f as i64)
+        }
+        Some(_) => Err(zod_422(
+            "conversationId",
+            "Expected integer, received float",
+        )),
+        None => Err(zod_422("conversationId", "Expected number, received nan")),
+    }
+}
+
+/// POST /api/conversations/:id/move — move to another inbox.
+pub async fn move_to_inbox(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let mailbox_id = match zod_int_msg(&body, "mailboxId") {
+        Ok(v) => v,
+        Err(m) => return zod_422("mailboxId", &m),
+    };
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        if conv_by_local_id(&conn, conversation_id).is_none() {
+            return rejected("Conversation not found locally.");
+        }
+    }
+    // Real mode: PATCH the remote first (reference realProvider.updateConversation).
+    if let Some(real) = state.real.clone() {
+        let remote_id: i64 = {
+            let conn = state.conn_lock();
+            conv_by_local_id(&conn, conversation_id)
+                .map(|c| c.remote_id)
+                .unwrap_or_default()
+        };
+        if let Err(e) = real
+            .request(
+                &format!("/v2/conversations/{remote_id}"),
+                "PATCH",
+                Some(json!({ "op": "move", "path": "/mailboxId", "value": mailbox_id })),
+            )
+            .await
+        {
+            return rejected(&format!("Conversation was NOT moved. {e}"));
+        }
+    }
+    let conn = state.conn_lock();
+    op_move_to_inbox(&conn, conversation_id, mailbox_id)
+}
+
+/// POST /api/conversations/:id/tags — merge-semantics tag update.
+pub async fn update_tags_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // add/remove default [], set nullish
+    let mut change = json!({});
+    for key in ["add", "remove"] {
+        match body.get(key) {
+            None | Some(Value::Null) => {
+                change[key] = json!([]);
+            }
+            Some(Value::Array(a)) => {
+                for v in a {
+                    if !v.is_string() {
+                        return zod_422(
+                            key,
+                            &format!(
+                                "Expected string, received {}",
+                                if v.is_number() {
+                                    "number"
+                                } else if v.is_boolean() {
+                                    "boolean"
+                                } else {
+                                    "object"
+                                }
+                            ),
+                        );
+                    }
+                }
+                change[key] = json!(a);
+            }
+            Some(_) => return zod_422(key, "Expected array, received non-array"),
+        }
+    }
+    match body.get("set") {
+        Some(Value::Null) | None => {}
+        Some(Value::Array(a)) => {
+            change["set"] = json!(a);
+        }
+        Some(_) => return zod_422("set", "Expected array, received non-array"),
+    }
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        if conv_by_local_id(&conn, conversation_id).is_none() {
+            return rejected("Conversation not found locally.");
+        }
+    }
+    // Real mode: PUT the complete desired state (fresh-read happens remotely).
+    if let Some(real) = state.real.clone() {
+        let remote_id: i64 = {
+            let conn = state.conn_lock();
+            conv_by_local_id(&conn, conversation_id)
+                .map(|c| c.remote_id)
+                .unwrap_or_default()
+        };
+        if let Ok(remote) = real
+            .request(&format!("/v2/conversations/{remote_id}"), "GET", None)
+            .await
+        {
+            let current: Vec<String> = remote["tags"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let desired = crate::conversation_ops::merge_tags(&current, &change);
+            if let Err(e) = real
+                .request(
+                    &format!("/v2/conversations/{remote_id}/tags"),
+                    "PUT",
+                    Some(json!({ "tags": desired })),
+                )
+                .await
+            {
+                return rejected(&format!("Tags were NOT changed. {e}"));
+            }
+        }
+    }
+    let conn = state.conn_lock();
+    op_update_tags(&conn, conversation_id, &change)
+}
+
+/// POST /api/conversations/:id/fields — custom field update.
+pub async fn update_fields_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Some(fields) = body.get("fields").and_then(|f| f.as_array()) else {
+        return zod_422("fields", "Required");
+    };
+    let mut parsed: Vec<(i64, Option<String>)> = Vec::new();
+    for f in fields {
+        let Some(fid) = f.get("id").and_then(|v| v.as_i64()) else {
+            return zod_422("fields", "Expected object with integer id");
+        };
+        // value: z.string().nullish() — string, null or absent.
+        let value: Option<String> = match f.get("value") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return zod_422("value", "Expected string, received non-string");
+            }
+        };
+        parsed.push((fid, value));
+    }
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        if conv_by_local_id(&conn, conversation_id).is_none() {
+            return rejected("Conversation not found locally.");
+        }
+    }
+    if let Some(real) = state.real.clone() {
+        let remote_id: i64 = {
+            let conn = state.conn_lock();
+            conv_by_local_id(&conn, conversation_id)
+                .map(|c| c.remote_id)
+                .unwrap_or_default()
+        };
+        let payload = json!({ "fields": parsed.iter().map(|(id, v)| json!({
+            "id": id, "value": v.clone().unwrap_or_default()
+        })).collect::<Vec<_>>() });
+        if let Err(e) = real
+            .request(
+                &format!("/v2/conversations/{remote_id}/fields"),
+                "PUT",
+                Some(payload),
+            )
+            .await
+        {
+            return rejected(&format!("Fields were NOT changed. {e}"));
+        }
+    }
+    let conn = state.conn_lock();
+    op_update_custom_fields(&conn, conversation_id, &parsed)
+}
+
+/// POST /api/conversations/:id/snooze
+pub async fn snooze_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Ok(snoozed_until) = zod_string_msg(&body, "snoozedUntil") else {
+        return zod_422("snoozedUntil", "Required");
+    };
+    // unsnoozeOnCustomerReply defaults to true.
+    let _unsnooze = match body.get("unsnoozeOnCustomerReply") {
+        None | Some(Value::Null) => true,
+        _ => match zod_bool_msg(&body, "unsnoozeOnCustomerReply") {
+            Ok(b) => b,
+            Err(m) => return zod_422("unsnoozeOnCustomerReply", &m),
+        },
+    };
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        if conv_by_local_id(&conn, conversation_id).is_none() {
+            return rejected("Conversation not found locally.");
+        }
+    }
+    if let Some(real) = state.real.clone() {
+        let remote_id: i64 = {
+            let conn = state.conn_lock();
+            conv_by_local_id(&conn, conversation_id)
+                .map(|c| c.remote_id)
+                .unwrap_or_default()
+        };
+        if let Err(e) = real
+            .request(
+                &format!("/v2/conversations/{remote_id}/snooze"),
+                "PUT",
+                Some(
+                    json!({ "snoozedUntil": snoozed_until, "unsnoozeOnCustomerReply": _unsnooze }),
+                ),
+            )
+            .await
+        {
+            return rejected(&format!("Snooze was NOT applied. {e}"));
+        }
+    }
+    let conn = state.conn_lock();
+    op_snooze(&conn, conversation_id, &snoozed_until)
+}
+
+/// DELETE /api/conversations/:id/snooze
+pub async fn unsnooze_route(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        if conv_by_local_id(&conn, conversation_id).is_none() {
+            return rejected("Conversation not found locally.");
+        }
+    }
+    if let Some(real) = state.real.clone() {
+        let remote_id: i64 = {
+            let conn = state.conn_lock();
+            conv_by_local_id(&conn, conversation_id)
+                .map(|c| c.remote_id)
+                .unwrap_or_default()
+        };
+        if let Err(e) = real
+            .request(
+                &format!("/v2/conversations/{remote_id}/snooze"),
+                "DELETE",
+                None,
+            )
+            .await
+        {
+            return rejected(&format!("Snooze was NOT removed. {e}"));
+        }
+    }
+    let conn = state.conn_lock();
+    op_unsnooze(&conn, conversation_id)
+}
+
+/// POST /api/conversations/:id/schedule
+pub async fn schedule_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    // Zod collects ALL issues: threadId + scheduledFor (+ optional bool).
+    let mut issues: Vec<(&str, String)> = Vec::new();
+    let thread_id = match zod_int_msg(&body, "threadId") {
+        Ok(v) => Some(v),
+        Err(m) => {
+            issues.push(("threadId", m));
+            None
+        }
+    };
+    let scheduled_for = match zod_string_msg(&body, "scheduledFor") {
+        Ok(v) => Some(v),
+        Err(m) => {
+            issues.push(("scheduledFor", m));
+            None
+        }
+    };
+    if !issues.is_empty() {
+        let owned: Vec<(&str, &str)> = issues.iter().map(|(p, m)| (*p, m.as_str())).collect();
+        return zod_422_multi(&owned);
+    }
+    let thread_id = thread_id.unwrap_or_default();
+    let scheduled_for = scheduled_for.unwrap_or_default();
+    let _u = match body.get("unscheduleOnCustomerReply") {
+        None | Some(Value::Null) => true,
+        _ => match zod_bool_msg(&body, "unscheduleOnCustomerReply") {
+            Ok(b) => b,
+            Err(m) => return zod_422("unscheduleOnCustomerReply", &m),
+        },
+    };
+    let _ = _u;
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+    }
+    if let Some(real) = state.real.clone() {
+        let remote_ids = {
+            let conn = state.conn_lock();
+            let c = conv_by_local_id(&conn, conversation_id);
+            let t_remote: Option<i64> = conn
+                .query_row(
+                    "SELECT remote_id FROM conversation_threads WHERE id = ?1",
+                    rusqlite::params![thread_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            (c.map(|c| c.remote_id), t_remote)
+        };
+        match remote_ids {
+            (Some(conv_remote), Some(_thread_remote)) => {
+                if let Err(e) = real
+                    .request(
+                        &format!("/v2/conversations/{conv_remote}/threads/{thread_id}/schedule"),
+                        "PUT",
+                        Some(json!({ "scheduledFor": scheduled_for, "unscheduleOnCustomerReply": _u, "sendAsCreator": false })),
+                    )
+                    .await
+                {
+                    return rejected(&format!("Schedule was NOT applied. {e}"));
+                }
+            }
+            _ => return rejected("Conversation or draft thread not found locally."),
+        }
+    }
+    let conn = state.conn_lock();
+    op_schedule_reply(&conn, conversation_id, thread_id, &scheduled_for)
+}
+
+/// POST /api/conversations/:id/schedule/publish
+pub async fn schedule_publish_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Ok(thread_id) = zod_int_msg(&body, "threadId") else {
+        return zod_422("threadId", "Required");
+    };
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+    }
+    if let Some(real) = state.real.clone() {
+        let conv_remote: i64 = {
+            let conn = state.conn_lock();
+            conv_by_local_id(&conn, conversation_id)
+                .map(|c| c.remote_id)
+                .unwrap_or_default()
+        };
+        if let Err(e) = real
+            .request(
+                &format!("/v2/conversations/{conv_remote}/threads/{thread_id}/schedule"),
+                "PATCH",
+                Some(json!({ "op": "replace", "path": "/state", "value": "published" })),
+            )
+            .await
+        {
+            return rejected(&format!("Publish failed. {e}"));
+        }
+    }
+    let conn = state.conn_lock();
+    op_publish_schedule(&conn, conversation_id, thread_id)
+}
+
+/// DELETE /api/conversations/:id/schedule
+pub async fn schedule_delete_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let Ok(thread_id) = zod_int_msg(&body, "threadId") else {
+        return zod_422("threadId", "Required");
+    };
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+    }
+    if let Some(real) = state.real.clone() {
+        let conv_remote: i64 = {
+            let conn = state.conn_lock();
+            conv_by_local_id(&conn, conversation_id)
+                .map(|c| c.remote_id)
+                .unwrap_or_default()
+        };
+        if let Err(e) = real
+            .request(
+                &format!("/v2/conversations/{conv_remote}/threads/{thread_id}/schedule"),
+                "DELETE",
+                None,
+            )
+            .await
+        {
+            return rejected(&format!("Delete failed. {e}"));
+        }
+    }
+    let conn = state.conn_lock();
+    op_delete_schedule(&conn, conversation_id, thread_id)
+}
+
+/// POST /api/conversations/bulk — queue-based bulk actions.
+pub async fn bulk_route(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    let Some(ids) = body.get("conversationIds").and_then(|v| v.as_array()) else {
+        return zod_422("conversationIds", "Required");
+    };
+    if ids.is_empty() {
+        return zod_422(
+            "conversationIds",
+            "Array must contain at least 1 element(s)",
+        );
+    }
+    let mut conversation_ids = Vec::new();
+    for v in ids {
+        match v.as_i64() {
+            Some(i) => conversation_ids.push(i),
+            None => {
+                return zod_422(
+                    "conversationIds",
+                    &format!(
+                        "Expected number, received {}",
+                        if v.is_string() { "string" } else { "object" }
+                    ),
+                )
+            }
+        }
+    }
+    let Some(action) = body.get("action").and_then(|v| v.as_str()) else {
+        return zod_422("action", "Required");
+    };
+    const ACTIONS: [&str; 6] = ["tag", "untag", "assign", "unassign", "status", "close"];
+    if !ACTIONS.contains(&action) {
+        return zod_422("action", &zod_enum_message(&ACTIONS, action));
+    }
+    let params_body = body.get("params").cloned().unwrap_or_else(|| json!({}));
+    let conn = state.conn_lock();
+    op_bulk_action(&conn, &conversation_ids, action, &params_body)
+}
+
+/// POST /api/conversations/:id/refresh — refresh one conversation via the
+/// shared sync coordinator (reference operations.ts refreshOne).
+pub async fn refresh_route(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let remote_id = {
+        let conn = state.conn_lock();
+        match conv_by_local_id(&conn, conversation_id) {
+            Some(c) => c.remote_id,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "statusCode": 404, "error": "NotFound",
+                        "message": "Conversation not found locally."
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    };
+    // Demo mode: no remote to refresh — the local store IS current.
+    if let Some(sync) = state.sync.clone() {
+        match sync.sync_single_conversation(remote_id).await {
+            Ok(_) => (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "message": "Conversation refreshed from Help Scout." })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::OK,
+                Json(json!({ "ok": false, "message": format!("Refresh failed: {e}") })),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "message": "Conversation refreshed from Help Scout." })),
+        )
+            .into_response()
+    }
+}
+
+/// POST /api/conversations/:id/workflow/:workflowId — run a Help Scout
+/// workflow on a conversation.
+pub async fn workflow_route(
+    State(state): State<AppState>,
+    Path((id, workflow_id)): Path<(String, String)>,
+) -> Response {
+    let conversation_id = match path_id(&id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let workflow_id = match js_number(&workflow_id) {
+        Some(f) if f.is_finite() && f.fract() == 0.0 => f as i64,
+        Some(_) => return zod_422("workflowId", "Expected integer, received float"),
+        None => return zod_422("workflowId", "Expected number, received nan"),
+    };
+    {
+        let conn = state.conn_lock();
+        if let Some(msg) = eval_mode_blocked(&conn) {
+            return rejected(msg);
+        }
+        if conv_by_local_id(&conn, conversation_id).is_none() {
+            return rejected("Conversation not found locally.");
+        }
+    }
+    if let Some(real) = state.real.clone() {
+        let remote_id: i64 = {
+            let conn = state.conn_lock();
+            conv_by_local_id(&conn, conversation_id)
+                .map(|c| c.remote_id)
+                .unwrap_or_default()
+        };
+        if let Err(e) = real
+            .request(
+                &format!("/v2/workflows/{workflow_id}/run"),
+                "POST",
+                Some(json!({ "conversationId": remote_id })),
+            )
+            .await
+        {
+            return rejected(&format!("Workflow failed. {e}"));
+        }
+    }
+    let conn = state.conn_lock();
+    op_run_workflow(&conn, conversation_id, workflow_id)
+}
+
+/// POST /api/attachments/:id/download — fetch attachment bytes to the local
+/// attachments directory.
+pub async fn attachment_download_route(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let attachment_id = match js_number(&id) {
+        Some(f) if f.is_finite() && f.fract() == 0.0 => f as i64,
+        _ => return zod_422("id", "Expected number, received nan"),
+    };
+    let attachments_dir = state.data_dir.join("attachments");
+    let conn = state.conn_lock();
+    crate::conversation_ops::op_download_attachment(&conn, &attachments_dir, attachment_id)
 }

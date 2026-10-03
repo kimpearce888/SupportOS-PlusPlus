@@ -602,8 +602,9 @@ impl RealHelpScoutProvider {
     // ---------------- Core HTTP ----------------
 
     /// Single point for all Help Scout HTTP: bearer token, rate limiting,
-    /// retries (429 + 5xx + network), friendly error mapping.
-    async fn request(&self, path: &str, method: &str, body: Option<Value>) -> Result<Value> {
+    /// retries (429 + 5xx + network), friendly error mapping. Public so the
+    /// operations layer can issue the reference's remote writes.
+    pub async fn request(&self, path: &str, method: &str, body: Option<Value>) -> Result<Value> {
         self.request_inner(path, method, body, 3).await
     }
 
@@ -864,6 +865,14 @@ impl RealHelpScoutProvider {
             created_at: v["createdAt"].as_str().map(|s| s.to_string()),
             updated_at: v["userUpdatedAt"].as_str().map(|s| s.to_string()),
             closed_at: v["closedAt"].as_str().map(|s| s.to_string()),
+            tags: v["tags"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t["tag"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 

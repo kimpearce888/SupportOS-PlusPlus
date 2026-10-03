@@ -256,6 +256,19 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
             c.closed_at,
         ],
     )?;
+    // Mirror the reference's per-conversation tags (conversation_tags join).
+    let local: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM conversations WHERE remote_id = ?1",
+            params![c.remote_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(conv_local) = local {
+        // Reference updateLocalTags: unknown names get monotonic negative
+        // remote ids; case-insensitive lookup; slugified names.
+        crate::conversation_ops::write_conversation_tags(conn, conv_local, &c.tags);
+    }
     Ok(())
 }
 
@@ -545,6 +558,7 @@ mod tests {
             created_at: Some("2026-01-01T00:00:00Z".into()),
             updated_at: Some("2026-01-01T12:00:00Z".into()),
             closed_at: None,
+            tags: vec!["timezone".into(), "vip".into()],
         };
         upsert_conversation(&conn, &c).unwrap();
 

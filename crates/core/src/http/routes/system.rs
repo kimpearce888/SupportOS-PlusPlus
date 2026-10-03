@@ -10,6 +10,18 @@ use serde_json::{json, Value};
 use super::super::server::AppState;
 use axum::response::IntoResponse;
 
+/// The application version reported by /health (mirrors the reference's
+/// `APP_VERSION` constant in shared/constants.ts — the port reproduces the
+/// same product's API contract).
+pub const APP_VERSION: &str = "2.2.1";
+
+/// JS `new Date().toISOString()`: millisecond precision, `Z` suffix.
+fn js_iso_now() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
 /// GET /health — basic health check.
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let db_ok = {
@@ -27,8 +39,8 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         Json(json!({
             "status": status,
             "database": db_ok,
-            "version": env!("CARGO_PKG_VERSION"),
-            "time": chrono::Utc::now().to_rfc3339(),
+            "version": APP_VERSION,
+            "time": js_iso_now(),
         })),
     )
 }
@@ -228,8 +240,8 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
         code,
         Json(json!({
             "status": status,
-            "version": env!("CARGO_PKG_VERSION"),
-            "time": chrono::Utc::now().to_rfc3339(),
+            "version": APP_VERSION,
+            "time": js_iso_now(),
             "database": {
                 "ok": db_ok,
                 "path": db_path,
@@ -802,4 +814,126 @@ pub async fn backups_export_csv(State(state): State<AppState>) -> impl IntoRespo
     let conn = state.conn_lock();
     let result = crate::backup_service::export_conversations_csv(&conn, &backups_dir(&state));
     (StatusCode::OK, Json(result))
+}
+
+/// GET /api/attachments/:id/file — serve a downloaded attachment's bytes
+/// (reference system.ts:261-296: raster/vector images inline, everything
+/// else forced to download with nosniff; path containment enforced).
+pub async fn attachment_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let attachment_id = match id.parse::<i64>() {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "statusCode": 400, "error": "BadRequest",
+                    "message": "Invalid attachment id."
+                })),
+            )
+                .into_response()
+        }
+    };
+    let att = {
+        let conn = state.conn_lock();
+        crate::conversation_ops::attachment_by_id(&conn, attachment_id)
+    };
+    let Some(att) = att else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404, "error": "NotFound",
+                "message": "Attachment not downloaded yet. Use the download action first."
+            })),
+        )
+            .into_response();
+    };
+    let Some(local_path) = att.local_path else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404, "error": "NotFound",
+                "message": "Attachment not downloaded yet. Use the download action first."
+            })),
+        )
+            .into_response();
+    };
+    let bytes = match std::fs::read(&local_path) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "statusCode": 404, "error": "NotFound",
+                    "message": "Attachment file is no longer readable on disk."
+                })),
+            )
+                .into_response()
+        }
+    };
+    // Separator-aware containment: the file must live under the attachments
+    // dir (blocks sibling dirs sharing a prefix, e.g. data-x/ vs data/).
+    let root = state.data_dir.join("attachments");
+    let resolved = std::path::Path::new(&local_path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&local_path));
+    let root = root
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(&root));
+    if !resolved.starts_with(&root) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400, "error": "BadRequest",
+                "message": "Invalid attachment path."
+            })),
+        )
+            .into_response();
+    }
+    // Only raster/vector images are served inline; everything else
+    // (including text/html) is forced to download.
+    let mime = att
+        .mime_type
+        .unwrap_or_else(|| "application/octet-stream".into());
+    let inline = regex_lite_check_image(&mime);
+    let safe_filename = att
+        .filename
+        .unwrap_or_else(|| "attachment".into())
+        .replace(['"', '\\', '\r', '\n'], "_");
+    let mut headers = axum::http::HeaderMap::new();
+    let content_type = if inline {
+        mime
+    } else {
+        "application/octet-stream".into()
+    };
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_str(&content_type).unwrap_or(
+            axum::http::HeaderValue::from_static("application/octet-stream"),
+        ),
+    );
+    if let Ok(v) =
+        axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{safe_filename}\""))
+    {
+        headers.insert(axum::http::header::CONTENT_DISPOSITION, v);
+    }
+    headers.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
+/// `^image\/(png|jpe?g|gif|webp|bmp|svg\+xml)$` (case-insensitive).
+fn regex_lite_check_image(mime: &str) -> bool {
+    let m = mime.to_ascii_lowercase();
+    let Some(rest) = m.strip_prefix("image/") else {
+        return false;
+    };
+    matches!(
+        rest,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg+xml"
+    )
 }

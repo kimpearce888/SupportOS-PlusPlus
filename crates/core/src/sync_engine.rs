@@ -1614,7 +1614,7 @@ mod tests {
             .unwrap();
         assert_eq!(mailboxes, 2);
         assert_eq!(users, 3);
-        assert_eq!(tags, 5);
+        assert_eq!(tags, 14);
         assert_eq!(orgs, 2);
         assert_eq!(folders, 4);
         assert!(fields >= 3);

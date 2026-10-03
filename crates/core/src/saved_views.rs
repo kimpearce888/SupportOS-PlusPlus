@@ -209,7 +209,8 @@ fn compile_leaf(
             let escaped = escape_like_wildcards(val);
             params.push(rusqlite::types::Value::Text(format!("%{escaped}%")));
             Ok(
-                "c.id IN (SELECT conversation_id FROM conversation_tags WHERE tag_name LIKE ?)"
+                "c.id IN (SELECT ct.conversation_id FROM conversation_tags ct \
+                 JOIN tags t ON t.id = ct.tag_id WHERE t.name LIKE ?)"
                     .to_string(),
             )
         }
