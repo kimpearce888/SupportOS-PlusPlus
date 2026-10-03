@@ -162,9 +162,14 @@ pub fn enforce_retention(conn: &Connection, retention_days: i64) -> Result<usize
         }
     }
     // v1.8.0: notifications are local operational data too — same window.
+    // Reference `pruneOlderThan`: created_at < cutoff OR (read AND
+    // read_at < cutoff) — old UNREAD notifications prune too; a recent read
+    // one survives until its read_at crosses the window.
     if let Ok(n) = conn.execute(
-        "DELETE FROM notifications WHERE read_at IS NOT NULL AND julianday(created_at) < julianday('now', '-?1 days')",
-        [retention_days],
+        "DELETE FROM notifications
+         WHERE julianday(created_at) < julianday('now', ?1)
+            OR (read_at IS NOT NULL AND julianday(read_at) < julianday('now', ?1))",
+        [format!("-{retention_days} days")],
     ) {
         removed += n;
     }
@@ -322,5 +327,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM webhook_events", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn retention_prunes_old_unread_notifications_too() {
+        let conn = fresh_db();
+        // The reference pruneOlderThan predicate: created_at < cutoff OR
+        // (read AND read_at < cutoff). Old UNREAD notifications prune; a
+        // recently-read one survives; a fresh one survives.
+        conn.execute(
+            "INSERT INTO notifications (type, severity, title, dedup_key, created_at)
+             VALUES ('mentioned', 'info', 'old unread', 'n:r:1', datetime('now', '-40 days'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notifications (type, severity, title, dedup_key, created_at, read_at)
+             VALUES ('mentioned', 'info', 'old read', 'n:r:2', datetime('now', '-40 days'), datetime('now', '-35 days'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO notifications (type, severity, title, dedup_key, created_at, read_at)
+             VALUES ('mentioned', 'info', 'recent read', 'n:r:3', datetime('now', '-5 days'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        let removed = enforce_retention(&conn, 30).unwrap();
+        assert_eq!(removed, 2, "old unread + old read prune");
+        let titles: Vec<String> = conn
+            .prepare("SELECT title FROM notifications ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(titles, vec!["recent read".to_string()]);
     }
 }

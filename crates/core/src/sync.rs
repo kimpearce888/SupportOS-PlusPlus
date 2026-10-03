@@ -75,7 +75,10 @@ pub fn upsert_user(conn: &Connection, u: &HsUser) -> Result<()> {
     Ok(())
 }
 
-/// Upsert a team into the `teams` table.
+/// Upsert a team into the `teams` table + refresh its membership
+/// (`team_members`) — the reference `upsertTeam` + `upsertTeamMembers`
+/// (referenceRepo.ts:125-143): members are replaced wholesale with the
+/// remote list, resolved to LOCAL user ids.
 pub fn upsert_team(conn: &Connection, t: &HsTeam) -> Result<()> {
     conn.execute(
         "INSERT INTO teams (remote_id, name)
@@ -83,6 +86,32 @@ pub fn upsert_team(conn: &Connection, t: &HsTeam) -> Result<()> {
          ON CONFLICT(remote_id) DO UPDATE SET name = excluded.name",
         params![t.remote_id, t.name],
     )?;
+    let team_local: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM teams WHERE remote_id = ?1",
+            params![t.remote_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(team_local) = team_local {
+        // Older schemas without the team_members mirror (db_breadth's 001
+        // shape) simply skip the membership refresh.
+        if !crate::sync_schema::table_exists(conn, "team_members").unwrap_or(false) {
+            return Ok(());
+        }
+        conn.execute(
+            "DELETE FROM team_members WHERE team_id = ?1",
+            params![team_local],
+        )?;
+        for member_remote in &t.member_user_ids {
+            if let Some(user_local) = crate::sync_engine::local_id(conn, "users", *member_remote) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?1, ?2)",
+                    params![team_local, user_local],
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -136,6 +165,16 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
         .assignee_id
         .filter(|rid| *rid > 0)
         .and_then(|rid| crate::sync_engine::local_id(conn, "users", rid));
+    // The stored row BEFORE the upsert — the reference's observation diff
+    // base (conversationRepo.ts:168-208). `None` = first ingest (no diff
+    // events for a brand-new conversation).
+    let previous: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT assignee_id FROM conversations WHERE remote_id = ?1",
+            params![c.remote_id],
+            |r| r.get(0),
+        )
+        .ok();
     conn.execute(
         "INSERT INTO conversations (remote_id, number, subject, preview, status, state, type,
             source_type, source_via, mailbox_id, assignee_id, customer_id, priority, created_at,
@@ -192,6 +231,42 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
         // Reference updateLocalTags: unknown names get monotonic negative
         // remote ids; case-insensitive lookup; slugified names.
         crate::conversation_ops::write_conversation_tags(conn, conv_local, &c.tags);
+    }
+    // v1.7.0 conversation change event (sync observation diff): Help Scout
+    // exposes no change log, so this honestly records OBSERVATION time with
+    // source='sync' — the change happened between the previous observation
+    // and this one. The notification sweep turns an assignment observation
+    // into a `ticket_assigned` notification (the assignee diff is the only
+    // kind the sweep consumes; the reference also records
+    // status/team/moved/snooze/tag diffs for the activity timeline).
+    if let (Some(prev_assignee), Some(conv_local)) = (previous, local) {
+        if prev_assignee != assignee_local {
+            let observed_at = crate::activity::now_iso();
+            crate::activity::record_full_event(
+                conn,
+                &crate::activity::FullActivityEvent {
+                    base: crate::activity::ActivityEvent {
+                        id: None,
+                        conversation_id: conv_local,
+                        event_type: "assignment_changed".into(),
+                        actor_type: "user".into(),
+                        actor_id: None,
+                        occurred_at: observed_at.clone(),
+                        dedup_key: format!("assignment_changed:{}:{observed_at}", c.remote_id),
+                    },
+                    thread_local_id: None,
+                    source: "sync".into(),
+                    metadata: Some(
+                        serde_json::json!({
+                            "previous": prev_assignee,
+                            "next": assignee_local,
+                            "observed": true
+                        })
+                        .to_string(),
+                    ),
+                },
+            )?;
+        }
     }
     Ok(())
 }

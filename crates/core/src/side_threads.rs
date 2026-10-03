@@ -1,11 +1,14 @@
-//! Side threads — M006 migration + CRUD + list (M4-T09).
+//! Side threads — the reference sideThreadService + sideThreadRepo
+//! (migration 012, plan Phase 14): internal-only collaboration threads
+//! with mention resolution + immediate Notification Center fan-out.
 //!
 //! Per spec M4: "Team operations: Operations Center, workload and capacity,
 //! Notification Center, mentions, side threads, automation."
 //!
 //! Side threads are agent-only discussion threads attached to a conversation.
 //! They are separate from the customer-visible conversation thread (per spec:
-//! "side threads") — customers never see side-thread messages.
+//! "side threads") — customers never see side-thread messages, and no method
+//! here touches the Help Scout provider.
 //!
 //! ## Schema
 //!
@@ -14,17 +17,26 @@
 //!   Each message has an optional `mentions_json` column (a JSON array of
 //!   mention strings parsed from the body) so mentions can be reprocessed
 //!   later (e.g. for notification replay) without re-scanning the body.
+//! - `side_thread_mentions` — the RESOLVED @mentions per message (user or
+//!   team, local ids) — the reference's backing store for the "mentions
+//!   for me" queue.
+//!
+//! Mentions notify immediately (not via the sweep): the actor just typed
+//! them, so the target should hear about it now. Dedup keys still make
+//! re-submission idempotent.
 //!
 //! Per KNOWN PITFALLS: all timestamp comparisons use `julianday()`.
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::NotificationType;
 use crate::error::Result;
 use crate::mentions;
+use crate::notifications::{record_notification, NotificationInput};
 
-/// The M006 migration: creates `side_threads` + `side_thread_messages` tables
-/// + indexes.
+/// The M006 migration: creates `side_threads` + `side_thread_messages` +
+/// `side_thread_mentions` tables + indexes.
 pub const M006_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS side_threads (
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,6 +57,17 @@ pub const M006_SQL: &str = r#"
     );
     CREATE INDEX IF NOT EXISTS idx_side_thread_messages_thread
         ON side_thread_messages (thread_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS side_thread_mentions (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        side_thread_id  INTEGER NOT NULL REFERENCES side_threads (id) ON DELETE CASCADE,
+        message_id      INTEGER NOT NULL REFERENCES side_thread_messages (id) ON DELETE CASCADE,
+        user_local_id   INTEGER,
+        team_local_id   INTEGER,
+        created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_side_thread_mentions_user
+        ON side_thread_mentions (user_local_id, created_at);
 
     UPDATE app_state SET schema_version = 6 WHERE id = 1;
 "#;
@@ -70,7 +93,18 @@ pub fn apply_m006(conn: &Connection) -> Result<()> {
             mentions_json       TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_side_thread_messages_thread
-            ON side_thread_messages (thread_id, created_at);",
+            ON side_thread_messages (thread_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS side_thread_mentions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            side_thread_id  INTEGER NOT NULL REFERENCES side_threads (id) ON DELETE CASCADE,
+            message_id      INTEGER NOT NULL REFERENCES side_thread_messages (id) ON DELETE CASCADE,
+            user_local_id   INTEGER,
+            team_local_id   INTEGER,
+            created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_side_thread_mentions_user
+            ON side_thread_mentions (user_local_id, created_at);",
     )?;
     let _ = conn.execute("UPDATE app_state SET schema_version = 6 WHERE id = 1", []);
     Ok(())
@@ -126,15 +160,17 @@ pub fn create_side_thread(
     Ok(conn.last_insert_rowid())
 }
 
-/// Add a message to a side thread. The body is scanned for mentions (per
-/// M4-T08); the parsed mentions are stored as JSON in `mentions_json` so
-/// they can be reprocessed without re-scanning.
+/// Add a message to a side thread — the reference
+/// `SideThreadService.addMessage`: the body is scanned for mentions, the
+/// RESOLVED mentions are stored in `side_thread_mentions`, and every
+/// mentioned user (and every member of a mentioned team, minus the actor)
+/// is notified immediately through the Notification Center funnel.
+/// Re-submission is idempotent (`n:stm:{message_id}:…` dedup keys).
 ///
 /// Per spec: side thread messages are agent-only — they are NEVER shown to
-/// the customer. The mention scan here records the mentions in the row
-/// only; the caller is responsible for emitting notifications via
-/// [`mentions::emit_mention_notifications`] if desired (separation of concerns:
-/// storage vs. notification).
+/// the customer.
+///
+/// Returns the new message's row id.
 ///
 /// # Errors
 ///
@@ -142,18 +178,21 @@ pub fn create_side_thread(
 /// body exceeds `mentions::MAX_BODY_BYTES`.
 pub fn add_side_thread_message(
     conn: &Connection,
+    bus: Option<&crate::http::EventBus>,
     thread_id: i64,
     body: &str,
     author_user_id: Option<i64>,
 ) -> Result<i64> {
     // Scan for mentions up front so we can store them in the row.
     // Fail-fast if the body is too large.
-    let mentions = mentions::scan_for_mentions(body)?;
-    let mentions_json = if mentions.is_empty() {
+    let raw_mentions = mentions::scan_for_mentions(body)?;
+    let mentions_json = if raw_mentions.is_empty() {
         None
     } else {
-        let display_strings: Vec<String> =
-            mentions.iter().map(mentions::Mention::display).collect();
+        let display_strings: Vec<String> = raw_mentions
+            .iter()
+            .map(mentions::Mention::display)
+            .collect();
         Some(serde_json::to_string(&display_strings).map_err(|e| {
             crate::error::Error::Config(format!("mentions_json serialization failed: {e}"))
         })?)
@@ -164,7 +203,175 @@ pub fn add_side_thread_message(
          VALUES (?1, ?2, ?3, ?4)",
         params![thread_id, body, author_user_id, mentions_json],
     )?;
-    Ok(conn.last_insert_rowid())
+    let message_id = conn.last_insert_rowid();
+
+    // Mention fan-out (immediate — the actor just typed it). The thread's
+    // conversation facts resolve local-first (side threads may carry either
+    // the local or the remote conversation id, depending on the caller).
+    let thread: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT conversation_id, title FROM side_threads WHERE id = ?1",
+            params![thread_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    if let Some((conversation_ref, thread_title)) = thread {
+        let conv: Option<(i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT id, number FROM conversations
+                 WHERE id = ?1 OR remote_id = ?1
+                 ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+                params![conversation_ref],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        let (conversation_id, conversation_number) = conv
+            .map(|(id, number)| (Some(id), number))
+            .unwrap_or((None, None));
+        let thread_title = thread_title.unwrap_or_else(|| "side thread".into());
+        let number_for_title = conversation_number.unwrap_or(conversation_ref);
+        let author_name = author_user_id
+            .and_then(|id| {
+                mentions::build_mention_directory(conn)
+                    .ok()
+                    .and_then(|d| d.display_by_user.get(&id).cloned())
+            })
+            .unwrap_or_else(|| "Someone".into());
+        let trimmed_body = trim_200(body);
+
+        let directory = mentions::build_mention_directory(conn)?;
+        for m in mentions::parse_mentions(body, &directory)? {
+            // Persist the resolved mention (the "mentions for me" store).
+            let _ = conn.execute(
+                "INSERT INTO side_thread_mentions
+                    (side_thread_id, message_id, user_local_id, team_local_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![thread_id, message_id, m.user_local_id, m.team_local_id],
+            );
+            if let Some(user) = m.user_local_id {
+                if Some(user) == author_user_id {
+                    continue;
+                }
+                let _ = record_notification(
+                    conn,
+                    bus,
+                    &NotificationInput {
+                        notification_type: NotificationType::Mentioned,
+                        title: format!(
+                            "{author_name} mentioned you in \"{thread_title}\" (#{number_for_title})"
+                        ),
+                        body: Some(trimmed_body.clone()),
+                        target_user_local_id: Some(user),
+                        actor_user_local_id: author_user_id,
+                        conversation_id,
+                        conversation_number,
+                        side_thread_id: Some(thread_id),
+                        dedup_key: format!("n:stm:{message_id}:{user}"),
+                        ..Default::default()
+                    },
+                );
+            }
+            if let Some(team) = m.team_local_id {
+                for member in mentions::team_members(conn, team)?.into_iter() {
+                    if Some(member) == author_user_id {
+                        continue;
+                    }
+                    let _ = record_notification(
+                        conn,
+                        bus,
+                        &NotificationInput {
+                            notification_type: NotificationType::TeamMentioned,
+                            title: format!(
+                                "{author_name} mentioned @{} (you are a member) in \"{thread_title}\" (#{number_for_title})",
+                                m.display
+                            ),
+                            body: Some(trimmed_body.clone()),
+                            target_user_local_id: Some(member),
+                            actor_user_local_id: author_user_id,
+                            conversation_id,
+                            conversation_number,
+                            side_thread_id: Some(thread_id),
+                            dedup_key: format!("n:stm:{message_id}:team{team}:{member}"),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(message_id)
+}
+
+/// The reference's 200-char body cap: `body.length > 200 ? slice(0,199)+'…'`.
+fn trim_200(body: &str) -> String {
+    if body.chars().count() > 200 {
+        let cut: String = body.chars().take(199).collect();
+        format!("{cut}…")
+    } else {
+        body.to_string()
+    }
+}
+
+/// One "mentions for me" row — the reference
+/// `sideThreadRepo.mentionsForUser` entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SideThreadMentionForUser {
+    pub message_id: i64,
+    pub thread_id: i64,
+    pub thread_title: Option<String>,
+    pub conversation_id: i64,
+    pub conversation_number: Option<i64>,
+    pub author: Option<String>,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// The side-thread mentions targeting one user — "mentions for me" source
+/// #2 (the reference `sideThreadRepo.mentionsForUser`).
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the query fails.
+pub fn mentions_for_user(conn: &Connection, me: i64) -> Result<Vec<SideThreadMentionForUser>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.thread_id, t.title, t.conversation_id, m.body, m.created_at,
+                (SELECT TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, ''))
+                   FROM users u WHERE u.id = m.author_user_id) AS author
+         FROM side_thread_mentions stm
+         JOIN side_thread_messages m ON m.id = stm.message_id
+         JOIN side_threads t ON t.id = stm.side_thread_id
+         WHERE stm.user_local_id = ?1
+         ORDER BY m.created_at DESC LIMIT 100",
+    )?;
+    let rows = stmt
+        .query_map(params![me], |r| {
+            Ok(SideThreadMentionForUser {
+                message_id: r.get(0)?,
+                thread_id: r.get(1)?,
+                thread_title: r.get(2)?,
+                conversation_id: r.get(3)?,
+                conversation_number: None,
+                author: r.get(6)?,
+                body: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Resolve the conversation numbers (local-first; side threads may carry
+    // either key form).
+    let mut resolved = rows;
+    for m in &mut resolved {
+        m.conversation_number = conn
+            .query_row(
+                "SELECT number FROM conversations
+                 WHERE id = ?1 OR remote_id = ?1
+                 ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+                params![m.conversation_id],
+                |r| r.get(0),
+            )
+            .ok();
+    }
+    Ok(resolved)
 }
 
 /// List all side threads attached to a conversation, ordered oldest-first
@@ -245,9 +452,6 @@ pub fn count_side_thread_messages(conn: &Connection, thread_id: i64) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::apply_m003;
-    use crate::notifications::apply_m005;
-    use crate::ticket_states::apply_m004;
     use tempfile::NamedTempFile;
 
     fn fresh_db() -> Connection {
@@ -257,15 +461,39 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        apply_m003(&conn).unwrap();
-        apply_m004(&conn).unwrap();
-        apply_m005(&conn).unwrap();
-        apply_m006(&conn).unwrap();
-        // mentions.rs depends on users + teams tables for emit_mention_notifications,
-        // but the side_threads module only calls scan_for_mentions (no DB lookup).
+        // The canonical boot chain — the mention fan-out reads the users /
+        // teams / team_members / conversations mirrors and writes
+        // reference-shaped notifications.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
+    }
+
+    /// The standard demo-ish identity fixture: Alex (id 1, @alex),
+    /// Priya (id 2, @priya), team "Tier 1" (id 1) with both members.
+    fn seed_identities(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO users (remote_id, first_name, last_name, mention, user_type)
+             VALUES (1001, 'Alex', 'Rivera', 'alex', 'user'),
+                    (1002, 'Priya', 'Nair', 'priya', 'user')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO teams (remote_id, name) VALUES (501, 'Tier 1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO team_members (team_id, user_id) VALUES (1, 1), (1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+             VALUES (105000, 5001, 'active', 201, 3001)",
+            [],
+        )
+        .unwrap();
     }
 
     // ---- M006 migration -----------------------------------------------------
@@ -357,7 +585,8 @@ mod tests {
     fn add_side_thread_message_returns_row_id() {
         let conn = fresh_db();
         let thread_id = create_side_thread(&conn, 1001, Some(42)).unwrap();
-        let msg_id = add_side_thread_message(&conn, thread_id, "Hello team", Some(42)).unwrap();
+        let msg_id =
+            add_side_thread_message(&conn, None, thread_id, "Hello team", Some(42)).unwrap();
         assert!(msg_id > 0);
     }
 
@@ -366,7 +595,7 @@ mod tests {
         let conn = fresh_db();
         let thread_id = create_side_thread(&conn, 1001, Some(42)).unwrap();
         let msg_id =
-            add_side_thread_message(&conn, thread_id, "Heads up @alice", Some(42)).unwrap();
+            add_side_thread_message(&conn, None, thread_id, "Heads up @alice", Some(42)).unwrap();
         let (body, author): (String, Option<i64>) = conn
             .query_row(
                 "SELECT body, author_user_id FROM side_thread_messages WHERE id = ?1",
@@ -384,6 +613,7 @@ mod tests {
         let thread_id = create_side_thread(&conn, 1001, Some(42)).unwrap();
         let msg_id = add_side_thread_message(
             &conn,
+            None,
             thread_id,
             "Hey @alice please ask @team:engineering",
             Some(42),
@@ -410,7 +640,7 @@ mod tests {
         let conn = fresh_db();
         let thread_id = create_side_thread(&conn, 1001, Some(42)).unwrap();
         let msg_id =
-            add_side_thread_message(&conn, thread_id, "No mentions here", Some(42)).unwrap();
+            add_side_thread_message(&conn, None, thread_id, "No mentions here", Some(42)).unwrap();
         let mentions_json: Option<String> = conn
             .query_row(
                 "SELECT mentions_json FROM side_thread_messages WHERE id = ?1",
@@ -426,8 +656,151 @@ mod tests {
         let conn = fresh_db();
         let thread_id = create_side_thread(&conn, 1001, Some(42)).unwrap();
         let big = "a".repeat(mentions::MAX_BODY_BYTES + 1);
-        let result = add_side_thread_message(&conn, thread_id, &big, Some(42));
+        let result = add_side_thread_message(&conn, None, thread_id, &big, Some(42));
         assert!(result.is_err(), "oversized body must be rejected");
+    }
+
+    // ---- mention fan-out (reference sideThreadService.addMessage) ----------
+
+    #[test]
+    fn user_mention_in_side_thread_notifies_immediately() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 105000, Some(2)).unwrap();
+        conn.execute(
+            "UPDATE side_threads SET title = 'Billing escalation' WHERE id = ?1",
+            params![thread_id],
+        )
+        .unwrap();
+
+        let msg_id = add_side_thread_message(
+            &conn,
+            None,
+            thread_id,
+            "@alex can you take the refund part?",
+            Some(2),
+        )
+        .unwrap();
+
+        let (title, body, target, actor, side_thread, dedup): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT title, body, target_user_id, actor_user_local_id, side_thread_id, dedup_key
+                 FROM notifications WHERE type = 'mentioned'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            title,
+            "Priya Nair mentioned you in \"Billing escalation\" (#5001)"
+        );
+        assert_eq!(body.as_deref(), Some("@alex can you take the refund part?"));
+        assert_eq!(target, Some(1), "Alex was mentioned");
+        assert_eq!(actor, Some(2), "Priya wrote the message");
+        assert_eq!(side_thread, Some(thread_id));
+        assert_eq!(dedup, format!("n:stm:{msg_id}:1"));
+
+        // The resolved mention row backs the "mentions for me" queue.
+        let mine = mentions_for_user(&conn, 1).unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].message_id, msg_id);
+        assert_eq!(mine[0].thread_title.as_deref(), Some("Billing escalation"));
+        assert_eq!(mine[0].conversation_number, Some(5001));
+        assert_eq!(mine[0].author.as_deref(), Some("Priya Nair"));
+    }
+
+    #[test]
+    fn team_mention_in_side_thread_notifies_every_member_except_the_actor() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 105000, Some(1)).unwrap();
+        conn.execute(
+            "UPDATE side_threads SET title = 'Spike huddle' WHERE id = ?1",
+            params![thread_id],
+        )
+        .unwrap();
+
+        // Alex mentions the whole Tier 1 team; he is a member himself.
+        let msg_id =
+            add_side_thread_message(&conn, None, thread_id, "@Tier 1 heads up", Some(1)).unwrap();
+
+        let rows: Vec<(Option<i64>, String)> = conn
+            .prepare(
+                "SELECT target_user_id, title FROM notifications WHERE type = 'team_mentioned'",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1, "only Priya — the actor is skipped");
+        assert_eq!(rows[0].0, Some(2));
+        assert_eq!(
+            rows[0].1,
+            "Alex Rivera mentioned @Tier 1 (you are a member) in \"Spike huddle\" (#5001)"
+        );
+        let dedup: String = conn
+            .query_row(
+                "SELECT dedup_key FROM notifications WHERE type = 'team_mentioned'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dedup, format!("n:stm:{msg_id}:team1:2"));
+    }
+
+    #[test]
+    fn self_mention_and_unknown_mentions_never_notify() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 105000, Some(1)).unwrap();
+        add_side_thread_message(
+            &conn,
+            None,
+            thread_id,
+            "@alex talking to myself and @nobody",
+            Some(1),
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notifications", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "self-mention + unknown token → no notifications");
+    }
+
+    #[test]
+    fn mention_fan_out_emits_notification_received_sse() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 105000, Some(2)).unwrap();
+        let bus = crate::http::EventBus::new(8);
+        let mut rx = bus.subscribe();
+        add_side_thread_message(&conn, Some(&bus), thread_id, "@alex ping", Some(2)).unwrap();
+        let event = rx.blocking_recv().expect("SSE event emitted");
+        assert!(
+            matches!(
+                event,
+                crate::events::ServerEvent::NotificationReceived(ref e)
+                    if e.kind == "mentioned"
+            ),
+            "got {event:?}"
+        );
     }
 
     // ---- list_side_threads_for_conversation ---------------------------------
@@ -484,9 +857,9 @@ mod tests {
         let conn = fresh_db();
         let t1 = create_side_thread(&conn, 1001, Some(42)).unwrap();
         let t2 = create_side_thread(&conn, 1001, Some(43)).unwrap();
-        add_side_thread_message(&conn, t1, "msg 1 in t1", Some(42)).unwrap();
-        add_side_thread_message(&conn, t1, "msg 2 in t1", Some(42)).unwrap();
-        add_side_thread_message(&conn, t2, "msg in t2", Some(43)).unwrap();
+        add_side_thread_message(&conn, None, t1, "msg 1 in t1", Some(42)).unwrap();
+        add_side_thread_message(&conn, None, t1, "msg 2 in t1", Some(42)).unwrap();
+        add_side_thread_message(&conn, None, t2, "msg in t2", Some(43)).unwrap();
 
         let messages = list_side_thread_messages(&conn, t1).unwrap();
         assert_eq!(messages.len(), 2, "only messages in t1");
@@ -507,14 +880,14 @@ mod tests {
     fn list_side_thread_messages_is_ordered_oldest_first_via_julianday() {
         let conn = fresh_db();
         let thread_id = create_side_thread(&conn, 1001, Some(42)).unwrap();
-        let m1 = add_side_thread_message(&conn, thread_id, "first", Some(42)).unwrap();
+        let m1 = add_side_thread_message(&conn, None, thread_id, "first", Some(42)).unwrap();
         // Set explicit timestamps out of order.
         conn.execute(
             "UPDATE side_thread_messages SET created_at = '2026-01-01T10:00:00Z' WHERE id = ?1",
             params![m1],
         )
         .unwrap();
-        let m2 = add_side_thread_message(&conn, thread_id, "second", Some(42)).unwrap();
+        let m2 = add_side_thread_message(&conn, None, thread_id, "second", Some(42)).unwrap();
         conn.execute(
             "UPDATE side_thread_messages SET created_at = '2026-01-01T09:00:00Z' WHERE id = ?1",
             params![m2],
@@ -541,9 +914,9 @@ mod tests {
     fn count_side_thread_messages_counts_correctly() {
         let conn = fresh_db();
         let thread_id = create_side_thread(&conn, 1001, Some(42)).unwrap();
-        add_side_thread_message(&conn, thread_id, "msg 1", Some(42)).unwrap();
-        add_side_thread_message(&conn, thread_id, "msg 2", Some(42)).unwrap();
-        add_side_thread_message(&conn, thread_id, "msg 3", Some(42)).unwrap();
+        add_side_thread_message(&conn, None, thread_id, "msg 1", Some(42)).unwrap();
+        add_side_thread_message(&conn, None, thread_id, "msg 2", Some(42)).unwrap();
+        add_side_thread_message(&conn, None, thread_id, "msg 3", Some(42)).unwrap();
         let count = count_side_thread_messages(&conn, thread_id).unwrap();
         assert_eq!(count, 3);
     }

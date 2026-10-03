@@ -72,12 +72,24 @@ pub async fn get_side_thread(State(state): State<AppState>, Path(id): Path<i64>)
 pub async fn add_message(
     State(state): State<AppState>,
     Path(thread_id): Path<i64>,
-    Json(body): Json<Value>,
+    body: Option<Json<Value>>,
 ) -> Json<Value> {
+    let Some(Json(body)) = body else {
+        return Json(json!({"ok": false, "error": "Body must be { body: string }."}));
+    };
     let text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let author = body.get("authorUserId").and_then(|v| v.as_i64());
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::side_threads::add_side_thread_message(&conn, thread_id, text, author) {
+    // Mention fan-out is immediate (reference sideThreadService.addMessage):
+    // the resolved mentions land in side_thread_mentions and every mentioned
+    // user / team member gets a Notification Center row + SSE event.
+    match crate::side_threads::add_side_thread_message(
+        &conn,
+        Some(&state.bus),
+        thread_id,
+        text,
+        author,
+    ) {
         Ok(id) => Json(json!({"ok": true, "id": id})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }

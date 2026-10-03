@@ -1,38 +1,39 @@
-//! Mentions — text scan + emit Mentioned/TeamMentioned notification (M4-T08).
+//! Mentions — the reference `mentionParser.ts` port + the legacy text scan.
 //!
-//! Per spec M4: "Team operations: Operations Center, workload and capacity,
-//! Notification Center, mentions, side threads, automation."
+//! Two layers:
+//! - [`scan_for_mentions`]: the port's original raw text scan
+//!   (`@username` / `@team:name` tokens). Still used to store the
+//!   `mentions_json` summary on side-thread messages.
+//! - [`build_mention_directory`] + [`parse_mentions`]: the reference
+//!   mentionParser.ts port. Resolves @tokens against the identities Help
+//!   Scout itself knows about:
+//!   - users: their Help Scout mention name (users.mention, e.g. "alex"),
+//!     plus deterministic fallbacks — first name, "first last",
+//!     "firstlast", "first.last" — because synced users may lack a mention
+//!     name.
+//!   - teams: exact team name (case-insensitive, spaces allowed after @).
 //!
-//! ## What this module does
-//!
-//! `scan_for_mentions(body)` parses a message body for two patterns:
-//! - `@username` → emits a `NotificationType::Mentioned` notification
-//!   targeted at the mentioned user.
-//! - `@team:teamname` → emits a `NotificationType::TeamMentioned` notification
-//!   targeted at the team's members.
+//! Honesty rules (ported verbatim):
+//! - UNKNOWN tokens stay plain text (no guessed identity, no notification).
+//! - Matching is exact (case-insensitive); we do NOT do prefix/substring
+//!   matching, so "@al" never silently notifies Alex.
+//! - Emails are not mentionable (agents are addressed by name here): the
+//!   token class includes dots, so `alice@example.com` resolves as the
+//!   single token "example.com" which matches no identity.
 //!
 //! ## Safety
 //!
 //! The `regex` crate uses a bounded NFA (no backtracking) — there is no
-//! ReDoS surface. The patterns are static (compiled once via `LazyLock`),
-//! and the message body is bounded by the caller (Help Scout message bodies
-//! are capped at 64KB; we apply our own 100KB cap as a defensive bound).
-//!
-//! ## Fail-safe
-//!
-//! Mentions of nonexistent users or teams produce no notification (fail-safe).
-//! The caller resolves mention strings to user/team IDs via the existing
-//! `users` and `teams` SQLite tables (the `mention` column on `users` and
-//! the `name` column on `teams` are the lookup keys).
+//! ReDoS surface. Patterns are static (compiled once), and message bodies
+//! are bounded by [`MAX_BODY_BYTES`].
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use regex::Regex;
 use rusqlite::{params, Connection};
 
-use crate::catalog::NotificationType;
 use crate::error::Result;
-use crate::notifications::record_notification;
 
 /// The maximum message body size we'll scan, in bytes. Help Scout message
 /// bodies are capped at 64KB; we apply 100KB as a defensive bound so a
@@ -40,7 +41,7 @@ use crate::notifications::record_notification;
 pub const MAX_BODY_BYTES: usize = 100_000;
 
 /// A parsed mention — either a user mention (`@username`) or a team
-/// mention (`@team:teamname`).
+/// mention (`@team:teamname`). The raw-text scan result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mention {
     /// A user mention. `username` is the text after `@` (without the `@`).
@@ -85,7 +86,7 @@ fn team_mention_regex() -> &'static Regex {
 }
 
 /// Returns `true` if the character at `body[pos - 1]` is a word character
-/// (alphanumeric or underscore). Returns `false` if `pos == 0` (start of
+/// (alphanumeric + underscore). Returns `false` if `pos == 0` (start of
 /// string). Used to filter out email-style `@` matches.
 fn is_preceded_by_word_char(body: &str, pos: usize) -> bool {
     if pos == 0 {
@@ -105,8 +106,9 @@ fn is_preceded_by_word_char(body: &str, pos: usize) -> bool {
     }
 }
 
-/// Scan a message body for mentions. Returns the parsed mentions in order
-/// of appearance. Deduplicates: each unique mention string appears only once.
+/// Scan a message body for raw mentions. Returns the parsed mentions in
+/// order of appearance. Deduplicates: each unique mention string appears
+/// only once.
 ///
 /// # Errors
 ///
@@ -172,143 +174,254 @@ pub fn scan_for_mentions(body: &str) -> Result<Vec<Mention>> {
     Ok(mentions)
 }
 
-/// The result of emitting notifications for a scanned message body.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MentionEmissionResult {
-    /// The number of `Mentioned` notifications emitted (may be less than the
-    /// number of user mentions if some usernames didn't resolve to a real user).
-    pub user_notifications_emitted: u32,
-    /// The number of `TeamMentioned` notifications emitted (one per team member,
-    /// so a 5-member team mention emits 5 notifications).
-    pub team_notifications_emitted: u32,
-    /// The number of mentions that didn't resolve to a real user/team
-    /// (fail-safe: no notification emitted).
-    pub unresolved_mentions: u32,
+// ---------------------------------------------------------------------------
+// Reference mentionParser.ts (plan Phase 13: "Respect Help Scout identity")
+// ---------------------------------------------------------------------------
+
+/// The identities @tokens resolve against — the reference
+/// `MentionDirectory`.
+#[derive(Debug, Clone, Default)]
+pub struct MentionDirectory {
+    /// Exact mentionable names (lowercased) → user LOCAL id.
+    pub user_by_name: HashMap<String, i64>,
+    /// Lowercased team names → team LOCAL id.
+    pub team_by_name: HashMap<String, i64>,
+    /// Display names for users.
+    pub display_by_user: HashMap<i64, String>,
 }
 
-/// Emit notifications for all mentions in `body`. The `conversation_id` and
-/// `author_user_id` are recorded in the notification payload for context.
-///
-/// Per spec: AI is advisory. Mentions are NOT AI — they're a real human
-/// action, so they always emit if the mention resolves to a real user/team.
+/// Build the mention directory from the mirror — the reference
+/// `buildMentionDirectory(db)`.
 ///
 /// # Errors
 ///
-/// Returns `Error::Sqlite` if any query/insert fails, or `Error::Other` if
-/// the body exceeds `MAX_BODY_BYTES`.
-pub fn emit_mention_notifications(
-    conn: &Connection,
-    body: &str,
-    conversation_id: i64,
-    author_user_id: Option<i64>,
-) -> Result<MentionEmissionResult> {
-    let mentions = scan_for_mentions(body)?;
-    let mut result = MentionEmissionResult::default();
+/// Returns `Error::Sqlite` if the users/teams reads fail.
+/// (id, first, last, mention, email) from the users mirror.
+type UserRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
-    for mention in &mentions {
-        match mention {
-            Mention::User { username } => {
-                // Resolve the username to a user via `users.mention` (case-sensitive).
-                let target_user_id: Option<i64> = conn
-                    .query_row(
-                        "SELECT remote_id FROM users WHERE mention = ?1",
-                        params![username],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                match target_user_id {
-                    Some(uid) => {
-                        // Don't notify the author about their own mention.
-                        if Some(uid) == author_user_id {
-                            continue;
-                        }
-                        let payload = serde_json::json!({
-                            "mention": mention.display(),
-                            "username": username,
-                            "conversation_id": conversation_id,
-                            "author_user_id": author_user_id,
-                        })
-                        .to_string();
-                        // Reference dedup key: `n:mention:{scope}:{user}` —
-                        // the same mention never notifies twice.
-                        let dedup =
-                            format!("n:mention:{conversation_id}:{}:{uid}", mention.display());
-                        let created = record_notification(
-                            conn,
-                            &NotificationType::Mentioned,
-                            Some(uid),
-                            Some(conversation_id),
-                            Some(&payload),
-                            &dedup,
-                        )?;
-                        if created.is_some() {
-                            result.user_notifications_emitted += 1;
-                        }
-                    }
-                    None => {
-                        result.unresolved_mentions += 1;
-                    }
-                }
-            }
-            Mention::Team { teamname } => {
-                // Resolve the team name to a team via `teams.name` (case-insensitive).
-                let team_remote_id: Option<i64> = conn
-                    .query_row(
-                        "SELECT remote_id FROM teams WHERE LOWER(name) = LOWER(?1)",
-                        params![teamname],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                match team_remote_id {
-                    Some(tid) => {
-                        // Per spec, team mentions notify all team members.
-                        // The teams table doesn't persist membership — that
-                        // comes from Help Scout sync as
-                        // HsTeam.member_user_ids. For M4-T08 we emit a single
-                        // broadcast notification (target_user_id = NULL) tagged
-                        // with the team_remote_id in the payload; M4-T10 (the
-                        // Tauri shell wiring) will fan it out to actual members
-                        // once team membership is loaded.
-                        let payload = serde_json::json!({
-                            "mention": mention.display(),
-                            "teamname": teamname,
-                            "team_remote_id": tid,
-                            "conversation_id": conversation_id,
-                            "author_user_id": author_user_id,
-                        })
-                        .to_string();
-                        let dedup = format!(
-                            "n:mention:{conversation_id}:{}:team:{tid}",
-                            mention.display()
-                        );
-                        let created = record_notification(
-                            conn,
-                            &NotificationType::TeamMentioned,
-                            None, // broadcast — M4-T10 wires per-member fanout.
-                            Some(conversation_id),
-                            Some(&payload),
-                            &dedup,
-                        )?;
-                        if created.is_some() {
-                            result.team_notifications_emitted += 1;
-                        }
-                    }
-                    None => {
-                        result.unresolved_mentions += 1;
-                    }
-                }
+pub fn build_mention_directory(conn: &Connection) -> Result<MentionDirectory> {
+    let mut dir = MentionDirectory::default();
+    let users: Vec<UserRow> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, first_name, last_name, mention, email FROM users
+             WHERE deleted_at IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (id, first, last, mention, email) in users {
+        let display = [first.clone(), last.clone()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let display = if !display.is_empty() {
+            display
+        } else {
+            email.unwrap_or_else(|| format!("user #{id}"))
+        };
+        dir.display_by_user.insert(id, display);
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(m) = mention {
+            candidates.push(m);
+        }
+        if let Some(f) = &first {
+            candidates.push(f.clone());
+        }
+        let full = [first, last]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !full.is_empty() {
+            candidates.push(full.clone());
+            candidates.push(full.split_whitespace().collect::<String>());
+            candidates.push(full.split_whitespace().collect::<Vec<_>>().join("."));
+        }
+        for c in candidates {
+            let key = c.trim().to_lowercase();
+            if !key.is_empty() {
+                dir.user_by_name.entry(key).or_insert(id);
             }
         }
     }
+    let teams: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, name FROM teams")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (id, name) in teams {
+        let key = name.trim().to_lowercase();
+        if !key.is_empty() {
+            dir.team_by_name.entry(key).or_insert(id);
+        }
+    }
+    Ok(dir)
+}
 
-    Ok(result)
+/// One resolved @mention — the reference `ParsedMention`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedMention {
+    /// The matched token text (without the leading `@`).
+    pub token: String,
+    /// The mentioned user's LOCAL id (None for team mentions).
+    pub user_local_id: Option<i64>,
+    /// The mentioned team's LOCAL id (None for user mentions).
+    pub team_local_id: Option<i64>,
+    /// Display string for rendering.
+    pub display: String,
+}
+
+/// Whether `c` is in the reference token class `[A-Za-z0-9._-]`.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+}
+
+/// Parse @mentions in a body — the reference `parseMentions`. Team mentions
+/// are resolved greedily: for every @-position we first try the single token
+/// against users, then extend the match across spaces (team names may
+/// contain spaces), trying progressively shorter prefixes.
+///
+/// # Errors
+///
+/// Returns `Error::Other` if `body.len()` exceeds `MAX_BODY_BYTES`.
+pub fn parse_mentions(body: &str, directory: &MentionDirectory) -> Result<Vec<ParsedMention>> {
+    if body.len() > MAX_BODY_BYTES {
+        return Err(crate::error::Error::Other(
+            format!(
+                "mention parse refused: body {} bytes exceeds max {} bytes",
+                body.len(),
+                MAX_BODY_BYTES
+            )
+            .into(),
+        ));
+    }
+    let mut mentions: Vec<ParsedMention> = Vec::new();
+    let mut seen_users: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut seen_teams: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let team_max_len = directory
+        .team_by_name
+        .keys()
+        .map(|k| k.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut search_from = 0usize;
+    while let Some(found) = body[search_from..].find('@') {
+        let at = search_from + found;
+        let after_at = at + 1;
+        let token: String = body[after_at..]
+            .chars()
+            .take_while(|c| is_token_char(*c))
+            .collect();
+        if token.is_empty() {
+            search_from = after_at;
+            continue;
+        }
+        let lower = token.to_lowercase();
+        // 1) single-token user match (exact, case-insensitive).
+        if let Some(uid) = directory.user_by_name.get(&lower) {
+            if seen_users.insert(*uid) {
+                mentions.push(ParsedMention {
+                    token: token.clone(),
+                    user_local_id: Some(*uid),
+                    team_local_id: None,
+                    display: directory
+                        .display_by_user
+                        .get(uid)
+                        .cloned()
+                        .unwrap_or_else(|| token.clone()),
+                });
+            }
+            search_from = after_at + token.len();
+            continue;
+        }
+        // 2) team match, possibly spanning spaces.
+        if !directory.team_by_name.is_empty() {
+            let window_len = 60.min(team_max_len.max(lower.len()));
+            let window_end = (after_at + window_len).min(body.len());
+            let window = &body[after_at..window_end];
+            let mut matched: Option<(i64, usize, String)> = None;
+            let mut len = window.len().min(team_max_len + 12);
+            while len >= lower.len() {
+                // Keep the slice on a char boundary (team names may sit next
+                // to multibyte text).
+                while len > 0 && !window.is_char_boundary(len) {
+                    len -= 1;
+                }
+                if len < lower.len() {
+                    break;
+                }
+                let raw = &window[..len];
+                let candidate = raw.trim().to_lowercase();
+                let candidate = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !candidate.is_empty() {
+                    if let Some(tid) = directory.team_by_name.get(&candidate) {
+                        if !seen_teams.contains(tid) {
+                            // Require the consumed span to end at a word
+                            // boundary (next char is not a token char).
+                            let next_char = window[len..].chars().next();
+                            let boundary_ok = next_char.is_none_or(|c| !is_token_char(c));
+                            if boundary_ok {
+                                matched = Some((*tid, len, raw.trim().to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+                len -= 1;
+            }
+            if let Some((tid, matched_len, raw)) = matched {
+                seen_teams.insert(tid);
+                mentions.push(ParsedMention {
+                    token: raw.clone(),
+                    user_local_id: None,
+                    team_local_id: Some(tid),
+                    display: raw,
+                });
+                search_from = after_at + matched_len;
+                continue;
+            }
+        }
+        // 3) unknown token: stays plain text, no mention row, no notification.
+        search_from = after_at + token.len();
+    }
+    Ok(mentions)
+}
+
+/// The members of a team (LOCAL user ids) — the reference
+/// `sideThreadService.teamMembers`.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the query fails (no team_members table on
+/// very old schemas → empty list).
+pub fn team_members(conn: &Connection, team_local_id: i64) -> Result<Vec<i64>> {
+    let mut stmt = match conn.prepare("SELECT user_id FROM team_members WHERE team_id = ?1") {
+        Ok(stmt) => stmt,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let rows = stmt
+        .query_map(params![team_local_id], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notifications::count_unread_for_user;
-    use rusqlite::params;
     use tempfile::NamedTempFile;
 
     fn fresh_db() -> Connection {
@@ -318,9 +431,8 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        // The canonical boot chain — mention emission writes notifications,
-        // which only have their dedup_key column + unique index under the
-        // full schema.
+        // The canonical boot chain — the directory reads users/teams and the
+        // team fan-out reads team_members (db_breadth's 001 shape).
         crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
@@ -509,141 +621,158 @@ mod tests {
         assert_eq!(m.display(), "@team:engineering");
     }
 
-    // ---- emit_mention_notifications -----------------------------------------
+    // ---- build_mention_directory --------------------------------------------
 
     #[test]
-    fn emit_user_mention_creates_notification_for_resolved_user() {
+    fn directory_maps_mention_names_first_names_and_full_names() {
         let conn = fresh_db();
-        insert_user(&conn, 42, "alice");
-        insert_conversation(&conn, 1001);
-
-        let result =
-            emit_mention_notifications(&conn, "Hey @alice, please review.", 1001, Some(99))
-                .unwrap();
-        assert_eq!(result.user_notifications_emitted, 1);
-        assert_eq!(result.team_notifications_emitted, 0);
-        assert_eq!(result.unresolved_mentions, 0);
-
-        // The Mentioned notification should be visible to user 42.
-        let count = count_unread_for_user(&conn, 42).unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn emit_user_mention_for_nonexistent_user_is_fail_safe() {
-        let conn = fresh_db();
-        insert_conversation(&conn, 1001);
-
-        let result =
-            emit_mention_notifications(&conn, "Hey @nobody, please review.", 1001, None).unwrap();
-        assert_eq!(result.user_notifications_emitted, 0);
-        assert_eq!(result.unresolved_mentions, 1);
-
-        // No notification recorded for any user.
-        let count = count_unread_for_user(&conn, 42).unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn emit_team_mention_creates_broadcast_notification() {
-        let conn = fresh_db();
-        insert_team(&conn, 7, "engineering");
-        insert_conversation(&conn, 1001);
-
-        let result = emit_mention_notifications(
-            &conn,
-            "Hey @team:engineering, please review.",
-            1001,
-            Some(99),
+        conn.execute(
+            "INSERT INTO users (remote_id, first_name, last_name, mention, user_type)
+             VALUES (1001, 'Alex', 'Rivera', 'alex', 'user')",
+            [],
         )
         .unwrap();
-        assert_eq!(result.team_notifications_emitted, 1);
-        assert_eq!(result.user_notifications_emitted, 0);
-
-        // TeamMentioned is broadcast (target_user_id = NULL) — visible to all users.
-        let count = count_unread_for_user(&conn, 42).unwrap();
-        assert_eq!(count, 1, "broadcast notification visible to user 42");
-        let count = count_unread_for_user(&conn, 99).unwrap();
-        assert_eq!(count, 1, "broadcast notification visible to user 99 too");
+        let dir = build_mention_directory(&conn).unwrap();
+        let id = dir.user_by_name["alex"];
+        assert_eq!(dir.user_by_name["alex"], id);
+        assert_eq!(dir.user_by_name["alex"], id);
+        assert_eq!(dir.user_by_name["alex rivera"], id);
+        assert_eq!(dir.user_by_name["alexrivera"], id);
+        assert_eq!(dir.user_by_name["alex.rivera"], id);
+        assert_eq!(dir.display_by_user[&id], "Alex Rivera");
     }
 
     #[test]
-    fn emit_team_mention_for_nonexistent_team_is_fail_safe() {
+    fn directory_maps_team_names_case_insensitively() {
         let conn = fresh_db();
-        insert_conversation(&conn, 1001);
-
-        let result =
-            emit_mention_notifications(&conn, "Hey @team:nonexistent, please review.", 1001, None)
-                .unwrap();
-        assert_eq!(result.team_notifications_emitted, 0);
-        assert_eq!(result.unresolved_mentions, 1);
+        insert_team(&conn, 501, "Tier 1");
+        insert_team(&conn, 502, "Escalations");
+        let dir = build_mention_directory(&conn).unwrap();
+        assert!(dir.team_by_name.contains_key("tier 1"));
+        assert!(dir.team_by_name.contains_key("escalations"));
     }
 
     #[test]
-    fn emit_does_not_notify_author_about_their_own_mention() {
+    fn directory_first_identity_wins_on_colliding_names() {
         let conn = fresh_db();
-        insert_user(&conn, 42, "alice");
-        insert_conversation(&conn, 1001);
-
-        // Alice mentions herself — no self-notification.
-        let result = emit_mention_notifications(&conn, "Hey @alice", 1001, Some(42)).unwrap();
-        assert_eq!(
-            result.user_notifications_emitted, 0,
-            "self-mention is suppressed"
-        );
-    }
-
-    #[test]
-    fn emit_team_mention_match_is_case_insensitive() {
-        let conn = fresh_db();
-        insert_team(&conn, 7, "Engineering"); // capital E
-        insert_conversation(&conn, 1001);
-
-        let result = emit_mention_notifications(
-            &conn,
-            "Hey @team:engineering", // lowercase
-            1001,
-            None,
+        // Two users named Alex; the first synced user owns the name.
+        conn.execute(
+            "INSERT INTO users (remote_id, first_name, mention, user_type)
+             VALUES (1001, 'Alex', 'alex', 'user')",
+            [],
         )
         .unwrap();
-        assert_eq!(
-            result.team_notifications_emitted, 1,
-            "team name match is case-insensitive"
-        );
-    }
-
-    #[test]
-    fn emit_multiple_user_mentions_emit_one_per_resolved_user() {
-        let conn = fresh_db();
-        insert_user(&conn, 42, "alice");
-        insert_user(&conn, 43, "bob");
-        insert_conversation(&conn, 1001);
-
-        let result =
-            emit_mention_notifications(&conn, "@alice and @bob, please review.", 1001, None)
-                .unwrap();
-        assert_eq!(result.user_notifications_emitted, 2);
-        assert_eq!(count_unread_for_user(&conn, 42).unwrap(), 1);
-        assert_eq!(count_unread_for_user(&conn, 43).unwrap(), 1);
-    }
-
-    #[test]
-    fn emit_mixed_user_team_and_unresolved_mentions() {
-        let conn = fresh_db();
-        insert_user(&conn, 42, "alice");
-        insert_team(&conn, 7, "engineering");
-        insert_conversation(&conn, 1001);
-
-        let result = emit_mention_notifications(
-            &conn,
-            "@alice please ask @team:engineering about @nobody",
-            1001,
-            None,
+        conn.execute(
+            "INSERT INTO users (remote_id, first_name, mention, user_type)
+             VALUES (1002, 'Alex', 'alex', 'user')",
+            [],
         )
         .unwrap();
-        assert_eq!(result.user_notifications_emitted, 1, "alice resolves");
-        assert_eq!(result.team_notifications_emitted, 1, "engineering resolves");
-        assert_eq!(result.unresolved_mentions, 1, "nobody doesn't resolve");
+        let dir = build_mention_directory(&conn).unwrap();
+        assert_eq!(dir.user_by_name["alex"], 1, "first claimant wins");
+    }
+
+    // ---- parse_mentions -----------------------------------------------------
+
+    #[test]
+    fn parse_resolves_user_mention_to_local_id() {
+        let conn = fresh_db();
+        insert_user(&conn, 1001, "alex");
+        let dir = build_mention_directory(&conn).unwrap();
+        let mentions = parse_mentions("Hey @alex, please review.", &dir).unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].user_local_id, Some(1));
+        assert_eq!(mentions[0].team_local_id, None);
+        assert_eq!(mentions[0].token, "alex");
+    }
+
+    #[test]
+    fn parse_is_exact_no_prefix_matching() {
+        let conn = fresh_db();
+        insert_user(&conn, 1001, "alex");
+        let dir = build_mention_directory(&conn).unwrap();
+        let mentions = parse_mentions("Hey @al, please review.", &dir).unwrap();
+        assert!(mentions.is_empty(), "@al never silently notifies Alex");
+    }
+
+    #[test]
+    fn parse_unknown_tokens_stay_plain_text() {
+        let conn = fresh_db();
+        insert_user(&conn, 1001, "alex");
+        let dir = build_mention_directory(&conn).unwrap();
+        let mentions = parse_mentions("Hey @nobody and @alex", &dir).unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].user_local_id, Some(1));
+    }
+
+    #[test]
+    fn parse_team_mention_spans_spaces() {
+        let conn = fresh_db();
+        insert_team(&conn, 501, "Tier 1");
+        let dir = build_mention_directory(&conn).unwrap();
+        let mentions = parse_mentions("Loop in @Tier 1 please", &dir).unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].team_local_id, Some(1));
+        assert_eq!(mentions[0].token, "Tier 1");
+    }
+
+    #[test]
+    fn parse_team_mention_boundary_matches_reference_quirk() {
+        let conn = fresh_db();
+        insert_team(&conn, 501, "Tier 1");
+        let dir = build_mention_directory(&conn).unwrap();
+        // REFERENCE QUIRK (reported, not "fixed"): mentionParser.ts slices
+        // the team window at max(teamNameLength, tokenLength), so the
+        // boundary check `window[len] ?? ''` can never see the character
+        // AFTER a full-length team name — "@Tier 1x" matches "Tier 1" in
+        // the reference, and the port reproduces that exactly.
+        let mentions = parse_mentions("Loop in @Tier 1x please", &dir).unwrap();
+        assert_eq!(mentions.len(), 1, "the reference matches here too");
+        assert_eq!(mentions[0].team_local_id, Some(1));
+        assert_eq!(mentions[0].token, "Tier 1");
+    }
+
+    #[test]
+    fn parse_deduplicates_users_and_teams() {
+        let conn = fresh_db();
+        insert_user(&conn, 1001, "alex");
+        insert_team(&conn, 501, "Tier 1");
+        let dir = build_mention_directory(&conn).unwrap();
+        let mentions = parse_mentions("@alex @alex @Tier 1 @Tier 1", &dir).unwrap();
+        assert_eq!(mentions.len(), 2);
+    }
+
+    #[test]
+    fn parse_email_is_not_a_mention() {
+        let conn = fresh_db();
+        insert_user(&conn, 1001, "alex");
+        let dir = build_mention_directory(&conn).unwrap();
+        let mentions = parse_mentions("Contact alex@example.com and @alex", &dir).unwrap();
+        assert_eq!(mentions.len(), 1, "only the real @alex resolves");
+    }
+
+    #[test]
+    fn parse_rejects_body_exceeding_max_bytes() {
+        let dir = MentionDirectory::default();
+        let big = "a".repeat(MAX_BODY_BYTES + 1);
+        assert!(parse_mentions(&big, &dir).is_err());
+    }
+
+    // ---- team_members -------------------------------------------------------
+
+    #[test]
+    fn team_members_lists_local_user_ids() {
+        let conn = fresh_db();
+        insert_user(&conn, 1001, "alex");
+        insert_user(&conn, 1002, "priya");
+        insert_team(&conn, 501, "Tier 1");
+        conn.execute(
+            "INSERT INTO team_members (team_id, user_id) VALUES (1, 1), (1, 2)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(team_members(&conn, 1).unwrap(), vec![1, 2]);
+        assert!(team_members(&conn, 999).unwrap().is_empty());
     }
 
     // ---- Performance guard --------------------------------------------------
@@ -674,12 +803,21 @@ mod tests {
         }
         let elapsed = start.elapsed().as_millis();
         // Per project standard: MAX_QUERY_MS = 500 (perf_guards.rs).
-        // 1,000 message scans should be well under that budget, even under
-        // parallel-test load. The 500ms threshold matches the documented
-        // project standard for "bounded query" performance.
         assert!(
             elapsed < 500,
             "1,000-message scan took {elapsed}ms (must be < 500ms per MAX_QUERY_MS)"
         );
+    }
+
+    // ---- shared helpers used by both layers ---------------------------------
+
+    #[test]
+    fn insert_conversation_helper_works() {
+        let conn = fresh_db();
+        insert_conversation(&conn, 1001);
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

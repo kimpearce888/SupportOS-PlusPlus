@@ -427,14 +427,14 @@ impl WorkerManager {
         let data_dir = self.data_dir.clone();
         let bus = self.bus.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = conn.lock().unwrap_or_else(|p| p.into_inner());
+            let conn = conn.lock().unwrap_or_else(|p| p.into_inner());
             crate::maintenance::compute_trends(&conn)?;
             // v2.2.0: deterministic products registry refresh — never breaks
             // maintenance.
             let _ = crate::maintenance::refresh_products(&conn);
             // v1.8.0: notification sweep piggybacks so long-idle instances
             // still produce state notifications.
-            let _ = crate::notification_sweep::sweep_once(&mut conn);
+            let _ = crate::notification_sweep::sweep(&conn, Some(&bus));
             // v1.6.0 audit fix: actually honor backup_interval_hours and
             // prune to the newest 20.
             let backup_hours =
@@ -476,7 +476,6 @@ impl WorkerManager {
             if removed > 0 {
                 tracing::info!(operation = "retention", removed, "Retention pruning");
             }
-            let _ = bus;
             Ok(())
         })
         .await
@@ -494,12 +493,12 @@ impl WorkerManager {
         {
             return;
         }
-        let mut conn = self.lock();
-        match crate::notification_sweep::sweep_once(&mut conn) {
-            Ok(result) if result.notifications_emitted > 0 => {
+        let conn = self.lock();
+        match crate::notification_sweep::sweep(&conn, Some(&self.bus)) {
+            Ok(result) if result.created > 0 => {
                 tracing::debug!(
                     operation = "notification_sweep",
-                    created = result.notifications_emitted,
+                    created = result.created,
                     "Notification sweep created notifications"
                 );
             }

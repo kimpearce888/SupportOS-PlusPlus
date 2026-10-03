@@ -126,6 +126,63 @@ pub fn record_event(conn: &Connection, event: &ActivityEvent) -> Result<bool> {
     Ok(rows > 0)
 }
 
+/// The full event shape — the reference `RecordEventInput` (conversationRepo
+/// and activityRepo): the base [`ActivityEvent`] plus the breadth columns
+/// that the sync's event derivation stamps.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FullActivityEvent {
+    #[serde(flatten)]
+    pub base: ActivityEvent,
+    /// The local thread row the event was derived from (thread events).
+    pub thread_local_id: Option<i64>,
+    /// 'sync' | 'webhook' | 'local' | 'rebuild' (reference EventSource).
+    pub source: String,
+    /// JSON object with the diff/derivation facts.
+    pub metadata: Option<String>,
+}
+
+/// Record an event with the full reference shape. Idempotent on the dedup
+/// key; stamps the breadth columns when the schema has them (older chains
+/// fall back to the base columns). Returns `true` when a NEW row landed.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the insert fails.
+pub fn record_full_event(conn: &Connection, event: &FullActivityEvent) -> Result<bool> {
+    let has_columns = conn
+        .prepare("SELECT metadata, source, thread_local_id FROM activity_events LIMIT 0")
+        .is_ok();
+    if !has_columns {
+        return record_event(conn, &event.base);
+    }
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO activity_events
+            (conversation_id, event_type, actor_type, actor_id, occurred_at, dedup_key,
+             thread_local_id, source, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            event.base.conversation_id,
+            event.base.event_type,
+            event.base.actor_type,
+            event.base.actor_id,
+            event.base.occurred_at,
+            event.base.dedup_key,
+            event.thread_local_id,
+            event.source,
+            event.metadata,
+        ],
+    )?;
+    Ok(rows > 0)
+}
+
+/// The port's `nowIso()` — observation stamps for sync-derived events.
+#[must_use]
+pub fn now_iso() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
 /// Derive the response state for a conversation from its activity events.
 ///
 /// The 4 states (from the catalog `ResponseState` enum):

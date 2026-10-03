@@ -1,62 +1,65 @@
 //! Notifications routes — mirrors src/server/routes/notifications.ts
+//! (v1.8.0 Notification Center + the plan Phase 13 "mentions for me" queue).
+//!
+//! "Me" resolution matches the rest of the app (my-tickets view): the
+//! connected Help Scout user (me_remote_id), falling back to the first
+//! synced user. Broadcast notifications (target NULL) are visible to me.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use super::super::server::AppState;
-use axum::response::IntoResponse;
+use spp_catalog::NotificationType;
 
-/// GET /api/notifications — list notifications.
+/// `clampListParam(value, fallback, min, max)` — NaN/garbage falls back to
+/// the default, then clamps into [min, max] (routes/helpers.ts).
+fn clamp_list_param(value: Option<&String>, fallback: i64, min: i64, max: i64) -> i64 {
+    let n = value
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(fallback);
+    n.clamp(min, max)
+}
+
+/// GET /api/notifications — list notifications for the acting user.
+/// Query: `type` (a valid notification type, else ignored), `unreadOnly`
+/// ('true'|'1'), `limit` (default 50, 1..200), `offset` (default 0, 0..100000).
 pub async fn list(
     State(state): State<AppState>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let user_id = params
-        .get("userId")
-        .and_then(|u| u.parse::<i64>().ok())
-        .unwrap_or(1);
-    let limit = params
-        .get("limit")
-        .and_then(|l| l.parse::<u32>().ok())
-        .unwrap_or(50);
-    match crate::notifications::list_unread_for_user(&conn, user_id, limit) {
-        Ok(notifs) => {
-            let items: Vec<Value> = notifs
+    let me = crate::notifications::me_user_local_id(&conn).ok().flatten();
+    let notif_type = params
+        .get("type")
+        .filter(|t| {
+            NotificationType::ALL
                 .iter()
-                .filter_map(|n| serde_json::to_value(n).ok())
-                .collect();
-            let total = items.len() as i64;
-            let unread = items
-                .iter()
-                .filter(|n| n.get("read_at").and_then(|v| v.as_str()).is_none())
-                .count() as i64;
-            (
-                StatusCode::OK,
-                Json(json!({"notifications": items, "total": total, "unread": unread})),
-            )
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": e.to_string(), "notifications": [], "total": 0, "unread": 0})),
-        ),
-    }
-}
-
-/// GET /api/notifications/unread-count
-pub async fn unread_count(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let count = crate::notifications::count_unread_for_user(&conn, 1).unwrap_or(0);
-    (StatusCode::OK, Json(json!({"unread": count})))
-}
-
-/// POST /api/notifications/:id/read
-pub async fn mark_read(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::notifications::mark_as_read(&conn, id) {
-        Ok(ok) => (StatusCode::OK, Json(json!({"ok": ok}))),
+                .any(|n| n.as_str() == t.as_str())
+        })
+        .map(String::as_str);
+    let unread_only = matches!(
+        params.get("unreadOnly").map(String::as_str),
+        Some("true") | Some("1")
+    );
+    let opts = crate::notifications::ListOptions {
+        me_user_local_id: me,
+        unread_only,
+        notif_type,
+        limit: clamp_list_param(params.get("limit"), 50, 1, 200),
+        offset: clamp_list_param(params.get("offset"), 0, 0, 100_000),
+    };
+    match crate::notifications::list(&conn, &opts) {
+        Ok(result) => match serde_json::to_value(&result) {
+            Ok(v) => (StatusCode::OK, Json(v)),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": e.to_string()})),
+            ),
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"message": e.to_string()})),
@@ -64,23 +67,109 @@ pub async fn mark_read(State(state): State<AppState>, Path(id): Path<i64>) -> im
     }
 }
 
-/// POST /api/notifications/read-all
+/// GET /api/notifications/unread-count
+pub async fn unread_count(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let me = crate::notifications::me_user_local_id(&conn).ok().flatten();
+    let unread = crate::notifications::unread_count(&conn, me).unwrap_or(0);
+    (StatusCode::OK, Json(json!({"unread": unread})))
+}
+
+/// POST /api/notifications/:id/read — honors `{ read: boolean }` (missing
+/// body = read:true, the MarkReadSchema default), 404s unknown/invisible
+/// ids, returns `{ unread }`.
+pub async fn mark_read(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let Ok(id) = id.parse::<i64>() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "id must be a positive integer."
+            })),
+        );
+    };
+    if id <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "id must be a positive integer."
+            })),
+        );
+    }
+    // MarkReadSchema: { read: boolean } with read defaulting to true.
+    let read = match body {
+        None => true,
+        Some(Json(body)) => match body.get("read") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": "Body must be { read: boolean }."
+                    })),
+                );
+            }
+        },
+    };
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let me = crate::notifications::me_user_local_id(&conn).ok().flatten();
+    match crate::notifications::mark_read(&conn, id, me, read) {
+        Ok(true) => {
+            let unread = crate::notifications::unread_count(&conn, me).unwrap_or(0);
+            (StatusCode::OK, Json(json!({"unread": unread})))
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Notification not found (or not visible to you)."
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
+    }
+}
+
+/// POST /api/notifications/read-all — user-scoped `{ marked, unread }`.
 pub async fn mark_all_read(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute("UPDATE notifications SET read_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE read_at IS NULL", []);
-    (StatusCode::OK, Json(json!({"ok": true})))
+    let me = crate::notifications::me_user_local_id(&conn).ok().flatten();
+    match crate::notifications::mark_all_read(&conn, me) {
+        Ok(marked) => {
+            let unread = crate::notifications::unread_count(&conn, me).unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(json!({"marked": marked, "unread": unread})),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
+    }
 }
 
 /// Build the full prefs list (all catalog types, enabled falling back to the
 /// default when unset) — the exact reference `listPrefs()` shape.
 fn build_prefs(conn: &rusqlite::Connection) -> Vec<Value> {
-    use spp_catalog::NotificationType;
     NotificationType::ALL
         .iter()
         .map(|t| {
-            let key = format!("notifications.{}.enabled", t.as_str());
-            let enabled = crate::settings::get_bool(conn, &key, t.default_enabled())
-                .unwrap_or_else(|_| t.default_enabled());
+            let enabled =
+                crate::notifications::pref_for(conn, *t).unwrap_or_else(|_| t.default_enabled());
             json!({
                 "type": t.as_str(),
                 "enabled": enabled,
@@ -106,9 +195,6 @@ pub async fn set_pref(
     Path(notif_type): Path<String>,
     body: Option<Json<Value>>,
 ) -> impl IntoResponse {
-    use axum::http::StatusCode;
-    use spp_catalog::NotificationType;
-
     // Validate the type against the closed vocabulary.
     let valid = NotificationType::ALL
         .iter()
@@ -152,39 +238,65 @@ pub async fn set_pref(
     if let Err(e) = crate::settings::set_bool(&conn, &key, enabled) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"_status": 500, "message": e.to_string()})),
+            Json(json!({"message": e.to_string()})),
         );
     }
     (StatusCode::OK, Json(json!({"prefs": build_prefs(&conn)})))
 }
 
-/// GET /api/notifications/mentions
+/// GET /api/notifications/mentions — the "mentions for me" queue (plan
+/// Phase 13): two honest sources merged — mention notifications (internal
+/// notes, from the sweep) and side-thread mention rows (created at message
+/// time). Both link back to the conversation.
 pub async fn mentions(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let items: Vec<Value> = conn
-        .prepare("SELECT id, conversation_id, body, created_at FROM side_thread_messages WHERE body LIKE '%@%' ORDER BY created_at DESC LIMIT 20")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "conversation_id": r.get::<_, i64>(1)?,
-                    "body": r.get::<_, String>(2)?,
-                    "created_at": r.get::<_, String>(3)?,
-                }))
+    let me = crate::notifications::me_user_local_id(&conn).ok().flatten();
+    let Some(me) = me else {
+        return (
+            StatusCode::OK,
+            Json(json!({"me": null, "notifications": [], "side_thread_mentions": []})),
+        );
+    };
+    let notifications = crate::notifications::mentions_for_me(&conn, me, 100)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|n| serde_json::to_value(n).ok())
+        .collect::<Vec<_>>();
+    let side_thread_mentions = crate::side_threads::mentions_for_user(&conn, me)
+        .unwrap_or_default()
+        .iter()
+        .map(|m| {
+            json!({
+                "message_id": m.message_id,
+                "thread_id": m.thread_id,
+                "thread_title": m.thread_title,
+                "conversation_id": m.conversation_id,
+                "conversation_number": m.conversation_number,
+                "author": m.author,
+                "body": m.body,
+                "created_at": m.created_at,
             })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
         })
-        .unwrap_or_default();
-    (StatusCode::OK, Json(json!({"mentions": items})))
-}
-
-/// POST /api/notifications/sweep
-pub async fn sweep(State(state): State<AppState>) -> impl IntoResponse {
+        .collect::<Vec<_>>();
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "message": "Sweep completed."})),
+        Json(json!({
+            "me": me,
+            "notifications": notifications,
+            "side_thread_mentions": side_thread_mentions,
+        })),
     )
+}
+
+/// POST /api/notifications/sweep — manual sweep trigger (tests, demo, and
+/// "check now" in the UI). Runs the REAL sweep and returns `{ created }`.
+pub async fn sweep(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match crate::notification_sweep::sweep(&conn, Some(&state.bus)) {
+        Ok(outcome) => (StatusCode::OK, Json(json!({"created": outcome.created}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
+    }
 }

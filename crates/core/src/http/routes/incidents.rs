@@ -8,6 +8,42 @@ use serde_json::{json, Value};
 
 use super::super::server::AppState;
 
+/// The reference `IncidentService.notify` — one `incident_update`
+/// notification through the Notification Center funnel. The dedup key
+/// includes the minute (re-notifying the same transition twice in one
+/// minute dedups; a later repeat is a genuinely new event).
+fn notify_incident_update(
+    conn: &rusqlite::Connection,
+    bus: Option<&crate::http::EventBus>,
+    incident_id: i64,
+    title: &str,
+    body: &str,
+    severity: &str,
+    actor_user_id: Option<i64>,
+) {
+    let Some(incident) = crate::intelligence_features::incident_row_json(conn, incident_id) else {
+        return;
+    };
+    let code = incident
+        .get("code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("INC");
+    let minute = chrono::Utc::now().format("%Y-%m-%dT%H:%M").to_string();
+    let _ = crate::notifications::record_notification(
+        conn,
+        bus,
+        &crate::notifications::NotificationInput {
+            notification_type: spp_catalog::NotificationType::IncidentUpdate,
+            severity: Some(severity),
+            title: format!("{code}: {title}"),
+            body: Some(body.to_string()),
+            actor_user_local_id: actor_user_id,
+            dedup_key: format!("incident_update:{incident_id}:{title}:{minute}"),
+            ..Default::default()
+        },
+    );
+}
+
 /// GET /api/incidents
 pub async fn list(State(state): State<AppState>) -> Json<Value> {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -259,6 +295,29 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<Value>) -> R
                     "title": incident_json.get("title"),
                 })),
             );
+            // Reference IncidentService.create: fan out one incident_update
+            // ("incident declared") with the severity/status summary.
+            let linked = conversation_ids.len();
+            let body = if linked > 0 {
+                format!(
+                    "Severity {}, status {}, {linked} linked conversation(s).",
+                    incident.severity, incident.status
+                )
+            } else {
+                format!(
+                    "Severity {}, status {}.",
+                    incident.severity, incident.status
+                )
+            };
+            notify_incident_update(
+                &conn,
+                Some(&state.bus),
+                id,
+                "incident declared",
+                &body,
+                "warning",
+                owner_user_local_id,
+            );
             (
                 StatusCode::OK,
                 Json(json!({"ok": true, "incident": incident_json})),
@@ -284,17 +343,129 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Val
     }
 }
 
-/// PATCH /api/incidents/:id
+/// PATCH /api/incidents/:id — the reference `IncidentService.patch`
+/// notification-relevant subset: status and severity transitions (with
+/// `incident_update` fan-out + timeline events). Unknown ids 404; unknown
+/// enum values are ignored (the reference zod-parses the whole body and
+/// rejects, but the port's stub accepted everything — the field-level
+/// subset keeps the route honest without widening scope).
 pub async fn update(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(status) = body.get("status").and_then(|v| v.as_str()) {
-        // Status update via HTTP needs IncidentStatus enum parsing (not yet wired)
+    let Some(before) = crate::intelligence_features::incident_row_json(&conn, id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
+        )
+            .into_response();
+    };
+    let actor_user_id = body.get("actorUserId").and_then(|v| v.as_i64());
+    let status = body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .filter(|s| INCIDENT_STATUSES.contains(s));
+    let severity = body
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .filter(|s| INCIDENT_SEVERITIES.contains(s));
+
+    let mut updated = false;
+    if let Some(status) = status {
+        let before_status = before.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status != before_status {
+            conn.execute(
+                "UPDATE incidents SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?2",
+                rusqlite::params![status, id],
+            )
+            .map(|_| ())
+            .ok();
+            conn.execute(
+                "INSERT INTO incident_timeline (incident_id, event_type, description, created_at)
+                 VALUES (?1, 'status_changed', ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                rusqlite::params![
+                    id,
+                    format!("Status moved from {before_status} to {status}.")
+                ],
+            )
+            .map(|_| ())
+            .ok();
+            let body = if status == "resolved" {
+                "Incident resolved.".to_string()
+            } else {
+                format!("Status moved from {before_status} to {status}.")
+            };
+            let severity = if status == "resolved" {
+                "info"
+            } else {
+                "warning"
+            };
+            notify_incident_update(
+                &conn,
+                Some(&state.bus),
+                id,
+                &format!("status changed to {status}"),
+                &body,
+                severity,
+                actor_user_id,
+            );
+            updated = true;
+        }
     }
-    Json(json!({"ok": true}))
+    if let Some(severity) = severity {
+        let before_severity = before
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if severity != before_severity {
+            conn.execute(
+                "UPDATE incidents SET severity = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?2",
+                rusqlite::params![severity, id],
+            )
+            .map(|_| ())
+            .ok();
+            conn.execute(
+                "INSERT INTO incident_timeline (incident_id, event_type, description, created_at)
+                 VALUES (?1, 'severity_changed', ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                rusqlite::params![
+                    id,
+                    format!("Severity moved from {before_severity} to {severity}.")
+                ],
+            )
+            .map(|_| ())
+            .ok();
+            notify_incident_update(
+                &conn,
+                Some(&state.bus),
+                id,
+                &format!("severity changed to {severity}"),
+                &format!("Severity moved from {before_severity} to {severity}."),
+                "critical",
+                actor_user_id,
+            );
+            updated = true;
+        }
+    }
+    if !updated {
+        return (
+            StatusCode::OK,
+            Json(json!({"ok": true, "incident": before})),
+        )
+            .into_response();
+    }
+    let incident =
+        crate::intelligence_features::incident_row_json(&conn, id).unwrap_or(before.clone());
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "incident": incident})),
+    )
+        .into_response()
 }
 
 /// DELETE /api/incidents/:id
@@ -304,17 +475,45 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Json<
     Json(json!({"ok": true}))
 }
 
-/// POST /api/incidents/:id/conversations/:conversationId
+/// POST /api/incidents/:id/conversations/:conversationId — the reference
+/// `IncidentService.linkConversation`: link + `incident_update` fan-out
+/// when a NEW link was created.
 pub async fn link_conversation(
     State(state): State<AppState>,
     Path((id, conversation_id)): Path<(i64, i64)>,
 ) -> Json<Value> {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id) VALUES (?1, ?2)",
-        rusqlite::params![id, conversation_id],
-    );
-    Json(json!({"ok": true}))
+    let actor_user_id: Option<i64> = None;
+    let created = crate::intelligence_features::link_incident_conversation(
+        &conn,
+        id,
+        conversation_id,
+        "human",
+    )
+    .unwrap_or(false);
+    if created {
+        let number: Option<i64> = conn
+            .query_row(
+                "SELECT number FROM conversations WHERE id = ?1 OR remote_id = ?1",
+                rusqlite::params![conversation_id],
+                |r| r.get(0),
+            )
+            .ok();
+        let body = number.map_or_else(
+            || "A conversation was linked to this incident.".to_string(),
+            |n| format!("Conversation #{n} is now counted in this incident."),
+        );
+        notify_incident_update(
+            &conn,
+            Some(&state.bus),
+            id,
+            "conversation linked",
+            &body,
+            "info",
+            actor_user_id,
+        );
+    }
+    Json(json!({"ok": true, "created": created}))
 }
 
 /// POST /api/incidents/:id/notes

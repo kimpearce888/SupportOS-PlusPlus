@@ -456,7 +456,86 @@ fn upsert_thread(conn: &Connection, conversation_local: i64, t: &HsThread) -> Re
             created_at = excluded.created_at",
         params![conversation_local, t.kind, t.state, t.body, actor_type, actor_id, t.created_at, t.remote_id],
     )?;
+    record_thread_event(conn, conversation_local, t, actor_type, actor_id)?;
     Ok(())
+}
+
+/// Derive + record the conversation event for a newly-upserted thread —
+/// the reference `ActivityRepository.recordThreadEvent` (activityRepo.ts:60).
+/// Deduped on `thread:{remote_id}`, so re-syncs never duplicate. Returns
+/// the derived event type (`None` when the thread yields no event, e.g.
+/// drafts).
+fn record_thread_event(
+    conn: &Connection,
+    conversation_local: i64,
+    t: &HsThread,
+    actor_type: &str,
+    actor_id: i64,
+) -> Result<Option<&'static str>> {
+    if t.state.as_deref() != Some("published") {
+        return Ok(None); // drafts/scheduled replies are not history yet
+    }
+    let kind = t.kind.as_str();
+    let (event_type, actor_type) = match kind {
+        "note" => ("internal_note", "user"),
+        "lineitem" => {
+            // Help Scout action records — map conservatively; the raw text
+            // stays in the thread mirror.
+            let text = t.body.as_deref().unwrap_or("").to_lowercase();
+            let event_type = if text.contains("status") {
+                "status_changed"
+            } else if text.contains("assign") {
+                "assignment_changed"
+            } else if text.contains("moved") {
+                "moved"
+            } else if text.contains("tag") {
+                "tag_added"
+            } else {
+                "lineitem_action"
+            };
+            (event_type, "system")
+        }
+        _ => {
+            if t.created_by_customer_id.is_some() {
+                ("customer_message", actor_type)
+            } else if t.created_by_user_id.is_some() {
+                ("human_agent_message", actor_type)
+            } else {
+                ("customer_message", "unknown")
+            }
+        }
+    };
+    let thread_local: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM conversation_threads WHERE remote_id = ?1",
+            params![t.remote_id],
+            |r| r.get(0),
+        )
+        .ok();
+    crate::activity::record_full_event(
+        conn,
+        &crate::activity::FullActivityEvent {
+            base: crate::activity::ActivityEvent {
+                id: None,
+                conversation_id: conversation_local,
+                event_type: event_type.into(),
+                actor_type: actor_type.into(),
+                actor_id: (actor_type != "unknown").then_some(actor_id),
+                occurred_at: t.created_at.clone().unwrap_or_default(),
+                dedup_key: format!("thread:{}", t.remote_id),
+            },
+            thread_local_id: thread_local,
+            source: "sync".into(),
+            metadata: Some(
+                serde_json::json!({
+                    "thread_remote_id": t.remote_id,
+                    "thread_type": t.kind,
+                })
+                .to_string(),
+            ),
+        },
+    )?;
+    Ok(Some(event_type))
 }
 
 /// Whether the stored conversation row already reflects the remote's
