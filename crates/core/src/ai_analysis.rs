@@ -149,6 +149,14 @@ pub async fn analyze_conversation(
     // Build the analysis prompt.
     let prompt = build_analysis_prompt(conversation_text);
 
+    // Safety invariant (spec #127 / reference lmStudioProvider.chatJson with
+    // `redact: true`): payment data, tokens and API keys never reach the AI
+    // prompt. The setting `redaction_enabled` (default true) toggles the
+    // pass, exactly like the reference's `redactionEnabled` read.
+    let redaction_enabled =
+        crate::settings::get_bool(conn, "redaction_enabled", true).unwrap_or(true);
+    let (prompt, _redactions) = crate::security::redact_text(&prompt, redaction_enabled);
+
     // Check the cache via ai_runs. We use the embeddings cache since it stores
     // arbitrary JSON — the chat response is serialized as JSON.
     let input_hash = embeddings::content_hash(&prompt);
@@ -784,5 +792,65 @@ mod tests {
         let s = serde_json::to_string(&result).unwrap();
         assert!(s.contains("\"conversation_id\":1001"));
         assert!(s.contains("\"from_cache\":false"));
+    }
+
+    // ---- Prompt redaction (spec #127) --------------------------------------
+
+    /// The Fake provider echoes the user prompt back, so the response proves
+    /// what the provider actually received: payment data must never reach an
+    /// AI prompt (reference lmStudioProvider.chatJson `redact: true`).
+    #[tokio::test]
+    async fn analysis_prompt_is_redacted_before_the_provider_sees_it() {
+        let conn = fresh_db();
+        insert_conversation(&conn, 7);
+        let provider = FakeAiProvider::new();
+        let result = analyze_conversation(
+            &conn,
+            &provider,
+            "fake-chat-model",
+            "My card is 4111 1111 1111 1111 and my cvv: 1234 thanks",
+            7,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.raw_response.contains("[REDACTED-CARD]"),
+            "card number must not reach the provider: {}",
+            result.raw_response
+        );
+        assert!(
+            result.raw_response.contains("[REDACTED-CVV]"),
+            "cvv must not reach the provider: {}",
+            result.raw_response
+        );
+        assert!(
+            !result.raw_response.contains("4111 1111 1111 1111"),
+            "raw card number must not appear: {}",
+            result.raw_response
+        );
+    }
+
+    /// The setting `redaction_enabled=false` disables the pass, exactly like
+    /// the reference's `redactionEnabled` read.
+    #[tokio::test]
+    async fn analysis_prompt_redaction_can_be_disabled_by_setting() {
+        let conn = fresh_db();
+        insert_conversation(&conn, 7);
+        crate::settings::set_bool(&conn, "redaction_enabled", false).unwrap();
+        let provider = FakeAiProvider::new();
+        let result = analyze_conversation(
+            &conn,
+            &provider,
+            "fake-chat-model",
+            "My card is 4111 1111 1111 1111 thanks",
+            7,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.raw_response.contains("4111 1111 1111 1111"),
+            "with redaction off the provider sees the raw text: {}",
+            result.raw_response
+        );
     }
 }

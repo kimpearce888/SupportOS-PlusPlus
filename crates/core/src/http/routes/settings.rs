@@ -14,7 +14,12 @@ use axum::response::IntoResponse;
 /// (no nesting). Values are typed (bool, number, string, null).
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Load all settings from the application_settings table into a HashMap.
+    (StatusCode::OK, Json(all_settings_json(&conn)))
+}
+
+/// The flat all-settings object shared by GET and PATCH responses
+/// (reference `settingsRepo.getAllSettings()`).
+fn all_settings_json(conn: &rusqlite::Connection) -> Value {
     let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM application_settings") {
         if let Ok(rows) =
@@ -58,47 +63,147 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         })
     }
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "sync_interval_minutes": get_i64(&map, "sync_interval_minutes", 5),
-            "api_concurrency": get_i64(&map, "api_concurrency", 2),
-            "ai_enabled": get_bool(&map, "ai_enabled", true),
-            "automatic_analysis_enabled": get_bool(&map, "automatic_analysis_enabled", true),
-            "automatic_note_enabled": get_bool(&map, "automatic_note_enabled", false),
-            "automatic_draft_enabled": get_bool(&map, "automatic_draft_enabled", false),
-            "automation_enabled": get_bool(&map, "automation_enabled", false),
-            "automation_write_actions_enabled": get_bool(&map, "automation_write_actions_enabled", false),
-            "qdrant_enabled": get_bool(&map, "qdrant_enabled", true),
-            "attachment_auto_download": get_bool(&map, "attachment_auto_download", true),
-            "automatic_reply_sending": get_bool(&map, "automatic_reply_sending", false),
-            "retention_days": get_opt_i64(&map, "retention_days"),
-            "backup_interval_hours": get_i64(&map, "backup_interval_hours", 24),
-            "log_level": get_str(&map, "log_level", "info"),
-            "display_timezone": get_str(&map, "display_timezone", "system"),
-            "redaction_enabled": get_bool(&map, "redaction_enabled", true),
-            "ai_evaluation_mode": get_bool(&map, "ai_evaluation_mode", false),
-            "agent_language": get_str(&map, "agent_language", "en"),
-        })),
-    )
+    json!({
+        "sync_interval_minutes": get_i64(&map, "sync_interval_minutes", 5),
+        "api_concurrency": get_i64(&map, "api_concurrency", 2),
+        "ai_enabled": get_bool(&map, "ai_enabled", true),
+        "automatic_analysis_enabled": get_bool(&map, "automatic_analysis_enabled", true),
+        "automatic_note_enabled": get_bool(&map, "automatic_note_enabled", false),
+        "automatic_draft_enabled": get_bool(&map, "automatic_draft_enabled", false),
+        "automation_enabled": get_bool(&map, "automation_enabled", false),
+        "automation_write_actions_enabled": get_bool(&map, "automation_write_actions_enabled", false),
+        "qdrant_enabled": get_bool(&map, "qdrant_enabled", true),
+        "attachment_auto_download": get_bool(&map, "attachment_auto_download", true),
+        "automatic_reply_sending": get_bool(&map, "automatic_reply_sending", false),
+        "retention_days": get_opt_i64(&map, "retention_days"),
+        "backup_interval_hours": get_i64(&map, "backup_interval_hours", 24),
+        "log_level": get_str(&map, "log_level", "info"),
+        "display_timezone": get_str(&map, "display_timezone", "system"),
+        "redaction_enabled": get_bool(&map, "redaction_enabled", true),
+        "ai_evaluation_mode": get_bool(&map, "ai_evaluation_mode", false),
+        "agent_language": get_str(&map, "agent_language", "en"),
+    })
 }
 
-/// PATCH /api/settings — update settings.
+/// PATCH /api/settings — reference routes/settings.ts:24-43 + the settings
+/// repo's safety rule. Strict 19-key schema (Zod `.strict().partial()`):
+/// unknown or badly-typed keys are rejected with 422;
+/// `automatic_reply_sending` is ACCEPTED but always forced false (spec #14 —
+/// automatic customer-reply sending can never be enabled). Side effects:
+/// Qdrant adapter reconfigure, workers restart when the sync interval
+/// changes, and an audit `settings_updated` entry naming the patched keys.
 pub async fn update_settings(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(obj) = body.as_object() {
-        for (key, value) in obj {
-            let val_str = match value {
-                serde_json::Value::String(s) => s.clone(),
-                _ => value.to_string(),
-            };
-            let _ = crate::settings::set_string(&conn, key, &val_str);
+    let invalid = |cx: &str| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "ok": false,
+                "message": "Invalid settings patch: unknown or badly typed keys were rejected.",
+                "detail": cx,
+            })),
+        )
+    };
+
+    let Some(obj) = body.as_object() else {
+        return invalid("body must be an object");
+    };
+
+    // ---- strict schema: key -> type/range check (settingsPatchSchema) ----
+    let is_int_in =
+        |v: &Value, lo: i64, hi: i64| v.as_i64().is_some_and(|n| (lo..=hi).contains(&n));
+    for (key, value) in obj {
+        let ok = match key.as_str() {
+            "sync_interval_minutes" => is_int_in(value, 1, 1440),
+            "api_concurrency" => is_int_in(value, 1, 10),
+            "ai_enabled"
+            | "automatic_analysis_enabled"
+            | "automatic_note_enabled"
+            | "automatic_draft_enabled"
+            | "automation_enabled"
+            | "automation_write_actions_enabled"
+            | "qdrant_enabled"
+            | "attachment_auto_download"
+            | "automatic_reply_sending"
+            | "redaction_enabled"
+            | "ai_evaluation_mode" => value.is_boolean(),
+            "qdrant_url" => value.as_str().is_some_and(|s| {
+                s.len() <= 500 && s.contains("://") && !s.contains(char::is_whitespace)
+            }),
+            "retention_days" => value.is_null() || is_int_in(value, 1, 3650),
+            "backup_interval_hours" => value.is_null() || is_int_in(value, 1, 720),
+            "log_level" => matches!(
+                value.as_str(),
+                Some("debug") | Some("info") | Some("warn") | Some("error")
+            ),
+            "display_timezone" => value.as_str().is_some_and(|s| s.len() <= 64),
+            "agent_language" => value
+                .as_str()
+                .is_some_and(|s| s.len() == 2 && s.chars().all(|c| c.is_ascii_lowercase())),
+            _ => false,
+        };
+        if !ok {
+            return invalid(key);
         }
     }
-    (StatusCode::OK, Json(json!({"ok": true})))
+
+    // ---- persist (repo rule: automatic_reply_sending is forced false) ----
+    let qdrant_patch = (
+        obj.get("qdrant_url")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        obj.get("qdrant_enabled").and_then(|v| v.as_bool()),
+    );
+    let interval_changed = obj.contains_key("sync_interval_minutes");
+    {
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        for (key, value) in obj {
+            let res = match value {
+                Value::Bool(b) => {
+                    // spec #14: never storable as true.
+                    let b = if key == "automatic_reply_sending" {
+                        false
+                    } else {
+                        *b
+                    };
+                    crate::settings::set_bool(&conn, key, b)
+                }
+                Value::Number(_) => {
+                    crate::settings::set_i64(&conn, key, value.as_i64().unwrap_or(0))
+                }
+                Value::String(s) => crate::settings::set_string(&conn, key, s),
+                Value::Null => crate::settings::set_string(&conn, key, ""),
+                _ => Ok(()),
+            };
+            let _ = res;
+        }
+        let entry = crate::audit::AuditEntry::user("settings_updated").with_after_state(json!({
+            "keys": obj.keys().cloned().collect::<Vec<_>>(),
+        }));
+        let _ = crate::audit::audit(&conn, &entry);
+    }
+
+    // ---- side effects (reference: qdrant reconfigure, workers restart) ----
+    if qdrant_patch.0.is_some() || qdrant_patch.1.is_some() {
+        state.qdrant.reconfigure(qdrant_patch.0, qdrant_patch.1);
+    }
+    if interval_changed {
+        if let Some(workers) = state.workers.clone() {
+            workers.stop();
+            workers.start();
+        }
+    }
+
+    let settings = {
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        all_settings_json(&conn)
+    };
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "message": "Settings saved.", "settings": settings})),
+    )
 }
 
 /// GET /api/settings/lmstudio
@@ -546,4 +651,166 @@ pub async fn qdrant_test(State(state): State<AppState>) -> impl IntoResponse {
             "message": message,
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::{IntoResponse, Response};
+    use rusqlite::Connection;
+    use std::sync::{Arc, Mutex};
+
+    fn make_state() -> AppState {
+        let f = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        AppState {
+            conn: Arc::new(Mutex::new(conn)),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            port: 3000,
+            host: "127.0.0.1".into(),
+            demo_mode: false,
+            bus: crate::http::EventBus::new(64),
+            limiter: crate::http::RateLimiter::new(),
+            sync: None,
+            real: None,
+            provider_kind: "fake".into(),
+            workers: None,
+            qdrant: std::sync::Arc::new(crate::vectorstore_qdrant::EmbeddedQdrant::new(
+                "/tmp/spp-test-qdrant",
+                "http://127.0.0.1:6333",
+                false,
+            )),
+        }
+    }
+
+    async fn body_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// Reference safety test (spec #14): `automatic_reply_sending` can never
+    /// be enabled — the repo forces it false and the round-trip shows false.
+    #[tokio::test]
+    async fn patch_forces_automatic_reply_sending_false() {
+        let state = make_state();
+        let (status, body) = body_json(
+            update_settings(
+                State(state.clone()),
+                Json(json!({"automatic_reply_sending": true, "ai_enabled": false})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(
+            body["settings"]["automatic_reply_sending"],
+            json!(false),
+            "the patch is accepted but the value round-trips false"
+        );
+        // ai_enabled (a different flag) still persists.
+        assert_eq!(body["settings"]["ai_enabled"], json!(false));
+        // And GET agrees.
+        let (status, got) = body_json(get_settings(State(state)).await.into_response()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got["automatic_reply_sending"], json!(false));
+    }
+
+    /// Reference behavior: unknown keys are rejected with 422 (strict schema).
+    #[tokio::test]
+    async fn patch_rejects_unknown_key() {
+        let state = make_state();
+        let (status, body) = body_json(
+            update_settings(State(state), Json(json!({"totally_bogus": true})))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(
+            body["message"],
+            json!("Invalid settings patch: unknown or badly typed keys were rejected.")
+        );
+    }
+
+    /// Range + type validation (settingsPatchSchema).
+    #[tokio::test]
+    async fn patch_rejects_bad_types_and_ranges() {
+        for bad in [
+            json!({"sync_interval_minutes": 0}),
+            json!({"sync_interval_minutes": 1441}),
+            json!({"sync_interval_minutes": "5"}),
+            json!({"api_concurrency": 11}),
+            json!({"log_level": "verbose"}),
+            json!({"agent_language": "EN"}),
+            json!({"agent_language": "en-US"}),
+            json!({"qdrant_url": "notaurl"}),
+            json!({"qdrant_url": 42}),
+            json!({"retention_days": 0}),
+            json!({"retention_days": 3651}),
+            json!({"ai_enabled": "yes"}),
+            json!({"display_timezone": 7}),
+        ] {
+            let state = make_state();
+            let (status, body) = body_json(
+                update_settings(State(state), Json(bad.clone()))
+                    .await
+                    .into_response(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expected 422 for {bad}"
+            );
+            assert_eq!(body["ok"], json!(false));
+        }
+    }
+
+    /// Valid patch round-trips typed values and writes the audit entry.
+    #[tokio::test]
+    async fn patch_roundtrip_and_audit() {
+        let state = make_state();
+        let (status, body) = body_json(
+            update_settings(
+                State(state.clone()),
+                Json(json!({
+                    "log_level": "debug",
+                    "retention_days": null,
+                    "agent_language": "fr",
+                    "sync_interval_minutes": 10,
+                })),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["message"], json!("Settings saved."));
+        assert_eq!(body["settings"]["log_level"], json!("debug"));
+        assert_eq!(body["settings"]["retention_days"], Value::Null);
+        assert_eq!(body["settings"]["agent_language"], json!("fr"));
+        assert_eq!(body["settings"]["sync_interval_minutes"], json!(10));
+
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let audited: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE actor='user' AND action='settings_updated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(audited, 1, "settings_updated audit entry written");
+    }
 }

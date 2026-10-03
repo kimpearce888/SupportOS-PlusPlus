@@ -8,6 +8,16 @@ use serde_json::{json, Value};
 use super::super::server::AppState;
 use axum::response::IntoResponse;
 
+/// Eval-mode rejection in the tuple shape these handlers return (the shared
+/// `conversation_ops::rejected` builds a `Response`, which cannot mix with
+/// `impl IntoResponse` tuple arms).
+fn eval_rejected(msg: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({ "ok": false, "message": msg })),
+    )
+}
+
 /// GET /api/conversations — list conversations with filters.
 pub async fn list(
     State(state): State<AppState>,
@@ -111,6 +121,12 @@ pub async fn reply(
         );
     }
     let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Safety invariant (operations.ts sendReply): eval mode blocks EVERY
+    // remote write — replies included.
+    if let Some(msg) = eval_mode_blocked(&conn) {
+        drop(conn);
+        return eval_rejected(msg);
+    }
     let result = crate::inbox::reply_to_conversation(
         &mut conn,
         id,
@@ -157,6 +173,11 @@ pub async fn note(
 ) -> impl IntoResponse {
     let body_text = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
     let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Safety invariant (operations.ts addNote): eval mode blocks notes too.
+    if let Some(msg) = eval_mode_blocked(&conn) {
+        drop(conn);
+        return eval_rejected(msg);
+    }
     let result = crate::inbox::add_note(
         &mut conn,
         id,
@@ -203,6 +224,12 @@ pub async fn status(
         .and_then(|v| v.as_str())
         .unwrap_or("active");
     let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Safety invariant (operations.ts changeStatus): eval mode blocks status
+    // changes.
+    if let Some(msg) = eval_mode_blocked(&conn) {
+        drop(conn);
+        return eval_rejected(msg);
+    }
     let result = crate::inbox::change_status(
         &mut conn,
         id,
@@ -246,6 +273,11 @@ pub async fn assign(
 ) -> impl IntoResponse {
     let assignee = body.get("assigneeLocalId").and_then(|v| v.as_i64());
     let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Safety invariant (operations.ts assignTo): eval mode blocks assignments.
+    if let Some(msg) = eval_mode_blocked(&conn) {
+        drop(conn);
+        return eval_rejected(msg);
+    }
     let result = crate::inbox::assign(&mut conn, id, assignee, "user".to_string(), None);
     drop(conn);
     match result {
@@ -286,6 +318,12 @@ pub async fn priority(
         .and_then(|v| v.as_str())
         .unwrap_or("normal");
     let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Safety invariant: eval mode blocks every remote write, priority
+    // changes included.
+    if let Some(msg) = eval_mode_blocked(&conn) {
+        drop(conn);
+        return eval_rejected(msg);
+    }
     use crate::ticket_ops::{execute, TicketOperation};
     let op = TicketOperation::SetPriority {
         conversation_remote_id: id,
@@ -335,6 +373,11 @@ pub async fn subject(
 ) -> impl IntoResponse {
     let new_subject = body.get("subject").and_then(|v| v.as_str()).unwrap_or("");
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Safety invariant: eval mode blocks subject edits (remote write).
+    if let Some(msg) = eval_mode_blocked(&conn) {
+        drop(conn);
+        return eval_rejected(msg);
+    }
     let result = conn.execute(
         "UPDATE conversations SET subject = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE remote_id = ?2",
         rusqlite::params![new_subject, id],
@@ -373,6 +416,12 @@ pub async fn set_state(
 ) -> impl IntoResponse {
     let new_state = body.get("state").and_then(|v| v.as_str()).unwrap_or("");
     let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Safety invariant: eval mode blocks custom-state changes (status
+    // family).
+    if let Some(msg) = eval_mode_blocked(&conn) {
+        drop(conn);
+        return eval_rejected(msg);
+    }
     use crate::ticket_ops::{execute, TicketOperation};
     let op = TicketOperation::SetTicketState {
         conversation_remote_id: id,
@@ -1433,4 +1482,153 @@ pub async fn attachment_download_route(
     let attachments_dir = state.data_dir.join("attachments");
     let conn = state.conn_lock();
     crate::conversation_ops::op_download_attachment(&conn, &attachments_dir, attachment_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::{IntoResponse, Response};
+    use std::sync::{Arc, Mutex};
+
+    fn make_state() -> AppState {
+        let f = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        AppState {
+            conn: Arc::new(Mutex::new(conn)),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            port: 3000,
+            host: "127.0.0.1".into(),
+            demo_mode: false,
+            bus: crate::http::EventBus::new(64),
+            limiter: crate::http::RateLimiter::new(),
+            sync: None,
+            real: None,
+            provider_kind: "fake".into(),
+            workers: None,
+            qdrant: std::sync::Arc::new(crate::vectorstore_qdrant::EmbeddedQdrant::new(
+                "/tmp/spp-test-qdrant",
+                "http://127.0.0.1:6333",
+                false,
+            )),
+        }
+    }
+
+    async fn body_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    /// Safety invariant (operations.ts evalModeBlocked): with evaluation mode
+    /// ON, EVERY remote write is blocked — the five previously-ungated routes
+    /// (reply/note/status/assign/subject) must reject with the exact message
+    /// BEFORE touching the conversation.
+    #[tokio::test]
+    async fn eval_mode_blocks_reply_note_status_assign_subject() {
+        let state = make_state();
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::settings::set_bool(&conn, "ai_evaluation_mode", true).unwrap();
+        }
+
+        let r1 = body_json(
+            reply(
+                State(state.clone()),
+                Path(1),
+                Json(json!({"body": "hello"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        let r2 = body_json(
+            note(State(state.clone()), Path(1), Json(json!({"body": "note"})))
+                .await
+                .into_response(),
+        )
+        .await;
+        let r3 = body_json(
+            status(
+                State(state.clone()),
+                Path(1),
+                Json(json!({"status": "closed"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        let r4 = body_json(
+            assign(
+                State(state.clone()),
+                Path(1),
+                Json(json!({"assigneeLocalId": 2})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        let r5 = body_json(
+            subject(
+                State(state.clone()),
+                Path(1),
+                Json(json!({"subject": "new"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+
+        for (name, (code, body)) in [
+            ("reply", r1),
+            ("note", r2),
+            ("status", r3),
+            ("assign", r4),
+            ("subject", r5),
+        ] {
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{name} must 422");
+            assert_eq!(body["ok"], json!(false), "{name} must be ok:false");
+            assert_eq!(
+                body["message"],
+                json!("AI evaluation mode is ON: no replies, notes, status changes or other updates are sent to Help Scout."),
+                "{name} must carry the reference message"
+            );
+        }
+    }
+
+    /// With evaluation mode OFF the gate is silent — the request proceeds
+    /// into the pipeline (which handles the missing conversation its own
+    /// way; the 422 shape for that path is the write-pipeline port's scope).
+    #[tokio::test]
+    async fn eval_mode_off_reply_still_works() {
+        let state = make_state();
+        let (code, body) = body_json(
+            reply(
+                State(state.clone()),
+                Path(999),
+                Json(json!({"body": "hello"})),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        let msg = body["message"].as_str().unwrap_or("");
+        assert_ne!(
+            msg,
+            "AI evaluation mode is ON: no replies, notes, status changes or other updates are sent to Help Scout.",
+            "the gate must not fire when evaluation mode is off"
+        );
+        assert_ne!(
+            code,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no eval 422 when evaluation mode is off"
+        );
+    }
 }
