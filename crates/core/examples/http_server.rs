@@ -67,6 +67,9 @@ async fn main() -> std::io::Result<()> {
     let _ = spp_core::ticket_states::apply_m032(&conn);
     let _ = spp_core::ai_attributes::apply_m033(&conn);
     let _ = spp_core::intelligence_features::apply_m035(&conn);
+    let _ = spp_core::customer_events::apply_m036(&conn);
+    let _ = spp_core::maintenance::apply_m037(&conn);
+    let _ = spp_core::connectors::apply_m038(&conn);
     let _ = spp_core::webhook::ensure_webhook_events_table(&conn);
     let _ = spp_core::saved_views::ensure_saved_views_table(&conn);
     let _ = spp_core::oauth_state::ensure_oauth_states_table(&conn);
@@ -130,6 +133,7 @@ async fn main() -> std::io::Result<()> {
         sync: Some(sync),
         real,
         provider_kind,
+        workers: None,
     };
 
     let server = HttpServer::new(state);

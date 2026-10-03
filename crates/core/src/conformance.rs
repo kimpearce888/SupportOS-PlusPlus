@@ -125,6 +125,9 @@ pub fn verify_migration_idempotency(conn: &Connection) -> Result<()> {
     crate::reports::apply_m020_to_m022(conn)?;
     crate::outreach::apply_m023_to_m025(conn)?;
     crate::data_tools::apply_m026_to_m027(conn)?;
+    crate::customer_events::apply_m036(conn)?;
+    crate::maintenance::apply_m037(conn)?;
+    crate::connectors::apply_m038(conn)?;
     Ok(())
 }
 
@@ -168,6 +171,18 @@ mod tests {
         crate::reports::apply_m020_to_m022(&conn).unwrap();
         crate::outreach::apply_m023_to_m025(&conn).unwrap();
         crate::data_tools::apply_m026_to_m027(&conn).unwrap();
+        crate::inbox::apply_m028(&conn).unwrap();
+        crate::sync_schema::apply_m029(&conn).unwrap();
+        crate::conversation_ops::apply_m030(&conn).unwrap();
+        crate::outreach::apply_m031(&conn).unwrap();
+        crate::ticket_states::apply_m032(&conn).unwrap();
+        crate::ai_attributes::apply_m033(&conn).unwrap();
+        crate::reports::apply_m034(&conn).unwrap();
+        crate::intelligence_features::apply_m035(&conn).unwrap();
+        crate::customer_events::apply_m036(&conn).unwrap();
+        crate::maintenance::apply_m037(&conn).unwrap();
+        crate::connectors::apply_m038(&conn).unwrap();
+        crate::mirror_tables::apply_m039(&conn).unwrap();
         conn
     }
 

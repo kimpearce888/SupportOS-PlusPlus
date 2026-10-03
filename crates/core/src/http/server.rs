@@ -65,6 +65,9 @@ pub struct AppState {
     pub real: Option<Arc<crate::helpscout_real::RealHelpScoutProvider>>,
     /// "fake" or "real" — which provider backs the app.
     pub provider_kind: String,
+    /// The background WorkerManager (8 timers), when the server owns it.
+    /// `None` in unit tests and before `serve()` starts the workers.
+    pub workers: Option<Arc<crate::workers::WorkerManager>>,
 }
 
 impl AppState {
@@ -1162,7 +1165,50 @@ impl HttpServer {
     }
 
     /// Run the server forever.
-    pub async fn serve(self) -> std::io::Result<()> {
+    pub async fn serve(mut self) -> std::io::Result<()> {
+        // 9. background workers (spec #99: start them before the listener).
+        //    Jobs survive restarts; timers never block request handling.
+        let provider: Arc<dyn crate::helpscout::HelpScoutProvider> = match self.state.provider_kind.as_str() {
+            "real" => self.state.real.clone().map(|r| r as Arc<dyn crate::helpscout::HelpScoutProvider>).unwrap_or_else(|| Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())),
+            _ => Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo()),
+        };
+        let manager = crate::workers::start_workers(
+            self.state.conn.clone(),
+            self.state.sync.clone(),
+            provider,
+            self.state.bus.clone(),
+            self.state.data_dir.clone(),
+        );
+        // Demo mode with an empty database: run the initial demo sync
+        // automatically (reference index.ts) — the seed pass lands with the
+        // demo module; the engine's mirror pass is enough for the timer
+        // machinery to be exercised end-to-end.
+        if self.state.provider_kind == "fake" {
+            let conversation_count: i64 = {
+                let conn = self.state.conn_lock();
+                conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+                    .unwrap_or(0)
+            };
+            if conversation_count == 0 {
+                if let Some(engine) = self.state.sync.clone() {
+                    let conn = self.state.conn.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = engine.initial_sync().await {
+                            tracing::warn!(error = %e, "Demo initial sync failed");
+                            return;
+                        }
+                        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+                        let _ = crate::jobs::enqueue_on(&c, "embeddings", "embed_knowledge_chunks", "{}", 4);
+                        let seeded = crate::demo::seed_demo_data(&c);
+                        if seeded {
+                            let _ = crate::settings::set_string(&c, "demo_data_loaded", "true");
+                        }
+                    });
+                }
+            }
+        }
+        let workers_handle = manager.clone();
+        self.state.workers = Some(manager);
         // into_make_service_with_connect_info lets the rate-limit layer
         // read the client's socket address via ConnectInfo<SocketAddr>.
         // (Mirrors the reference's `request.socket.remoteAddress`.)
@@ -1171,7 +1217,14 @@ impl HttpServer {
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
         let listener = TcpListener::bind(self.addr).await?;
         tracing::info!(addr = %self.addr, "HTTP API server bound");
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                // v2.2.1 audit fix: stop the workers so in-flight ticks end
+                // on the process's own terms.
+                workers_handle.stop();
+            })
+            .await?;
         Ok(())
     }
 }

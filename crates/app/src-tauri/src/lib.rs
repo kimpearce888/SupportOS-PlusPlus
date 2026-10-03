@@ -141,6 +141,7 @@ pub fn run() {
         sync: Some(sync),
         real,
         provider_kind,
+        workers: None,
     };
 
     let http_server = spp_core::http::HttpServer::new(http_state);
@@ -285,6 +286,9 @@ fn open_db_with_all_migrations(
     spp_core::ticket_states::apply_m032(&conn)?;
     spp_core::ai_attributes::apply_m033(&conn)?;
     spp_core::intelligence_features::apply_m035(&conn)?;
+    spp_core::customer_events::apply_m036(&conn)?;
+    spp_core::maintenance::apply_m037(&conn)?;
+    spp_core::connectors::apply_m038(&conn)?;
 
     tracing::info!("All migrations M001–M035 applied successfully");
     Ok(conn)
@@ -324,6 +328,7 @@ fn launch_without_db() {
         sync: Some(sync),
         real: None,
         provider_kind: "fake".to_string(),
+        workers: None,
     };
 
     let http_server = spp_core::http::HttpServer::new(http_state);

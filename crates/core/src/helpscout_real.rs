@@ -1050,6 +1050,44 @@ impl HelpScoutProvider for RealHelpScoutProvider {
         Ok(Vec::new())
     }
 
+    async fn get_rating(&self, rating_id: i64) -> Result<Option<HsRating>> {
+        // GET /v2/ratings/:id — 404 maps to None like the reference.
+        let raw = match self.request(&format!("/v2/ratings/{rating_id}"), "GET", None).await {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("-> 404") {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+        };
+        let customer = raw.get("customer").cloned().unwrap_or(Value::Null);
+        let first = customer.get("firstName").and_then(|v| v.as_str());
+        let last = customer.get("lastName").and_then(|v| v.as_str());
+        let customer_name = match (first, last) {
+            (Some(f), Some(l)) => Some(format!("{f} {l}")),
+            (Some(f), None) => Some(f.to_string()),
+            (None, Some(l)) => Some(l.to_string()),
+            (None, None) => None,
+        };
+        Ok(Some(HsRating {
+            remote_id: raw.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+            conversation_id: raw.get("conversationId").and_then(|v| v.as_i64()),
+            thread_id: raw.get("threadId").and_then(|v| v.as_i64()),
+            rating: raw.get("rating").and_then(|v| v.as_str()).map(str::to_string),
+            comment: raw.get("comments").and_then(|v| v.as_str()).map(str::to_string),
+            customer_id: customer.get("id").and_then(|v| v.as_i64()),
+            customer_name,
+            user_id: raw.get("userId").and_then(|v| v.as_i64()).or_else(|| {
+                raw.get("user")
+                    .and_then(|u| u.get("id"))
+                    .and_then(|v| v.as_i64())
+            }),
+            created_at: raw.get("createdAt").and_then(|v| v.as_str()).map(str::to_string),
+        }))
+    }
+
     // ---------------- Extended surface ----------------
 
     async fn list_folders(&self, mailbox_id: i64) -> Result<Vec<HsFolder>> {

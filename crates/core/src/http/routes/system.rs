@@ -282,7 +282,10 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
                 "failed_jobs": failed_jobs,
             },
             "workers": {
-                "running": true,
+                "running": state
+                    .workers
+                    .as_ref()
+                    .is_some_and(|w| w.is_running()),
                 "queue_depth": queued_jobs,
             },
         })),

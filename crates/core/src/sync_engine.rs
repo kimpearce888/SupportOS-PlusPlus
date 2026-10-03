@@ -257,7 +257,7 @@ pub fn local_id(conn: &Connection, table: &str, remote_id: i64) -> Option<i64> {
 }
 
 /// `getConversationByRemoteId`.
-fn conversation_local_id(conn: &Connection, remote_id: i64) -> Option<i64> {
+pub fn conversation_local_id(conn: &Connection, remote_id: i64) -> Option<i64> {
     conn.query_row(
         "SELECT id FROM conversations WHERE remote_id = ?1",
         params![remote_id],
@@ -331,7 +331,7 @@ fn upsert_property_definitions(
     Ok(())
 }
 
-fn upsert_organization(conn: &Connection, o: &crate::helpscout::HsOrganization) -> Result<()> {
+pub fn upsert_organization(conn: &Connection, o: &crate::helpscout::HsOrganization) -> Result<()> {
     let domains = serde_json::to_string(&o.domains).unwrap_or_else(|_| "[]".into());
     conn.execute(
         "INSERT INTO organizations (remote_id, name, domains, remote_created_at, remote_updated_at, last_seen_at, last_synced_at)
@@ -455,12 +455,35 @@ fn upsert_thread(conn: &Connection, conversation_local: i64, t: &HsThread) -> Re
     Ok(())
 }
 
-/// Soft-delete a conversation by remote id (deleted_at is port-side marker:
-/// the reference marks `deleted_at`; the port's conversations table has none,
-/// so we set status='deleted' — the same observable marker the port uses).
+/// Whether the stored conversation row already reflects the remote's
+/// userUpdatedAt — the reference's reconcile skip condition (the port's
+/// `updated_at` column mirrors the remote userUpdatedAt).
+fn stored_user_updated_at_matches(
+    conn: &Connection,
+    remote_id: i64,
+    remote_updated_at: Option<&str>,
+) -> bool {
+    let Some(remote) = remote_updated_at else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT updated_at FROM conversations WHERE remote_id = ?1",
+        params![remote_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|stored| stored == remote)
+}
+
+/// Soft-delete a conversation by remote id. Sets BOTH markers: the
+/// reference-shaped `deleted_at` timestamp and the port's historical
+/// `status = 'deleted'` overload (kept for older read paths).
 fn soft_delete_by_remote_id(conn: &Connection, remote_id: i64) -> Result<()> {
     conn.execute(
-        "UPDATE conversations SET status = 'deleted' WHERE remote_id = ?1",
+        "UPDATE conversations SET status = 'deleted',
+             deleted_at = COALESCE(deleted_at, datetime('now'))
+           WHERE remote_id = ?1",
         params![remote_id],
     )?;
     Ok(())
@@ -821,6 +844,8 @@ impl SyncEngine {
         let mut result = ReconciliationResult::default();
         let outcome: Result<()> = async {
             // Phase 1: full remote listing — find missing local records.
+            // Unchanged conversations are skipped (the reference compares
+            // the stored userUpdatedAt against the remote one).
             let mut remote_ids: Vec<i64> = Vec::new();
             let mut cursor: Option<String> = None;
             loop {
@@ -847,8 +872,16 @@ impl SyncEngine {
                                 .push(format!("Added missing conversation #{}", c.number));
                         }
                         Some(_) => {
-                            self.ingest_conversation(c, &[], true).await?;
-                            result.updated += 1;
+                            let unchanged = {
+                                let conn = self.lock();
+                                stored_user_updated_at_matches(&conn, c.remote_id, c.updated_at.as_deref())
+                            };
+                            if unchanged {
+                                result.skipped += 1;
+                            } else {
+                                self.ingest_conversation(c, &[], true).await?;
+                                result.updated += 1;
+                            }
                         }
                     }
                     result.checked += 1;
@@ -862,7 +895,9 @@ impl SyncEngine {
             // Phase 2: local records missing remotely (merged / deleted).
             let locals: Vec<(i64, i64, i64)> = {
                 let conn = self.lock();
-                let mut stmt = conn.prepare("SELECT id, remote_id, number FROM conversations")?;
+                let mut stmt = conn.prepare(
+                    "SELECT id, remote_id, number FROM conversations WHERE deleted_at IS NULL",
+                )?;
                 let rows = stmt.query_map([], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
                 })?;
@@ -874,7 +909,6 @@ impl SyncEngine {
                     result.skipped += 1;
                     continue;
                 }
-                let _ = local_id;
                 match self.provider.get_conversation(remote_id).await {
                     Ok(Some(remote)) => {
                         self.ingest_conversation(&remote, &[], true).await?;
@@ -894,8 +928,33 @@ impl SyncEngine {
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("merged into") {
-                            // 301 merged: mark locally (port keeps the marker
-                            // in the sync_checkpoints detail for auditability).
+                            // 301 merged: mark the local row merged into its
+                            // target when the target exists locally (the
+                            // reference parses the merge target from the
+                            // error and marks the conversation).
+                            let target = msg
+                                .split_whitespace()
+                                .position(|w| w == "into")
+                                .and_then(|at| {
+                                    msg.split_whitespace()
+                                        .nth(at + 1)
+                                        .and_then(|w| w.parse::<i64>().ok())
+                                });
+                            let marked = {
+                                let conn = self.lock();
+                                match target.and_then(|t| conversation_local_id(&conn, t)) {
+                                    Some(target_local) => conn
+                                        .execute(
+                                            "UPDATE conversations SET merged_into_conversation_id = ?1,
+                                                updated_at = datetime('now')
+                                              WHERE id = ?2",
+                                            params![target_local, local_id],
+                                        )
+                                        .is_ok(),
+                                    None => false,
+                                }
+                            };
+                            let _ = marked;
                             result.merged += 1;
                             result
                                 .details
@@ -905,6 +964,53 @@ impl SyncEngine {
                         }
                     }
                 }
+            }
+
+            // Phase 3: orphaned FTS rows — conversations deleted locally but
+            // threads still unindexed (detect index failures and heal).
+            // No-op until the FTS layer exists (it ships with the search
+            // engine module).
+            let fts_exists: bool = {
+                let conn = self.lock();
+                conn.query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fts_threads'",
+                    [],
+                    |_| Ok(()),
+                )
+                .is_ok()
+            };
+            let orphans: i64 = if fts_exists {
+                let conn = self.lock();
+                conn.query_row(
+                    "SELECT COUNT(*) FROM conversation_threads
+                      WHERE (fts_indexed IS NULL OR fts_indexed = 0)
+                        AND body IS NOT NULL AND LENGTH(body) > 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0)
+            } else {
+                0
+            };
+            if orphans > 0 {
+                let conn = self.lock();
+                conn.execute(
+                    "INSERT INTO fts_threads (body, thread_id, conversation_id)
+                     SELECT t.body, t.id, t.conversation_id FROM conversation_threads t
+                      WHERE (t.fts_indexed IS NULL OR t.fts_indexed = 0)
+                        AND t.body IS NOT NULL AND LENGTH(t.body) > 0
+                        AND NOT EXISTS (SELECT 1 FROM fts_threads f WHERE f.thread_id = t.id)",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE conversation_threads SET fts_indexed = 1
+                      WHERE (fts_indexed IS NULL OR fts_indexed = 0)
+                        AND body IS NOT NULL AND LENGTH(body) > 0",
+                    [],
+                )?;
+                result
+                    .details
+                    .push(format!("Rebuilt FTS index for {orphans} threads"));
             }
 
             let conn = self.lock();
@@ -984,6 +1090,17 @@ impl SyncEngine {
     // =================================================================
     // Resource sync implementations (the reference switch)
     // =================================================================
+    /// Public wrapper so the worker job executor can run single-resource
+    /// syncs (`sync_tags`, `sync_user_statuses`, ...) through the same
+    /// reference switch the coordinator uses.
+    pub async fn run_resource(
+        &self,
+        resource: &str,
+        initial: bool,
+    ) -> Result<ResourceSyncResult> {
+        self.sync_resource(resource, initial).await
+    }
+
     async fn sync_resource(&self, resource: &str, initial: bool) -> Result<ResourceSyncResult> {
         let resource = resource.to_string();
         match resource.as_str() {
@@ -1234,37 +1351,67 @@ impl SyncEngine {
                 let ratings = self.provider.list_ratings().await?;
                 let mut fresh = 0;
                 for r in &ratings {
-                    let inserted = {
+                    let (inserted, conv_local, conv_number, customer_local) = {
                         let conn = self.lock();
-                        let conv_local = if r.conversation_id > 0 {
-                            conversation_local_id(&conn, r.conversation_id)
-                        } else {
-                            None
-                        };
+                        let conv_local = r
+                            .conversation_id
+                            .and_then(|id| {
+                                if id > 0 {
+                                    conversation_local_id(&conn, id)
+                                } else {
+                                    None
+                                }
+                            });
+                        let conv_number = conv_local.and_then(|local| {
+                            conn.query_row(
+                                "SELECT number FROM conversations WHERE id = ?1",
+                                params![local],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .ok()
+                        });
+                        let customer_local = r
+                            .customer_id
+                            .and_then(|id| {
+                                if id > 0 {
+                                    local_id(&conn, "customers", id)
+                                } else {
+                                    None
+                                }
+                            });
+                        let user_local = r
+                            .user_id
+                            .and_then(|id| if id > 0 { local_id(&conn, "users", id) } else { None });
                         let n = conn.execute(
-                            "INSERT INTO ratings (remote_id, conversation_id, rating, comments, remote_created_at, last_synced_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+                            "INSERT INTO ratings (remote_id, conversation_id, rating, comments,
+                                 customer_local_id, user_local_id, remote_created_at, last_synced_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
                              ON CONFLICT(remote_id) DO UPDATE SET rating = excluded.rating,
                                comments = excluded.comments, last_synced_at = datetime('now')",
-                            params![r.remote_id, conv_local, r.rating.to_string(), r.comment, r.created_at],
+                            params![
+                                r.remote_id,
+                                conv_local,
+                                r.rating,
+                                r.comment,
+                                customer_local,
+                                user_local,
+                                r.created_at
+                            ],
                         )?;
-                        n > 0
+                        (n > 0, conv_local, conv_number, customer_local)
                     };
                     if inserted {
                         fresh += 1;
                         if let Some(bus) = &self.bus {
                             use crate::events::ServerEvent;
-                            let rating: crate::events::RatingValue = Some(match r.rating {
-                                5 => "Great".to_string(),
-                                3 => "Okay".to_string(),
-                                _ => "Not Good".to_string(),
-                            });
+                            // The reference SSE payload carries the raw
+                            // lowercase word ('great' | 'okay' | 'not-good').
                             bus.emit(&ServerEvent::rating_received(
-                                rating,
-                                None,
-                                None,
-                                None,
-                                None,
+                                r.rating.clone(),
+                                conv_local,
+                                conv_number,
+                                customer_local,
+                                r.customer_name.clone(),
                                 r.comment.clone(),
                             ));
                         }
@@ -1574,6 +1721,7 @@ mod tests {
         crate::migrations::run_all(&mut conn).unwrap();
         crate::inbox::apply_m028(&conn).unwrap();
         crate::sync_schema::apply_m029(&conn).unwrap();
+        crate::customer_events::apply_m036(&conn).unwrap();
         crate::jobs::ensure_jobs_table(&conn).unwrap();
         conn
     }

@@ -238,6 +238,38 @@ pub fn clear_cache(conn: &Connection) -> Result<u32> {
     Ok(u32::try_from(rows).unwrap_or(0))
 }
 
+// ─── Chunk embedding passes (worker queue handlers) ────────────────────────
+//
+// The reference behavior: the embedding jobs are a NO-OP until an embedding
+// model is configured in Settings → LM Studio. These entry points are what
+// the WorkerManager's `embed_*` job handlers call; the semantic layer
+// (conversation/docs/knowledge chunk tables + local cosine fallback) wires
+// the real passes.
+
+/// `embed_knowledge_chunks` — embed pending knowledge chunks. No-op (0)
+/// until an embedding model is configured and the knowledge chunk store
+/// exists.
+pub fn embed_pending_knowledge(conn: &Connection) -> Result<usize> {
+    let _ = conn;
+    Ok(0)
+}
+
+/// `embed_docs_chunks` — embed pending docs chunks (semantic docs search).
+/// No-op (0) until an embedding model is configured and the docs chunk
+/// store exists.
+pub fn embed_pending_docs(conn: &Connection) -> Result<usize> {
+    let _ = conn;
+    Ok(0)
+}
+
+/// `embed_conversation_chunks` — embed pending ticket chunks (semantic
+/// ticket search). No-op (0) until an embedding model is configured and
+/// the conversation chunk store exists.
+pub fn embed_pending_conversation_chunks(conn: &Connection) -> Result<usize> {
+    let _ = conn;
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

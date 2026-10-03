@@ -146,6 +146,7 @@ mod tests {
             sync: None,
             real: None,
             provider_kind: "fake".into(),
+            workers: None,
         }
     }
 

@@ -141,9 +141,14 @@ pub struct HsDocArticle {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HsRating {
     pub remote_id: i64,
-    pub conversation_id: i64,
-    pub rating: u32,
+    pub conversation_id: Option<i64>,
+    pub thread_id: Option<i64>,
+    /// The reference vocabulary: 'great' | 'okay' | 'not-good' (or null).
+    pub rating: Option<String>,
     pub comment: Option<String>,
+    pub customer_id: Option<i64>,
+    pub customer_name: Option<String>,
+    pub user_id: Option<i64>,
     pub created_at: Option<String>,
 }
 
@@ -340,6 +345,14 @@ pub trait HelpScoutProvider: Send + Sync {
 
     /// List CSAT ratings (M2-T10). Used by the ratings watcher poller.
     async fn list_ratings(&self) -> Result<Vec<HsRating>>;
+
+    /// Fetch one rating by remote id (`GET /v2/ratings/:id`). The real
+    /// provider maps the full reference shape; the fake returns None (its
+    /// ratings are always listed) and a default keeps bounded implementors
+    /// compiling.
+    async fn get_rating(&self, _rating_id: i64) -> Result<Option<HsRating>> {
+        Ok(None)
+    }
 
     // -----------------------------------------------------------------
     // Extended resource surface (reference provider.ts). Default impls
@@ -991,27 +1004,39 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
     }
 
     async fn list_ratings(&self) -> Result<Vec<HsRating>> {
-        // Fake: return 3 demo ratings (mix of 5-star and 3-star).
+        // Fake: return 3 demo ratings in the reference word vocabulary.
         Ok(vec![
             HsRating {
                 remote_id: 7001,
-                conversation_id: 1001,
-                rating: 5,
+                conversation_id: Some(1001),
+                thread_id: None,
+                rating: Some("great".into()),
                 comment: Some("Great support!".into()),
+                customer_id: Some(101),
+                customer_name: Some("Demo Customer".into()),
+                user_id: None,
                 created_at: Some("2026-01-10T12:00:00Z".into()),
             },
             HsRating {
                 remote_id: 7002,
-                conversation_id: 1002,
-                rating: 3,
+                conversation_id: Some(1002),
+                thread_id: None,
+                rating: Some("okay".into()),
                 comment: Some("It was okay.".into()),
+                customer_id: Some(102),
+                customer_name: Some("Another Customer".into()),
+                user_id: None,
                 created_at: Some("2026-01-11T15:00:00Z".into()),
             },
             HsRating {
                 remote_id: 7003,
-                conversation_id: 1004,
-                rating: 5,
+                conversation_id: Some(1004),
+                thread_id: None,
+                rating: Some("great".into()),
                 comment: None,
+                customer_id: Some(103),
+                customer_name: None,
+                user_id: None,
                 created_at: Some("2026-01-12T09:00:00Z".into()),
             },
         ])
@@ -1325,8 +1350,8 @@ mod tests {
         let p = provider();
         let ratings = p.list_ratings().await.unwrap();
         assert_eq!(ratings.len(), 3);
-        assert_eq!(ratings[0].rating, 5);
-        assert_eq!(ratings[1].rating, 3);
+        assert_eq!(ratings[0].rating.as_deref(), Some("great"));
+        assert_eq!(ratings[1].rating.as_deref(), Some("okay"));
         assert!(ratings[2].comment.is_none());
     }
 }

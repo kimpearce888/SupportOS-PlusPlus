@@ -59,6 +59,70 @@ fn escape_fts5_query(query: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+/// Atomic rebuild of the FTS indexes (the `rebuild_search_index`
+/// maintenance job). Wiping FTS outside a transaction would leave search
+/// empty or degraded if the process died mid-rebuild, so everything runs
+/// inside one. Returns the number of conversations re-indexed.
+pub fn rebuild_indexes(conn: &Connection) -> Result<usize> {
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> Result<usize> {
+        conn.execute("DELETE FROM conversations_fts", [])?;
+        conn.execute("DELETE FROM customers_fts", [])?;
+        let rows: Vec<(i64, Option<String>, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT remote_id, subject, preview FROM conversations WHERE deleted_at IS NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        for (remote_id, subject, preview) in &rows {
+            conn.execute(
+                "INSERT INTO conversations_fts (remote_id, subject, preview) VALUES (?1, ?2, ?3)",
+                params![remote_id, subject, preview],
+            )?;
+        }
+        let customers: Vec<(i64, Option<String>, Option<String>, Option<String>, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT remote_id, first_name, last_name, email, organization FROM customers WHERE deleted_at IS NULL",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        for (remote_id, first, last, email, org) in &customers {
+            conn.execute(
+                "INSERT INTO customers_fts (remote_id, first_name, last_name, email, organization)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![remote_id, first, last, email, org],
+            )?;
+        }
+        Ok(rows.len())
+    })();
+    match result {
+        Ok(n) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(n)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 /// Search conversations + customers in one query.
 /// Returns results sorted by relevance (FTS5 rank).
 pub fn universal_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>> {
