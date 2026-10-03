@@ -120,6 +120,11 @@ pub fn upsert_tag(conn: &Connection, t: &HsTag) -> Result<()> {
 /// same way; when a mirror row is missing (the reference writes NULL, the
 /// port's columns are NOT NULL) the remote id is kept so the landing never
 /// drops a conversation.
+///
+/// The v1.3.0 channel columns (`type`, `source_type`, `source_via`), the
+/// `state`, `thread_count` and `snoozed_until` columns persist with the row
+/// (reference migration 001/007 columns) so Beacon chats keep their channel
+/// attribution in the mirror.
 pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> {
     let mailbox_local = crate::sync_engine::local_id(conn, "mailboxes", c.mailbox_id);
     let customer_local = if c.customer_id > 0 {
@@ -132,27 +137,38 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
         .filter(|rid| *rid > 0)
         .and_then(|rid| crate::sync_engine::local_id(conn, "users", rid));
     conn.execute(
-        "INSERT INTO conversations (remote_id, number, subject, preview, status, mailbox_id,
-            assignee_id, customer_id, priority, created_at, updated_at, closed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "INSERT INTO conversations (remote_id, number, subject, preview, status, state, type,
+            source_type, source_via, mailbox_id, assignee_id, customer_id, priority, created_at,
+            updated_at, closed_at, snoozed_until, thread_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(remote_id) DO UPDATE SET
             number = excluded.number,
             subject = excluded.subject,
             preview = excluded.preview,
             status = excluded.status,
+            state = excluded.state,
+            type = excluded.type,
+            source_type = excluded.source_type,
+            source_via = excluded.source_via,
             mailbox_id = excluded.mailbox_id,
             assignee_id = excluded.assignee_id,
             customer_id = excluded.customer_id,
             priority = excluded.priority,
             created_at = excluded.created_at,
             updated_at = excluded.updated_at,
-            closed_at = excluded.closed_at",
+            closed_at = excluded.closed_at,
+            snoozed_until = excluded.snoozed_until,
+            thread_count = excluded.thread_count",
         params![
             c.remote_id,
             c.number,
             c.subject,
             c.preview,
             c.status,
+            c.state,
+            c.kind,
+            c.source_type,
+            c.source_via,
             mailbox_local.unwrap_or(c.mailbox_id),
             assignee_local,
             customer_local.unwrap_or(c.customer_id),
@@ -160,6 +176,8 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
             c.created_at,
             c.updated_at,
             c.closed_at,
+            c.snoozed_until,
+            c.thread_count,
         ],
     )?;
     // Mirror the reference's per-conversation tags (conversation_tags join).
@@ -224,8 +242,9 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
+        // The canonical boot chain — conversations.state/type/source_* land
+        // with the later batches, so the upserts need the full chain.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 
@@ -259,16 +278,25 @@ mod tests {
         let c = HsConversation {
             remote_id: 1001,
             number: 1001,
+            kind: Some("email".into()),
+            source_type: None,
+            source_via: None,
             subject: Some("Test".into()),
             preview: Some("Preview".into()),
             status: "active".into(),
+            state: Some("published".into()),
             mailbox_id: 101,
             assignee_id: Some(1),
+            assignee_type: Some("user".into()),
+            assigned_team_id: None,
             customer_id: 2001,
             priority: None,
             created_at: Some("2026-01-01T00:00:00Z".into()),
             updated_at: Some("2026-01-01T12:00:00Z".into()),
             closed_at: None,
+            snoozed_until: None,
+            thread_count: 2,
+            merged_into: None,
             tags: vec!["timezone".into(), "vip".into()],
         };
         upsert_conversation(&conn, &c).unwrap();
@@ -282,6 +310,17 @@ mod tests {
             .unwrap();
         assert_eq!(subject, Some("Test".into()));
         assert_eq!(status, "active");
+        // The v1.3.0 channel + state/thread-count columns persist.
+        let (kind, state, thread_count): (Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT type, state, thread_count FROM conversations WHERE remote_id = 1001",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, Some("email".into()));
+        assert_eq!(state, Some("published".into()));
+        assert_eq!(thread_count, 2);
     }
 
     #[test]
@@ -334,6 +373,18 @@ mod tests {
                 phone: None,
                 created_at: None,
                 updated_at: None,
+                photo_url: None,
+                organization_id: None,
+                background: None,
+                age: None,
+                gender: None,
+                location: None,
+                emails: vec![],
+                phones: vec![],
+                websites: vec![],
+                social_profiles: vec![],
+                address: None,
+                properties: vec![],
             },
         )
         .unwrap();
@@ -342,16 +393,25 @@ mod tests {
             &HsConversation {
                 remote_id: 1001,
                 number: 1001,
+                kind: None,
+                source_type: None,
+                source_via: None,
                 subject: Some("Local ids".into()),
                 preview: None,
                 status: "active".into(),
+                state: None,
                 mailbox_id: 101,
                 assignee_id: Some(1),
+                assignee_type: None,
+                assigned_team_id: None,
                 customer_id: 2001,
                 priority: None,
                 created_at: None,
                 updated_at: None,
                 closed_at: None,
+                snoozed_until: None,
+                thread_count: 0,
+                merged_into: None,
                 tags: vec![],
             },
         )
@@ -406,16 +466,25 @@ mod tests {
             &HsConversation {
                 remote_id: 1002,
                 number: 1002,
+                kind: None,
+                source_type: None,
+                source_via: None,
                 subject: None,
                 preview: None,
                 status: "active".into(),
+                state: None,
                 mailbox_id: 101,
                 assignee_id: None,
+                assignee_type: None,
+                assigned_team_id: None,
                 customer_id: 2002,
                 priority: None,
                 created_at: None,
                 updated_at: None,
                 closed_at: None,
+                snoozed_until: None,
+                thread_count: 0,
+                merged_into: None,
                 tags: vec![],
             },
         )
@@ -444,6 +513,18 @@ mod tests {
             phone: Some("+1-555-0001".into()),
             created_at: Some("2026-01-01T00:00:00Z".into()),
             updated_at: Some("2026-01-01T00:00:00Z".into()),
+            photo_url: None,
+            organization_id: None,
+            background: None,
+            age: None,
+            gender: None,
+            location: None,
+            emails: vec![],
+            phones: vec![],
+            websites: vec![],
+            social_profiles: vec![],
+            address: None,
+            properties: vec![],
         };
         upsert_customer(&conn, &c).unwrap();
 

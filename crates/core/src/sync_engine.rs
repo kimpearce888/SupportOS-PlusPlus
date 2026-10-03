@@ -447,13 +447,14 @@ fn upsert_thread(conn: &Connection, conversation_local: i64, t: &HsThread) -> Re
         ("system", 0)
     };
     conn.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id, created_at, remote_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at, remote_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(remote_id) DO UPDATE SET
             conversation_id = excluded.conversation_id, thread_type = excluded.thread_type,
+            state = excluded.state,
             body = excluded.body, actor_type = excluded.actor_type, actor_id = excluded.actor_id,
             created_at = excluded.created_at",
-        params![conversation_local, t.kind, t.body, actor_type, actor_id, t.created_at, t.remote_id],
+        params![conversation_local, t.kind, t.state, t.body, actor_type, actor_id, t.created_at, t.remote_id],
     )?;
     Ok(())
 }
@@ -1727,12 +1728,10 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        crate::inbox::apply_m028(&conn).unwrap();
-        crate::sync_schema::apply_m029(&conn).unwrap();
-        crate::customer_events::apply_m036(&conn).unwrap();
-        crate::jobs::ensure_jobs_table(&conn).unwrap();
+        // The canonical boot chain: the conversations mirror columns the
+        // upserts write (state/type/source_*/thread_count/snoozed_until) and
+        // the M029/M036/M040 resource tables all land through it.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 
@@ -1771,12 +1770,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mailboxes, 2);
-        assert_eq!(users, 3);
+        assert_eq!(users, 4, "3 agents + the 9001 system user");
         assert_eq!(tags, 14);
         assert_eq!(orgs, 2);
         assert_eq!(folders, 4);
-        assert!(fields >= 3);
-        // Conversations + threads mirrored.
+        assert_eq!(fields, 4, "3 on Support + 1 on Billing");
+        // Conversations + threads mirrored: 21 world conversations, one merged
+        // away from listings (fakeProvider.ts:143) → 20 rows; 48 threads.
         let (convs, threads): (i64, i64) = conn
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM conversations), (SELECT COUNT(*) FROM conversation_threads)",
@@ -1784,8 +1784,8 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(convs, 10);
-        assert_eq!(threads, 20);
+        assert_eq!(convs, 20);
+        assert_eq!(threads, 48);
         // Every conversation's customer/assignee references resolve to
         // local mirror rows (the reference maps remote ids to local ids
         // before writing; dangling ids broke customer timelines, search
@@ -1816,7 +1816,9 @@ mod tests {
             dangling_assignee, 0,
             "conversations must reference local user ids"
         );
-        // Saved replies / workflows / docs mirrored.
+        // Saved replies / workflows / docs mirrored: 5 saved replies (the
+        // fake returns all five for every mailbox; upserts dedupe by remote
+        // id), 3 workflows, 9 docs articles (2 collections).
         let (replies, workflows, docs): (i64, i64, i64) = conn
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM saved_replies), (SELECT COUNT(*) FROM workflows),
@@ -1825,9 +1827,21 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(replies, 3);
+        assert_eq!(replies, 5);
         assert_eq!(workflows, 3);
-        assert_eq!(docs, 3);
+        assert_eq!(docs, 9);
+        // Beacon chats land as type='chat' conversations with their source
+        // attribution preserved (fakeData.ts chatSession shape).
+        let (chats, sources): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM conversations WHERE type = 'chat'),
+                        (SELECT COUNT(*) FROM conversations WHERE source_via = 'beacon')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(chats, 6);
+        assert_eq!(sources, 6);
         // Checkpoints recorded for every resource with ok status.
         let ok: i64 = conn
             .query_row(
@@ -1874,7 +1888,8 @@ mod tests {
         let result = engine.reconcile().await.unwrap();
         assert_eq!(result.added, 0);
         assert_eq!(result.failed, 0);
-        assert!(result.checked >= 10);
+        // 20 remote listings + 20 local rows all accounted for.
+        assert_eq!(result.checked, 40);
         let conn = conn.lock().unwrap();
         assert_eq!(get_state(&conn), "LIVE");
     }
@@ -1894,18 +1909,20 @@ mod tests {
     async fn single_conversation_sync_refreshes() {
         let (conn, engine) = engine();
         engine.initial_sync().await.unwrap();
-        let ok = engine.sync_single_conversation(1001).await.unwrap();
+        // Demo-world remote id of conversation #5001 (c1, the Lucía timezone
+        // ticket — 3 threads).
+        let ok = engine.sync_single_conversation(105_000).await.unwrap();
         assert!(ok);
         let conn = conn.lock().unwrap();
         let threads: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM conversation_threads WHERE conversation_id =
-                   (SELECT id FROM conversations WHERE remote_id = 1001)",
+                   (SELECT id FROM conversations WHERE remote_id = 105000)",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(threads, 2);
+        assert_eq!(threads, 3);
     }
 
     #[tokio::test]

@@ -300,9 +300,17 @@ fn upsert_document(
             conn.last_insert_rowid()
         }
     };
-    // Chunk (delete+insert; self-debouncing like the reference).
+    // Chunk (delete+insert; self-debouncing like the reference) + the FTS
+    // rows per chunk — the reference knowledgeRepo.upsertDocument maintains
+    // fts_knowledge in the same pass, and the gap engine's knowledgeHits()
+    // reads that index.
     conn.execute(
         "DELETE FROM knowledge_chunks WHERE document_id = ?1",
+        rusqlite::params![id],
+    )
+    .ok();
+    conn.execute(
+        "DELETE FROM fts_knowledge WHERE document_id = ?1",
         rusqlite::params![id],
     )
     .ok();
@@ -315,6 +323,13 @@ fn upsert_document(
             "INSERT INTO knowledge_chunks (document_id, chunk_index, content)
              VALUES (?1, ?2, ?3)",
             rusqlite::params![id, index as i64, chunk],
+        )
+        .ok();
+        let chunk_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO fts_knowledge (title, content, chunk_id, document_id, visibility)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![title, chunk, chunk_id, id, visibility],
         )
         .ok();
     }
@@ -386,20 +401,53 @@ struct KnownIssueSeed<'a> {
     conversation_ids: Vec<i64>,
 }
 
+/// `issues.addEngineeringRef` — a linear reference on a known issue.
+fn add_engineering_ref(conn: &Connection, known_issue_id: i64, reference_id: &str, title: &str) {
+    conn.execute(
+        "INSERT INTO known_issue_refs (known_issue_id, system, reference_id, title, status)
+         VALUES (?1, 'linear', ?2, ?3, 'in progress')",
+        rusqlite::params![known_issue_id, reference_id, title],
+    )
+    .ok();
+}
+
 fn save_analysis(
     conn: &Connection,
     conv_id: i64,
     analysis: &serde_json::Value,
     sources: &[serde_json::Value],
+    latency_ms: i64,
 ) {
-    // ai_runs row (the run record), then extracted facts + sources.
+    // ai_runs row (the run record), then extracted facts + sources. The run
+    // carries the reference's run metadata (type 'ticket_analysis', the
+    // conversation, completed status + latency) so the gap engine's
+    // repeated-question detection can read it back exactly like the
+    // reference's aiRepo.startRun/completeRun path.
     let input_hash = format!("seed:{conv_id}");
+    // Re-run safety: the reference never calls seedDemoData twice on one DB
+    // (index.ts guards on the empty mirror), and its startRun has no dedup —
+    // the port's seed is count-safe instead, so a repeated seed skips runs
+    // whose input hash already landed.
+    let already: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ai_runs WHERE input_hash = ?1 AND status = 'completed'",
+            rusqlite::params![input_hash],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if already > 0 {
+        return;
+    }
     conn.execute(
-        "INSERT INTO ai_runs (input_hash, prompt_version, model, response_json)
-         VALUES (?1, 'ticket_analysis_v1', 'demo_seed', ?2)",
+        "INSERT INTO ai_runs (input_hash, prompt_version, model, response_json, type,
+             conversation_id, status, latency_ms, provenance)
+         VALUES (?1, 'ticket_analysis_v1', 'demo_seed', ?2, 'ticket_analysis', ?3,
+             'completed', ?4, 'ai_generated')",
         rusqlite::params![
             input_hash,
-            serde_json::to_string(analysis).unwrap_or_default()
+            serde_json::to_string(analysis).unwrap_or_default(),
+            conv_id,
+            latency_ms
         ],
     )
     .ok();
@@ -446,6 +494,1116 @@ fn save_analysis(
         )
         .ok();
     }
+}
+
+// ─── Quality-layer derivations (demoSeed.ts v2.1.0/M5) ─────────────────────
+//
+// Interaction outcomes, friction findings, post-resolution QA and
+// knowledge-gap candidates are DETERMINISTIC derivations over the mirrored
+// demo world — the same formulas the reference engines run on demand.
+
+/// A published thread of one conversation, text already HTML-stripped.
+struct ThreadLite {
+    thread_id: i64,
+    kind: String,
+    text: String,
+    at: Option<String>,
+}
+
+/// Reference shared/utils.ts `htmlToText`.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut tag_name = String::new();
+    for c in html.chars() {
+        if in_tag {
+            if c == '>' {
+                in_tag = false;
+                let tag = tag_name.trim().to_lowercase();
+                // Block-closing tags and <br> become newlines (reference
+                // htmlToText); every other tag collapses to a space.
+                if tag == "br"
+                    || tag == "/p"
+                    || tag == "/div"
+                    || tag == "/li"
+                    || tag.starts_with("/h")
+                    || tag == "/tr"
+                {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                tag_name.clear();
+            } else {
+                tag_name.push(c);
+            }
+        } else if c == '<' {
+            in_tag = true;
+        } else {
+            out.push(c);
+        }
+    }
+    out.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+/// Reference ai/interaction/engine.ts `isClosingAcknowledgment`: a pure
+/// closing acknowledgment ("thanks, that worked") is not customer effort.
+fn is_closing_acknowledgment(text: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)still|again|but\b|however|issue|problem|not work|broken|error|fail|doesn'?t|didn'?t|can'?t|cannot",
+        )
+        .expect("closing-ack exclusion regex")
+    });
+    let start = START.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^(thanks|thank you|thankyou|thx|appreciate|that (is|was|'s|sounds|seems) (exactly |just |very )?(what i|great|perfect|helpful|awesome|amazing|clear)|perfect|great|works|working|resolved|closing|closed|all set|confirmed|done|sorted)",
+        )
+        .expect("closing-ack start regex")
+    });
+    let t = text.trim();
+    if t.is_empty() || t.chars().count() > 400 || t.contains('?') {
+        return false;
+    }
+    if re.is_match(t) {
+        return false;
+    }
+    start.is_match(t)
+}
+
+/// The published threads of one conversation, oldest first (reference
+/// engines read `threads ... state = 'published' ORDER BY remote_created_at`).
+fn published_threads(conn: &Connection, conversation_local: i64) -> Vec<ThreadLite> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, thread_type, COALESCE(body, ''), created_at FROM conversation_threads
+         WHERE conversation_id = ?1 AND state = 'published'
+         ORDER BY created_at ASC",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map(rusqlite::params![conversation_local], |r| {
+        Ok(ThreadLite {
+            thread_id: r.get(0)?,
+            kind: r.get(1)?,
+            text: html_to_text(&r.get::<_, String>(2)?),
+            at: r.get(3)?,
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Reference ai/interaction/engine.ts `computeOutcome` — the deterministic
+/// client-support-outcome layer. The port's `friction_scores` table is the
+/// documented client_support_outcomes analog, so the outcome row lands there
+/// (remote conversation id, like `compute_friction`), with the full reference
+/// outcome shape in `factors_json` and the effort score scaled to the port's
+/// 0-1 column convention (the reference scale is 0-10).
+fn seed_interaction_outcomes(conn: &Connection) -> usize {
+    static CLARIFY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ESCAL_NOTE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ESCAL_REPLY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static STYLE_STEPS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let clarify = CLARIFY.get_or_init(|| {
+        regex::Regex::new(r"(?i)still|again|re-?send|clarif|you didn'?t|that didn'?t|not what i|same issue|as i (said|mentioned|wrote)")
+            .expect("clarification regex")
+    });
+    let escal_note = ESCAL_NOTE.get_or_init(|| {
+        regex::Regex::new(r"(?i)escalat|urgent|priority|vip").expect("escalation note regex")
+    });
+    let escal_reply = ESCAL_REPLY
+        .get_or_init(|| regex::Regex::new(r"(?i)escalat").expect("escalation reply regex"));
+    let style_steps = STYLE_STEPS.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(step|first|then|next|finally)\b|1\.").expect("style regex")
+    });
+
+    let ids: Vec<i64> = {
+        let Ok(mut stmt) = conn.prepare("SELECT id FROM conversations WHERE deleted_at IS NULL")
+        else {
+            return 0;
+        };
+        stmt.query_map([], |r| r.get(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+    let mut written = 0;
+    for local in ids {
+        let Ok((remote_id, status, customer_local)) = conn.query_row(
+            "SELECT remote_id, status, customer_id FROM conversations WHERE id = ?1",
+            rusqlite::params![local],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        ) else {
+            continue;
+        };
+        let threads = published_threads(conn, local);
+        let customer: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "customer").collect();
+        let replies: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "reply").collect();
+        let notes: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "note").collect();
+        // Without customer messages the reference stores a null effort score;
+        // the port's column is NOT NULL, so the row is skipped instead.
+        if customer.is_empty() {
+            continue;
+        }
+        // Follow-ups: customer messages after the first reply that are not
+        // closing acknowledgments.
+        let mut saw_reply = false;
+        let mut follow_ups = 0u32;
+        for t in &threads {
+            if t.kind == "reply" {
+                saw_reply = true;
+            } else if t.kind == "customer" && saw_reply && !is_closing_acknowledgment(&t.text) {
+                follow_ups += 1;
+            }
+        }
+        // Clarifications: customer asks for clarification or repeats issue phrasing.
+        let clarifications = customer[1..]
+            .iter()
+            .filter(|t| clarify.is_match(&t.text))
+            .count() as u32;
+        let escalated = notes.iter().any(|n| escal_note.is_match(&n.text))
+            || replies.iter().any(|r| escal_reply.is_match(&r.text));
+        let resolved_after_first: serde_json::Value = if replies.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(follow_ups == 0 && status == "closed")
+        };
+        // Effort score (spec #52): support friction, 0 (low) .. 10 (high).
+        let effort = (customer.len() as f64 * 1.2
+            + follow_ups as f64 * 1.5
+            + clarifications as f64 * 2.0
+            + f64::from(escalated) * 2.0)
+            .min(10.0);
+        let effort_score = (effort * 10.0).round() / 10.0; // toFixed(1)
+        let friction = if effort_score >= 6.0 {
+            "high"
+        } else if effort_score >= 3.5 {
+            "moderate"
+        } else {
+            "none"
+        };
+        // Response style classifier (spec #16).
+        let joined = replies
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let response_style: serde_json::Value = if replies.is_empty() {
+            serde_json::Value::Null
+        } else {
+            let avg = joined.chars().count() as f64 / replies.len() as f64;
+            serde_json::json!(if avg > 700.0 {
+                "detailed_explanation"
+            } else if style_steps.is_match(&joined) {
+                "step_by_step"
+            } else if avg < 200.0 {
+                "short_answer"
+            } else {
+                "direct_answer_with_explanation"
+            })
+        };
+        let factors = serde_json::json!({
+            "follow_up_count": follow_ups,
+            "clarification_count": clarifications,
+            "escalated": escalated,
+            "resolved_after_first_response": resolved_after_first,
+            "response_style": response_style,
+            "friction": friction,
+            "effort_score": effort_score,
+        });
+        // The reference upserts client_support_outcomes by conversation; the
+        // port's friction_scores has no unique key, so an existing outcome
+        // row (kind IS NULL) is refreshed in place — repeated seeds stay
+        // count-safe.
+        let changed = conn
+            .execute(
+                "UPDATE friction_scores SET customer_local_id = ?2, effort_score = ?3,
+                     factors_json = ?4
+                 WHERE conversation_id = ?1 AND kind IS NULL",
+                rusqlite::params![
+                    remote_id,
+                    customer_local,
+                    (effort_score / 10.0).min(1.0),
+                    factors.to_string()
+                ],
+            )
+            .unwrap_or(0);
+        if changed == 0 {
+            conn.execute(
+                "INSERT INTO friction_scores (conversation_id, customer_local_id, effort_score, factors_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    remote_id,
+                    customer_local,
+                    (effort_score / 10.0).min(1.0),
+                    factors.to_string()
+                ],
+            )
+            .ok();
+        }
+        written += 1;
+    }
+    written
+}
+
+/// Reference friction.ts `repeatedSpans` — a >= `span_words`-word normalized
+/// span appearing in >= `min_msgs` separate messages of one author.
+fn repeated_customer_span(
+    msgs: &[&ThreadLite],
+    span_words: usize,
+    min_msgs: usize,
+) -> Option<(String, Vec<i64>)> {
+    let normalize = |text: &str| -> Vec<String> {
+        text.to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .filter(|w| w.chars().count() > 1)
+            .map(String::from)
+            .collect()
+    };
+    let normalized: Vec<(i64, Vec<String>, String)> = msgs
+        .iter()
+        .map(|m| {
+            let words = normalize(&m.text);
+            let joined = words.join(" ");
+            (m.thread_id, words, joined)
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for (i, (_, words, _)) in normalized.iter().enumerate() {
+        if words.len() < span_words {
+            continue;
+        }
+        for start in 0..=(words.len() - span_words) {
+            let span = words[start..start + span_words].join(" ");
+            if !seen.insert(span.clone()) {
+                continue;
+            }
+            let mut hits = vec![normalized[i].0];
+            for (tid, _, joined) in normalized.iter().skip(i + 1) {
+                if joined.contains(&span) {
+                    hits.push(*tid);
+                }
+            }
+            if hits.len() >= min_msgs {
+                return Some((span, hits));
+            }
+        }
+    }
+    None
+}
+
+/// A related-conversation row for the repeated_unresolved_interactions
+/// pattern (id, number, subject, status, created_at).
+type RelatedConversation = (i64, i64, Option<String>, String, Option<String>);
+
+/// Whether a finding of this kind is already stored for the conversation
+/// (the reference upserts friction_findings on (conversation_id, kind); the
+/// port's merged table has no unique key, so the seed checks first).
+fn friction_kind_exists(conn: &Connection, conversation_id: i64, kind: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM friction_scores WHERE conversation_id = ?1 AND kind = ?2",
+        rusqlite::params![conversation_id, kind],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+/// Reference friction.ts `rebuild()` — findings for every conversation with
+/// a customer message. The port ships the evidence-pinned detections the
+/// demo world can exercise (the two span kinds plus the customer-level
+/// repeated_unresolved_interactions pattern; troubleshooting_loop,
+/// repeated_handoffs and duplicated_information_requests derive zero rows
+/// over the demo world, same as the reference engine); rows persist in
+/// `friction_scores` with `kind` set (the merged friction_findings analog,
+/// upserted by conversation+kind like the reference).
+fn seed_friction_findings(conn: &Connection) -> (usize, usize) {
+    let ids: Vec<i64> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT c.id FROM conversations c
+             JOIN conversation_threads t ON t.conversation_id = c.id AND t.thread_type = 'customer'
+             WHERE c.deleted_at IS NULL",
+        ) else {
+            return (0, 0);
+        };
+        stmt.query_map([], |r| r.get(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+    let mut findings = 0usize;
+    for local in &ids {
+        let Ok((remote_id, _number, customer_local)) = conn.query_row(
+            "SELECT remote_id, number, customer_id FROM conversations WHERE id = ?1",
+            rusqlite::params![local],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        ) else {
+            continue;
+        };
+        let threads = published_threads(conn, *local);
+        let customer: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "customer").collect();
+        let agent: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "reply").collect();
+
+        // Kind 1: repeated_customer_explanations — a >=6-word span repeated
+        // across >=2 customer messages.
+        if let Some((span, thread_ids)) = repeated_customer_span(&customer, 6, 2) {
+            if !friction_kind_exists(conn, remote_id, "repeated_customer_explanations") {
+                let evidence: Vec<serde_json::Value> = customer
+                    .iter()
+                    .filter(|m| thread_ids.contains(&m.thread_id))
+                    .map(|m| {
+                        serde_json::json!({
+                            "thread_id": m.thread_id, "author_type": "customer",
+                            "excerpt": m.text.chars().take(160).collect::<String>(), "at": m.at
+                        })
+                    })
+                    .collect();
+                conn.execute(
+                    "INSERT INTO friction_scores (conversation_id, customer_local_id, effort_score,
+                         kind, severity, evidence, detail)
+                     VALUES (?1, ?2, 0, 'repeated_customer_explanations', ?3, ?4, ?5)",
+                    rusqlite::params![
+                        remote_id,
+                        customer_local,
+                        if thread_ids.len() >= 3 { "high" } else { "moderate" },
+                        serde_json::to_string(&evidence).unwrap_or_default(),
+                        format!(
+                            "The customer re-stated the same 6+ word span across {} messages (\"{}\"). Detected by repeated-span matching across customer messages; a heuristic, not a judgment.",
+                            thread_ids.len(),
+                            span.chars().take(80).collect::<String>()
+                        )
+                    ],
+                )
+                .ok();
+                findings += 1;
+            }
+        }
+
+        // Kind 2: repeated_agent_questions — the same normalized question
+        // (>= 4 chars) asked by agents across >=2 replies.
+        let mut q_map: std::collections::HashMap<String, Vec<(i64, Option<String>)>> =
+            std::collections::HashMap::new();
+        for m in &agent {
+            for q in m
+                .text
+                .split(['?', '？'])
+                .map(|s| s.trim())
+                .filter(|q| !q.is_empty())
+            {
+                let norm = q
+                    .to_lowercase()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if norm.chars().count() >= 4 {
+                    q_map
+                        .entry(norm)
+                        .or_default()
+                        .push((m.thread_id, m.at.clone()));
+                }
+            }
+        }
+        if let Some((norm, hits)) = q_map.iter().max_by_key(|(_, v)| v.len()) {
+            if hits.len() >= 2 && !friction_kind_exists(conn, remote_id, "repeated_agent_questions")
+            {
+                let evidence: Vec<serde_json::Value> = hits
+                    .iter()
+                    .map(|(tid, at)| {
+                        let text = agent
+                            .iter()
+                            .find(|m| m.thread_id == *tid)
+                            .map(|m| m.text.chars().take(160).collect::<String>())
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "thread_id": tid, "author_type": "agent",
+                            "excerpt": text, "at": at
+                        })
+                    })
+                    .collect();
+                conn.execute(
+                    "INSERT INTO friction_scores (conversation_id, customer_local_id, effort_score,
+                         kind, severity, evidence, detail)
+                     VALUES (?1, ?2, 0, 'repeated_agent_questions', 'moderate', ?3, ?4)",
+                    rusqlite::params![
+                        remote_id,
+                        customer_local,
+                        serde_json::to_string(&evidence).unwrap_or_default(),
+                        format!(
+                            "Agents asked the same question {} times (\"{}\"). Detected by normalized question matching across agent replies; a heuristic, not a judgment.",
+                            hits.len(),
+                            norm.chars().take(80).collect::<String>()
+                        )
+                    ],
+                )
+                .ok();
+                findings += 1;
+            }
+        }
+
+        // Kind 5: repeated_unresolved_interactions (customer-level pattern)
+        // — >= 2 other conversations of the same customer, created within
+        // 90 days, sharing at least one tag with this one.
+        if let Some(customer_local) = customer_local {
+            let related: Vec<RelatedConversation> = {
+                let Ok(mut stmt) = conn.prepare(
+                    "SELECT c2.id, c2.number, c2.subject, c2.status, c2.created_at
+                     FROM conversations c2
+                     WHERE c2.customer_id = ?1 AND c2.deleted_at IS NULL AND c2.id <> ?2
+                       AND c2.created_at >= datetime('now', '-90 days')
+                       AND EXISTS (SELECT 1 FROM conversation_tags ct1
+                                   JOIN conversation_tags ct2 ON ct2.conversation_id = c2.id
+                                   JOIN tags tg ON tg.id = ct1.tag_id AND tg.id = ct2.tag_id
+                                   WHERE ct1.conversation_id = ?2)
+                     ORDER BY c2.created_at DESC LIMIT 10",
+                ) else {
+                    continue;
+                };
+                let rows = stmt.query_map(rusqlite::params![customer_local, local], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                });
+                match rows {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(_) => continue,
+                }
+            };
+            if related.len() >= 2
+                && !friction_kind_exists(conn, remote_id, "repeated_unresolved_interactions")
+            {
+                let shared_tag: Option<String> = conn
+                    .query_row(
+                        "SELECT tg.name FROM conversation_tags ct1
+                         JOIN conversation_tags ct2 ON ct2.conversation_id = ?1
+                         JOIN tags tg ON tg.id = ct1.tag_id AND tg.id = ct2.tag_id
+                         WHERE ct1.conversation_id = ?1 LIMIT 1",
+                        rusqlite::params![local],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let evidence: Vec<serde_json::Value> = related
+                    .iter()
+                    .take(4)
+                    .map(|(_, number, subject, status, at)| {
+                        serde_json::json!({
+                            "thread_id": 0, "author_type": "customer",
+                            "excerpt": format!(
+                                "Conversation #{number}: {} ({status})",
+                                subject.as_deref().unwrap_or("(no subject)")
+                            ),
+                            "at": at
+                        })
+                    })
+                    .collect();
+                conn.execute(
+                    "INSERT INTO friction_scores (conversation_id, customer_local_id, effort_score,
+                         kind, severity, evidence, detail)
+                     VALUES (?1, ?2, 0, 'repeated_unresolved_interactions', ?3, ?4, ?5)",
+                    rusqlite::params![
+                        remote_id,
+                        customer_local,
+                        if related.len() >= 3 { "high" } else { "moderate" },
+                        serde_json::to_string(&evidence).unwrap_or_default(),
+                        format!(
+                            "The customer opened {} conversations in the last 90 days sharing the tag{} - the same problem keeps returning. Customer-level pattern detected from the local mirror; association, not causation.",
+                            related.len() + 1,
+                            shared_tag
+                                .as_deref()
+                                .map(|t| format!(" \"{t}\""))
+                                .unwrap_or_default()
+                        )
+                    ],
+                )
+                .ok();
+                findings += 1;
+            }
+        }
+    }
+    (ids.len(), findings)
+}
+
+/// A closed-conversation row for the QA rebuild (id, remote_id, closed_at,
+/// created_at, first_response_at, customer_id, activity_history_complete).
+type ClosedConversationRow = (
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    i64,
+);
+
+/// Reference ai/postResolutionQa.ts `rebuild()` — the deterministic QA layer
+/// for every closed conversation.
+fn seed_post_resolution_qa(conn: &Connection) -> usize {
+    let closed: Vec<ClosedConversationRow> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, remote_id, closed_at, created_at, first_response_at, customer_id,
+                    activity_history_complete
+             FROM conversations WHERE deleted_at IS NULL AND status = 'closed'",
+        ) else {
+            return 0;
+        };
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+    let minutes_between = |later: &str, earlier: &str| -> Option<i64> {
+        let l = chrono::DateTime::parse_from_rfc3339(later).ok()?;
+        let e = chrono::DateTime::parse_from_rfc3339(earlier).ok()?;
+        let m = (l - e).num_minutes();
+        (m >= 0).then_some(m)
+    };
+    let mut written = 0;
+    for (local, remote_id, closed_at, created_at, first_response_at, _customer, history_complete) in
+        closed
+    {
+        let threads = published_threads(conn, local);
+        let customer: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "customer").collect();
+        let replies: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "reply").collect();
+        // Back-and-forth: customer messages after the first reply that are
+        // not closing acknowledgments (same semantics as the engine).
+        let mut saw_reply = false;
+        let mut back_and_forth = 0u32;
+        for t in &threads {
+            if t.kind == "reply" {
+                saw_reply = true;
+            } else if t.kind == "customer" && saw_reply && !is_closing_acknowledgment(&t.text) {
+                back_and_forth += 1;
+            }
+        }
+        // Repeated information: >= 6-word spans repeated across customer messages.
+        let mut repeated: Vec<serde_json::Value> = Vec::new();
+        if let Some((span, thread_ids)) = repeated_customer_span(&customer, 6, 2) {
+            let tid = thread_ids.first().copied().unwrap_or_default();
+            repeated.push(serde_json::json!({
+                "thread_id": tid,
+                "excerpt": span.chars().take(120).collect::<String>()
+            }));
+        }
+        // Messages after close (observable avoidable-follow-up signal).
+        let messages_after_close = closed_at.as_deref().map_or(0, |closed| {
+            customer
+                .iter()
+                .filter(|m| m.at.as_deref().is_some_and(|at| at > closed))
+                .count()
+        }) as u32;
+        // Handoffs from the local event history.
+        let handoffs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM activity_events
+                 WHERE conversation_id = ?1 AND event_type = 'assignment_changed'",
+                rusqlite::params![remote_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        // Coarse question count (sentences ending in '?').
+        let question_count: u32 = customer
+            .iter()
+            .map(|m| m.text.matches('?').count() as u32)
+            .sum();
+        // First response: prefer the maintained derived column; fall back to
+        // the first reply thread timestamp.
+        let first_reply_at = replies.first().and_then(|r| r.at.clone());
+        let first_response_stamp = first_response_at.or(first_reply_at);
+        let first_response_minutes = first_response_stamp
+            .as_deref()
+            .zip(created_at.as_deref())
+            .and_then(|(later, earlier)| minutes_between(later, earlier));
+        let resolution_minutes = closed_at
+            .as_deref()
+            .zip(created_at.as_deref())
+            .and_then(|(later, earlier)| minutes_between(later, earlier));
+        let history_complete = history_complete != 0;
+        let deterministic = serde_json::json!({
+            "conversation_local_id": local,
+            "closed": true,
+            "back_and_forth_count": back_and_forth,
+            "repeated_information_count": repeated.len(),
+            "repeated_information_evidence": repeated,
+            "messages_after_close": messages_after_close,
+            "handoff_count": handoffs,
+            "handoff_history_complete": history_complete,
+            "customer_question_count": question_count,
+            "agent_reply_count": replies.len(),
+            "first_response_minutes": first_response_minutes,
+            "resolution_minutes": resolution_minutes,
+            "computed_honestly": [
+                "Counts derive from the locally mirrored thread list; pre-sync edits are not reconstructable.",
+                "Repeated information is a repeated 6-word-span heuristic, not semantic understanding.",
+                format!("Handoff counts cover locally recorded events only{}",
+                    if history_complete { "" } else { " (pre-sync history unknown)" })
+            ]
+        });
+        conn.execute(
+            "DELETE FROM post_resolution_qa WHERE conversation_id = ?1",
+            rusqlite::params![local],
+        )
+        .ok();
+        conn.execute(
+            "INSERT INTO post_resolution_qa (conversation_id, deterministic) VALUES (?1, ?2)",
+            rusqlite::params![local, deterministic.to_string()],
+        )
+        .ok();
+        written += 1;
+    }
+    written
+}
+
+/// One repeated primary question across latest ticket_analysis runs.
+struct RepeatedQuestion {
+    question: String,
+    conversation_ids: Vec<i64>,
+    count: usize,
+}
+
+/// Reference gapEngine.ts `repeatedQuestions(days)` — primary questions from
+/// the latest completed ticket_analysis run per conversation, grouped.
+fn repeated_questions(conn: &Connection, days: i64) -> Vec<RepeatedQuestion> {
+    let days = days.clamp(1, 3650);
+    let rows: Vec<(String, i64)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT json_extract(response_json, '$.primary_question') AS question, conversation_id
+             FROM ai_runs
+             WHERE type = 'ticket_analysis' AND status = 'completed' AND conversation_id IS NOT NULL
+               AND id IN (SELECT MAX(id) FROM ai_runs
+                           WHERE type = 'ticket_analysis' AND status = 'completed'
+                             AND conversation_id IS NOT NULL
+                           GROUP BY conversation_id)
+               AND json_extract(response_json, '$.primary_question') IS NOT NULL
+               AND created_at >= datetime('now', '-' || ?1 || ' days')",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(rusqlite::params![days], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+    let mut by_q: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+    for (question, conversation) in rows {
+        let q = question
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if q.is_empty() {
+            continue;
+        }
+        by_q.entry(q).or_default().push(conversation);
+    }
+    let mut out: Vec<RepeatedQuestion> = by_q
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= 2)
+        .map(|(question, conversation_ids)| RepeatedQuestion {
+            question,
+            count: conversation_ids.len(),
+            conversation_ids,
+        })
+        .collect();
+    out.sort_by_key(|q| std::cmp::Reverse(q.count));
+    out.truncate(40);
+    out
+}
+
+/// The FTS query the reference builds for a question (first 6 tokens longer
+/// than 2 chars, quoted + prefix).
+fn fts_tokens(question: &str) -> Option<String> {
+    let tokens: Vec<String> = question
+        .replace(['"', '*', '(', ')'], " ")
+        .split_whitespace()
+        .filter(|t| t.chars().count() > 2)
+        .take(6)
+        .map(|t| format!("\"{t}\"*"))
+        .collect();
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+/// Reference gapEngine.ts `knowledgeHits`.
+fn knowledge_hits(conn: &Connection, question: &str) -> i64 {
+    let Some(tokens) = fts_tokens(question) else {
+        return 0;
+    };
+    conn.query_row(
+        "SELECT COUNT(*) FROM fts_knowledge WHERE fts_knowledge MATCH ?1",
+        rusqlite::params![tokens],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Reference gapEngine.ts `closestDocument`.
+fn closest_document(conn: &Connection, question: &str) -> Option<(i64, String, String)> {
+    let tokens = fts_tokens(question)?;
+    conn.query_row(
+        "SELECT f.document_id, d.title, d.content
+         FROM fts_knowledge f JOIN knowledge_documents d ON d.id = f.document_id
+         WHERE fts_knowledge MATCH ?1 ORDER BY rank LIMIT 1",
+        rusqlite::params![tokens],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .ok()
+}
+
+/// Reference gapEngine.ts `frictionAmong` — conversations of the group with
+/// clarification or follow-up friction (the port's outcome rows).
+fn friction_among(conn: &Connection, conversation_ids: &[i64]) -> usize {
+    if conversation_ids.is_empty() {
+        return 0;
+    }
+    let placeholders = vec!["?"; conversation_ids.len()].join(",");
+    let sql = format!(
+        "SELECT COUNT(*) FROM friction_scores f
+         JOIN conversations c ON c.remote_id = f.conversation_id
+         WHERE c.id IN ({placeholders})
+           AND (json_extract(f.factors_json, '$.clarification_count') > 0
+                OR json_extract(f.factors_json, '$.follow_up_count') > 0)"
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut params = Vec::with_capacity(conversation_ids.len());
+    for id in conversation_ids {
+        params.push(id);
+    }
+    let n: i64 = stmt
+        .query_row(rusqlite::params_from_iter(params.iter()), |r| r.get(0))
+        .unwrap_or(0);
+    usize::try_from(n).unwrap_or(0)
+}
+
+/// MIN/MAX created_at over the evidence conversations (the reference reads
+/// remote_created_at, which carries the same stamps in the port's mirror).
+fn seen_bounds(conn: &Connection, conversation_ids: &[i64]) -> (Option<String>, Option<String>) {
+    if conversation_ids.is_empty() {
+        return (None, None);
+    }
+    let placeholders = vec!["?"; conversation_ids.len()].join(",");
+    let sql = format!(
+        "SELECT MIN(created_at), MAX(created_at) FROM conversations WHERE id IN ({placeholders})"
+    );
+    conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(conversation_ids.iter()),
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap_or((None, None))
+}
+
+/// Insert (or refresh) one knowledge-gap candidate. The reference upserts on
+/// the UNIQUE dedup_key; the port's table has no unique constraint, so the
+/// check-then-refresh keeps the same observable behaviour (human decisions
+/// survive rebuilds untouched).
+fn insert_gap_candidate(
+    conn: &Connection,
+    kind: &str,
+    question: &str,
+    count: usize,
+    conversation_ids: &[i64],
+    document_ids: &[i64],
+    detail: serde_json::Value,
+) -> bool {
+    let normalized: String = question
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(300)
+        .collect();
+    let dedup_key = format!("{kind}:{normalized}");
+    let evidence: Vec<i64> = conversation_ids.iter().take(50).copied().collect();
+    let docs: Vec<i64> = document_ids.iter().take(20).copied().collect();
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM knowledge_gap_candidates WHERE dedup_key = ?1",
+            rusqlite::params![dedup_key],
+            |r| r.get(0),
+        )
+        .ok();
+    match existing {
+        None => {
+            conn.execute(
+                "INSERT INTO knowledge_gap_candidates (dedup_key, kind, query_text,
+                     occurrence_count, evidence_conversation_ids, related_document_ids,
+                     detail, status, provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', 'deterministic_local')",
+                rusqlite::params![
+                    dedup_key,
+                    kind,
+                    normalized,
+                    count as i64,
+                    serde_json::to_string(&evidence).unwrap_or_default(),
+                    serde_json::to_string(&docs).unwrap_or_default(),
+                    detail.to_string()
+                ],
+            )
+            .ok();
+            true
+        }
+        Some(id) => {
+            conn.execute(
+                "UPDATE knowledge_gap_candidates SET occurrence_count = ?1,
+                     evidence_conversation_ids = ?2, related_document_ids = ?3,
+                     detail = ?4, updated_at = datetime('now')
+                 WHERE id = ?5",
+                rusqlite::params![
+                    count as i64,
+                    serde_json::to_string(&evidence).unwrap_or_default(),
+                    serde_json::to_string(&docs).unwrap_or_default(),
+                    detail.to_string(),
+                    id
+                ],
+            )
+            .ok();
+            false
+        }
+    }
+}
+
+/// Reference knowledge/gapEngine.ts `rebuild(days)` — the deterministic
+/// knowledge-gap detection over the demo world (port table:
+/// knowledge_gap_candidates; undecided status is 'open').
+fn seed_knowledge_gaps(conn: &Connection) -> (usize, usize) {
+    static TROUBLESHOOTING: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static STEP_STRUCTURE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let troubleshooting = TROUBLESHOOTING.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(error|fail(ed|ing)?|broken|not working|crash|issue|bug|fix|doesn'?t work|stopped working)\b")
+            .expect("troubleshooting regex")
+    });
+    let step_structure = STEP_STRUCTURE.get_or_init(|| {
+        regex::Regex::new(r"(?is)(\n\s*\d+[.)]\s|\bstep\s*\d|\bfirst\b.*\bthen\b|\n\s*[-*]\s)")
+            .expect("step-structure regex")
+    });
+
+    let mut created = 0;
+    let questions = repeated_questions(conn, 90);
+
+    // ---- 1 + 2: repeated questions vs knowledge coverage ----
+    for q in &questions {
+        let hits = knowledge_hits(conn, &q.question);
+        if hits == 0 {
+            let (first_seen, last_seen) = seen_bounds(conn, &q.conversation_ids);
+            let newly = insert_gap_candidate(
+                conn,
+                "repeated_question_uncovered",
+                &q.question,
+                q.count,
+                &q.conversation_ids,
+                &[],
+                serde_json::json!({
+                    "explanation": format!("\"{}\" was asked in {} conversations and produced zero knowledge-base hits.",
+                        q.question.chars().take(120).collect::<String>(), q.count),
+                    "method": "Repeated primary questions (latest ticket_analysis runs) matched against the local FTS knowledge index; 0 hits.",
+                    "first_seen": first_seen,
+                    "last_seen": last_seen
+                }),
+            );
+            created += usize::from(newly);
+            continue;
+        }
+        // 2: covered but conversations still showed clarification/follow-up friction.
+        let friction_count = friction_among(conn, &q.conversation_ids);
+        let threshold = ((q.count as f64) / 2.0).ceil().max(1.0) as usize;
+        if friction_count >= threshold {
+            let (first_seen, last_seen) = seen_bounds(conn, &q.conversation_ids);
+            let newly = insert_gap_candidate(
+                conn,
+                "repeated_question_unsolved",
+                &q.question,
+                q.count,
+                &q.conversation_ids,
+                &[],
+                serde_json::json!({
+                    "explanation": format!("\"{}\" has {} knowledge hit(s), yet {} of {} asking conversations still showed clarification or follow-up friction - the existing answer did not resolve it.",
+                        q.question.chars().take(120).collect::<String>(), hits, friction_count, q.count),
+                    "method": "Cross of repeated questions with the interaction engine clarification/follow-up counts over the same conversations; association, not causation.",
+                    "first_seen": first_seen,
+                    "last_seen": last_seen
+                }),
+            );
+            created += usize::from(newly);
+        }
+    }
+
+    // ---- 3: conflicting knowledge (title-token overlap pairs) ----
+    let docs: Vec<(i64, String)> = conn
+        .prepare("SELECT id, title FROM knowledge_documents")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    let tokens = |title: &str| -> std::collections::HashSet<String> {
+        title
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .filter(|t| t.chars().count() > 2)
+            .map(String::from)
+            .collect()
+    };
+    let mut reported_pairs = std::collections::HashSet::new();
+    for (i, (a_id, a_title)) in docs.iter().take(500).enumerate() {
+        for (b_id, b_title) in docs.iter().take(500).skip(i + 1) {
+            let ta = tokens(a_title);
+            let tb = tokens(b_title);
+            let shared: Vec<&String> = tb.iter().filter(|t| ta.contains(*t)).collect();
+            if shared.len() >= 3 {
+                let pair_key = format!("{}:{}", (*a_id).min(*b_id), (*a_id).max(*b_id));
+                if !reported_pairs.insert(pair_key) {
+                    continue;
+                }
+                let newly = insert_gap_candidate(
+                    conn,
+                    "conflicting_knowledge",
+                    &format!("{a_title} / {b_title}"),
+                    shared.len(),
+                    &[],
+                    &[*a_id, *b_id],
+                    serde_json::json!({
+                        "explanation": format!("Two documents share {} title tokens (\"{}\") and may cover overlapping or conflicting guidance.",
+                            shared.len(), shared.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")),
+                        "conflicting_titles": [a_title, b_title],
+                        "method": "Deterministic title-token overlap (>= 3 shared tokens) over local documents - the same shape as the freshness report. Overlap does not prove contradiction; a human review decides."
+                    }),
+                );
+                created += usize::from(newly);
+            }
+        }
+    }
+
+    // ---- 4: missing troubleshooting steps ----
+    for q in &questions {
+        if !troubleshooting.is_match(&q.question) {
+            continue;
+        }
+        if let Some((doc_id, title, content)) = closest_document(conn, &q.question) {
+            if !step_structure.is_match(&content) {
+                let (first_seen, last_seen) = seen_bounds(conn, &q.conversation_ids);
+                let newly = insert_gap_candidate(
+                    conn,
+                    "missing_troubleshooting_steps",
+                    &q.question,
+                    q.count,
+                    &q.conversation_ids,
+                    &[doc_id],
+                    serde_json::json!({
+                        "explanation": format!("\"{}\" is troubleshooting-shaped, and the closest document (\"{}\") contains no step structure (no numbered steps, no step markers).",
+                            q.question.chars().take(120).collect::<String>(), title),
+                        "closest_document_title": title,
+                        "method": "Troubleshooting-shaped question detection + step-structure regex over the closest FTS-matching document. A heuristic; the document may simply use prose.",
+                        "first_seen": first_seen,
+                        "last_seen": last_seen
+                    }),
+                );
+                created += usize::from(newly);
+            }
+        }
+    }
+
+    // ---- 5: new issue with no documentation ----
+    let cluster_rows: Vec<(i64, String, i64)> = conn
+        .prepare(
+            "SELECT c.id, c.title,
+                    (SELECT COUNT(*) FROM issue_cluster_members m WHERE m.cluster_id = c.id) AS n
+             FROM issue_clusters c
+             WHERE (SELECT COUNT(*) FROM issue_cluster_members m WHERE m.cluster_id = c.id) >= 3
+             ORDER BY n DESC LIMIT 30",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    let mut clusters: Vec<(i64, String, usize, Vec<i64>)> = cluster_rows
+        .into_iter()
+        .map(|(id, title, n)| {
+            let members: Vec<i64> = conn
+                .prepare(
+                    "SELECT conversation_id FROM issue_cluster_members
+                     WHERE cluster_id = ?1 ORDER BY assigned_at DESC LIMIT 50",
+                )
+                .ok()
+                .and_then(|mut s| {
+                    s.query_map(rusqlite::params![id], |r| r.get(0))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                        .ok()
+                })
+                .unwrap_or_default();
+            (id, title, usize::try_from(n).unwrap_or(0), members)
+        })
+        .collect();
+    clusters.sort_by_key(|c| std::cmp::Reverse(c.2));
+    for (_id, title, count, members) in clusters {
+        if knowledge_hits(conn, &title) == 0 {
+            let (first_seen, last_seen) = seen_bounds(conn, &members);
+            let newly = insert_gap_candidate(
+                conn,
+                "new_issue_undocumented",
+                &title,
+                count,
+                &members,
+                &[],
+                serde_json::json!({
+                    "explanation": format!("Issue \"{}\" groups {} conversations and has no covering documentation.",
+                        title.chars().take(120).collect::<String>(), count),
+                    "issue_label": title,
+                    "method": "Issue clusters (>= 3 conversations) matched against the local FTS knowledge index; 0 hits.",
+                    "first_seen": first_seen,
+                    "last_seen": last_seen
+                }),
+            );
+            created += usize::from(newly);
+        }
+    }
+
+    let total: usize = conn
+        .query_row("SELECT COUNT(*) FROM knowledge_gap_candidates", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|n| usize::try_from(n).unwrap_or(0))
+        .unwrap_or(0);
+    (total, created)
 }
 
 /// Seed the demo intelligence layer (reference `seedDemoData`). Safety:
@@ -520,6 +1678,10 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             conversation_ids: slack_conv.map(|c| vec![c.id]).unwrap_or_default(),
         },
     );
+    // Engineering references (issues.addEngineeringRef): ki1 → ENG-4472,
+    // ki2 → ENG-4471, both "in progress".
+    add_engineering_ref(conn, ki1, "ENG-4472", "Re-anchor schedules after DST");
+    add_engineering_ref(conn, ki2, "ENG-4471", "Slack auto re-auth");
     tracing::info!(count = 2, "Seeded known issues");
 
     // ---------------- Issue clusters ----------------
@@ -551,6 +1713,14 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             )
             .ok();
         }
+        // upsertCluster maintains conversation_count/last_seen_at — the gap
+        // engine's new_issue_undocumented detection reads the count.
+        conn.execute(
+            "UPDATE issue_clusters SET conversation_count = (SELECT COUNT(*) FROM issue_cluster_members WHERE cluster_id = ?1),
+                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            rusqlite::params![cluster],
+        )
+        .ok();
     }
     let billing_convs: Vec<i64> = convs
         .iter()
@@ -582,6 +1752,12 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             )
             .ok();
         }
+        conn.execute(
+            "UPDATE issue_clusters SET conversation_count = (SELECT COUNT(*) FROM issue_cluster_members WHERE cluster_id = ?1),
+                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            rusqlite::params![cluster],
+        )
+        .ok();
     }
     let _ = crate::maintenance::compute_trends(conn);
     tracing::info!("Seeded issue clusters");
@@ -594,12 +1770,14 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             serde_json::json!({
                 "intent": "bug_report",
                 "primary_question": "How can the daily dispatch report schedule be made to follow the Santiago timezone after the DST change?",
+                "secondary_questions": ["Why does the schedule editor still show UTC times?"],
                 "customer_goal": "Receive the daily dispatch report at 8 AM Chilean time, every day of the year.",
                 "product": "Reports", "feature": "Schedules", "problem_type": "defect",
                 "requested_action": "Fix the schedule to follow the workspace timezone, or provide steps to correct it.",
                 "urgency": "high", "sentiment": "negative",
                 "known_issue_candidate": "Schedules keep previous DST offset after a clock change",
                 "issue_cluster_candidate": "timezone schedules",
+                "missing_information": [],
                 "summary": "A VIP operations customer in Chile reports that a daily scheduled report fires at 3 AM local time after a DST change. Re-saving the schedule fixed one report; a second one remains offset. This matches an identified known issue about schedule re-anchoring.",
                 "confidence": "high"
             }),
@@ -614,12 +1792,14 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             serde_json::json!({
                 "intent": "bug_report",
                 "primary_question": "Why did the Slack integration stop posting updates and when will it be fixed?",
+                "secondary_questions": [],
                 "customer_goal": "Restore Slack alerting for their ops channel.",
                 "product": "Integrations", "feature": "Slack", "problem_type": "defect",
                 "requested_action": "Fix the integration urgently; they use it for alerting.",
                 "urgency": "critical", "sentiment": "frustrated",
                 "known_issue_candidate": "Slack integration stops posting after Slack token rotation",
                 "issue_cluster_candidate": "slack integration auth",
+                "missing_information": [],
                 "summary": "A customer reports the Slack integration stopped posting updates, with log ID INT-88231. This matches a known engineering issue (Slack token rotation). Escalation note exists; customer-facing wording must stay generic.",
                 "confidence": "high"
             }),
@@ -633,6 +1813,7 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             serde_json::json!({
                 "intent": "question",
                 "primary_question": "Why is the invitation email for a new teammate not arriving?",
+                "secondary_questions": [],
                 "customer_goal": "Get their teammate onboarded.",
                 "product": "Accounts", "feature": "Invitations", "problem_type": "configuration",
                 "requested_action": "Resend or fix the invitation delivery.",
@@ -652,12 +1833,14 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             serde_json::json!({
                 "intent": "billing",
                 "primary_question": "Can the failed card payment be retried?",
+                "secondary_questions": [],
                 "customer_goal": "Restore the subscription to active.",
                 "product": "Billing", "feature": "Payments", "problem_type": "billing",
                 "requested_action": "Retry the charge on their valid card.",
                 "urgency": "high", "sentiment": "negative",
                 "known_issue_candidate": null,
                 "issue_cluster_candidate": "billing payment issues",
+                "missing_information": [],
                 "summary": "Subscription shows past-due but the bank reports no charge attempt - the invoice likely entered a retry backoff. The documented self-service path is updating the card and clicking Retry payment.",
                 "confidence": "high"
             }),
@@ -668,7 +1851,9 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
     ];
     for (number, analysis, sources) in &samples {
         if let Some(conv) = by_number(*number) {
-            save_analysis(conn, conv.id, analysis, sources);
+            // Reference: 850 + Math.floor(Math.random() * 900) — the port
+            // pins the floor so the demo dataset stays deterministic.
+            save_analysis(conn, conv.id, analysis, sources, 850);
             seeded_analyses += 1;
         }
     }
@@ -684,40 +1869,59 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             let analysis = serde_json::json!({
                 "intent": "how_to",
                 "primary_question": repeated_question,
+                "secondary_questions": [],
                 "customer_goal": "Serve the product from their own domain.",
                 "product": "Workspace", "feature": "Domains", "problem_type": "how_to",
                 "requested_action": "Provide custom domain setup steps.",
                 "urgency": "normal", "sentiment": "neutral",
                 "known_issue_candidate": null,
                 "issue_cluster_candidate": "custom domains",
-                "confidence": "high"
+                "missing_information": [],
+                "frustration_level": "low",
+                "confidence": 0.9
             });
-            save_analysis(conn, conv.id, &analysis, &[]);
+            save_analysis(conn, conv.id, &analysis, &[], 700);
         }
     }
     tracing::info!("Seeded 1 repeated question across 2 conversations (gap-engine input)");
 
     // ---------------- Customer memories ----------------
+    // Reference aiRepo.upsertMemory(source:'ai', origin:'conversation',
+    // confidence:'high'). The port's customer_memory.evidence_excerpt is NOT
+    // NULL and the (customer, key) index is not UNIQUE, so the upsert is a
+    // count-check + insert (same observable result on the demo world).
+    let ai_memory = |customer: i64, key: &str, value: &str, conversation: i64| {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM customer_memory WHERE customer_id = ?1 AND memory_key = ?2",
+                rusqlite::params![customer, key],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            conn.execute(
+                "INSERT INTO customer_memory (customer_id, memory_key, memory_value,
+                     evidence_excerpt, source_conversation_id, origin, confidence, source)
+                 VALUES (?1, ?2, ?3, '', ?4, 'conversation', 'high', 'ai')",
+                rusqlite::params![customer, key, value, conversation],
+            )
+            .ok();
+        }
+    };
     if let Some(lucia) = by_number(5001) {
         if let Some(customer) = lucia.customer_id {
-            conn.execute(
-                "INSERT INTO customer_memory (customer_id, memory_key, memory_value, evidence_excerpt, source_conversation_id)
-                 VALUES (?1, 'operates_in_chile', ?2, NULL, ?3)
-                 ON CONFLICT (customer_id, memory_key) DO UPDATE SET memory_value = excluded.memory_value",
-                rusqlite::params![
-                    customer,
-                    "Operations in Santiago, Chile (America/Santiago timezone, UTC-4 during DST).",
-                    lucia.id
-                ],
-            )
-            .ok();
-            conn.execute(
-                "INSERT INTO customer_memory (customer_id, memory_key, memory_value, evidence_excerpt, source_conversation_id)
-                 VALUES (?1, 'vip_account', ?2, NULL, ?3)
-                 ON CONFLICT (customer_id, memory_key) DO UPDATE SET memory_value = excluded.memory_value",
-                rusqlite::params![customer, "Andes Logistics is a VIP account (vip tag applied).", lucia.id],
-            )
-            .ok();
+            ai_memory(
+                customer,
+                "operates_in_chile",
+                "Operations in Santiago, Chile (America/Santiago timezone, UTC-4 during DST).",
+                lucia.id,
+            );
+            ai_memory(
+                customer,
+                "vip_account",
+                "Andes Logistics is a VIP account (vip tag applied).",
+                lucia.id,
+            );
         }
     }
     tracing::info!("Seeded customer memories");
@@ -770,12 +1974,18 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
     let mut incident_count = 0;
     if !slack_convs.is_empty() {
         conn.execute(
-            "INSERT INTO incidents (known_issue_id, status, severity, source, description, title, code)
+            "INSERT INTO incidents (known_issue_id, status, severity, source, description, title, code,
+                 product, feature, internal_explanation, customer_safe_explanation, known_cause, workaround)
              VALUES (?1, 'identified', 'sev2', 'known_issue', ?2,
-                     'Slack integration stops posting after token rotation', 'INC-001')",
+                     'Slack integration stops posting after token rotation', 'INC-001',
+                     'Integrations', 'Slack', ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 ki2,
-                "Workspaces connected before the Slack token-rotation policy change report the integration stopped posting updates (repeated 401s in integration logs)."
+                "Workspaces connected before the Slack token-rotation policy change report the integration stopped posting updates (repeated 401s in integration logs).",
+                "ENG-4471 tracks the automatic re-auth flow. Refresh tokens were invalidated for older connections; disconnect/reconnect restores service.",
+                "An authentication change on Slack\u{2019}s side is affecting some workspaces. Reconnecting the integration restores updates; historical data is unaffected.",
+                "Slack token rotation policy invalidated refresh tokens for older connections.",
+                "Disconnect and reconnect the integration; historical data is preserved."
             ],
         )
         .ok();
@@ -788,9 +1998,35 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             )
             .ok();
         }
+        // incidents.addRelated(inc, 'known_issue', ki2, 'Declared from this known issue')
+        conn.execute(
+            "INSERT OR IGNORE INTO incident_related (incident_id, target_kind, target_local_id, note)
+             VALUES (?1, 'known_issue', ?2, 'Declared from this known issue')",
+            rusqlite::params![inc, ki2],
+        )
+        .ok();
         conn.execute(
             "INSERT INTO incident_refs (incident_id, system, reference, title, status, url)
              VALUES (?1, 'linear', 'ENG-4471', 'Slack auto re-auth', 'in progress', 'https://linear.app/example/issue/ENG-4471')",
+            rusqlite::params![inc],
+        )
+        .ok();
+        // incidents.addRelease: v4.12.0, released 6 days ago.
+        conn.execute(
+            "INSERT INTO incident_releases (incident_id, version_label, released_at, notes, correlation)
+             VALUES (?1, 'v4.12.0', ?2, ?3, ?4)",
+            rusqlite::params![
+                inc,
+                days_ago_date(6),
+                "Slack app permissions scope change rolled out server-side by Slack.",
+                "First 401 reports appeared within days of this window - a temporal association, not a causal claim."
+            ],
+        )
+        .ok();
+        // incidents.addNote (author null).
+        conn.execute(
+            "INSERT INTO incident_notes (incident_id, author_user_local_id, body)
+             VALUES (?1, NULL, 'Confirmed with three affected workspaces: disconnect/reconnect restores posting immediately.')",
             rusqlite::params![inc],
         )
         .ok();
@@ -798,12 +2034,18 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
     }
     if !tz_convs_all.is_empty() {
         conn.execute(
-            "INSERT INTO incidents (known_issue_id, status, severity, source, description, title, code)
+            "INSERT INTO incidents (known_issue_id, status, severity, source, description, title, code,
+                 product, feature, internal_explanation, customer_safe_explanation, known_cause, workaround)
              VALUES (?1, 'fix_in_progress', 'sev3', 'known_issue', ?2,
-                     'Scheduled reports drift one hour after DST changes', 'INC-002')",
+                     'Scheduled reports drift one hour after DST changes', 'INC-002',
+                     'Reports', 'Schedules', ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 ki1,
-                "Scheduled reports fire one hour off after daylight-saving changes until the schedule is re-saved."
+                "Scheduled reports fire one hour off after daylight-saving changes until the schedule is re-saved.",
+                "ENG-4472: re-anchor job scheduled for next release; schedule store keeps absolute UTC offsets.",
+                "A known issue affects scheduled items around daylight-saving changes: times can be off by one hour until the schedule is re-saved.",
+                "Stored schedule times anchor to the UTC offset at save time.",
+                "Open each schedule and re-save it once after the DST change."
             ],
         )
         .ok();
@@ -817,6 +2059,12 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             .ok();
         }
         conn.execute(
+            "INSERT OR IGNORE INTO incident_related (incident_id, target_kind, target_local_id, note)
+             VALUES (?1, 'known_issue', ?2, 'Declared from this known issue')",
+            rusqlite::params![inc, ki1],
+        )
+        .ok();
+        conn.execute(
             "INSERT INTO incident_refs (incident_id, system, reference, title, status)
              VALUES (?1, 'linear', 'ENG-4472', 'Re-anchor schedules after DST', 'in progress')",
             rusqlite::params![inc],
@@ -828,31 +2076,135 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
 
     // ---------------- Custom objects (Account + Deployment) ----------------
     let mut object_count = 0;
+    // customObjects.createType('Account', ...) — description + field defs.
     let account_type: Option<i64> = {
         conn.execute(
             "INSERT OR IGNORE INTO custom_object_types (name, slug) VALUES ('Account', 'account')",
             [],
         )
         .ok();
-        conn.query_row(
-            "SELECT id FROM custom_object_types WHERE slug = 'account'",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
+        let id = conn
+            .query_row(
+                "SELECT id FROM custom_object_types WHERE slug = 'account'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(type_id) = id {
+            conn.execute(
+                "UPDATE custom_object_types SET description = 'Commercial account record for a customer organization.' WHERE id = ?1",
+                rusqlite::params![type_id],
+            )
+            .ok();
+            let field_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM custom_object_fields WHERE type_id = ?1",
+                    rusqlite::params![type_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if field_count == 0 {
+                for (order, (key, label, field_type, required, options)) in [
+                    (
+                        "plan_tier",
+                        "Plan tier",
+                        "select",
+                        true,
+                        Some(r#"["free","starter","growth","enterprise"]"#),
+                    ),
+                    ("mrr", "MRR (USD)", "number", false, None),
+                    ("renewal_date", "Renewal date", "date", false, None),
+                    ("csm", "Customer success manager", "text", false, None),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    conn.execute(
+                        "INSERT INTO custom_object_fields (type_id, name, label, field_type, required, options_json, sort_order)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            type_id,
+                            key,
+                            label,
+                            field_type,
+                            i64::from(required),
+                            options,
+                            (order + 1) as i64
+                        ],
+                    )
+                    .ok();
+                }
+            }
+        }
+        id
     };
+    // customObjects.createType('Deployment', ...).
     let deployment_type: Option<i64> = {
         conn.execute(
             "INSERT OR IGNORE INTO custom_object_types (name, slug) VALUES ('Deployment', 'deployment')",
             [],
         )
         .ok();
-        conn.query_row(
-            "SELECT id FROM custom_object_types WHERE slug = 'deployment'",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
+        let id = conn
+            .query_row(
+                "SELECT id FROM custom_object_types WHERE slug = 'deployment'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(type_id) = id {
+            conn.execute(
+                "UPDATE custom_object_types SET description = 'A product deployment/release record.' WHERE id = ?1",
+                rusqlite::params![type_id],
+            )
+            .ok();
+            let field_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM custom_object_fields WHERE type_id = ?1",
+                    rusqlite::params![type_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if field_count == 0 {
+                for (order, (key, label, field_type, required, options)) in [
+                    ("version", "Version", "text", true, None),
+                    (
+                        "environment",
+                        "Environment",
+                        "select",
+                        true,
+                        Some(r#"["production","staging"]"#),
+                    ),
+                    ("deployed_at", "Deployed at", "date", true, None),
+                    (
+                        "status",
+                        "Status",
+                        "select",
+                        false,
+                        Some(r#"["healthy","degraded","rolled_back"]"#),
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    conn.execute(
+                        "INSERT INTO custom_object_fields (type_id, name, label, field_type, required, options_json, sort_order)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            type_id,
+                            key,
+                            label,
+                            field_type,
+                            i64::from(required),
+                            options,
+                            (order + 1) as i64
+                        ],
+                    )
+                    .ok();
+                }
+            }
+        }
+        id
     };
     let org_id_by_name = |name: &str| -> Option<i64> {
         conn.query_row(
@@ -942,12 +2294,12 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
             let releases = vec![
                 (
                     "v4.12.0 production",
-                    serde_json::json!({"version": "v4.12.0", "environment": "production", "status": "degraded"}),
+                    serde_json::json!({"version": "v4.12.0", "environment": "production", "deployed_at": days_ago_date(6), "status": "degraded"}),
                     slack_incident,
                 ),
                 (
                     "v4.11.2 production",
-                    serde_json::json!({"version": "v4.11.2", "environment": "production", "status": "healthy"}),
+                    serde_json::json!({"version": "v4.11.2", "environment": "production", "deployed_at": days_ago_date(34), "status": "healthy"}),
                     None,
                 ),
             ];
@@ -985,9 +2337,9 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
         let _ = std::fs::create_dir_all(&connectors_dir);
         let release_file = connectors_dir.join("product-releases.json");
         let releases = serde_json::json!([
-            {"version": "v4.12.0", "channel": "production", "notes": "Slack scopes change window"},
-            {"version": "v4.11.2", "channel": "production", "notes": "Scheduling engine patch"},
-            {"version": "v4.10.0", "channel": "production", "notes": "Billing retry backoff fix"}
+            {"version": "v4.12.0", "channel": "production", "released_at": days_ago_date(6), "notes": "Slack scopes change window"},
+            {"version": "v4.11.2", "channel": "production", "released_at": days_ago_date(34), "notes": "Scheduling engine patch"},
+            {"version": "v4.10.0", "channel": "production", "released_at": days_ago_date(62), "notes": "Billing retry backoff fix"}
         ]);
         if std::fs::write(
             &release_file,
@@ -1046,6 +2398,71 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
     match crate::customer_events::rebuild(conn) {
         Ok(created) => tracing::info!(created, "Derived customer timeline events"),
         Err(e) => tracing::warn!(error = %e, "Demo timeline derive skipped"),
+    }
+
+    // ---------------- v2.1.0 (M5): quality layer seeds ----------------
+    // Friction findings + post-resolution QA rows + knowledge-gap candidates
+    // are all DETERMINISTIC derivations over the demo world - the same code
+    // paths a real instance runs on demand (no fake data).
+    // Interaction outcomes (the interaction engine's deterministic layer):
+    // the same formulas the reference workers' post-sync backfill uses.
+    let outcome_count = seed_interaction_outcomes(conn);
+    tracing::info!(count = outcome_count, "Seeded interaction outcomes");
+
+    // Friction findings rebuild (the two evidence-pinned span kinds the port
+    // ships; the demo world yields none, same as the reference's full engine).
+    let (friction_convs, friction_rows) = seed_friction_findings(conn);
+    tracing::info!(
+        findings = friction_rows,
+        conversations = friction_convs,
+        "Seeded friction findings"
+    );
+
+    // Deterministic post-resolution QA for closed conversations.
+    let qa_count = seed_post_resolution_qa(conn);
+    tracing::info!(
+        conversations = qa_count,
+        "Seeded deterministic post-resolution QA"
+    );
+
+    // Knowledge-gap candidates (decisions preserved; nothing auto-publishes).
+    let (gap_total, gap_new) = seed_knowledge_gaps(conn);
+    tracing::info!(
+        candidates = gap_total,
+        new = gap_new,
+        "Seeded knowledge-gap candidates"
+    );
+    // Give the demo world one human decision so the lifecycle is visible:
+    // approve the most frequent candidate if any exist. Approve one
+    // candidate ONLY when at least two exist, so the demo world always keeps
+    // an open candidate for the lifecycle UI.
+    let open_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM knowledge_gap_candidates WHERE status = 'open'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if open_count >= 2 {
+        let first: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM knowledge_gap_candidates WHERE status = 'open'
+                 ORDER BY occurrence_count DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = first {
+            conn.execute(
+                "UPDATE knowledge_gap_candidates SET status = 'approved',
+                     decided_at = datetime('now'),
+                     decision_note = 'Demo decision: document this answer.',
+                     updated_at = datetime('now')
+                 WHERE id = ?1 AND status = 'open'",
+                rusqlite::params![id],
+            )
+            .ok();
+        }
     }
 
     // One saved report definition so the builder opens with an example.
@@ -1107,16 +2524,26 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
         )
         .ok();
     if let Some(customer) = top_customer {
-        conn.execute(
-            "INSERT INTO customer_memory (customer_id, memory_key, memory_value, evidence_excerpt, source_conversation_id, source)
-             VALUES (?1, 'Preferred escalation path', ?2, NULL, NULL, 'human')
-             ON CONFLICT (customer_id, memory_key) DO UPDATE SET memory_value = excluded.memory_value",
-            rusqlite::params![
-                customer,
-                "Ping the on-call engineer directly after 2 unresolved replies; this account has a history of urgency."
-            ],
-        )
-        .ok();
+        // Reference memory.upsertHumanEntry: source 'human', kind 'context'.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM customer_memory WHERE customer_id = ?1 AND memory_key = ?2",
+                rusqlite::params![customer, "Preferred escalation path"],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            conn.execute(
+                "INSERT INTO customer_memory (customer_id, memory_key, memory_value,
+                     evidence_excerpt, source_conversation_id, source, kind)
+                 VALUES (?1, 'Preferred escalation path', ?2, '', NULL, 'human', 'context')",
+                rusqlite::params![
+                    customer,
+                    "Ping the on-call engineer directly after 2 unresolved replies; this account has a history of urgency."
+                ],
+            )
+            .ok();
+        }
         tracing::info!("Seeded 1 human memory entry (escalation context)");
     }
 
@@ -1170,6 +2597,183 @@ mod tests {
         let conn = fresh_db();
         settings::set_bool(&conn, "demo_mode", true).unwrap();
         conn
+    }
+
+    /// The full demo boot path (reference index.ts: fake provider + empty DB
+    /// → initialSync → seedDemoData) with every count the reference dataset
+    /// defines, verified against the mirrored world + the intelligence seed.
+    #[tokio::test]
+    async fn seed_demo_data_ports_the_reference_demo_world() {
+        let mut conn = fresh_db();
+        // The canonical boot chain — the resource tables the seed writes
+        // (issue_clusters.product, customer_memory.origin, ai_runs.type, the
+        // ratings/gap/QA tables) all land through it.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        settings::set_bool(&conn, "demo_mode", true).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let engine = crate::sync_engine::SyncEngine::new(
+            shared.clone(),
+            std::sync::Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo()),
+        );
+        engine.initial_sync().await.unwrap();
+
+        let conn = shared.lock().unwrap();
+        // ---- Mirror counts (fakeData.ts world) ----
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+        assert_eq!(count("SELECT COUNT(*) FROM conversations"), 20);
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM conversations WHERE type = 'chat' AND source_via = 'beacon'"
+            ),
+            6
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM conversation_threads"), 48);
+        assert_eq!(count("SELECT COUNT(*) FROM customers"), 8);
+        assert_eq!(count("SELECT COUNT(*) FROM tags"), 14);
+        assert_eq!(count("SELECT COUNT(*) FROM users"), 4);
+        assert_eq!(count("SELECT COUNT(*) FROM folders"), 4);
+        assert_eq!(count("SELECT COUNT(*) FROM inbox_fields"), 4);
+        assert_eq!(count("SELECT COUNT(*) FROM saved_replies"), 5);
+        assert_eq!(count("SELECT COUNT(*) FROM workflows"), 3);
+        // Webhooks are NOT part of INITIAL_SYNC_ORDER in either codebase, and
+        // the reference's upsertWebhookConfig has no caller — the mirror
+        // stays empty; the fake world's webhook lives in the provider only.
+        assert_eq!(count("SELECT COUNT(*) FROM webhook_configs"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM organizations"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM ratings"), 7);
+        assert_eq!(count("SELECT COUNT(*) FROM user_statuses"), 3);
+        assert_eq!(count("SELECT COUNT(*) FROM docs_collections"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM docs_categories"), 4);
+        assert_eq!(count("SELECT COUNT(*) FROM docs"), 9);
+
+        assert!(seed_demo_data(&conn, true));
+
+        // ---- demoSeed.ts intelligence counts ----
+        assert_eq!(count("SELECT COUNT(*) FROM knowledge_sources"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM knowledge_documents"), 5);
+        // The internal runbook is the only internal_only document.
+        assert_eq!(
+            count("SELECT COUNT(*) FROM knowledge_documents WHERE visibility = 'internal_only'"),
+            1
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM known_issues"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM known_issue_refs"), 2);
+        // tz cluster (3 conversations) + billing cluster (2 conversations).
+        assert_eq!(count("SELECT COUNT(*) FROM issue_clusters"), 2);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM issue_cluster_members"),
+            5,
+            "3 timezone + 2 billing cluster members"
+        );
+        // 4 sample analyses + the repeated-question pair.
+        assert_eq!(count("SELECT COUNT(*) FROM ai_runs"), 6);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM ai_runs WHERE type = 'ticket_analysis' AND status = 'completed'"),
+            6
+        );
+        // Lucía's two AI memories + one human entry (Ravi, 4 conversations).
+        assert_eq!(count("SELECT COUNT(*) FROM customer_memory"), 3);
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM customer_memory WHERE source = 'human' AND kind = 'context'"
+            ),
+            1
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM support_cases"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM incidents"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM incident_refs"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM incident_releases"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM incident_notes"), 1);
+        // 2 known-issue relateds + 1 human graph edge (INC-002 → INC-001).
+        assert_eq!(count("SELECT COUNT(*) FROM incident_related"), 3);
+        assert_eq!(count("SELECT COUNT(*) FROM custom_object_types"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM custom_object_fields"), 8);
+        // 3 accounts (Andes, Bright Path, Harbor Fitness) + 2 deployments.
+        assert_eq!(count("SELECT COUNT(*) FROM custom_objects"), 5);
+        // Reference oddity kept verbatim: the org lookup for the candidate
+        // title 'Bright Path Education' misses the mirrored world org
+        // 'BrightPath Education' (fakeData.ts names it without the space),
+        // so that account links to its customer only.
+        assert_eq!(count("SELECT COUNT(*) FROM custom_object_links"), 5);
+        assert_eq!(count("SELECT COUNT(*) FROM connectors"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM report_definitions"), 1);
+        // Knowledge freshness stamps (Inviting teammates reviewed,
+        // Viewer role verified + reviewed).
+        assert_eq!(
+            count("SELECT COUNT(*) FROM knowledge_documents WHERE last_reviewed_at IS NOT NULL"),
+            2
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM knowledge_documents WHERE last_verified_at IS NOT NULL"),
+            1
+        );
+
+        // ---- v2.1.0 (M5) quality layer ----
+        // Interaction outcomes: one row per mirrored conversation.
+        assert_eq!(
+            count("SELECT COUNT(*) FROM friction_scores WHERE kind IS NULL"),
+            20
+        );
+        // Friction findings: the customer-level repeated_unresolved_interactions
+        // pattern fires for Chloe's billing trio (c7, c8, ch3 each see the two
+        // other billing-tagged conversations of customer 3007 within 90 days)
+        // — the same 3 findings the reference's full 6-kind engine derives
+        // over the same world; the other kinds find nothing here.
+        assert_eq!(
+            count("SELECT COUNT(*) FROM friction_scores WHERE kind IS NOT NULL"),
+            3
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM friction_scores \
+                 WHERE kind = 'repeated_unresolved_interactions' AND severity = 'moderate'"
+            ),
+            3
+        );
+        // Post-resolution QA: the 12 closed conversations.
+        assert_eq!(count("SELECT COUNT(*) FROM post_resolution_qa"), 12);
+        // Knowledge-gap candidates: the repeated custom-domain question (2
+        // conversations, zero knowledge hits). The timezone issue cluster is
+        // NOT a candidate — the "Timezones and scheduled reports" document
+        // covers every FTS token of its title ("re-anchor schedules ... DST
+        // change"), exactly like the reference's knowledgeHits.
+        assert_eq!(count("SELECT COUNT(*) FROM knowledge_gap_candidates"), 1);
+        // One open candidate is below the approve-decision threshold (>= 2),
+        // so the demo world keeps its single candidate open — no decision.
+        assert_eq!(
+            count("SELECT COUNT(*) FROM knowledge_gap_candidates WHERE status = 'open'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM knowledge_gap_candidates WHERE status = 'approved'"),
+            0
+        );
+        let (kind, occurrences): (String, i64) = conn
+            .query_row(
+                "SELECT kind, occurrence_count FROM knowledge_gap_candidates WHERE status = 'open'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "repeated_question_uncovered");
+        assert_eq!(occurrences, 2);
+
+        // Idempotence: re-running the seed never duplicates rows (the boot
+        // guard prevents it in production; the seed itself stays count-safe).
+        assert!(seed_demo_data(&conn, true));
+        assert_eq!(count("SELECT COUNT(*) FROM knowledge_documents"), 5);
+        assert_eq!(count("SELECT COUNT(*) FROM known_issues"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM knowledge_gap_candidates"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM ai_runs"), 6);
+        assert_eq!(count("SELECT COUNT(*) FROM custom_objects"), 5);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM friction_scores WHERE kind IS NULL"),
+            20
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM friction_scores WHERE kind IS NOT NULL"),
+            3
+        );
     }
 
     #[test]

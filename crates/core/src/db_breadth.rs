@@ -512,6 +512,13 @@ fn add_missing_reference_columns(conn: &Connection) -> Result<()> {
     // ---- conversation_threads (001 threads mirror) ----
     // (type→thread_type, body_text→body, from_type→actor_type,
     //  created_by_*→actor_id are the port's intentional renames.)
+    // `state` mirrors the reference threads.state ('published' | 'draft' ...).
+    add(
+        conn,
+        "conversation_threads",
+        "state",
+        "TEXT DEFAULT 'published'",
+    )?;
     add(conn, "conversation_threads", "body_html", "TEXT")?;
     add(conn, "conversation_threads", "from_name", "TEXT")?;
     add(conn, "conversation_threads", "from_email", "TEXT")?;
@@ -1661,6 +1668,7 @@ mod tests {
             ("conversations", "folder_local_id"),
             ("conversation_threads", "embedding_state"),
             ("conversation_threads", "from_email"),
+            ("conversation_threads", "state"),
             ("customers", "background"),
             ("users", "alternate_emails"),
             ("users", "deleted_at"),

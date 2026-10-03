@@ -71,35 +71,159 @@ pub struct HsTag {
     pub updated_at: Option<String>,
 }
 
-/// A Help Scout customer.
+/// A Help Scout customer (v1.5.0 contact-first shape: emails/phones/
+/// websites/socialProfiles + enrichment + property values).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HsCustomer {
     pub remote_id: i64,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
+    /// Primary email (the reference resolves emails[0] for flat consumers).
     pub email: Option<String>,
+    /// Organization name (reference `organization.name`).
     pub organization: Option<String>,
     pub job_title: Option<String>,
+    /// Primary phone (the reference resolves phones[0] for flat consumers).
     pub phone: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    #[serde(default)]
+    pub photo_url: Option<String>,
+    /// Reference `organization.id` (remote).
+    #[serde(default)]
+    pub organization_id: Option<i64>,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub age: Option<String>,
+    #[serde(default)]
+    pub gender: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub emails: Vec<HsCustomerEmail>,
+    #[serde(default)]
+    pub phones: Vec<HsCustomerPhone>,
+    #[serde(default)]
+    pub websites: Vec<HsCustomerWebsite>,
+    #[serde(default)]
+    pub social_profiles: Vec<HsCustomerSocialProfile>,
+    #[serde(default)]
+    pub address: Option<HsCustomerAddress>,
+    /// Property values ({definitionRemoteId, key, name, value}).
+    #[serde(default)]
+    pub properties: Vec<HsCustomerPropertyValue>,
 }
 
-/// A Help Scout conversation (ticket).
+/// A customer email entry (`{value, type}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsCustomerEmail {
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+}
+
+/// A customer phone entry (`{value, type}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsCustomerPhone {
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+}
+
+/// A customer website entry (`{value}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsCustomerWebsite {
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+/// A customer social profile entry (`{value, type}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsCustomerSocialProfile {
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+}
+
+/// A customer postal address (reference wire keys; `postalCode` renamed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsCustomerAddress {
+    #[serde(default)]
+    pub line1: Option<String>,
+    #[serde(default)]
+    pub line2: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(rename = "postalCode", default)]
+    pub postal_code: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
+}
+
+/// A customer property value (`{definitionRemoteId, key, name, value}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsCustomerPropertyValue {
+    #[serde(rename = "definitionRemoteId", default)]
+    pub definition_remote_id: Option<i64>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+/// A Help Scout conversation (ticket). Mirrors the reference HsConversation
+/// (provider.ts:135) — the v1.3.0 channel fields (`type`, source
+/// attribution) and the snooze/thread-count fields land with serde defaults
+/// so older payloads still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HsConversation {
     pub remote_id: i64,
     pub number: i64,
+    /// 'email' | 'chat' (v3 `type`).
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    /// Source attribution (v3 `source.type`): e.g. 'chat' for Beacon chats.
+    #[serde(default)]
+    pub source_type: Option<String>,
+    /// Source attribution (v3 `source.via`): e.g. 'beacon'.
+    #[serde(default)]
+    pub source_via: Option<String>,
     pub subject: Option<String>,
     pub preview: Option<String>,
     pub status: String,
+    /// 'published' | 'draft' ...
+    #[serde(default)]
+    pub state: Option<String>,
     pub mailbox_id: i64,
     pub assignee_id: Option<i64>,
+    /// 'user' | 'team' | null (who `assignee_id` points at).
+    #[serde(default)]
+    pub assignee_type: Option<String>,
+    #[serde(default)]
+    pub assigned_team_id: Option<i64>,
     pub customer_id: i64,
     pub priority: Option<String>,
     pub created_at: Option<String>,
+    /// The remote `userUpdatedAt` — the port's sync-checkpoint analog.
     pub updated_at: Option<String>,
     pub closed_at: Option<String>,
+    #[serde(default)]
+    pub snoozed_until: Option<String>,
+    #[serde(default)]
+    pub thread_count: i64,
+    /// Demo/test-only merge marker (fakeData.ts sets it post-construction on
+    /// the merged conversation; merged conversations leave listings and
+    /// answer 301 on direct access).
+    #[serde(default)]
+    pub merged_into: Option<i64>,
     /// Per-conversation tag names (reference conversation shape carries
     /// `tags: [{name}]`; the port models the names).
     #[serde(default)]
@@ -125,14 +249,23 @@ pub struct HsBeaconChat {
     pub updated_at: Option<String>,
 }
 
-/// A Docs article (M2-T09).
+/// A Docs article (reference provider.ts HsDocArticle).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HsDocArticle {
     pub remote_id: i64,
     pub collection_id: i64,
+    #[serde(default)]
+    pub category_id: Option<i64>,
+    #[serde(default)]
+    pub number: Option<i64>,
     pub slug: Option<String>,
     pub name: String,
+    /// 'published' | 'draft' | 'internal'.
+    #[serde(default)]
+    pub status: Option<String>,
     pub text: Option<String>,
+    #[serde(default)]
+    pub views: Option<i64>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -264,21 +397,31 @@ pub struct HsUserStatus {
     pub mailbox_statuses: serde_json::Value,
 }
 
-/// A Docs collection.
+/// A Docs collection (reference provider.ts HsDocCollection).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HsDocCollection {
     pub remote_id: i64,
     pub slug: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub article_count: Option<i64>,
 }
 
-/// A Docs category within a collection.
+/// A Docs category within a collection (reference provider.ts
+/// HsDocCategory).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HsDocCategory {
     pub remote_id: i64,
     pub collection_id: i64,
     pub slug: Option<String>,
     pub name: String,
+    /// Reference `order`.
+    #[serde(default)]
+    pub sort_order: Option<i64>,
 }
 
 /// Query parameters for listing conversations.
@@ -347,8 +490,8 @@ pub trait HelpScoutProvider: Send + Sync {
     async fn list_ratings(&self) -> Result<Vec<HsRating>>;
 
     /// Fetch one rating by remote id (`GET /v2/ratings/:id`). The real
-    /// provider maps the full reference shape; the fake returns None (its
-    /// ratings are always listed) and a default keeps bounded implementors
+    /// provider maps the full reference shape (404 → None); the fake resolves
+    /// its seeded ratings by remote id. A default keeps bounded implementors
     /// compiling.
     async fn get_rating(&self, _rating_id: i64) -> Result<Option<HsRating>> {
         Ok(None)
@@ -528,12 +671,14 @@ pub struct FakeHelpScoutProvider {
     world: Mutex<FakeWorld>,
 }
 
-/// The in-memory data store for the Fake provider.
+/// The in-memory data store for the Fake provider (reference fakeData.ts
+/// `FakeWorld`).
 #[derive(Debug, Clone, Default)]
 pub struct FakeWorld {
     pub me: HsUser,
     pub mailboxes: Vec<HsMailbox>,
     pub users: Vec<HsUser>,
+    pub system_users: Vec<HsUser>,
     pub teams: Vec<HsTeam>,
     pub tags: Vec<HsTag>,
     pub conversations: Vec<HsConversation>,
@@ -548,6 +693,7 @@ pub struct FakeWorld {
     pub org_props: Vec<HsPropertyDef>,
     pub organizations: Vec<HsOrganization>,
     pub threads: Vec<HsThread>,
+    pub ratings: Vec<HsRating>,
     pub user_statuses: Vec<HsUserStatus>,
     pub doc_collections: Vec<HsDocCollection>,
     pub doc_categories: Vec<HsDocCategory>,
@@ -555,211 +701,684 @@ pub struct FakeWorld {
 }
 
 /// Reference fakeData.ts `daysAgo(n, hour = 10, minute = 30)`: UTC now
-/// minus `n` days, pinned to HH:MM:00.000Z.
-fn days_ago(n: i64) -> String {
+/// minus `n` days, pinned to HH:MM:00.000Z. A negative `n` lands in the
+/// future (the reference uses that for `snoozedUntil`).
+fn days_ago(n: i64, hour: u32, minute: u32) -> String {
     let t = chrono::Utc::now() - chrono::Duration::days(n);
-    // Pin to 10:30 UTC like the reference default.
     let date = t.date_naive();
     use chrono::TimeZone;
     chrono::Utc
-        .from_utc_datetime(&date.and_hms_opt(10, 30, 0).unwrap_or_else(|| t.naive_utc()))
+        .from_utc_datetime(
+            &date
+                .and_hms_opt(hour, minute, 0)
+                .unwrap_or_else(|| t.naive_utc()),
+        )
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// Reference fakeData.ts `minutesAfter(iso, minutes)`.
+fn minutes_after(iso: &str, minutes: i64) -> String {
+    parse_iso(iso)
+        .map(|t| {
+            (t + chrono::Duration::minutes(minutes))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
+        .unwrap_or_else(|| iso.to_string())
+}
+
+/// Reference fakeData.ts `hoursAgoNow(hours)` — always in the PAST (unlike
+/// `daysAgo(0, h, m)`, which can land later today when run early UTC).
+fn hours_ago_now(hours: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::hours(hours))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn parse_iso(iso: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
 impl FakeWorld {
-    /// Build a deterministic demo world with a small set of sample data.
-    /// The data is designed to exercise the UI: 2 mailboxes, 3 agents,
-    /// 2 teams, 5 tags, 10 conversations, 8 customers.
+    /// Build the deterministic demo world — a 1:1 port of the reference
+    /// `buildFakeWorld()` (fakeData.ts): a small SaaS support mailbox
+    /// (timezone/scheduling, registration, viewer, integrations, billing
+    /// topics) so dashboards, search, issue radar and AI flows are
+    /// demonstrable. 21 world conversations (one merged away from listings),
+    /// 8 customers, 2 organizations, 7 ratings, 9 docs articles.
     #[must_use]
     pub fn demo() -> Self {
+        let mut b = WorldBuilder::new();
+
+        // 1. Timezone issue (Lucía) - recurring topic, knowledge exists
+        let c1 = b.conversation(ConvSpec {
+            subject: "Scheduled report sent at wrong hour (Santiago time)",
+            preview:
+                "Our daily dispatch report is being sent at 3 AM Chilean time instead of 8 AM...",
+            mailbox_id: 201,
+            customer_id: 3001,
+            status: "active",
+            tags: &["timezone", "vip"],
+            assignee_id: Some(1001),
+            created_days_ago: 3,
+            closed_days_ago: None,
+            snoozed_until: None,
+        });
+        b.thread(c1, "customer", "<p>Hello,</p><p>Our daily dispatch report is being sent at 3 AM Chilean time instead of 8 AM as configured. We are in Santiago (UTC-4 currently due to daylight saving). The workspace timezone says \"America/Santiago\" in the settings page but the schedule editor still shows UTC times.</p><p>Can you tell me how to make the schedule follow our local timezone? This affects our morning operations meeting.</p><p>Thank you,<br>Lucía Morales<br>Andes Logistics</p>", days_ago(3, 9, 12), Some(3001), None);
+        b.thread(c1, "reply", "<p>Hi Lucía,</p><p>Thanks for the details. I can see the workspace is set to America/Santiago and the \"Daily dispatch\" schedule is currently stored with a UTC offset from before the daylight-saving change.</p><p>Could you open the schedule and re-save it once? That re-stamps it with the current offset. I am checking with engineering whether a mid-cycle DST change can re-anchor schedules automatically.</p><p>Best,<br>Alex</p>", days_ago(3, 13, 5), None, Some(1001));
+        b.thread(c1, "customer", "<p>I re-saved the schedule and it now shows 8 AM correctly. But a second report (\"Weekly summary\") is still one hour off.</p>", days_ago(2, 10, 22), Some(3001), None);
+
+        // 2. Second timezone ticket (Mateo, same company) - shows recurrence/cluster
+        let c2 = b.conversation(ConvSpec {
+            subject: "Meeting reminders in wrong timezone after DST",
+            preview:
+                "Since the clock change last weekend all meeting reminders arrive one hour late...",
+            mailbox_id: 201,
+            customer_id: 3002,
+            status: "active",
+            tags: &["timezone", "release-2-4"],
+            assignee_id: None,
+            created_days_ago: 5,
+            closed_days_ago: None,
+            snoozed_until: None,
+        });
+        b.thread(c2, "customer", "<p>Since the clock change last weekend all meeting reminders arrive one hour late. We are in Chile. Is there a fix?</p>", days_ago(5, 11, 3), Some(3002), None);
+
+        // 3. Old closed timezone ticket - historical resolution for retrieval
+        let c3 = b.conversation(ConvSpec {
+            subject: "Timezone for scheduled exports",
+            preview: "How do I set the timezone used for scheduled exports?",
+            mailbox_id: 201,
+            customer_id: 3005,
+            status: "closed",
+            tags: &["timezone"],
+            assignee_id: Some(1002),
+            created_days_ago: 40,
+            closed_days_ago: Some(39),
+            snoozed_until: None,
+        });
+        b.thread(c3, "customer", "<p>How do I set the timezone used for scheduled exports? They all arrive in UTC and my team is in Stockholm.</p>", days_ago(40, 9, 45), Some(3005), None);
+        b.thread(c3, "reply", "<p>Hi Emma,</p><p>Scheduled exports follow the workspace timezone: Settings > Workspace > Regional settings. After changing it, re-save each schedule once so the stored times re-anchor to the new timezone.</p><p>Best,<br>Priya</p>", days_ago(40, 12, 10), None, Some(1002));
+        b.thread(
+            c3,
+            "customer",
+            "<p>That worked, thank you!</p>",
+            days_ago(39, 8, 30),
+            Some(3005),
+            None,
+        );
+
+        // 4. Registration invite issue (Sarah)
+        let c4 = b.conversation(ConvSpec {
+            subject: "Invitation email never arrives for new teammate",
+            preview: "I invited daniel@brightpathedu.org three times but no email arrives...",
+            mailbox_id: 201,
+            customer_id: 3003,
+            status: "pending",
+            tags: &["registration"],
+            assignee_id: Some(1002),
+            created_days_ago: 6,
+            closed_days_ago: None,
+            snoozed_until: None,
+        });
+        b.thread(c4, "customer", "<p>Hello,</p><p>I invited daniel@brightpathedu.org three times yesterday but no invitation email arrives. Our mail provider logs show nothing from your domain either. Could you check whether the invitations are being sent?</p><p>Thanks,<br>Sarah</p>", days_ago(6, 10, 5), Some(3003), None);
+        b.thread(c4, "note", "<p>Checked mail logs - invitation to daniel@brightpathedu.org bounced with \"550 policy reasons\" from their provider. Re-sent after whitelisting; asked customer to confirm arrival. If it bounces again we will recommend sending to an alias address.</p>", days_ago(6, 15, 20), None, Some(1002));
+        b.thread(c4, "reply", "<p>Hi Sarah,</p><p>The invitation to daniel@brightpathedu.org was bouncing with a policy rejection from your mail provider. I have re-sent it and whitelisted your domain on our side. Could you confirm whether it arrives in the next few minutes? If not, we can send it to an alternate address.</p><p>Best,<br>Priya</p>", days_ago(6, 15, 25), None, Some(1002));
+
+        // 5. Viewer permissions (Daniel)
+        let c5 = b.conversation(ConvSpec {
+            subject: "What can a Viewer see?",
+            preview:
+                "What is the difference between Viewer and Editor? Can viewers see all reports...",
+            mailbox_id: 201,
+            customer_id: 3004,
+            status: "closed",
+            tags: &["viewer"],
+            assignee_id: Some(1001),
+            created_days_ago: 12,
+            closed_days_ago: Some(11),
+            snoozed_until: None,
+        });
+        b.thread(c5, "customer", "<p>What is the difference between Viewer and Editor? Can viewers see all reports or only ones shared with them? Can they export data?</p>", days_ago(12, 9, 40), Some(3004), None);
+        b.thread(c5, "reply", "<p>Hi Daniel,</p><p>A Viewer can see every dashboard and report shared with their team, but cannot edit, comment, or create new ones. Viewers can export data from reports they can see (CSV/PDF). An Editor seat is required for edit rights.</p><p>Best,<br>Alex</p>", days_ago(12, 11, 15), None, Some(1001));
+
+        // 6a. Ravi history: detailed, technical, calm closed tickets (Client
+        // Interaction Intelligence demo baseline)
+        let c6h1 = b.conversation(ConvSpec {
+            subject: "Webhook payload format after v2.4 upgrade",
+            preview: "After upgrading to v2.4 our webhook receiver rejects the payload schema...",
+            mailbox_id: 201,
+            customer_id: 3006,
+            status: "closed",
+            tags: &["integration"],
+            assignee_id: Some(1002),
+            created_days_ago: 70,
+            closed_days_ago: Some(68),
+            snoozed_until: None,
+        });
+        b.thread(c6h1, "customer", "<p>Hello,</p><p>After upgrading to v2.4 last Saturday our webhook receiver started rejecting the payload schema. I captured the failing delivery from the integrations log (delivery ID WH-10231) and diffed it against the v2.3 format:</p><p>- The \"event.type\" field now uses dot notation (\"conversation.updated\" instead of \"conversationUpdated\")<br>- The \"payload\" object is base64-encoded rather than plain JSON<br>- Headers include a new X-Signature-v2 alongside the legacy X-Signature</p><p>Our receiver validates against a strict JSON schema and returns HTTP 422 before the handler runs, so nothing is processed. I could relax the schema, but I would rather understand the intended contract first. Is there a changelog entry describing the new format, and is the legacy format supported during a transition period? We process roughly 4,000 events per day through this endpoint, so I want to migrate deliberately rather than reactively.</p><p>Thanks,<br>Ravi Sundaram<br>PixelWorks IT</p>", days_ago(70, 9, 40), Some(3006), None);
+        b.thread(c6h1, "reply", "<p>Hi Ravi,</p><p>The v2.4 release notes cover the webhook contract change under \"Breaking changes\". The legacy format is supported until the end of the quarter via the workspace setting \"Webhooks: legacy payload\", after which dot-notation events become the only format. Both signature headers validate with the same secret during the transition.</p><p>Recommended migration order: add schema acceptance for both shapes first, monitor dual-format traffic for a week, then drop the legacy branch.</p><p>Best,<br>Priya</p>", days_ago(69, 11, 20), None, Some(1002));
+        b.thread(c6h1, "customer", "<p>That is exactly what I needed — the dual-format monitoring suggestion made the migration straightforward. Receiver deployed with both schemas accepted and traffic looks clean. Closing from my side.</p>", days_ago(68, 8, 15), Some(3006), None);
+
+        let c6h2 = b.conversation(ConvSpec {
+            subject: "API rate limits for bulk export endpoint",
+            preview: "What are the documented rate limits for the bulk export API and do they reset per token...",
+            mailbox_id: 201,
+            customer_id: 3006,
+            status: "closed",
+            tags: &["api"],
+            assignee_id: Some(1002),
+            created_days_ago: 38,
+            closed_days_ago: Some(36),
+            snoozed_until: None,
+        });
+        b.thread(c6h2, "customer", "<p>Hello,</p><p>Two questions about the bulk export API (<code>/v3/exports</code>):</p><p>1. The documentation mentions a per-minute rate limit but not whether it applies per API token, per workspace, or per endpoint. Which is it? We run two workers with separate tokens from the same workspace and saw inconsistent 429 behavior.<br>2. When a 429 returns the Retry-After header, does the documented limit reset at that instant or at the next window boundary?</p><p>Context: we schedule exports nightly with a 15-minute window, and a mid-run 429 currently aborts the whole job. I would rather back off and resume than abort, but I need to know which clock the limit resets on.</p><p>Thanks,<br>Ravi</p>", days_ago(38, 10, 5), Some(3006), None);
+        b.thread(c6h2, "reply", "<p>Hi Ravi,</p><p>Answers below:</p><p>1. The limit is per API token, not per workspace. Your two workers each have the full documented quota, which explains the inconsistency you saw — one worker was likely consuming a shared proxy cache.<br>2. The window is a fixed rolling 60 seconds counted from the first request; Retry-After points to the end of the current window, so backing off until that timestamp is correct and resuming is safe.</p><p>Your resume-instead-of-abort plan is exactly what the header is for.</p><p>Best,<br>Priya</p>", days_ago(37, 9, 50), None, Some(1002));
+        b.thread(c6h2, "customer", "<p>Clear and complete. Implemented per-token accounting with resume-on-429 and the nightly job has been clean since. Thank you!</p>", days_ago(36, 9, 10), Some(3006), None);
+
+        let c6h3 = b.conversation(ConvSpec {
+            subject: "SSO SAML metadata renewal question",
+            preview: "Our identity provider is rotating certificates next month - what do we need to update...",
+            mailbox_id: 201,
+            customer_id: 3006,
+            status: "closed",
+            tags: &["sso", "account"],
+            assignee_id: Some(1001),
+            created_days_ago: 17,
+            closed_days_ago: Some(15),
+            snoozed_until: None,
+        });
+        b.thread(c6h3, "customer", "<p>Hello,</p><p>Our identity provider rotates SAML signing certificates annually and the next rotation lands on the first of next month. Before that date I want to confirm the renewal procedure on your side so logins do not break for our 120 users:</p><p>- Does the workspace accept a metadata URL that serves both the current and the upcoming certificate during overlap, or must the new certificate be uploaded manually?<br>- Is there a documented propagation delay after metadata refresh that we should schedule around?<br>- Are there logs in the admin panel that would show a failing assertion signature specifically, so I can distinguish a rotation issue from a clock-skew issue?</p><p>Historically the annual rotation has been smooth, but last year the overlap window was shorter than the propagation delay and a few users hit a failed login loop. I would like to avoid a repeat.</p><p>Thanks,<br>Ravi</p>", days_ago(17, 9, 25), Some(3006), None);
+        b.thread(c6h3, "reply", "<p>Hi Ravi,</p><p>The metadata URL path is the recommended one: we fetch it nightly and accept every certificate it advertises, so serving both during the overlap period is exactly right. Propagation is at most 24 hours after the nightly fetch, so start the overlap window two days early. Admin → Security → SSO log entries distinguish \"assertion signature validation failed\" (rotation) from \"assertion time window exceeded\" (clock skew).</p><p>Best,<br>Alex</p>", days_ago(16, 14, 5), None, Some(1001));
+        b.thread(c6h3, "customer", "<p>Started the overlap window today as suggested. Rotation completed overnight with zero failed logins — the log filter you pointed out made verification quick. Thanks again.</p>", days_ago(15, 9, 0), Some(3006), None);
+
+        // 6. Integration broken (Ravi) - escalated
+        let c6 = b.conversation(ConvSpec {
+            subject: "Slack integration stopped posting updates",
+            preview:
+                "Since last week the Slack integration no longer posts updates to our channel...",
+            mailbox_id: 201,
+            customer_id: 3006,
+            status: "active",
+            tags: &["integration", "escalated", "release-2-4"],
+            assignee_id: Some(1003),
+            created_days_ago: 4,
+            closed_days_ago: None,
+            snoozed_until: None,
+        });
+        b.thread(c6, "customer", "<p>Hi,</p><p>Since last week the Slack integration no longer posts updates to our #ops channel. I disconnected and reconnected once already. We use it for alerting so this is urgent for us.</p><p>Log ID from the integrations page: INT-88231.</p><p>Ravi</p>", days_ago(4, 8, 55), Some(3006), None);
+        b.thread(c6, "note", "<p>INT-88231 shows repeated 401 from Slack side after their token rotation policy change. Escalating to engineering - reference ENG-4471. Customer-facing wording must stay generic until engineering confirms.</p>", days_ago(3, 9, 30), None, Some(1003));
+        b.thread(c6, "reply", "<p>Hi Ravi,</p><p>Thanks for the log ID. We traced the failure to an authentication change on Slack's side affecting some workspaces. Our engineering team is working on a fix and I will update you as soon as it is deployed. Your historical data is unaffected.</p><p>Best,<br>Tom</p>", days_ago(3, 9, 45), None, Some(1003));
+
+        // 7. Billing failed charge (Chloe)
+        let c7 = b.conversation(ConvSpec {
+            subject: "Card payment failing but card is valid",
+            preview: "Our subscription shows past due but our card works everywhere else...",
+            mailbox_id: 202,
+            customer_id: 3007,
+            status: "active",
+            tags: &["billing"],
+            assignee_id: None,
+            created_days_ago: 2,
+            closed_days_ago: None,
+            snoozed_until: None,
+        });
+        b.thread(c7, "customer", "<p>Bonjour,</p><p>Our subscription shows \"past due\" but our card works everywhere else. The bank says no charge was even attempted this month. Can you retry the payment?</p><p>Merci,<br>Chloe Dubois<br>Atelier France</p>", days_ago(2, 9, 5), Some(3007), None);
+
+        // 8. Billing VAT invoice (Chloe)
+        let c8 = b.conversation(ConvSpec {
+            subject: "Need VAT number on invoices",
+            preview: "Can you add our VAT number FR40303265045 to all invoices...",
+            mailbox_id: 202,
+            customer_id: 3007,
+            status: "closed",
+            tags: &["billing"],
+            assignee_id: Some(1001),
+            created_days_ago: 25,
+            closed_days_ago: Some(24),
+            snoozed_until: None,
+        });
+        b.thread(c8, "customer", "<p>Can you add our VAT number FR40303265045 to all invoices, including past ones? Our accounting needs it for the annual filing.</p>", days_ago(25, 10, 15), Some(3007), None);
+        b.thread(c8, "reply", "<p>Hi Chloe,</p><p>I have added VAT number FR40303265045 to your billing profile and re-issued the last 12 invoices as PDFs; they are attached to your billing history. Future invoices will include it automatically.</p><p>Best,<br>Alex</p>", days_ago(24, 14, 0), None, Some(1001));
+
+        // 9. Automation question (Hiro)
+        let c9 = b.conversation(ConvSpec {
+            subject: "Can automation rules run on a schedule?",
+            preview: "Can I schedule an automation rule to run every morning at 9 and tag stale tickets...",
+            mailbox_id: 201,
+            customer_id: 3008,
+            status: "active",
+            tags: &["automation"],
+            assignee_id: Some(1002),
+            created_days_ago: 1,
+            closed_days_ago: None,
+            snoozed_until: None,
+        });
+        b.thread(c9, "customer", "<p>Hello,</p><p>Two questions about automation rules:</p><p>1) Can I schedule a rule to run every morning at 9 AM, e.g. to tag stale tickets?</p><p>2) Is there an API to trigger rules externally?</p><p>Thank you,<br>Hiro Tanaka</p>", days_ago(1, 8, 20), Some(3008), None);
+
+        // 10. Registration duplicate (Emma) - closed
+        let c10 = b.conversation(ConvSpec {
+            subject: "Duplicate account created",
+            preview:
+                "I accidentally signed up twice with two emails. Can you merge the accounts...",
+            mailbox_id: 201,
+            customer_id: 3005,
+            status: "closed",
+            tags: &["registration"],
+            assignee_id: Some(1001),
+            created_days_ago: 55,
+            closed_days_ago: Some(54),
+            snoozed_until: None,
+        });
+        b.thread(c10, "customer", "<p>I accidentally signed up twice with two emails. Can you merge the accounts? The one to keep is emma.lindqvist@nordicmail.se.</p>", days_ago(55, 13, 30), Some(3005), None);
+        b.thread(c10, "reply", "<p>Hi Emma,</p><p>I merged the accounts and moved the license to emma.lindqvist@nordicmail.se. The duplicate address can no longer be used to log in.</p><p>Best,<br>Alex</p>", days_ago(54, 10, 0), None, Some(1001));
+
+        // 11. Pending snoozed conversation (Sarah, waiting for customer)
+        let c11 = b.conversation(ConvSpec {
+            subject: "Data export format question",
+            preview: "Can exports include the raw JSON fields in addition to CSV...",
+            mailbox_id: 201,
+            customer_id: 3003,
+            status: "pending",
+            tags: &[],
+            assignee_id: Some(1001),
+            created_days_ago: 8,
+            closed_days_ago: None,
+            snoozed_until: Some(days_ago(-2, 9, 0)),
+        });
+        b.thread(c11, "customer", "<p>Can exports include the raw JSON fields in addition to CSV? We want to load them into our warehouse.</p>", days_ago(8, 11, 11), Some(3003), None);
+        b.thread(c11, "reply", "<p>Hi Sarah,</p><p>CSV is the only scheduled-export format today. I have noted your interest in JSON. Would a one-off manual export work for you in the meantime?</p><p>Best,<br>Alex</p>", days_ago(8, 15, 45), None, Some(1001));
+
+        // 12. Merged conversation: c12 was merged into c2
+        let c12 = b.conversation(ConvSpec {
+            subject: "Reminder one hour late",
+            preview: "Meeting reminders are one hour late since the weekend.",
+            mailbox_id: 201,
+            customer_id: 3002,
+            status: "closed",
+            tags: &["timezone"],
+            assignee_id: None,
+            created_days_ago: 5,
+            closed_days_ago: None,
+            snoozed_until: None,
+        });
+        if let Some(merged) = b.conversations.iter_mut().find(|c| c.remote_id == c12) {
+            merged.merged_into = Some(c2);
+        }
+
+        // --- Beacon chat sessions (v1.3.0): type='chat', source={type:'chat', via:'beacon'} ---
+
+        // Beacon chat 1 (Daniel, viewer seats, closed in 14 min, great rating)
+        let ch1 = b.chat_session(ChatSpec {
+            subject: "Quick question about viewer seats",
+            preview: "Do viewers count against our seat limit?",
+            mailbox_id: 201,
+            customer_id: 3004,
+            status: "closed",
+            tags: &["beacon", "viewer"],
+            assignee_id: Some(1002),
+            created_days_ago: 2,
+            start_hour: 15,
+            closed_after_min: Some(14),
+        });
+        b.thread(
+            ch1,
+            "customer",
+            "Hi! Quick question — do viewer seats count against our plan limit?",
+            days_ago(2, 15, 0),
+            Some(3004),
+            None,
+        );
+        b.thread(ch1, "reply", "Hi Daniel! Viewers are unlimited on the Growth plan — only editor seats count. You are currently at 7 of 10 editor seats, so you can invite as many viewers as you like.", minutes_after(&days_ago(2, 15, 0), 6), None, Some(1002));
+        b.thread(
+            ch1,
+            "customer",
+            "Perfect, exactly what I needed. Thanks Priya!",
+            minutes_after(&days_ago(2, 15, 0), 11),
+            Some(3004),
+            None,
+        );
+
+        // Beacon chat 2 (Hiro, SSO loop, closed in 9 min, great rating)
+        let ch2 = b.chat_session(ChatSpec {
+            subject: "SSO login loop",
+            preview: "SSO keeps redirecting me back to the login page.",
+            mailbox_id: 201,
+            customer_id: 3008,
+            status: "closed",
+            tags: &["beacon", "sso"],
+            assignee_id: Some(1002),
+            created_days_ago: 4,
+            start_hour: 9,
+            closed_after_min: Some(9),
+        });
+        b.thread(ch2, "customer", "Hi — SSO keeps redirecting me back to the login page. Chrome on macOS, started this morning.", days_ago(4, 9, 0), Some(3008), None);
+        b.thread(ch2, "reply", "Hi Hiro! Please try an incognito window first. If that works, clear cookies for app.zylker.io — a stale session cookie is the usual cause of this loop. There is also a checklist in our internal SSO article I can walk you through.", minutes_after(&days_ago(4, 9, 0), 4), None, Some(1002));
+        b.thread(
+            ch2,
+            "customer",
+            "Incognito worked. Cleared the cookies and I am in. Arigatō!",
+            minutes_after(&days_ago(4, 9, 0), 8),
+            Some(3008),
+            None,
+        );
+
+        // Beacon chat 3 (Chloe, receipt resend, Billing mailbox, closed in 5 min, okay rating)
+        let ch3 = b.chat_session(ChatSpec {
+            subject: "Receipt for last month",
+            preview: "Can you resend the receipt for last month?",
+            mailbox_id: 202,
+            customer_id: 3007,
+            status: "closed",
+            tags: &["beacon", "billing"],
+            assignee_id: Some(1001),
+            created_days_ago: 6,
+            start_hour: 11,
+            closed_after_min: Some(5),
+        });
+        b.thread(ch3, "customer", "Bonjour — can you resend the receipt for last month? My accountant lost the original email.", days_ago(6, 11, 0), Some(3007), None);
+        b.thread(ch3, "reply", "Of course, Chloe — I have just re-sent the November receipt to chloe@atelierfrance.fr. It should arrive within a minute. You can also download receipts any time under Billing → Invoices.", minutes_after(&days_ago(6, 11, 0), 3), None, Some(1001));
+        b.thread(
+            ch3,
+            "customer",
+            "Received, merci.",
+            minutes_after(&days_ago(6, 11, 0), 4),
+            Some(3007),
+            None,
+        );
+
+        // Beacon chat 4 (Sarah, invite teammate, closed in 4 min, great rating)
+        let ch4 = b.chat_session(ChatSpec {
+            subject: "How do I invite a teammate?",
+            preview: "How do I invite a teammate as a viewer?",
+            mailbox_id: 201,
+            customer_id: 3003,
+            status: "closed",
+            tags: &["beacon"],
+            assignee_id: Some(1001),
+            created_days_ago: 9,
+            start_hour: 14,
+            closed_after_min: Some(4),
+        });
+        b.thread(
+            ch4,
+            "customer",
+            "How do I invite a teammate as a viewer? I do not want them to edit reports.",
+            days_ago(9, 14, 0),
+            Some(3003),
+            None,
+        );
+        b.thread(ch4, "reply", "Hi Sarah! Go to Settings → Team → Invite and pick \"Viewer\" in the role dropdown before sending. Viewers can see every shared report but cannot edit or schedule anything.", minutes_after(&days_ago(9, 14, 0), 2), None, Some(1001));
+        b.thread(
+            ch4,
+            "customer",
+            "Done — invitation sent. Thanks!",
+            minutes_after(&days_ago(9, 14, 0), 3),
+            Some(3003),
+            None,
+        );
+
+        // Beacon chat 5 (Mateo, manual export while schedule broken, closed in 12 min)
+        let ch5 = b.chat_session(ChatSpec {
+            subject: "Manual export while the schedule is broken",
+            preview: "Can I trigger the dispatch report manually today?",
+            mailbox_id: 201,
+            customer_id: 3002,
+            status: "closed",
+            tags: &["beacon", "timezone"],
+            assignee_id: Some(1002),
+            created_days_ago: 1,
+            start_hour: 16,
+            closed_after_min: Some(12),
+        });
+        b.thread(ch5, "customer", "Since the DST issue our dispatch report is late — can I trigger it manually for today?", days_ago(1, 16, 0), Some(3002), None);
+        b.thread(ch5, "reply", "Yes! Reports → Dispatch → \"Run now\" runs immediately and does not touch the schedule. I have also re-anchored your schedule to the current Santiago offset, so tomorrow's run should fire at 8 AM local again.", minutes_after(&days_ago(1, 16, 0), 8), None, Some(1002));
+        b.thread(
+            ch5,
+            "customer",
+            "Perfect — running now. Gracias!",
+            minutes_after(&days_ago(1, 16, 0), 10),
+            Some(3002),
+            None,
+        );
+
+        // Beacon chat 6 (Emma, shared view 404, ACTIVE - waiting for an agent)
+        let ch6 = b.chat_session(ChatSpec {
+            subject: "Shared view link returns 404",
+            preview: "The shared view link I sent a colleague returns a 404.",
+            mailbox_id: 201,
+            customer_id: 3005,
+            status: "active",
+            tags: &["beacon", "viewer"],
+            assignee_id: Some(1002),
+            created_days_ago: 0,
+            start_hour: 10,
+            closed_after_min: None,
+        });
+        // Recompute the start into the past (2h ago): daysAgo(0, h, m) can
+        // land LATER TODAY when the world is built early in the UTC day,
+        // which would exclude the chat from "created <= now" windows and
+        // date it in the future.
+        for c in b.conversations.iter_mut().filter(|c| c.remote_id == ch6) {
+            c.created_at = Some(hours_ago_now(2));
+            c.updated_at = Some(hours_ago_now(2));
+        }
+        b.thread(
+            ch6,
+            "customer",
+            "Hi — the shared view link I sent a colleague returns a 404 page. It worked last week.",
+            hours_ago_now(2),
+            Some(3005),
+            None,
+        );
+
+        let ratings = vec![
+            HsRating {
+                remote_id: 601,
+                conversation_id: Some(c3),
+                thread_id: None,
+                rating: Some("great".into()),
+                comment: Some("Quick and clear, thank you!".into()),
+                customer_id: Some(3005),
+                customer_name: Some("Emma Lindqvist".into()),
+                user_id: Some(1002),
+                created_at: Some(days_ago(39, 9, 0)),
+            },
+            HsRating {
+                remote_id: 602,
+                conversation_id: Some(c5),
+                thread_id: None,
+                rating: Some("great".into()),
+                comment: None,
+                customer_id: Some(3004),
+                customer_name: Some("Daniel Kim".into()),
+                user_id: Some(1001),
+                created_at: Some(days_ago(11, 12, 0)),
+            },
+            HsRating {
+                remote_id: 603,
+                conversation_id: Some(c8),
+                thread_id: None,
+                rating: Some("okay".into()),
+                comment: Some("Fine, but would like this self-service.".into()),
+                customer_id: Some(3007),
+                customer_name: Some("Chloe Dubois".into()),
+                user_id: Some(1001),
+                created_at: Some(days_ago(24, 15, 0)),
+            },
+            HsRating {
+                remote_id: 604,
+                conversation_id: Some(c10),
+                thread_id: None,
+                rating: Some("great".into()),
+                comment: None,
+                customer_id: Some(3005),
+                customer_name: Some("Emma Lindqvist".into()),
+                user_id: Some(1001),
+                created_at: Some(days_ago(54, 11, 0)),
+            },
+            HsRating {
+                remote_id: 605,
+                conversation_id: Some(ch1),
+                thread_id: None,
+                rating: Some("great".into()),
+                comment: Some("Answered in six minutes over chat!".into()),
+                customer_id: Some(3004),
+                customer_name: Some("Daniel Kim".into()),
+                user_id: Some(1002),
+                created_at: Some(days_ago(2, 15, 14)),
+            },
+            HsRating {
+                remote_id: 606,
+                conversation_id: Some(ch3),
+                thread_id: None,
+                rating: Some("okay".into()),
+                comment: Some("Fast, but I would love a self-service receipts page.".into()),
+                customer_id: Some(3007),
+                customer_name: Some("Chloe Dubois".into()),
+                user_id: Some(1001),
+                created_at: Some(days_ago(6, 11, 6)),
+            },
+            HsRating {
+                remote_id: 607,
+                conversation_id: Some(ch2),
+                thread_id: None,
+                rating: Some("great".into()),
+                comment: None,
+                customer_id: Some(3008),
+                customer_name: Some("Hiro Tanaka".into()),
+                user_id: Some(1002),
+                created_at: Some(days_ago(4, 9, 10)),
+            },
+        ];
+
         Self {
             me: HsUser {
-                remote_id: 1,
-                first_name: Some("Demo".into()),
-                last_name: Some("Agent".into()),
-                email: Some("demo@supportos.test".into()),
+                remote_id: 1001,
+                first_name: Some("Alex".into()),
+                last_name: Some("Rivera".into()),
+                email: Some("alex@zylker.io".into()),
                 role: Some("owner".into()),
                 user_type: "user".into(),
-                timezone: Some("UTC".into()),
+                timezone: Some("America/New_York".into()),
                 photo_url: None,
-                initials: Some("DA".into()),
-                mention: Some("@demo".into()),
+                initials: Some("AR".into()),
+                mention: Some("alex".into()),
                 job_title: Some("Support Lead".into()),
                 phone: None,
                 alternate_emails: vec![],
-                created_at: Some("2026-01-01T00:00:00Z".into()),
-                updated_at: Some("2026-01-01T00:00:00Z".into()),
+                created_at: Some(days_ago(400, 10, 30)),
+                updated_at: Some(days_ago(20, 10, 30)),
             },
             mailboxes: vec![
-                HsMailbox {
-                    remote_id: 101,
-                    name: "General Support".into(),
-                    slug: Some("general".into()),
-                    email: Some("support@example.com".into()),
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                },
-                HsMailbox {
-                    remote_id: 102,
-                    name: "Billing".into(),
-                    slug: Some("billing".into()),
-                    email: Some("billing@example.com".into()),
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                },
+                HsMailbox { remote_id: 201, name: "Support".into(), slug: Some("a1b2c3".into()), email: Some("support@zylker.io".into()), created_at: Some(days_ago(400, 10, 30)), updated_at: Some(days_ago(20, 10, 30)) },
+                HsMailbox { remote_id: 202, name: "Billing".into(), slug: Some("d4e5f6".into()), email: Some("billing@zylker.io".into()), created_at: Some(days_ago(350, 10, 30)), updated_at: Some(days_ago(12, 10, 30)) },
             ],
             users: vec![
                 HsUser {
-                    remote_id: 1,
-                    first_name: Some("Demo".into()),
-                    last_name: Some("Agent".into()),
-                    email: Some("demo@supportos.test".into()),
+                    remote_id: 1001,
+                    first_name: Some("Alex".into()),
+                    last_name: Some("Rivera".into()),
+                    email: Some("alex@zylker.io".into()),
                     role: Some("owner".into()),
                     user_type: "user".into(),
-                    timezone: Some("UTC".into()),
+                    timezone: Some("America/New_York".into()),
                     photo_url: None,
-                    initials: Some("DA".into()),
-                    mention: Some("@demo".into()),
+                    initials: Some("AR".into()),
+                    mention: Some("alex".into()),
                     job_title: Some("Support Lead".into()),
                     phone: None,
                     alternate_emails: vec![],
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
+                    created_at: Some(days_ago(400, 10, 30)),
+                    updated_at: Some(days_ago(20, 10, 30)),
                 },
                 HsUser {
-                    remote_id: 2,
-                    first_name: Some("Jane".into()),
-                    last_name: Some("Smith".into()),
-                    email: Some("jane@supportos.test".into()),
-                    role: Some("admin".into()),
-                    user_type: "user".into(),
-                    timezone: Some("UTC".into()),
-                    photo_url: None,
-                    initials: Some("JS".into()),
-                    mention: Some("@jane".into()),
-                    job_title: Some("Agent".into()),
-                    phone: None,
-                    alternate_emails: vec![],
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                },
-                HsUser {
-                    remote_id: 3,
-                    first_name: Some("Bob".into()),
-                    last_name: Some("Jones".into()),
-                    email: Some("bob@supportos.test".into()),
+                    remote_id: 1002,
+                    first_name: Some("Priya".into()),
+                    last_name: Some("Nair".into()),
+                    email: Some("priya@zylker.io".into()),
                     role: Some("user".into()),
                     user_type: "user".into(),
-                    timezone: Some("UTC".into()),
+                    timezone: Some("Asia/Kolkata".into()),
                     photo_url: None,
-                    initials: Some("BJ".into()),
-                    mention: Some("@bob".into()),
-                    job_title: Some("Agent".into()),
+                    initials: Some("PN".into()),
+                    mention: Some("priya".into()),
+                    job_title: Some("Support Engineer".into()),
                     phone: None,
                     alternate_emails: vec![],
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
+                    created_at: Some(days_ago(300, 10, 30)),
+                    updated_at: Some(days_ago(15, 10, 30)),
+                },
+                HsUser {
+                    remote_id: 1003,
+                    first_name: Some("Tom".into()),
+                    last_name: Some("Bright".into()),
+                    email: Some("tom@zylker.io".into()),
+                    role: Some("user".into()),
+                    user_type: "user".into(),
+                    timezone: Some("Europe/Berlin".into()),
+                    photo_url: None,
+                    initials: Some("TB".into()),
+                    mention: Some("tom".into()),
+                    job_title: Some("Support Engineer".into()),
+                    phone: None,
+                    alternate_emails: vec![],
+                    created_at: Some(days_ago(250, 10, 30)),
+                    updated_at: Some(days_ago(10, 10, 30)),
+                },
+            ],
+            system_users: vec![
+                HsUser {
+                    remote_id: 9001,
+                    first_name: Some("AI Agent".into()),
+                    last_name: Some(String::new()),
+                    email: Some("ai-agent@zylker.io".into()),
+                    role: Some("user".into()),
+                    user_type: "system_user".into(),
+                    timezone: Some("UTC".into()),
+                    photo_url: None,
+                    initials: Some("AA".into()),
+                    mention: None,
+                    job_title: None,
+                    phone: None,
+                    alternate_emails: vec![],
+                    created_at: Some(days_ago(60, 10, 30)),
+                    updated_at: Some(days_ago(60, 10, 30)),
                 },
             ],
             teams: vec![
-                HsTeam {
-                    remote_id: 201,
-                    name: "Support Team".into(),
-                    member_user_ids: vec![1, 2, 3],
-                },
-                HsTeam {
-                    remote_id: 202,
-                    name: "Billing Team".into(),
-                    member_user_ids: vec![2, 3],
-                },
+                HsTeam { remote_id: 501, name: "Tier 1".into(), member_user_ids: vec![1001, 1002] },
+                HsTeam { remote_id: 502, name: "Escalations".into(), member_user_ids: vec![1003] },
             ],
             tags: vec![
                 // Reference fakeData.ts:129-144 — the same 14 tags with the
                 // same remote ids, colors and ticket counts. Dates are
                 // relative (daysAgo) exactly like the reference.
-                HsTag { remote_id: 701, name: "timezone".into(), slug: Some("timezone".into()), color: Some("#37A4FF".into()), ticket_count: Some(6), created_at: Some(days_ago(200)), updated_at: Some(days_ago(2)) },
-                HsTag { remote_id: 702, name: "billing".into(), slug: Some("billing".into()), color: Some("#517EDB".into()), ticket_count: Some(5), created_at: Some(days_ago(200)), updated_at: Some(days_ago(3)) },
-                HsTag { remote_id: 703, name: "integration".into(), slug: Some("integration".into()), color: Some("#517EDB".into()), ticket_count: Some(4), created_at: Some(days_ago(180)), updated_at: Some(days_ago(1)) },
-                HsTag { remote_id: 704, name: "registration".into(), slug: Some("registration".into()), color: Some("#56AF31".into()), ticket_count: Some(3), created_at: Some(days_ago(150)), updated_at: Some(days_ago(5)) },
-                HsTag { remote_id: 705, name: "viewer".into(), slug: Some("viewer".into()), color: Some("#56AF31".into()), ticket_count: Some(3), created_at: Some(days_ago(120)), updated_at: Some(days_ago(4)) },
-                HsTag { remote_id: 706, name: "automation".into(), slug: Some("automation".into()), color: Some("#929499".into()), ticket_count: Some(2), created_at: Some(days_ago(90)), updated_at: Some(days_ago(6)) },
-                HsTag { remote_id: 707, name: "vip".into(), slug: Some("vip".into()), color: Some("#E4BB2F".into()), ticket_count: Some(2), created_at: Some(days_ago(80)), updated_at: Some(days_ago(7)) },
-                HsTag { remote_id: 708, name: "escalated".into(), slug: Some("escalated".into()), color: Some("#DE5B49".into()), ticket_count: Some(2), created_at: Some(days_ago(70)), updated_at: Some(days_ago(2)) },
-                HsTag { remote_id: 709, name: "release-2-4".into(), slug: Some("release-2-4".into()), color: Some("#929499".into()), ticket_count: Some(3), created_at: Some(days_ago(14)), updated_at: Some(days_ago(1)) },
-                HsTag { remote_id: 710, name: "docs-gap".into(), slug: Some("docs-gap".into()), color: Some("#929499".into()), ticket_count: Some(1), created_at: Some(days_ago(30)), updated_at: Some(days_ago(30)) },
-                HsTag { remote_id: 711, name: "api".into(), slug: Some("api".into()), color: Some("#37A4FF".into()), ticket_count: Some(1), created_at: Some(days_ago(60)), updated_at: Some(days_ago(36)) },
-                HsTag { remote_id: 712, name: "sso".into(), slug: Some("sso".into()), color: Some("#517EDB".into()), ticket_count: Some(1), created_at: Some(days_ago(40)), updated_at: Some(days_ago(15)) },
-                HsTag { remote_id: 713, name: "account".into(), slug: Some("account".into()), color: Some("#929499".into()), ticket_count: Some(1), created_at: Some(days_ago(100)), updated_at: Some(days_ago(15)) },
-                HsTag { remote_id: 714, name: "beacon".into(), slug: Some("beacon".into()), color: Some("#37A4FF".into()), ticket_count: Some(6), created_at: Some(days_ago(60)), updated_at: Some(days_ago(1)) },
+                HsTag { remote_id: 701, name: "timezone".into(), slug: Some("timezone".into()), color: Some("#37A4FF".into()), ticket_count: Some(6), created_at: Some(days_ago(200, 10, 30)), updated_at: Some(days_ago(2, 10, 30)) },
+                HsTag { remote_id: 702, name: "billing".into(), slug: Some("billing".into()), color: Some("#517EDB".into()), ticket_count: Some(5), created_at: Some(days_ago(200, 10, 30)), updated_at: Some(days_ago(3, 10, 30)) },
+                HsTag { remote_id: 703, name: "integration".into(), slug: Some("integration".into()), color: Some("#517EDB".into()), ticket_count: Some(4), created_at: Some(days_ago(180, 10, 30)), updated_at: Some(days_ago(1, 10, 30)) },
+                HsTag { remote_id: 704, name: "registration".into(), slug: Some("registration".into()), color: Some("#56AF31".into()), ticket_count: Some(3), created_at: Some(days_ago(150, 10, 30)), updated_at: Some(days_ago(5, 10, 30)) },
+                HsTag { remote_id: 705, name: "viewer".into(), slug: Some("viewer".into()), color: Some("#56AF31".into()), ticket_count: Some(3), created_at: Some(days_ago(120, 10, 30)), updated_at: Some(days_ago(4, 10, 30)) },
+                HsTag { remote_id: 706, name: "automation".into(), slug: Some("automation".into()), color: Some("#929499".into()), ticket_count: Some(2), created_at: Some(days_ago(90, 10, 30)), updated_at: Some(days_ago(6, 10, 30)) },
+                HsTag { remote_id: 707, name: "vip".into(), slug: Some("vip".into()), color: Some("#E4BB2F".into()), ticket_count: Some(2), created_at: Some(days_ago(80, 10, 30)), updated_at: Some(days_ago(7, 10, 30)) },
+                HsTag { remote_id: 708, name: "escalated".into(), slug: Some("escalated".into()), color: Some("#DE5B49".into()), ticket_count: Some(2), created_at: Some(days_ago(70, 10, 30)), updated_at: Some(days_ago(2, 10, 30)) },
+                HsTag { remote_id: 709, name: "release-2-4".into(), slug: Some("release-2-4".into()), color: Some("#929499".into()), ticket_count: Some(3), created_at: Some(days_ago(14, 10, 30)), updated_at: Some(days_ago(1, 10, 30)) },
+                HsTag { remote_id: 710, name: "docs-gap".into(), slug: Some("docs-gap".into()), color: Some("#929499".into()), ticket_count: Some(1), created_at: Some(days_ago(30, 10, 30)), updated_at: Some(days_ago(30, 10, 30)) },
+                HsTag { remote_id: 711, name: "api".into(), slug: Some("api".into()), color: Some("#37A4FF".into()), ticket_count: Some(1), created_at: Some(days_ago(60, 10, 30)), updated_at: Some(days_ago(36, 10, 30)) },
+                HsTag { remote_id: 712, name: "sso".into(), slug: Some("sso".into()), color: Some("#517EDB".into()), ticket_count: Some(1), created_at: Some(days_ago(40, 10, 30)), updated_at: Some(days_ago(15, 10, 30)) },
+                HsTag { remote_id: 713, name: "account".into(), slug: Some("account".into()), color: Some("#929499".into()), ticket_count: Some(1), created_at: Some(days_ago(100, 10, 30)), updated_at: Some(days_ago(15, 10, 30)) },
+                HsTag { remote_id: 714, name: "beacon".into(), slug: Some("beacon".into()), color: Some("#37A4FF".into()), ticket_count: Some(6), created_at: Some(days_ago(60, 10, 30)), updated_at: Some(days_ago(1, 10, 30)) },
             ],
-            conversations: (1..=10)
-                .map(|i| {
-                    // Tag sets mirror the reference fakeData.ts scripted
-                    // world (conversation order preserved).
-                    let tags: Vec<String> = match i {
-                        1 => vec!["timezone", "vip"],
-                        2 => vec!["timezone", "release-2-4"],
-                        3 => vec!["timezone"],
-                        4 => vec!["registration"],
-                        5 => vec!["viewer"],
-                        6 => vec!["integration"],
-                        7 => vec!["api"],
-                        8 => vec!["sso", "account"],
-                        9 => vec!["integration", "escalated", "release-2-4"],
-                        10 => vec!["billing"],
-                        _ => vec![],
-                    }
-                    .into_iter()
-                    .map(String::from)
-                    .collect();
-                    HsConversation {
-                        remote_id: 1000 + i,
-                        number: 1000 + i,
-                        subject: Some(format!("Conversation #{}", i)),
-                        preview: Some(format!("Preview text for conversation {}", i)),
-                        status: if i % 3 == 0 { "closed" } else { "active" }.into(),
-                        mailbox_id: if i <= 5 { 101 } else { 102 },
-                        assignee_id: Some((i % 3) + 1),
-                        // Round-robin over the fake customer list (the
-                        // reference's fake data only ever references real
-                        // customer objects — conversations must never point
-                        // at a customer the provider cannot serve).
-                        customer_id: 2000 + ((i - 1) % 8) + 1,
-                        priority: if i == 1 { Some("urgent".into()) } else { None },
-                        created_at: Some(format!("2026-01-{:02}T00:00:00Z", i)),
-                        updated_at: Some(format!("2026-01-{:02}T12:00:00Z", i)),
-                        closed_at: if i % 3 == 0 {
-                            Some(format!("2026-01-{:02}T18:00:00Z", i))
-                        } else {
-                            None
-                        },
-                        tags,
-                    }
-                })
-                .collect(),
-            customers: (1..=8)
-                .map(|i| HsCustomer {
-                    remote_id: 2000 + i,
-                    first_name: Some(format!("Customer{}", i)),
-                    last_name: Some("Last".into()),
-                    email: Some(format!("customer{}@example.com", i)),
-                    organization: Some(if i <= 4 { "Acme Corp" } else { "Globex" }.into()),
-                    job_title: Some(if i <= 4 { "Engineer" } else { "Manager" }.into()),
-                    phone: Some(format!("+1-555-{:04}", i)),
-                    created_at: Some("2026-01-01T00:00:00Z".into()),
-                    updated_at: Some("2026-01-01T00:00:00Z".into()),
-                })
-                .collect(),
             folders: vec![
-                HsFolder { remote_id: 501, mailbox_id: 101, name: "Unassigned".into(), kind: "unassigned".into(), user_id: None, total_count: 3, active_count: 2 },
-                HsFolder { remote_id: 502, mailbox_id: 101, name: "Mine".into(), kind: "mine".into(), user_id: Some(1), total_count: 4, active_count: 3 },
-                HsFolder { remote_id: 503, mailbox_id: 101, name: "Drafts".into(), kind: "drafts".into(), user_id: Some(1), total_count: 1, active_count: 1 },
-                HsFolder { remote_id: 504, mailbox_id: 102, name: "Unassigned".into(), kind: "unassigned".into(), user_id: None, total_count: 2, active_count: 1 },
+                HsFolder { remote_id: 301, mailbox_id: 201, name: "Unassigned".into(), kind: "unassigned".into(), user_id: None, total_count: 4, active_count: 3 },
+                HsFolder { remote_id: 302, mailbox_id: 201, name: "Mine".into(), kind: "mine".into(), user_id: Some(1001), total_count: 6, active_count: 4 },
+                HsFolder { remote_id: 303, mailbox_id: 201, name: "Drafts".into(), kind: "drafts".into(), user_id: Some(1001), total_count: 1, active_count: 1 },
+                HsFolder { remote_id: 304, mailbox_id: 202, name: "Unassigned".into(), kind: "unassigned".into(), user_id: None, total_count: 2, active_count: 1 },
             ],
             fields: vec![
                 HsField {
                     remote_id: 104,
-                    mailbox_id: 101,
+                    mailbox_id: 201,
                     name: "Topic".into(),
                     kind: "dropdown".into(),
                     system_type: None,
@@ -776,7 +1395,7 @@ impl FakeWorld {
                 },
                 HsField {
                     remote_id: 105,
-                    mailbox_id: 101,
+                    mailbox_id: 201,
                     name: "ai-topic".into(),
                     kind: "dropdown".into(),
                     system_type: Some("topic".into()),
@@ -787,32 +1406,58 @@ impl FakeWorld {
                         HsFieldOption { id: 181, order: 2, label: "Shipping".into() },
                     ],
                 },
-                HsField { remote_id: 107, mailbox_id: 102, name: "Plan issue".into(), kind: "singleline".into(), system_type: None, required: false, sort_order: 1, options: vec![] },
+                HsField {
+                    remote_id: 106,
+                    mailbox_id: 201,
+                    name: "Account tier".into(),
+                    kind: "dropdown".into(),
+                    system_type: None,
+                    required: false,
+                    sort_order: 3,
+                    options: vec![
+                        HsFieldOption { id: 190, order: 1, label: "Free".into() },
+                        HsFieldOption { id: 191, order: 2, label: "Pro".into() },
+                        HsFieldOption { id: 192, order: 3, label: "Enterprise".into() },
+                    ],
+                },
+                HsField { remote_id: 107, mailbox_id: 202, name: "Plan issue".into(), kind: "singleline".into(), system_type: None, required: false, sort_order: 1, options: vec![] },
             ],
             saved_replies: vec![
                 HsSavedReply {
                     remote_id: 401,
                     name: "Timezone - set workspace timezone".into(),
                     preview: Some("Hi there! You can change the workspace timezone under Settings > Workspace > Regional...".into()),
-                    text: Some("Hi there!\n\nYou can change the workspace timezone under **Settings > Workspace > Regional settings**. After changing it, new scheduled items use the new timezone.".into()),
+                    text: Some("Hi there!\n\nYou can change the workspace timezone under **Settings > Workspace > Regional settings**. After changing it, new scheduled items use the new timezone; existing scheduled reports keep their original time.\n\nLet me know if anything still looks off!".into()),
                 },
                 HsSavedReply {
                     remote_id: 402,
                     name: "Registration - invite not arriving".into(),
                     preview: Some("Sorry the invite did not arrive. Common causes: spam filtering or a typo in the address...".into()),
-                    text: Some("Hi there!\n\nSorry the invite did not arrive. The most common causes are spam filtering or a typo in the address. Could you check your spam folder and confirm the exact address you used?".into()),
+                    text: Some("Hi there!\n\nSorry the invite did not arrive. The most common causes are spam filtering or a typo in the address. Could you check your spam folder and confirm the exact address you used? I have re-sent the invitation now, and I have also whitelisted your domain on our side.".into()),
                 },
                 HsSavedReply {
                     remote_id: 403,
+                    name: "Viewer role - what it can access".into(),
+                    preview: Some("Viewers can see dashboards and reports but cannot edit them...".into()),
+                    text: Some("Hi there!\n\nA Viewer can see every dashboard and report that is shared with their team, but cannot edit, comment, or create new ones. If someone needs edit rights, an Editor seat is required.".into()),
+                },
+                HsSavedReply {
+                    remote_id: 404,
                     name: "Billing - update card and retry".into(),
                     preview: Some("You can update your card under Settings > Billing. After updating...".into()),
-                    text: Some("Hi there!\n\nYou can update your card under **Settings > Billing > Payment method**. After updating, click Retry payment so the pending invoice is charged again.".into()),
+                    text: Some("Hi there!\n\nYou can update your card under **Settings > Billing > Payment method**. After updating, click \"Retry payment\" so the pending invoice is charged again; the license re-activates immediately after a successful charge.".into()),
+                },
+                HsSavedReply {
+                    remote_id: 405,
+                    name: "Integration - reconnect OAuth".into(),
+                    preview: Some("To reconnect the integration: open Integrations, click Disconnect...".into()),
+                    text: Some("Hi there!\n\nTo reconnect the integration: open **Integrations**, click **Disconnect**, then **Connect** again and approve the permission prompt. Reconnecting never deletes your historical sync data.".into()),
                 },
             ],
             workflows: vec![
-                HsWorkflow { remote_id: 601, mailbox_id: Some(101), name: "Assign to Tier 1".into(), kind: "manual".into(), status: "active".into(), sort_order: 1 },
-                HsWorkflow { remote_id: 602, mailbox_id: Some(101), name: "Spam cleanup".into(), kind: "manual".into(), status: "active".into(), sort_order: 2 },
-                HsWorkflow { remote_id: 603, mailbox_id: Some(102), name: "Auto-route billing".into(), kind: "automatic".into(), status: "active".into(), sort_order: 1 },
+                HsWorkflow { remote_id: 601, mailbox_id: Some(201), name: "Assign to Tier 1".into(), kind: "manual".into(), status: "active".into(), sort_order: 1 },
+                HsWorkflow { remote_id: 602, mailbox_id: Some(201), name: "Spam cleanup".into(), kind: "manual".into(), status: "active".into(), sort_order: 2 },
+                HsWorkflow { remote_id: 603, mailbox_id: Some(202), name: "Auto-route billing".into(), kind: "automatic".into(), status: "active".into(), sort_order: 1 },
             ],
             webhooks: vec![
                 HsWebhookConfig {
@@ -832,64 +1477,595 @@ impl FakeWorld {
                 HsPropertyDef { remote_id: 4201, name: "Industry".into(), slug: Some("industry".into()), kind: "text".into(), sort_order: 1 },
             ],
             organizations: vec![
-                HsOrganization { remote_id: 9001, name: "Acme Corp".into(), domains: vec!["acme.com".into()], created_at: Some("2025-06-01T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
-                HsOrganization { remote_id: 9002, name: "Globex".into(), domains: vec!["globex.io".into()], created_at: Some("2025-08-15T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
+                HsOrganization { remote_id: 2001, name: "Andes Logistics".into(), domains: vec!["andeslogistics.cl".into()], created_at: Some(days_ago(220, 10, 30)), updated_at: Some(days_ago(10, 10, 30)) },
+                HsOrganization { remote_id: 2002, name: "BrightPath Education".into(), domains: vec!["brightpathedu.org".into()], created_at: Some(days_ago(150, 10, 30)), updated_at: Some(days_ago(5, 10, 30)) },
             ],
-            threads: (1..=10)
-                .flat_map(|i| {
-                    let conv = 1000 + i;
-                    vec![
-                        HsThread {
-                            remote_id: conv * 10 + 1,
-                            conversation_id: conv,
-                            kind: "customer".into(),
-                            status: Some("active".into()),
-                            state: Some("published".into()),
-                            body: Some(format!("Customer message for conversation {} — please help with this issue.", i)),
-                            created_by_customer_id: Some(2000 + i),
-                            created_by_user_id: None,
-                            assigned_to_id: None,
-                            created_at: Some(format!("2026-01-{:02}T01:00:00Z", i)),
-                        },
-                        HsThread {
-                            remote_id: conv * 10 + 2,
-                            conversation_id: conv,
-                            kind: "message".into(),
-                            status: Some("active".into()),
-                            state: Some("published".into()),
-                            body: Some(format!("Agent reply for conversation {} — here is what we found.", i)),
-                            created_by_customer_id: None,
-                            created_by_user_id: Some((i % 3) + 1),
-                            assigned_to_id: None,
-                            created_at: Some(format!("2026-01-{:02}T05:00:00Z", i)),
-                        },
-                    ]
-                })
-                .collect(),
-            user_statuses: (1..=3)
-                .map(|i| HsUserStatus {
-                    user_id: i,
-                    email_status: Some(if i == 1 { "away".into() } else { "active".into() }),
-                    email_updated_at: Some("2026-01-01T00:00:00Z".into()),
+            customers: vec![
+                build_customer(CustomerSpec {
+                    remote_id: 3001,
+                    first: "Lucía",
+                    last: "Morales",
+                    job_title: Some("Operations Manager"),
+                    emails: vec![cust_email("lucia@andeslogistics.cl", "work"), cust_email("l.morales@gmail.com", "other")],
+                    phones: vec![cust_phone("+56 2 1234 5678", "work")],
+                    websites: vec![cust_site("https://andeslogistics.cl")],
+                    socials: vec![cust_social("luciam", "twitter")],
+                    address: Some(HsCustomerAddress {
+                        line1: Some("Av. Providencia 1234".into()),
+                        line2: None,
+                        city: Some("Santiago".into()),
+                        state: None,
+                        postal_code: Some("7500572".into()),
+                        country: Some("Chile".into()),
+                    }),
+                    organization: Some((2001, "Andes Logistics")),
+                    created_days_ago: 220,
+                    updated_days_ago: 3,
+                    background: Some("Key account contact since 2024. Prefers Spanish, answers in English fine."),
+                    age: Some("30-35"),
+                    gender: Some("female"),
+                    location: Some("Santiago, Chile"),
+                    properties: vec![cust_prop(4101, "Pro"), cust_prop(4102, "120"), cust_prop(4103, "LATAM"), cust_prop(4104, "Alex Rivera")],
+                }),
+                build_customer(CustomerSpec {
+                    remote_id: 3002,
+                    first: "Mateo",
+                    last: "Morales",
+                    job_title: Some("Dispatcher"),
+                    emails: vec![cust_email("mateo@andeslogistics.cl", "work")],
+                    phones: vec![],
+                    websites: vec![],
+                    socials: vec![],
+                    address: None,
+                    organization: Some((2001, "Andes Logistics")),
+                    created_days_ago: 180,
+                    updated_days_ago: 10,
+                    background: Some("Backup dispatcher; escalate to Lucía for billing topics."),
+                    age: Some("25-30"),
+                    gender: Some("male"),
+                    location: Some("Valparaíso, Chile"),
+                    properties: vec![cust_prop(4101, "Pro"), cust_prop(4102, "120"), cust_prop(4103, "LATAM")],
+                }),
+                build_customer(CustomerSpec {
+                    remote_id: 3003,
+                    first: "Sarah",
+                    last: "Okafor",
+                    job_title: Some("CTO"),
+                    emails: vec![cust_email("sarah@brightpathedu.org", "work")],
+                    phones: vec![cust_phone("+1 555 010 2233", "mobile")],
+                    websites: vec![cust_site("https://brightpathedu.org")],
+                    socials: vec![cust_social("sarahokafor", "linkedin")],
+                    address: Some(HsCustomerAddress {
+                        line1: Some("88 Kingsway".into()),
+                        line2: None,
+                        city: Some("London".into()),
+                        state: None,
+                        postal_code: Some("WC2B 6AA".into()),
+                        country: Some("United Kingdom".into()),
+                    }),
+                    organization: Some((2002, "BrightPath Education")),
+                    created_days_ago: 150,
+                    updated_days_ago: 5,
+                    background: Some("Technical decision maker. Loves detailed RFC-style answers."),
+                    age: Some("35-40"),
+                    gender: Some("female"),
+                    location: Some("London, UK"),
+                    properties: vec![cust_prop(4101, "Business"), cust_prop(4102, "45"), cust_prop(4103, "EMEA"), cust_prop(4104, "Alex Rivera")],
+                }),
+                build_customer(CustomerSpec {
+                    remote_id: 3004,
+                    first: "Daniel",
+                    last: "Kim",
+                    job_title: Some("Developer"),
+                    emails: vec![cust_email("daniel.kim@brightpathedu.org", "work")],
+                    phones: vec![],
+                    websites: vec![],
+                    socials: vec![],
+                    address: None,
+                    organization: Some((2002, "BrightPath Education")),
+                    created_days_ago: 90,
+                    updated_days_ago: 8,
+                    background: None,
+                    age: Some("25-30"),
+                    gender: Some("male"),
+                    location: Some("London, UK"),
+                    properties: vec![cust_prop(4101, "Business"), cust_prop(4102, "45"), cust_prop(4103, "EMEA")],
+                }),
+                build_customer(CustomerSpec {
+                    remote_id: 3005,
+                    first: "Emma",
+                    last: "Lindqvist",
+                    job_title: None,
+                    emails: vec![cust_email("emma.lindqvist@nordicmail.se", "work")],
+                    phones: vec![],
+                    websites: vec![],
+                    socials: vec![],
+                    address: None,
+                    organization: None,
+                    created_days_ago: 60,
+                    updated_days_ago: 12,
+                    background: Some("Freelance consultant using the free plan."),
+                    age: None,
+                    gender: None,
+                    location: Some("Stockholm, Sweden"),
+                    properties: vec![cust_prop(4101, "Free"), cust_prop(4102, "1"), cust_prop(4103, "EMEA")],
+                }),
+                build_customer(CustomerSpec {
+                    remote_id: 3006,
+                    first: "Ravi",
+                    last: "Sundaram",
+                    job_title: Some("IT Admin"),
+                    emails: vec![cust_email("ravi@pixelworks.in", "work")],
+                    phones: vec![],
+                    websites: vec![cust_site("https://pixelworks.in")],
+                    socials: vec![],
+                    address: None,
+                    organization: None,
+                    created_days_ago: 45,
+                    updated_days_ago: 6,
+                    background: Some("Runs IT for a 40-person studio; strong PowerShell user."),
+                    age: Some("30-35"),
+                    gender: Some("male"),
+                    location: Some("Chennai, India"),
+                    properties: vec![cust_prop(4101, "Pro"), cust_prop(4102, "40"), cust_prop(4103, "APAC")],
+                }),
+                build_customer(CustomerSpec {
+                    remote_id: 3007,
+                    first: "Chloe",
+                    last: "Dubois",
+                    job_title: Some("Finance Lead"),
+                    emails: vec![cust_email("chloe@atelierfrance.fr", "work")],
+                    phones: vec![],
+                    websites: vec![],
+                    socials: vec![],
+                    address: None,
+                    organization: None,
+                    created_days_ago: 30,
+                    updated_days_ago: 2,
+                    background: Some("Invoices go to finance@atelierfrance.fr."),
+                    age: Some("40-45"),
+                    gender: Some("female"),
+                    location: Some("Paris, France"),
+                    properties: vec![cust_prop(4101, "Free"), cust_prop(4102, "8"), cust_prop(4103, "EMEA")],
+                }),
+                build_customer(CustomerSpec {
+                    remote_id: 3008,
+                    first: "Hiro",
+                    last: "Tanaka",
+                    job_title: Some("Product Manager"),
+                    emails: vec![cust_email("hiro.tanaka@sakuradata.jp", "work")],
+                    phones: vec![],
+                    websites: vec![],
+                    socials: vec![],
+                    address: None,
+                    organization: None,
+                    created_days_ago: 20,
+                    updated_days_ago: 1,
+                    background: Some("Evaluating the API for an internal tool."),
+                    age: Some("30-35"),
+                    gender: Some("male"),
+                    location: Some("Tokyo, Japan"),
+                    properties: vec![cust_prop(4101, "Business"), cust_prop(4102, "60"), cust_prop(4103, "APAC")],
+                }),
+            ],
+            conversations: b.conversations,
+            threads: b.threads,
+            ratings,
+            user_statuses: vec![
+                HsUserStatus {
+                    user_id: 1001,
+                    email_status: Some("active".into()),
+                    email_updated_at: Some(days_ago(1, 8, 0)),
                     chat_status: Some("active".into()),
-                    mailbox_statuses: serde_json::json!({ "101": "active", "102": "away" }),
-                })
-                .collect(),
+                    mailbox_statuses: serde_json::json!({ "201": "assign", "202": "assign" }),
+                },
+                HsUserStatus {
+                    user_id: 1002,
+                    email_status: Some("active".into()),
+                    email_updated_at: Some(days_ago(1, 8, 0)),
+                    chat_status: Some("assign".into()),
+                    mailbox_statuses: serde_json::json!({ "201": "assign" }),
+                },
+                HsUserStatus {
+                    user_id: 1003,
+                    email_status: Some("away".into()),
+                    email_updated_at: Some(days_ago(2, 9, 0)),
+                    chat_status: Some("unavailable".into()),
+                    mailbox_statuses: serde_json::json!({}),
+                },
+            ],
             doc_collections: vec![
-                HsDocCollection { remote_id: 7001, slug: Some("guides".into()), name: "Product Guides".into() },
-                HsDocCollection { remote_id: 7002, slug: Some("faq".into()), name: "FAQ".into() },
+                HsDocCollection {
+                    remote_id: 801,
+                    name: "Getting Started".into(),
+                    slug: Some("getting-started".into()),
+                    description: Some("First steps with Zylker: workspace setup, team invites and your first report.".into()),
+                    visibility: Some("public".into()),
+                    article_count: Some(5),
+                },
+                HsDocCollection {
+                    remote_id: 802,
+                    name: "Billing & Account".into(),
+                    slug: Some("billing-account".into()),
+                    description: Some("Plans, seats, invoices, VAT and receipts.".into()),
+                    visibility: Some("public".into()),
+                    article_count: Some(4),
+                },
             ],
             doc_categories: vec![
-                HsDocCategory { remote_id: 7101, collection_id: 7001, slug: Some("getting-started".into()), name: "Getting Started".into() },
-                HsDocCategory { remote_id: 7102, collection_id: 7001, slug: Some("advanced".into()), name: "Advanced".into() },
-                HsDocCategory { remote_id: 7103, collection_id: 7002, slug: Some("billing".into()), name: "Billing FAQ".into() },
+                HsDocCategory { remote_id: 851, collection_id: 801, name: "Setup".into(), slug: Some("setup".into()), sort_order: Some(1) },
+                HsDocCategory { remote_id: 852, collection_id: 801, name: "Team".into(), slug: Some("team".into()), sort_order: Some(2) },
+                HsDocCategory { remote_id: 853, collection_id: 802, name: "Invoices".into(), slug: Some("invoices".into()), sort_order: Some(1) },
+                HsDocCategory { remote_id: 854, collection_id: 802, name: "Plans & Seats".into(), slug: Some("plans-seats".into()), sort_order: Some(2) },
             ],
             doc_articles: vec![
-                HsDocArticle { remote_id: 7201, collection_id: 7001, slug: Some("create-workspace".into()), name: "Create your first workspace".into(), text: Some("Workspaces hold your dashboards and reports. To create one...".into()), created_at: Some("2025-09-01T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
-                HsDocArticle { remote_id: 7202, collection_id: 7001, slug: Some("invite-teammates".into()), name: "Invite teammates".into(), text: Some("Go to Settings > Members and click Invite...".into()), created_at: Some("2025-09-05T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
-                HsDocArticle { remote_id: 7203, collection_id: 7002, slug: Some("refund-policy".into()), name: "Refund policy".into(), text: Some("Refunds are available within 30 days of purchase...".into()), created_at: Some("2025-10-01T00:00:00Z".into()), updated_at: Some("2026-01-01T00:00:00Z".into()) },
+                HsDocArticle {
+                    remote_id: 8011,
+                    collection_id: 801,
+                    category_id: Some(851),
+                    number: Some(101),
+                    slug: Some("first-report".into()),
+                    name: "Creating your first report".into(),
+                    status: Some("published".into()),
+                    views: Some(320),
+                    text: Some("To create your first report, open the Reports section and click \"New report\". Pick a data source (dispatch, conversations or exports), then drag the fields you want onto the canvas. Schedules are optional: without one the report only runs on demand via the \"Run now\" button. When you add a schedule, the times shown follow your workspace timezone, which you can change under Settings → Workspace.".into()),
+                    created_at: Some(days_ago(180, 10, 30)),
+                    updated_at: Some(days_ago(12, 10, 30)),
+                },
+                HsDocArticle {
+                    remote_id: 8012,
+                    collection_id: 801,
+                    category_id: Some(851),
+                    number: Some(102),
+                    slug: Some("schedule-timezones".into()),
+                    name: "Understanding schedule timezones".into(),
+                    status: Some("published".into()),
+                    views: Some(540),
+                    text: Some("Schedules store the UTC offset that was active when you last saved them. When daylight-saving time changes in your region, existing schedules keep the old offset and can fire an hour early or late. To fix this, open the schedule and re-save it once after the clock change — the new offset is stamped automatically. Recurring exports, dispatch reports and reminders all follow the same rule. If two reports behave differently after a clock change, check which one was re-saved most recently.".into()),
+                    created_at: Some(days_ago(150, 10, 30)),
+                    updated_at: Some(days_ago(3, 10, 30)),
+                },
+                HsDocArticle {
+                    remote_id: 8013,
+                    collection_id: 801,
+                    category_id: Some(852),
+                    number: Some(103),
+                    slug: Some("inviting-teammates".into()),
+                    name: "Inviting teammates and roles".into(),
+                    status: Some("published".into()),
+                    views: Some(610),
+                    text: Some("Invite teammates from Settings → Team → Invite. The role dropdown decides what they can do: Editors can build, edit and schedule reports; Viewers can open any shared report but cannot edit anything. Viewer seats are unlimited on every plan — only editors count against your seat limit. Invitations expire after 7 days; simply resend to renew.".into()),
+                    created_at: Some(days_ago(140, 10, 30)),
+                    updated_at: Some(days_ago(20, 10, 30)),
+                },
+                HsDocArticle {
+                    remote_id: 8014,
+                    collection_id: 801,
+                    category_id: Some(852),
+                    number: Some(104),
+                    slug: Some("sharing-views".into()),
+                    name: "Sharing views with a link".into(),
+                    status: Some("draft".into()),
+                    views: Some(45),
+                    text: Some("DRAFT — not yet published. Share any saved view via the \"Share\" menu → \"Copy link\". Links inherit the visibility of the view: public links work for anyone with the URL, while restricted links require signing in. If a shared link returns 404, the view was most likely deleted or its visibility changed after the link was created.".into()),
+                    created_at: Some(days_ago(10, 10, 30)),
+                    updated_at: Some(days_ago(2, 10, 30)),
+                },
+                HsDocArticle {
+                    remote_id: 8021,
+                    collection_id: 802,
+                    category_id: Some(853),
+                    number: Some(201),
+                    slug: Some("receipts-and-invoices".into()),
+                    name: "Downloading receipts and invoices".into(),
+                    status: Some("published".into()),
+                    views: Some(480),
+                    text: Some("Every charge generates a receipt. Download receipts any time under Billing → Invoices, using the download icon on each row. Invoices include your billing profile address and, when set, your VAT number. If you need a receipt re-sent by email, contact billing and include the month — re-sending is instant. Accounting exports (CSV) are also available from the same screen for annual filing.".into()),
+                    created_at: Some(days_ago(200, 10, 30)),
+                    updated_at: Some(days_ago(30, 10, 30)),
+                },
+                HsDocArticle {
+                    remote_id: 8022,
+                    collection_id: 802,
+                    category_id: Some(853),
+                    number: Some(202),
+                    slug: Some("vat-numbers".into()),
+                    name: "Adding a VAT number to invoices".into(),
+                    status: Some("published".into()),
+                    views: Some(260),
+                    text: Some("Add your VAT number under Billing → Billing profile. New invoices include it automatically. We can also re-issue past invoices with the VAT number for your annual filing — contact billing with the range of months you need. The number must include your country prefix (for example FR40303265045 for France).".into()),
+                    created_at: Some(days_ago(120, 10, 30)),
+                    updated_at: Some(days_ago(24, 10, 30)),
+                },
+                HsDocArticle {
+                    remote_id: 8023,
+                    collection_id: 802,
+                    category_id: Some(854),
+                    number: Some(203),
+                    slug: Some("plan-limits".into()),
+                    name: "Plan limits: editors vs viewers".into(),
+                    status: Some("published".into()),
+                    views: Some(720),
+                    text: Some("Seat limits count editors only. Viewers are unlimited on every plan. On the Growth plan you have 10 editor seats; Studio has 25. You can check current usage under Billing → Plan. Downgrading does not delete extra editors — they become read-only until seats free up again.".into()),
+                    created_at: Some(days_ago(210, 10, 30)),
+                    updated_at: Some(days_ago(15, 10, 30)),
+                },
+                HsDocArticle {
+                    remote_id: 8024,
+                    collection_id: 802,
+                    category_id: Some(854),
+                    number: Some(204),
+                    slug: Some("changing-plans".into()),
+                    name: "Upgrading or downgrading your plan".into(),
+                    status: Some("published".into()),
+                    views: Some(190),
+                    text: Some("Plan changes take effect immediately and are prorated. Upgrading unlocks the extra editor seats right away. Downgrading keeps your data intact; features outside the new plan become read-only. Failed charges put the account in a \"past due\" state for 14 days before any restriction — update the card under Billing → Payment method and we retry automatically within an hour.".into()),
+                    created_at: Some(days_ago(110, 10, 30)),
+                    updated_at: Some(days_ago(18, 10, 30)),
+                },
+                HsDocArticle {
+                    remote_id: 8025,
+                    collection_id: 801,
+                    category_id: Some(851),
+                    number: Some(105),
+                    slug: Some("sso-troubleshooting".into()),
+                    name: "SSO troubleshooting checklist (internal)".into(),
+                    status: Some("internal".into()),
+                    views: Some(95),
+                    text: Some("INTERNAL — for support agents only. SSO redirect loops are almost always a stale session cookie: 1) Ask the customer to try an incognito window. 2) If incognito works, clear cookies for app.zylker.io. 3) If it persists, check the identity provider logs for a failed assertion and verify the ACS URL has no trailing slash. 4) Escalate to platform engineering only after steps 1-3 with the SAML trace attached. Never share this checklist with customers directly.".into()),
+                    created_at: Some(days_ago(90, 10, 30)),
+                    updated_at: Some(days_ago(4, 10, 30)),
+                },
             ],
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Demo-world construction helpers (fakeData.ts thread()/conversation()/
+// chatSession() builders + the customer shape)
+// ---------------------------------------------------------------------------
+
+/// The two mutable counters + output vecs the fakeData.ts construction
+/// closures share (`convNum`, `threadId`, `conversations`, `threads`).
+struct WorldBuilder {
+    conversations: Vec<HsConversation>,
+    threads: Vec<HsThread>,
+    conv_num: i64,
+    thread_id: i64,
+}
+
+impl WorldBuilder {
+    fn new() -> Self {
+        Self {
+            conversations: Vec::new(),
+            threads: Vec::new(),
+            conv_num: 5000,
+            thread_id: 10_000,
+        }
+    }
+
+    /// fakeData.ts `conversation(opts)` — an email conversation.
+    fn conversation(&mut self, opts: ConvSpec<'_>) -> i64 {
+        let remote_id = self.conv_num + 100_000;
+        let number = self.conv_num + 1;
+        self.conv_num = number;
+        let c = HsConversation {
+            remote_id,
+            number,
+            kind: Some("email".into()),
+            source_type: None,
+            source_via: None,
+            subject: Some(opts.subject.into()),
+            preview: Some(opts.preview.into()),
+            status: opts.status.into(),
+            state: Some("published".into()),
+            mailbox_id: opts.mailbox_id,
+            assignee_id: opts.assignee_id,
+            assignee_type: opts.assignee_id.map(|_| "user".into()),
+            assigned_team_id: None,
+            customer_id: opts.customer_id,
+            priority: None,
+            created_at: Some(days_ago(opts.created_days_ago, 9, 12)),
+            // fakeData.ts: userUpdatedAt = daysAgo(max(0, createdDaysAgo - 1), 14, 40).
+            updated_at: Some(days_ago((opts.created_days_ago - 1).max(0), 14, 40)),
+            closed_at: opts.closed_days_ago.map(|d| days_ago(d, 16, 5)),
+            snoozed_until: opts.snoozed_until,
+            thread_count: 0,
+            merged_into: None,
+            tags: opts.tags.iter().map(|t| (*t).into()).collect(),
+        };
+        self.conversations.push(c);
+        remote_id
+    }
+
+    /// fakeData.ts `chatSession(opts)` — a Beacon chat conversation
+    /// (type='chat', source={type:'chat', via:'beacon'}).
+    fn chat_session(&mut self, opts: ChatSpec<'_>) -> i64 {
+        let remote_id = self.conv_num + 100_000;
+        let number = self.conv_num + 1;
+        self.conv_num = number;
+        let start = days_ago(opts.created_days_ago, opts.start_hour, 0);
+        let end = opts.closed_after_min.map(|m| minutes_after(&start, m));
+        let c = HsConversation {
+            remote_id,
+            number,
+            kind: Some("chat".into()),
+            source_type: Some("chat".into()),
+            source_via: Some("beacon".into()),
+            subject: Some(opts.subject.into()),
+            preview: Some(opts.preview.into()),
+            status: opts.status.into(),
+            state: Some("published".into()),
+            mailbox_id: opts.mailbox_id,
+            assignee_id: opts.assignee_id,
+            assignee_type: opts.assignee_id.map(|_| "user".into()),
+            assigned_team_id: None,
+            customer_id: opts.customer_id,
+            priority: None,
+            created_at: Some(start.clone()),
+            updated_at: Some(end.clone().unwrap_or(start)),
+            closed_at: end,
+            snoozed_until: None,
+            thread_count: 0,
+            merged_into: None,
+            tags: opts.tags.iter().map(|t| (*t).into()).collect(),
+        };
+        self.conversations.push(c);
+        remote_id
+    }
+
+    /// fakeData.ts `thread(conv, opts)` — push a thread and refresh the
+    /// conversation's `threadCount`.
+    fn thread(
+        &mut self,
+        conv_remote_id: i64,
+        kind: &str,
+        body: &str,
+        created_at: String,
+        customer_id: Option<i64>,
+        user_id: Option<i64>,
+    ) {
+        self.thread_id += 1;
+        self.threads.push(HsThread {
+            remote_id: self.thread_id,
+            conversation_id: conv_remote_id,
+            kind: kind.into(),
+            status: None,
+            state: Some("published".into()),
+            body: Some(body.into()),
+            created_by_customer_id: customer_id,
+            created_by_user_id: user_id,
+            assigned_to_id: None,
+            created_at: Some(created_at),
+        });
+        let count = self
+            .threads
+            .iter()
+            .filter(|t| t.conversation_id == conv_remote_id)
+            .count() as i64;
+        if let Some(conv) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conv_remote_id)
+        {
+            conv.thread_count = count;
+        }
+    }
+}
+
+/// fakeData.ts `conversation(opts)` parameters.
+struct ConvSpec<'a> {
+    subject: &'a str,
+    preview: &'a str,
+    mailbox_id: i64,
+    customer_id: i64,
+    status: &'a str,
+    tags: &'a [&'a str],
+    assignee_id: Option<i64>,
+    created_days_ago: i64,
+    closed_days_ago: Option<i64>,
+    snoozed_until: Option<String>,
+}
+
+/// fakeData.ts `chatSession(opts)` parameters.
+struct ChatSpec<'a> {
+    subject: &'a str,
+    preview: &'a str,
+    mailbox_id: i64,
+    customer_id: i64,
+    status: &'a str,
+    tags: &'a [&'a str],
+    assignee_id: Option<i64>,
+    created_days_ago: i64,
+    start_hour: u32,
+    closed_after_min: Option<i64>,
+}
+
+/// The varying parts of a reference `rawCustomers` entry + its enrichment +
+/// property values.
+struct CustomerSpec<'a> {
+    remote_id: i64,
+    first: &'a str,
+    last: &'a str,
+    job_title: Option<&'a str>,
+    emails: Vec<HsCustomerEmail>,
+    phones: Vec<HsCustomerPhone>,
+    websites: Vec<HsCustomerWebsite>,
+    socials: Vec<HsCustomerSocialProfile>,
+    address: Option<HsCustomerAddress>,
+    organization: Option<(i64, &'a str)>,
+    created_days_ago: i64,
+    updated_days_ago: i64,
+    background: Option<&'a str>,
+    age: Option<&'a str>,
+    gender: Option<&'a str>,
+    location: Option<&'a str>,
+    properties: Vec<HsCustomerPropertyValue>,
+}
+
+/// Build an `HsCustomer` from a spec, deriving the flat fields the port's
+/// simplified consumers read (`email` = emails[0], `phone` = phones[0],
+/// `organization` = the org name) exactly like the reference's flat reads.
+fn build_customer(s: CustomerSpec<'_>) -> HsCustomer {
+    HsCustomer {
+        remote_id: s.remote_id,
+        first_name: Some(s.first.into()),
+        last_name: Some(s.last.into()),
+        email: s.emails.first().and_then(|e| e.value.clone()),
+        organization: s.organization.map(|(_, name)| name.into()),
+        job_title: s.job_title.map(String::from),
+        phone: s.phones.first().and_then(|p| p.value.clone()),
+        created_at: Some(days_ago(s.created_days_ago, 10, 30)),
+        updated_at: Some(days_ago(s.updated_days_ago, 10, 30)),
+        photo_url: None,
+        organization_id: s.organization.map(|(id, _)| id),
+        background: s.background.map(String::from),
+        age: s.age.map(String::from),
+        gender: s.gender.map(String::from),
+        location: s.location.map(String::from),
+        emails: s.emails,
+        phones: s.phones,
+        websites: s.websites,
+        social_profiles: s.socials,
+        address: s.address,
+        properties: s.properties,
+    }
+}
+
+fn cust_email(value: &str, kind: &str) -> HsCustomerEmail {
+    HsCustomerEmail {
+        value: Some(value.into()),
+        kind: Some(kind.into()),
+    }
+}
+
+fn cust_phone(value: &str, kind: &str) -> HsCustomerPhone {
+    HsCustomerPhone {
+        value: Some(value.into()),
+        kind: Some(kind.into()),
+    }
+}
+
+fn cust_site(value: &str) -> HsCustomerWebsite {
+    HsCustomerWebsite {
+        value: Some(value.into()),
+    }
+}
+
+fn cust_social(value: &str, kind: &str) -> HsCustomerSocialProfile {
+    HsCustomerSocialProfile {
+        value: Some(value.into()),
+        kind: Some(kind.into()),
+    }
+}
+
+fn cust_prop(def: i64, value: &str) -> HsCustomerPropertyValue {
+    HsCustomerPropertyValue {
+        definition_remote_id: Some(def),
+        key: None,
+        name: None,
+        value: Some(value.into()),
     }
 }
 
@@ -963,138 +2139,117 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
     }
 
     async fn list_conversations(&self, query: &ConversationQuery) -> Result<Page<HsConversation>> {
-        let world = self
-            .world
-            .lock()
-            .expect("FakeHelpScoutProvider mutex poisoned");
+        let world = self.lock_world();
+        // Merged conversations no longer appear in listings (they return 301
+        // on direct access) — fakeProvider.ts:143.
         let mut items: Vec<HsConversation> = world
             .conversations
             .iter()
+            .filter(|c| c.merged_into.is_none())
             .filter(|c| query.mailbox_id.is_none_or(|m| c.mailbox_id == m))
-            // 'all' means no status filter (reference fakeProvider parity).
+            // 'open' = active|pending; 'all' or absent = no filter.
             .filter(|c| {
-                query
-                    .status
-                    .as_deref()
-                    .is_none_or(|s| s == "all" || s == c.status)
+                query.status.as_deref().is_none_or(|s| {
+                    s == "all"
+                        || s == c.status
+                        || (s == "open" && (c.status == "active" || c.status == "pending"))
+                })
+            })
+            .filter(|c| {
+                query.modified_since.as_deref().is_none_or(|since| {
+                    let modified = c.updated_at.as_deref().or(c.created_at.as_deref());
+                    modified.is_some_and(|m| m >= since)
+                })
             })
             .cloned()
             .collect();
-        #[allow(clippy::cast_possible_truncation)]
-        let page_size = query.page_size.unwrap_or(50) as usize;
-        let take = page_size.min(items.len());
-        let _remaining = items.split_off(take);
+        // Newest first, by remote id desc (mirrors the v3 default ordering).
+        items.sort_by_key(|a| std::cmp::Reverse(a.remote_id));
+        // Cursor pagination: base64url of the next start index,
+        // pageSizes.conversations = 25 (fakeProvider.ts:18).
+        let size = query.page_size.unwrap_or(25) as usize;
+        let start = query.cursor.as_deref().and_then(decode_cursor).unwrap_or(0);
+        let slice: Vec<HsConversation> = items.iter().skip(start).take(size).cloned().collect();
+        let next_index = start + size;
+        let next_cursor = if next_index < items.len() {
+            Some(encode_cursor(next_index))
+        } else {
+            None
+        };
         Ok(Page {
-            items,
-            next_cursor: None, // Fake has no pagination — all on one page
+            items: slice,
+            next_cursor,
         })
     }
 
     async fn list_customers(&self, query: &CustomerQuery) -> Result<Page<HsCustomer>> {
-        let world = self
-            .world
-            .lock()
-            .expect("FakeHelpScoutProvider mutex poisoned");
-        let items = world.customers.clone();
-        let _ = query; // Fake doesn't filter customers (M2 will add if needed)
+        let world = self.lock_world();
+        let mut items: Vec<HsCustomer> = world
+            .customers
+            .iter()
+            .filter(|c| {
+                query
+                    .modified_since
+                    .as_deref()
+                    .is_none_or(|since| c.updated_at.as_deref().is_none_or(|u| u >= since))
+            })
+            .cloned()
+            .collect();
+        items.sort_by_key(|c| c.remote_id);
+        // pageSizes.customers = 50 (fakeProvider.ts:18).
+        let size = query.page_size.unwrap_or(50) as usize;
+        let start = query.cursor.as_deref().and_then(decode_cursor).unwrap_or(0);
+        let slice: Vec<HsCustomer> = items.iter().skip(start).take(size).cloned().collect();
+        let next_index = start + size;
+        let next_cursor = if next_index < items.len() {
+            Some(encode_cursor(next_index))
+        } else {
+            None
+        };
         Ok(Page {
-            items,
-            next_cursor: None,
+            items: slice,
+            next_cursor,
         })
     }
 
     async fn list_beacon_chats(&self) -> Result<Vec<HsBeaconChat>> {
-        // Fake: return 2 demo Beacon chats.
-        Ok(vec![
-            HsBeaconChat {
-                remote_id: 5001,
-                customer_id: 2001,
-                mailbox_id: 101,
-                status: "active".into(),
-                created_at: Some("2026-01-15T10:00:00Z".into()),
-                updated_at: Some("2026-01-15T10:30:00Z".into()),
-            },
-            HsBeaconChat {
-                remote_id: 5002,
-                customer_id: 2002,
-                mailbox_id: 102,
-                status: "closed".into(),
-                created_at: Some("2026-01-16T14:00:00Z".into()),
-                updated_at: Some("2026-01-16T14:15:00Z".into()),
-            },
-        ])
+        // The reference serves chats as conversations with type='chat'
+        // (listChatSessions filters locally); the port's chats pass maps the
+        // world's chat conversations into its simplified chat shape.
+        let world = self.lock_world();
+        Ok(world
+            .conversations
+            .iter()
+            .filter(|c| c.kind.as_deref() == Some("chat") && c.merged_into.is_none())
+            .map(|c| HsBeaconChat {
+                remote_id: c.remote_id,
+                customer_id: c.customer_id,
+                mailbox_id: c.mailbox_id,
+                status: c.status.clone(),
+                created_at: c.created_at.clone(),
+                updated_at: c.updated_at.clone(),
+            })
+            .collect())
     }
 
     async fn list_docs(&self) -> Result<Vec<HsDocArticle>> {
-        // Fake: return 3 demo Docs articles.
-        Ok(vec![
-            HsDocArticle {
-                remote_id: 6001,
-                collection_id: 101,
-                slug: Some("getting-started".into()),
-                name: "Getting Started Guide".into(),
-                text: Some("Welcome to SupportOS++! This guide covers the basics.".into()),
-                created_at: Some("2026-01-01T00:00:00Z".into()),
-                updated_at: Some("2026-01-10T12:00:00Z".into()),
-            },
-            HsDocArticle {
-                remote_id: 6002,
-                collection_id: 101,
-                slug: Some("faq".into()),
-                name: "FAQ".into(),
-                text: Some("Frequently asked questions about SupportOS++.".into()),
-                created_at: Some("2026-01-05T00:00:00Z".into()),
-                updated_at: Some("2026-01-12T09:00:00Z".into()),
-            },
-            HsDocArticle {
-                remote_id: 6003,
-                collection_id: 102,
-                slug: Some("troubleshooting".into()),
-                name: "Troubleshooting".into(),
-                text: Some("Common issues and how to resolve them.".into()),
-                created_at: Some("2026-01-08T00:00:00Z".into()),
-                updated_at: Some("2026-01-14T16:00:00Z".into()),
-            },
-        ])
+        // All articles across collections (the port's flattened docs list).
+        let world = self.lock_world();
+        Ok(world.doc_articles.clone())
     }
 
     async fn list_ratings(&self) -> Result<Vec<HsRating>> {
-        // Fake: return 3 demo ratings in the reference word vocabulary.
-        Ok(vec![
-            HsRating {
-                remote_id: 7001,
-                conversation_id: Some(1001),
-                thread_id: None,
-                rating: Some("great".into()),
-                comment: Some("Great support!".into()),
-                customer_id: Some(101),
-                customer_name: Some("Demo Customer".into()),
-                user_id: None,
-                created_at: Some("2026-01-10T12:00:00Z".into()),
-            },
-            HsRating {
-                remote_id: 7002,
-                conversation_id: Some(1002),
-                thread_id: None,
-                rating: Some("okay".into()),
-                comment: Some("It was okay.".into()),
-                customer_id: Some(102),
-                customer_name: Some("Another Customer".into()),
-                user_id: None,
-                created_at: Some("2026-01-11T15:00:00Z".into()),
-            },
-            HsRating {
-                remote_id: 7003,
-                conversation_id: Some(1004),
-                thread_id: None,
-                rating: Some("great".into()),
-                comment: None,
-                customer_id: Some(103),
-                customer_name: None,
-                user_id: None,
-                created_at: Some("2026-01-12T09:00:00Z".into()),
-            },
-        ])
+        let world = self.lock_world();
+        Ok(world.ratings.clone())
+    }
+
+    async fn get_rating(&self, rating_id: i64) -> Result<Option<HsRating>> {
+        let world = self.lock_world();
+        Ok(world
+            .ratings
+            .iter()
+            .find(|r| r.remote_id == rating_id)
+            .cloned())
     }
 
     fn reset(&self) {
@@ -1190,11 +2345,28 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
 
     async fn get_conversation(&self, conversation_id: i64) -> Result<Option<HsConversation>> {
         let world = self.lock_world();
-        Ok(world
+        let conv = world
             .conversations
             .iter()
             .find(|c| c.remote_id == conversation_id)
-            .cloned())
+            .cloned();
+        match conv {
+            Some(c) if c.merged_into.is_some() => {
+                // Mirrors the documented 301 behavior for merged
+                // conversations (fakeProvider.ts:169-179).
+                Err(crate::helpscout_real::HsApiError {
+                    status_code: 301,
+                    message: format!(
+                        "Conversation merged into {}",
+                        c.merged_into.unwrap_or_default()
+                    ),
+                    friendly: "This conversation was merged into another conversation in Help Scout. Open the target conversation instead.".into(),
+                    retryable: false,
+                }
+                .into())
+            }
+            other => Ok(other),
+        }
     }
 
     async fn list_threads(&self, conversation_id: i64) -> Result<Vec<HsThread>> {
@@ -1228,7 +2400,8 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
     }
 
     async fn list_system_users(&self) -> Result<Vec<HsUser>> {
-        Ok(Vec::new())
+        let world = self.lock_world();
+        Ok(world.system_users.clone())
     }
 
     async fn list_doc_collections(&self) -> Result<Vec<HsDocCollection>> {
@@ -1288,7 +2461,13 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             created_at: Some(now.clone()),
         };
         world.threads.push(thread);
-        // conv.threadCount / userUpdatedAt analog: updated_at drives the
+        // fakeProvider.ts refreshes conv.threadCount after every thread push.
+        conv.thread_count = world
+            .threads
+            .iter()
+            .filter(|t| t.conversation_id == input.conversation_id)
+            .count() as i64;
+        // conv.userUpdatedAt analog: updated_at drives the
         // sync checkpoint, so a mutated conversation is always re-pulled.
         conv.updated_at = Some(now);
         if !input.draft {
@@ -1335,6 +2514,11 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             created_at: Some(now.clone()),
         };
         world.threads.push(thread);
+        conv.thread_count = world
+            .threads
+            .iter()
+            .filter(|t| t.conversation_id == input.conversation_id)
+            .count() as i64;
         conv.updated_at = Some(now);
         Ok(ThreadCreated {
             thread_id: next_id,
@@ -1382,6 +2566,21 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
     }
 }
 
+/// The fake's opaque cursor: base64url of the page start index
+/// (fakeProvider.ts `Buffer.from(String(startIndex)).toString('base64url')`).
+fn encode_cursor(start: usize) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(start.to_string())
+}
+
+fn decode_cursor(cursor: &str) -> Option<usize> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()?;
+    String::from_utf8(bytes).ok()?.parse().ok()
+}
+
 /// The fake provider's 404 (fakeProvider.ts throws `new HelpScoutApiError(
 /// 404, 'Conversation not found', friendlyError(404, '', method))`).
 fn not_found_remote(method: &str) -> crate::error::Error {
@@ -1407,8 +2606,10 @@ mod tests {
     async fn get_me_returns_demo_agent() {
         let p = provider();
         let me = p.get_me().await.unwrap();
-        assert_eq!(me.first_name, Some("Demo".into()));
-        assert_eq!(me.email, Some("demo@supportos.test".into()));
+        assert_eq!(me.first_name, Some("Alex".into()));
+        assert_eq!(me.last_name, Some("Rivera".into()));
+        assert_eq!(me.email, Some("alex@zylker.io".into()));
+        assert_eq!(me.role, Some("owner".into()));
     }
 
     #[tokio::test]
@@ -1416,7 +2617,7 @@ mod tests {
         let p = provider();
         let mailboxes = p.list_mailboxes().await.unwrap();
         assert_eq!(mailboxes.len(), 2);
-        assert_eq!(mailboxes[0].name, "General Support");
+        assert_eq!(mailboxes[0].name, "Support");
         assert_eq!(mailboxes[1].name, "Billing");
     }
 
@@ -1428,11 +2629,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_system_users_returns_the_ai_agent() {
+        let p = provider();
+        let users = p.list_system_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].remote_id, 9001);
+        assert_eq!(users[0].user_type, "system_user");
+    }
+
+    #[tokio::test]
     async fn list_teams_returns_two() {
         let p = provider();
         let teams = p.list_teams().await.unwrap();
         assert_eq!(teams.len(), 2);
-        assert_eq!(teams[0].member_user_ids.len(), 3);
+        assert_eq!(teams[0].name, "Tier 1");
+        assert_eq!(teams[0].member_user_ids, vec![1001, 1002]);
+        assert_eq!(teams[1].name, "Escalations");
     }
 
     #[tokio::test]
@@ -1440,16 +2652,19 @@ mod tests {
         let p = provider();
         let tags = p.list_tags().await.unwrap();
         assert_eq!(tags.len(), 14);
+        assert_eq!(tags[0].name, "timezone");
+        assert_eq!(tags[13].name, "beacon");
     }
 
     #[tokio::test]
-    async fn list_conversations_returns_ten() {
+    async fn list_conversations_returns_twenty() {
         let p = provider();
         let page = p
             .list_conversations(&ConversationQuery::default())
             .await
             .unwrap();
-        assert_eq!(page.items.len(), 10);
+        // 21 world conversations; c12 is merged away from listings.
+        assert_eq!(page.items.len(), 20);
         assert!(page.next_cursor.is_none());
     }
 
@@ -1458,13 +2673,14 @@ mod tests {
         let p = provider();
         let page = p
             .list_conversations(&ConversationQuery {
-                mailbox_id: Some(101),
+                mailbox_id: Some(201),
                 ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(page.items.len(), 5);
-        assert!(page.items.iter().all(|c| c.mailbox_id == 101));
+        // 12 email + 5 chat conversations on the Support mailbox.
+        assert_eq!(page.items.len(), 17);
+        assert!(page.items.iter().all(|c| c.mailbox_id == 201));
     }
 
     #[tokio::test]
@@ -1477,8 +2693,52 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(page.items.len(), 3); // items 3, 6, 9 are closed
+        // c3, c5, c6h1-h3, c8, c10 + chats ch1-ch5 (c12 is merged away).
+        assert_eq!(page.items.len(), 12);
         assert!(page.items.iter().all(|c| c.status == "closed"));
+    }
+
+    #[tokio::test]
+    async fn list_conversations_open_includes_pending() {
+        let p = provider();
+        let page = p
+            .list_conversations(&ConversationQuery {
+                status: Some("open".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(page
+            .items
+            .iter()
+            .all(|c| c.status == "active" || c.status == "pending"));
+        // active: c1, c2, c6, c7, c9, ch6; pending: c4, c11.
+        assert_eq!(page.items.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn merged_conversation_answers_301_and_leaves_listings() {
+        let p = provider();
+        // c12 (remote 105014) was merged into c2 (105001).
+        let err = p.get_conversation(105_014).await.unwrap_err();
+        assert!(err.to_string().contains("merged into"));
+        let page = p
+            .list_conversations(&ConversationQuery::default())
+            .await
+            .unwrap();
+        assert!(page.items.iter().all(|c| c.remote_id != 105_014));
+    }
+
+    #[tokio::test]
+    async fn snoozed_conversation_carries_future_snooze() {
+        let p = provider();
+        let conv = p.get_conversation(105_013).await.unwrap().unwrap();
+        assert_eq!(conv.number, 5014);
+        assert!(conv.snoozed_until.is_some());
+        assert!(
+            conv.snoozed_until.as_deref().unwrap_or_default()
+                > conv.created_at.as_deref().unwrap_or_default()
+        );
     }
 
     #[tokio::test]
@@ -1489,29 +2749,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn customers_carry_contact_first_shape() {
+        let p = provider();
+        let lucia = p.get_customer(3001).await.unwrap().unwrap();
+        assert_eq!(lucia.emails.len(), 2);
+        assert_eq!(
+            lucia.emails[0].value.as_deref(),
+            Some("lucia@andeslogistics.cl")
+        );
+        assert_eq!(
+            lucia.background.as_deref(),
+            Some("Key account contact since 2024. Prefers Spanish, answers in English fine.")
+        );
+        assert_eq!(lucia.properties.len(), 4);
+        assert_eq!(lucia.organization_id, Some(2001));
+    }
+
+    #[tokio::test]
     async fn reset_restores_demo_world() {
         let p = provider();
-        // The demo world has 10 conversations; after reset it should still be 10.
+        // The demo world lists 20 conversations; after reset it should still be 20.
         let before = p
             .list_conversations(&ConversationQuery::default())
             .await
             .unwrap();
-        assert_eq!(before.items.len(), 10);
+        assert_eq!(before.items.len(), 20);
         p.reset();
         let after = p
             .list_conversations(&ConversationQuery::default())
             .await
             .unwrap();
-        assert_eq!(after.items.len(), 10);
+        assert_eq!(after.items.len(), 20);
     }
 
     #[test]
     fn fake_world_demo_is_deterministic() {
         let w1 = FakeWorld::demo();
         let w2 = FakeWorld::demo();
-        assert_eq!(w1.mailboxes.len(), w2.mailboxes.len());
-        assert_eq!(w1.conversations.len(), w2.conversations.len());
-        assert_eq!(w1.conversations[0].subject, w2.conversations[0].subject);
+        // ch6's start is recomputed with hoursAgoNow(2) so its timestamps
+        // move with the clock (same as the reference); everything else is
+        // byte-identical between builds.
+        assert_eq!(w1.conversations[..19], w2.conversations[..19]);
+        assert_eq!(w1.threads.len(), w2.threads.len());
+        assert_eq!(w1.threads[..47], w2.threads[..47]);
+        assert_eq!(w1.customers, w2.customers);
+        assert_eq!(w1.tags, w2.tags);
+        assert_eq!(w1.doc_articles, w2.doc_articles);
+        assert_eq!(w1.ratings, w2.ratings);
+    }
+
+    #[test]
+    fn fake_world_demo_counts_match_reference() {
+        let w = FakeWorld::demo();
+        assert_eq!(w.users.len(), 3);
+        assert_eq!(w.system_users.len(), 1);
+        assert_eq!(w.teams.len(), 2);
+        assert_eq!(w.mailboxes.len(), 2);
+        assert_eq!(w.folders.len(), 4);
+        assert_eq!(w.tags.len(), 14);
+        assert_eq!(w.fields.len(), 4);
+        assert_eq!(w.saved_replies.len(), 5);
+        assert_eq!(w.workflows.len(), 3);
+        assert_eq!(w.webhooks.len(), 1);
+        assert_eq!(w.customer_props.len(), 4);
+        assert_eq!(w.org_props.len(), 1);
+        assert_eq!(w.customers.len(), 8);
+        assert_eq!(w.organizations.len(), 2);
+        assert_eq!(w.conversations.len(), 21);
+        assert_eq!(w.threads.len(), 48);
+        assert_eq!(w.ratings.len(), 7);
+        assert_eq!(w.user_statuses.len(), 3);
+        assert_eq!(w.doc_collections.len(), 2);
+        assert_eq!(w.doc_categories.len(), 4);
+        assert_eq!(w.doc_articles.len(), 9);
+    }
+
+    #[test]
+    fn fake_world_chats_carry_channel_attribution() {
+        let w = FakeWorld::demo();
+        let chats: Vec<&HsConversation> = w
+            .conversations
+            .iter()
+            .filter(|c| c.kind.as_deref() == Some("chat"))
+            .collect();
+        assert_eq!(chats.len(), 6);
+        for c in &chats {
+            assert_eq!(c.source_type.as_deref(), Some("chat"));
+            assert_eq!(c.source_via.as_deref(), Some("beacon"));
+        }
+        // Email conversations carry the plain email type.
+        let emails: Vec<&HsConversation> = w
+            .conversations
+            .iter()
+            .filter(|c| c.kind.as_deref() == Some("email"))
+            .collect();
+        assert_eq!(emails.len(), 15);
+    }
+
+    #[test]
+    fn fake_world_conversation_numbers_are_sequential() {
+        let w = FakeWorld::demo();
+        // c1..c12 → 5001..5015 (15 email), ch1..ch6 → 5016..5021.
+        let numbers: Vec<i64> = w.conversations.iter().map(|c| c.number).collect();
+        assert_eq!(numbers.len(), 21);
+        assert_eq!(numbers[0], 5001);
+        assert_eq!(numbers[20], 5021);
+        // remoteId = the pre-increment convNum + 100000.
+        assert_eq!(w.conversations[0].remote_id, 105_000);
+        assert_eq!(w.conversations[20].remote_id, 105_020);
+    }
+
+    #[test]
+    fn fake_world_docs_carry_status_variety() {
+        let w = FakeWorld::demo();
+        let statuses: Vec<&str> = w
+            .doc_articles
+            .iter()
+            .map(|a| a.status.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(statuses.iter().filter(|s| **s == "published").count(), 7);
+        assert_eq!(statuses.iter().filter(|s| **s == "draft").count(), 1);
+        assert_eq!(statuses.iter().filter(|s| **s == "internal").count(), 1);
     }
 
     #[test]
@@ -1521,30 +2879,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_beacon_chats_returns_two() {
+    async fn list_beacon_chats_returns_six() {
         let p = provider();
         let chats = p.list_beacon_chats().await.unwrap();
-        assert_eq!(chats.len(), 2);
-        assert_eq!(chats[0].customer_id, 2001);
+        assert_eq!(chats.len(), 6);
+        assert_eq!(chats[0].customer_id, 3004);
         assert_eq!(chats[1].status, "closed");
     }
 
     #[tokio::test]
-    async fn list_docs_returns_three() {
+    async fn list_docs_returns_nine() {
         let p = provider();
         let docs = p.list_docs().await.unwrap();
-        assert_eq!(docs.len(), 3);
-        assert_eq!(docs[0].name, "Getting Started Guide");
-        assert!(docs[1].slug.as_ref().is_some_and(|s| s == "faq"));
+        assert_eq!(docs.len(), 9);
+        assert_eq!(docs[0].name, "Creating your first report");
+        assert!(docs[1]
+            .slug
+            .as_ref()
+            .is_some_and(|s| s == "schedule-timezones"));
     }
 
     #[tokio::test]
-    async fn list_ratings_returns_three() {
+    async fn list_ratings_returns_seven() {
         let p = provider();
         let ratings = p.list_ratings().await.unwrap();
-        assert_eq!(ratings.len(), 3);
+        assert_eq!(ratings.len(), 7);
         assert_eq!(ratings[0].rating.as_deref(), Some("great"));
-        assert_eq!(ratings[1].rating.as_deref(), Some("okay"));
-        assert!(ratings[2].comment.is_none());
+        assert_eq!(
+            ratings[0].comment.as_deref(),
+            Some("Quick and clear, thank you!")
+        );
+        assert_eq!(ratings[2].rating.as_deref(), Some("okay"));
+        assert!(ratings[1].comment.is_none());
+        // getRating by remote id resolves the same rows.
+        let r605 = p.get_rating(605).await.unwrap().unwrap();
+        assert_eq!(r605.customer_name.as_deref(), Some("Daniel Kim"));
     }
 }

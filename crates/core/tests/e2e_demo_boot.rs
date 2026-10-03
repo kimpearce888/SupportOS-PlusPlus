@@ -102,6 +102,9 @@ async fn demo_boot_runtime_verification() {
     step(&mut out, "boot /health 200", up, "GET /health".into());
 
     // ── 2. Demo seed lands (initial sync + demoSeed) ────────────────────────
+    // The boot chain sets `demo_data_loaded` only after the FULL seed pass
+    // (mirror + demoSeed), so waiting on it removes the mid-seed race for
+    // the count assertions below.
     let mut seeded = false;
     let mut conv_count = 0usize;
     let mut knowledge_count = 0usize;
@@ -109,10 +112,10 @@ async fn demo_boot_runtime_verification() {
     while Instant::now() < deadline {
         // The guard is confined inside `seed_counts` — no lock is ever held
         // across the sleep await below (clippy::await_holding_lock).
-        let (convs, docs) = seed_counts(&http_conn);
+        let (convs, docs, loaded) = seed_counts(&http_conn);
         conv_count = convs;
         knowledge_count = docs;
-        if conv_count > 0 && knowledge_count > 0 {
+        if loaded {
             seeded = true;
             break;
         }
@@ -123,7 +126,7 @@ async fn demo_boot_runtime_verification() {
         c.query_row("SELECT COUNT(*) FROM customers", [], |r| r.get(0))
             .unwrap_or(0)
     };
-    let (tag_count, known_issue_count, ai_runs) = {
+    let (tag_count, known_issue_count, ai_runs, thread_count, ratings_count) = {
         let c = http_conn.lock().unwrap_or_else(|p| p.into_inner());
         (
             c.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
@@ -131,6 +134,12 @@ async fn demo_boot_runtime_verification() {
             c.query_row("SELECT COUNT(*) FROM known_issues", [], |r| r.get(0))
                 .unwrap_or(0),
             c.query_row("SELECT COUNT(*) FROM ai_runs", [], |r| r.get(0))
+                .unwrap_or(0),
+            c.query_row("SELECT COUNT(*) FROM conversation_threads", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0),
+            c.query_row("SELECT COUNT(*) FROM ratings", [], |r| r.get(0))
                 .unwrap_or(0),
         )
     };
@@ -159,14 +168,28 @@ async fn demo_boot_runtime_verification() {
         }
         st.join(",")
     };
+    // Reference-derived demo counts (fakeData.ts + demoSeed.ts): 21 world
+    // conversations with c12 merged away from listings → 20 mirror rows,
+    // 48 threads, 8 customers (3001-3008), 14 tags, 7 ratings; the seed
+    // writes 5 knowledge documents, 2 known issues and 6 AI runs (4 sample
+    // analyses + the repeated-question pair).
+    let counts_ok = seeded
+        && conv_count == 20
+        && thread_count == 48
+        && cust_count == 8
+        && tag_count == 14
+        && ratings_count == 7
+        && knowledge_count == 5
+        && known_issue_count == 2
+        && ai_runs == 6;
     step(
         &mut out,
-        "demo seed counts (reference: 21 conversations, 12 customers)",
-        seeded,
+        "demo seed counts (reference: 21 world conversations/20 mirrored, 8 customers)",
+        counts_ok,
         format!(
-            "conversations={conv_count} customers={cust_count} tags={tag_count} \
-             knowledge_documents={knowledge_count} known_issues={known_issue_count} \
-             ai_runs={ai_runs} sync_state={sync_diag}"
+            "conversations={conv_count} threads={thread_count} customers={cust_count} \
+             tags={tag_count} ratings={ratings_count} knowledge_documents={knowledge_count} \
+             known_issues={known_issue_count} ai_runs={ai_runs} sync_state={sync_diag}"
         ),
     );
 
@@ -201,7 +224,7 @@ async fn demo_boot_runtime_verification() {
     // ── 5. Simulated webhook through the real HMAC pipeline ────────────────
     match client
         .post(format!("{base}/api/demo/simulate-webhook"))
-        .json(&json!({"event": "convo.created", "conversationRemoteId": 5001}))
+        .json(&json!({"event": "convo.created", "conversationRemoteId": 105000}))
         .send()
         .await
     {
@@ -226,7 +249,7 @@ async fn demo_boot_runtime_verification() {
     // ── 6. Simulated rating event ───────────────────────────────────────────
     match client
         .post(format!("{base}/api/demo/simulate-rating"))
-        .json(&json!({"conversationRemoteId": 5001, "rating": "great", "comments": ""}))
+        .json(&json!({"conversationRemoteId": 105000, "rating": "great", "comments": ""}))
         .send()
         .await
     {
@@ -388,14 +411,23 @@ async fn demo_boot_runtime_verification() {
     assert!(failed.is_empty(), "runtime verification failed: {failed:?}");
 }
 
-/// (conversations, knowledge_documents) counts — guard stays inside.
-fn seed_counts(conn: &Arc<Mutex<rusqlite::Connection>>) -> (usize, usize) {
+/// (conversations, knowledge_documents, demo_data_loaded) counts — guard
+/// stays inside.
+fn seed_counts(conn: &Arc<Mutex<rusqlite::Connection>>) -> (usize, usize, bool) {
     let c = conn.lock().unwrap_or_else(|p| p.into_inner());
     (
         c.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
             .unwrap_or(0),
         c.query_row("SELECT COUNT(*) FROM knowledge_documents", [], |r| r.get(0))
             .unwrap_or(0),
+        c.query_row(
+            "SELECT value FROM application_settings WHERE key = 'demo_data_loaded'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| serde_json::from_str::<bool>(&v).ok().or(Some(v == "true")))
+        .unwrap_or(false),
     )
 }
 
