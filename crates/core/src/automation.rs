@@ -512,6 +512,177 @@ pub fn reject(conn: &Connection, approval_id: i64, decided_by_user_id: i64) -> R
     Ok(rows > 0)
 }
 
+// ─── Manual trigger (reference engine.fireTrigger + routes/automation.ts) ──
+
+/// Execute one rule action against a conversation through the
+/// write-protection pipeline (`ticket_ops::execute`, the single source of
+/// truth for state mutations). Returns the run outcome:
+/// `completed` / `failed` / `awaiting_approval`.
+///
+/// High-impact actions never execute directly — they park a pending
+/// `automation_approvals` row (the port's approval tier, mirroring the
+/// reference's higher-risk handling).
+fn execute_action(
+    conn: &mut Connection,
+    rule_id: i64,
+    action: &Action,
+    conversation_remote_id: i64,
+    conversation_local_id: i64,
+) -> &'static str {
+    use crate::ticket_ops::{execute, OperationResult, TicketOperation};
+    if action.requires_approval() {
+        if let Ok(action_json) = serde_json::to_string(action) {
+            let _ = conn.execute(
+                "INSERT INTO automation_approvals (rule_id, conversation_id, proposed_action_json, status)
+                 VALUES (?1, ?2, ?3, 'pending')",
+                params![rule_id, conversation_remote_id, action_json],
+            );
+        }
+        return "awaiting_approval";
+    }
+    let op = match action {
+        Action::Assign { assignee_remote_id } => {
+            // The action stores the Help Scout user remote id; the write
+            // pipeline wants the local user id.
+            let assignee_local_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM users WHERE remote_id = ?1",
+                    params![assignee_remote_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            TicketOperation::Assign {
+                conversation_remote_id,
+                assignee_local_id,
+                actor_type: "automation".to_string(),
+                actor_id: None,
+            }
+        }
+        Action::ChangeStatus { new_status } => TicketOperation::ChangeStatus {
+            conversation_remote_id,
+            new_status: new_status.clone(),
+            actor_type: "automation".to_string(),
+            actor_id: None,
+        },
+        Action::SetPriority { new_priority } => {
+            match crate::ticket_states::TicketPriority::parse(new_priority) {
+                Some(p) => TicketOperation::SetPriority {
+                    conversation_remote_id,
+                    new_priority: p,
+                    actor_type: "automation".to_string(),
+                    actor_id: None,
+                },
+                None => return "failed", // unknown priority vocabulary
+            }
+        }
+        Action::SendNote { body } => TicketOperation::AddNote {
+            conversation_remote_id,
+            body: body.clone(),
+            actor_type: "automation".to_string(),
+            actor_id: None,
+        },
+        Action::AddTag { tag } => {
+            // Tags are not a TicketOperation — they go through the M030
+            // conversation_tags join (read current, merge, write back).
+            let mut tags =
+                crate::conversation_ops::read_conversation_tags(conn, conversation_local_id);
+            if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                tags.push(tag.clone());
+                crate::conversation_ops::write_conversation_tags(
+                    conn,
+                    conversation_local_id,
+                    &tags,
+                );
+            }
+            return "completed";
+        }
+    };
+    match execute(conn, &op) {
+        Ok(OperationResult::Success { .. }) => "completed",
+        Ok(OperationResult::Rejected { .. }) => "failed",
+        Err(_) => "failed",
+    }
+}
+
+/// Fire a trigger for a conversation (reference AutomationEngine.fireTrigger,
+/// the manual-trigger path from routes/automation.ts:82-88):
+///
+/// - `automation_enabled` OFF ⇒ no runs.
+/// - unknown conversation ⇒ no runs.
+/// - every ENABLED rule with the fired trigger runs: high-impact actions
+///   park a pending approval (`awaiting_approval`), low-impact actions
+///   execute directly through `ticket_ops` (`completed` / `failed`).
+/// - each fired rule records one `automation_runs` row; the LAST run row
+///   per rule is returned (the reference pushes the last recorded run).
+///
+/// The conversation id is accepted as either the local or the remote id
+/// (the port's routes historically use both); the row's remote id drives
+/// the write pipeline.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if any DB op fails.
+pub fn fire_trigger(
+    conn: &mut Connection,
+    fired: &Trigger,
+    conversation_id: i64,
+) -> Result<Vec<serde_json::Value>> {
+    if !crate::settings::get_bool(conn, "automation_enabled", false)? {
+        return Ok(Vec::new());
+    }
+    let conversation: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT id, remote_id FROM conversations WHERE id = ?1 OR remote_id = ?1",
+            params![conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let Some((conversation_local_id, conversation_remote_id)) = conversation else {
+        return Ok(Vec::new());
+    };
+    // The M035 automation_runs table (created by intelligence_features).
+    crate::intelligence_features::apply_m035(conn)?;
+    let mut runs = Vec::new();
+    for rule in list_rules(conn)? {
+        if !rule.enabled || &rule.trigger != fired {
+            continue;
+        }
+        let rule_id = rule.id.unwrap_or_default();
+        let outcome = execute_action(
+            conn,
+            rule_id,
+            &rule.action,
+            conversation_remote_id,
+            conversation_local_id,
+        );
+        conn.execute(
+            "INSERT INTO automation_runs (rule_id, conversation_id, triggered_by, outcome)
+             VALUES (?1, ?2, 'manual', ?3)",
+            params![rule_id, conversation_id, outcome],
+        )?;
+        // The reference returns the LAST recorded run row per rule.
+        let last = conn.last_insert_rowid();
+        if let Ok(v) = conn.query_row(
+            "SELECT id, rule_id, conversation_id, triggered_by, outcome, created_at
+             FROM automation_runs WHERE id = ?1",
+            params![last],
+            |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "rule_id": r.get::<_, i64>(1)?,
+                    "conversation_id": r.get::<_, Option<i64>>(2)?,
+                    "triggered_by": r.get::<_, String>(3)?,
+                    "outcome": r.get::<_, String>(4)?,
+                    "created_at": r.get::<_, String>(5)?,
+                }))
+            },
+        ) {
+            runs.push(v);
+        }
+    }
+    Ok(runs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

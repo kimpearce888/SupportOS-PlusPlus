@@ -283,8 +283,10 @@ fn open_db_with_all_migrations(
     spp_core::conversation_ops::apply_m030(&conn)?;
     spp_core::outreach::apply_m031(&conn)?;
     spp_core::ticket_states::apply_m032(&conn)?;
+    spp_core::ai_attributes::apply_m033(&conn)?;
+    spp_core::intelligence_features::apply_m035(&conn)?;
 
-    tracing::info!("All migrations M001–M028 applied successfully");
+    tracing::info!("All migrations M001–M035 applied successfully");
     Ok(conn)
 }
 

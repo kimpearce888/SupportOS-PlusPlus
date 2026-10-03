@@ -251,3 +251,184 @@ pub async fn case_from_conversation(
 ) -> Json<Value> {
     Json(json!({"ok": true, "conversationId": conversation_id}))
 }
+
+/// GET /api/issues/known/:id/impact — known-issue impact (reference
+/// incidents.ts:277 — `ctx.issueImpact.forKnownIssue(id)`).
+///
+/// Impact = conversations / distinct customers / organizations, first + last
+/// seen (remote_created_at), open/closed/waiting counts, 7-day growth vs the
+/// previous 7 days, trend classification, top-10 mailbox breakdown.
+pub async fn known_impact(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // 404 when the known issue itself does not exist.
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM known_issues WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !exists {
+        return Json(json!({
+            "statusCode": 404,
+            "error": "NotFound",
+            "message": "Known issue not found."
+        }));
+    }
+    // Base counts over linked, non-deleted conversations.
+    let counts_ok = conn.query_row(
+        "SELECT COUNT(*),
+                COUNT(DISTINCT c.customer_local_id),
+                MIN(c.remote_created_at),
+                MAX(c.remote_created_at),
+                SUM(CASE WHEN c.status = 'active' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.status = 'closed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN c.customer_waiting_since IS NOT NULL AND c.status = 'active' THEN 1 ELSE 0 END)
+         FROM conversations c
+         WHERE c.deleted_at IS NULL AND c.id IN (
+            SELECT l.conversation_id FROM known_issue_conversations l
+            WHERE l.known_issue_id = ?1
+         )",
+        rusqlite::params![id],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+            ))
+        },
+    );
+    let (conversations, customers, first_seen, last_seen, open_count, closed_count, waiting_count) =
+        match counts_ok {
+            Ok(v) => v,
+            Err(_) => (0, 0, None, None, 0, 0, 0),
+        };
+    // Distinct organizations among linked conversations' customers.
+    let organizations: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT cu.organization_id)
+             FROM conversations c JOIN customers cu ON cu.id = c.customer_local_id
+             WHERE c.deleted_at IS NULL AND cu.organization_id IS NOT NULL
+               AND c.id IN (
+                 SELECT l.conversation_id FROM known_issue_conversations l
+                 WHERE l.known_issue_id = ?1
+               )",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    // Growth: started in the last 7 days vs the previous 7.
+    let conv_in = "|LINK|";
+    let _ = conv_in;
+    let recent: i64 = linked_count_since(&conn, id, "-7 days").unwrap_or(0);
+    let previous: i64 = linked_count_between(&conn, id, "-14 days", "-7 days").unwrap_or(0);
+    let recent14: i64 = linked_count_since(&conn, id, "-14 days").unwrap_or(0);
+    let prior14: i64 = linked_count_between(&conn, id, "-28 days", "-14 days").unwrap_or(0);
+    let growth = if previous > 0 {
+        json!({ "window_days": 7, "recent": recent, "previous": previous,
+                "ratio": (recent as f64) / (previous as f64),
+                "direction": if (recent as f64) / (previous as f64) >= 1.3 { "rising" }
+                             else if (recent as f64) / (previous as f64) <= 0.7 { "falling" } else { "flat" } })
+    } else if recent > 0 {
+        json!({ "window_days": 7, "recent": recent, "previous": previous, "ratio": null, "direction": "rising" })
+    } else {
+        json!({ "window_days": 7, "recent": recent, "previous": previous, "ratio": 0.0, "direction": "unknown" })
+    };
+    // Trend: new / rising / falling / stable (reference impact.ts compute).
+    let trend = if conversations == 0 {
+        "unknown".to_string()
+    } else if first_seen
+        .as_deref()
+        .map(|fs| {
+            conn.query_row(
+                "SELECT julianday(?1) >= julianday('now', '-7 days')",
+                rusqlite::params![fs],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v == 1)
+            .unwrap_or(false)
+        })
+        .unwrap_or(false)
+    {
+        "new".to_string()
+    } else if prior14 == 0 && recent14 >= 1 {
+        "rising".to_string()
+    } else if prior14 > 0 && recent14 < (prior14 as f64 * 0.7) as i64 {
+        "falling".to_string()
+    } else {
+        "stable".to_string()
+    };
+    // Top-10 mailbox breakdown.
+    let mut inboxes = Vec::new();
+    let _ = conn.prepare(
+        "SELECT (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_local_id) AS mailbox, COUNT(*) AS n
+         FROM conversations c
+         WHERE c.deleted_at IS NULL AND c.id IN (
+            SELECT l.conversation_id FROM known_issue_conversations l WHERE l.known_issue_id = ?1
+         )
+         GROUP BY c.mailbox_local_id ORDER BY n DESC LIMIT 10",
+    )
+    .and_then(|mut stmt| {
+        let rows = stmt.query_map(rusqlite::params![id], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows.flatten() {
+            inboxes.push(json!({ "mailbox": row.0, "conversations": row.1 }));
+        }
+        Ok(())
+    });
+    Json(json!({
+        "impact": {
+            "conversations": conversations,
+            "customers": customers,
+            "organizations": organizations,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "open_count": open_count,
+            "closed_count": closed_count,
+            "waiting_count": waiting_count,
+            "growth_rate_7d": growth,
+            "trend": trend,
+            "inboxes": inboxes
+        }
+    }))
+}
+
+/// COUNT of linked conversations created at or after `julianday('now', since)`.
+fn linked_count_since(conn: &rusqlite::Connection, id: i64, since: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM conversations c
+             WHERE c.deleted_at IS NULL
+               AND julianday(c.remote_created_at) >= julianday('now', '{since}')
+               AND c.id IN (SELECT l.conversation_id FROM known_issue_conversations l WHERE l.known_issue_id = ?1)"
+        ),
+        rusqlite::params![id],
+        |r| r.get(0),
+    )
+}
+
+/// COUNT of linked conversations created in [from, to) relative to now.
+fn linked_count_between(
+    conn: &rusqlite::Connection,
+    id: i64,
+    from: &str,
+    to: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM conversations c
+             WHERE c.deleted_at IS NULL
+               AND julianday(c.remote_created_at) >= julianday('now', '{from}')
+               AND julianday(c.remote_created_at) < julianday('now', '{to}')
+               AND c.id IN (SELECT l.conversation_id FROM known_issue_conversations l WHERE l.known_issue_id = ?1)"
+        ),
+        rusqlite::params![id],
+        |r| r.get(0),
+    )
+}

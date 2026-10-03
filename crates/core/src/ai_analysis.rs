@@ -11,14 +11,17 @@
 //! M6-T02 (analysis): `analyze_conversation` calls `provider.chat()` with a
 //! structured prompt asking the AI to analyze the conversation. The result
 //! is a structured `AnalysisResult` containing the 14 AI attribute keys.
+//! The analysis is cached via the `ai_runs` table (M5-T07).
 //!
-//! M6-T03 (attributes): M010 migration creates the `ai_attributes` table.
-//! `set_attribute` stores a derived attribute with evidence + thread_ref.
-//! `get_attributes` retrieves all attributes for a conversation.
+//! M6-T03 (attributes): the persisted attribute layer now lives in
+//! `crate::ai_attributes` (M033 reference shape: versioned snapshots via
+//! `superseded_at`, closed 14-key catalog, deterministic + AI layers).
+//! `apply_m010` below only remains for boot-order compatibility: it creates
+//! the legacy shape on DBs that have not yet reached M033, and is a no-op
+//! once the M033 shape is in place.
 //!
 //! Per spec: AI attributes never overwrite Help Scout source data — they're a
-//! separate layer, like `supportos_priority` from M3-T04. The analysis is cached
-//! via the `ai_runs` table (M5-T07).
+//! separate layer, like `supportos_priority` from M3-T04.
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -46,8 +49,22 @@ pub const M010_SQL: &str = r#"
     UPDATE app_state SET schema_version = 10 WHERE id = 1;
 "#;
 
-/// Apply M010 migration. Idempotent.
+/// Apply M010 migration. Idempotent. Superseded by M033 (`ai_attributes`
+/// reference shape): once the table carries the `attribute` column, this is a
+/// deliberate no-op so re-running the boot sequence never recreates the
+/// legacy index on the rebuilt table.
 pub fn apply_m010(conn: &Connection) -> Result<()> {
+    // M033 shape already present — nothing to do (forward-only).
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(ai_attributes)")?;
+        let has_new_shape = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|c| c.ok())
+            .any(|c| c == "attribute");
+        if has_new_shape {
+            return Ok(());
+        }
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS ai_attributes (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -282,14 +299,24 @@ fn lookup_cached_analysis(
     }
 }
 
-/// Store a derived AI attribute. Per the reference notes: "Every AI-derived
-/// attribute carries an evidence excerpt + thread reference."
+// ---------------------------------------------------------------------------
+// Attribute persistence
+// ---------------------------------------------------------------------------
+
+/// Store one derived AI attribute via the versioned attribute repo
+/// (`crate::ai_attributes::upsert_single`: retires only this key's current
+/// rows — sibling keys stay untouched — then inserts through the closed
+/// catalog validation). Per the reference notes: "Every AI-derived attribute
+/// carries an evidence excerpt + thread reference." The legacy evidence
+/// shape ({excerpt, thread_ref}) is preserved; the numeric confidence maps
+/// onto the operational vocabulary (> 0 → 'medium', else 'unknown').
+/// Returns the inserted row id.
 ///
 /// # Errors
 ///
-/// Returns `Error::Sqlite` if the insert fails.
+/// Returns `Error::Sqlite` if the write fails.
 pub fn set_attribute(
-    conn: &Connection,
+    conn: &mut Connection,
     conversation_id: i64,
     key: AiAttributeKey,
     value: &str,
@@ -297,67 +324,36 @@ pub fn set_attribute(
     thread_ref: &str,
     confidence: f64,
 ) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO ai_attributes
-            (conversation_id, attribute_key, value, evidence_excerpt, thread_ref, confidence)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            conversation_id,
-            key.as_str(),
-            value,
-            evidence_excerpt,
-            thread_ref,
-            confidence
-        ],
-    )?;
-    Ok(conn.last_insert_rowid())
+    let record = crate::ai_attributes::AttributeRecord {
+        key,
+        value: value.to_string(),
+        confidence: if confidence > 0.0 {
+            "medium"
+        } else {
+            "unknown"
+        },
+        source: "ai",
+        evidence: vec![serde_json::json!({
+            "excerpt": evidence_excerpt,
+            "thread_ref": thread_ref,
+        })],
+        run_id: None,
+    };
+    crate::ai_attributes::upsert_single(conn, conversation_id, record)
 }
 
-/// Get all AI attributes for a conversation.
+/// Current AI attribute rows for a conversation, mapped back onto the
+/// analysis `AiAttribute` shape (first evidence entry wins).
 ///
 /// # Errors
 ///
 /// Returns `Error::Sqlite` if the query fails.
 pub fn get_attributes(conn: &Connection, conversation_id: i64) -> Result<Vec<AiAttribute>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, attribute_key, value, evidence_excerpt, thread_ref, confidence, created_at
-         FROM ai_attributes
-         WHERE conversation_id = ?1
-         ORDER BY id ASC",
-    )?;
-    let rows = stmt
-        .query_map(params![conversation_id], |r| {
-            let key_str: String = r.get(2)?;
-            let key = AiAttributeKey::ALL
-                .iter()
-                .find(|k| k.as_str() == key_str.as_str())
-                .copied()
-                .ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unknown attribute key: {key_str}"),
-                        )),
-                    )
-                })?;
-            Ok(AiAttribute {
-                id: r.get(0)?,
-                conversation_id: r.get(1)?,
-                key,
-                value: r.get(3)?,
-                evidence_excerpt: r.get(4)?,
-                thread_ref: r.get(5)?,
-                confidence: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    let rows = crate::ai_attributes::current_for_conversation(conn, conversation_id)?;
+    Ok(rows.into_iter().filter_map(row_to_ai_attribute).collect())
 }
 
-/// Get a specific attribute for a conversation.
+/// The current value of one attribute for a conversation.
 ///
 /// # Errors
 ///
@@ -367,42 +363,50 @@ pub fn get_attribute(
     conversation_id: i64,
     key: AiAttributeKey,
 ) -> Result<Option<AiAttribute>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, attribute_key, value, evidence_excerpt, thread_ref, confidence, created_at
-         FROM ai_attributes
-         WHERE conversation_id = ?1 AND attribute_key = ?2
-         ORDER BY created_at DESC LIMIT 1",
-    )?;
-    let row: Option<AiAttribute> = stmt
-        .query_row(params![conversation_id, key.as_str()], |r| {
-            let key_str: String = r.get(2)?;
-            let key = AiAttributeKey::ALL
-                .iter()
-                .find(|k| k.as_str() == key_str.as_str())
-                .copied()
-                .ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unknown attribute key: {key_str}"),
-                        )),
-                    )
-                })?;
-            Ok(AiAttribute {
-                id: r.get(0)?,
-                conversation_id: r.get(1)?,
-                key,
-                value: r.get(3)?,
-                evidence_excerpt: r.get(4)?,
-                thread_ref: r.get(5)?,
-                confidence: r.get(6)?,
-                created_at: r.get(7)?,
-            })
+    let rows = crate::ai_attributes::current_for_conversation(conn, conversation_id)?;
+    Ok(rows
+        .into_iter()
+        .find(|r| r.attribute == key.as_str())
+        .and_then(row_to_ai_attribute))
+}
+
+/// Map one stored attribute row onto the analysis shape.
+fn row_to_ai_attribute(row: crate::ai_attributes::AttributeRow) -> Option<AiAttribute> {
+    let key = AiAttributeKey::parse(&row.attribute)?;
+    let (evidence_excerpt, thread_ref) = row
+        .evidence
+        .as_array()
+        .and_then(|a| a.first())
+        .map(|e| {
+            let excerpt = e.get("excerpt").and_then(|v| v.as_str()).unwrap_or("");
+            let thread_ref = e
+                .get("thread_ref")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    e.get("thread_local_id")
+                        .and_then(|v| v.as_i64())
+                        .map(|id| id.to_string())
+                });
+            (excerpt.to_string(), thread_ref.unwrap_or_default())
         })
-        .ok();
-    Ok(row)
+        .unwrap_or_default();
+    let confidence = match row.confidence.as_str() {
+        "high" => 0.9,
+        "medium" => 0.6,
+        "low" => 0.3,
+        _ => 0.0,
+    };
+    Some(AiAttribute {
+        id: Some(row.id),
+        conversation_id: row.conversation_id,
+        key,
+        value: row.value,
+        evidence_excerpt,
+        thread_ref,
+        confidence,
+        created_at: row.computed_at,
+    })
 }
 
 #[cfg(test)]
@@ -423,7 +427,17 @@ mod tests {
         crate::migrations::run_all(&mut conn).unwrap();
         apply_m008(&conn).unwrap();
         apply_m010(&conn).unwrap();
+        crate::ai_attributes::apply_m033(&conn).unwrap();
         conn
+    }
+
+    fn insert_conversation(conn: &Connection, id: i64) {
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+             VALUES (?1, ?1, ?1, 'T', 1, 1)",
+            params![id],
+        )
+        .unwrap();
     }
 
     // ---- M010 migration ----------------------------------------------------
@@ -438,22 +452,30 @@ mod tests {
     }
 
     #[test]
-    fn m010_creates_index() {
+    fn m033_replaces_the_m010_index_with_the_reference_indexes() {
         let conn = fresh_db();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'index' AND name = 'idx_ai_attributes_conv'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
+        for idx in [
+            "idx_ai_attributes_current",
+            "idx_ai_attributes_value",
+            "idx_ai_attributes_run",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    params![idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing {idx}");
+        }
     }
 
     #[test]
     fn m010_is_idempotent() {
         let conn = fresh_db();
+        // After M033 the M010 apply is a deliberate no-op — re-running the
+        // boot sequence must not fail on the rebuilt table.
+        apply_m010(&conn).unwrap();
         apply_m010(&conn).unwrap();
     }
 
@@ -461,12 +483,13 @@ mod tests {
 
     #[test]
     fn set_attribute_stores_with_evidence_and_thread_ref() {
-        let conn = fresh_db();
+        let mut conn = fresh_db();
+        insert_conversation(&conn, 1001);
         let id = set_attribute(
-            &conn,
+            &mut conn,
             1001,
             AiAttributeKey::Intent,
-            "refund request",
+            "billing",
             "I want my money back",
             "msg_1",
             0.9,
@@ -474,36 +497,40 @@ mod tests {
         .unwrap();
         assert!(id > 0);
 
-        let (key, value, evidence, thread, conf): (String, String, String, String, f64) = conn
-            .query_row(
-                "SELECT attribute_key, value, evidence_excerpt, thread_ref, confidence
+        let (key, value, evidence, confidence, source): (String, String, String, String, String) =
+            conn.query_row(
+                "SELECT attribute, value, evidence, confidence, source
                  FROM ai_attributes WHERE id = ?1",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(key, "intent");
-        assert_eq!(value, "refund request");
-        assert_eq!(evidence, "I want my money back");
-        assert_eq!(thread, "msg_1");
-        assert!((conf - 0.9).abs() < 1e-6);
+        assert_eq!(value, "billing");
+        let parsed: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(parsed[0]["excerpt"], "I want my money back");
+        assert_eq!(parsed[0]["thread_ref"], "msg_1");
+        assert_eq!(confidence, "medium", "confidence > 0 maps to 'medium'");
+        assert_eq!(source, "ai");
     }
 
     #[test]
     fn get_attributes_returns_all_for_conversation() {
-        let conn = fresh_db();
+        let mut conn = fresh_db();
+        insert_conversation(&conn, 1001);
+        insert_conversation(&conn, 1002);
         set_attribute(
-            &conn,
+            &mut conn,
             1001,
             AiAttributeKey::Intent,
-            "refund",
+            "billing",
             "evidence1",
             "msg_1",
             0.9,
         )
         .unwrap();
         set_attribute(
-            &conn,
+            &mut conn,
             1001,
             AiAttributeKey::Urgency,
             "high",
@@ -513,7 +540,7 @@ mod tests {
         )
         .unwrap();
         set_attribute(
-            &conn,
+            &mut conn,
             1002,
             AiAttributeKey::Intent,
             "question",
@@ -539,24 +566,25 @@ mod tests {
 
     #[test]
     fn get_attribute_returns_latest() {
-        let conn = fresh_db();
-        // Insert two values for the same key — get_attribute should return the latest.
+        let mut conn = fresh_db();
+        insert_conversation(&conn, 1001);
+        // Insert two values for the same key — get_attribute should return the
+        // latest (the versioned repo retires the previous one).
         set_attribute(
-            &conn,
+            &mut conn,
             1001,
             AiAttributeKey::Intent,
-            "old",
+            "question",
             "old evidence",
             "msg_1",
             0.5,
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
         set_attribute(
-            &conn,
+            &mut conn,
             1001,
             AiAttributeKey::Intent,
-            "new",
+            "bug_report",
             "new evidence",
             "msg_2",
             0.9,
@@ -566,7 +594,8 @@ mod tests {
         let attr = get_attribute(&conn, 1001, AiAttributeKey::Intent)
             .unwrap()
             .unwrap();
-        assert_eq!(attr.value, "new", "get_attribute returns the latest");
+        assert_eq!(attr.value, "bug_report", "get_attribute returns the latest");
+        assert_eq!(attr.evidence_excerpt, "new evidence");
     }
 
     #[test]
@@ -580,13 +609,22 @@ mod tests {
 
     #[test]
     fn all_14_attribute_keys_round_trip() {
-        let conn = fresh_db();
+        let mut conn = fresh_db();
+        insert_conversation(&conn, 1001);
         for key in AiAttributeKey::ALL {
+            // Enum keys need a value from their closed vocabulary; booleans
+            // are 'true'/'false'; numbers must be finite.
+            let value = match key.value_type() {
+                crate::catalog::AttributeValueType::Enum => key.values()[0],
+                crate::catalog::AttributeValueType::Boolean => "true",
+                crate::catalog::AttributeValueType::Number => "3",
+                _ => "test_value",
+            };
             let id = set_attribute(
-                &conn,
+                &mut conn,
                 1001,
                 key,
-                "test_value",
+                value,
                 "test_evidence",
                 "test_thread",
                 0.5,

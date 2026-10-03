@@ -1,6 +1,7 @@
 //! Automation routes — mirrors src/server/routes/automation.ts
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde_json::{json, Value};
 
@@ -121,4 +122,35 @@ pub async fn delete_rule(State(state): State<AppState>, Path(id): Path<i64>) -> 
         rusqlite::params![id],
     );
     Json(json!({"ok": true}))
+}
+
+/// POST /api/automation/rules/:id/trigger/:conversationId — manual trigger
+/// for testing (reference automation.ts:82-88). A missing rule answers
+/// `{ ok: false, message: 'Rule not found.' }` with 200 (Fastify default —
+/// the reference does not 404 here), and the fired trigger records one run
+/// row per matching enabled rule.
+pub async fn trigger(
+    State(state): State<AppState>,
+    Path((id, conversation_id)): Path<(i64, i64)>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(rule) = crate::automation::load_rule(&conn, id).unwrap_or(None) else {
+        return (
+            StatusCode::OK,
+            Json(json!({"ok": false, "message": "Rule not found."})),
+        )
+            .into_response();
+    };
+    let runs = crate::automation::fire_trigger(&mut conn, &rule.trigger, conversation_id)
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "message": format!("Trigger fired ({} runs recorded).", runs.len()),
+            "runs": runs,
+        })),
+    )
+        .into_response()
 }

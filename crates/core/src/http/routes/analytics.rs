@@ -1,6 +1,6 @@
 //! Analytics routes — mirrors src/server/routes/analytics.ts
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde_json::{json, Value};
@@ -340,6 +340,187 @@ pub async fn report_catalog(State(state): State<AppState>) -> impl IntoResponse 
         Ok(facts) => (
             StatusCode::OK,
             Json(serde_json::to_value(&facts).unwrap_or(json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
+    }
+}
+
+// ---------------- Report builder (reference analytics.ts builder routes) ----------------
+
+/// POST /api/reports/builder/run — run a custom report.
+///
+/// Reference: `reportConfigSchema.safeParse` → 422 with joined
+/// `path: message` issues; `reportBuilder.run(config)` result on success;
+/// execution errors → 422 with the error message.
+pub async fn builder_run(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    match crate::reports::parse_report_config(&body) {
+        Err(issues) => {
+            let message = issues
+                .iter()
+                .map(|(path, msg)| format!("{path}: {msg}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": message
+                })),
+            )
+        }
+        Ok(config) => {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            match crate::reports::run_builder_report(&conn, &config) {
+                Ok(outcome) => (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(&outcome).unwrap_or(json!({}))),
+                ),
+                Err(message) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": message
+                    })),
+                ),
+            }
+        }
+    }
+}
+
+/// GET /api/reports/builder/saved — list saved report definitions.
+pub async fn builder_saved_list(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match crate::reports::list_saved_reports(&conn) {
+        Ok(saved) => (
+            StatusCode::OK,
+            Json(json!({
+                "saved": saved
+                    .iter()
+                    .filter_map(|s| serde_json::to_value(s).ok())
+                    .collect::<Vec<Value>>()
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
+        ),
+    }
+}
+
+/// POST /api/reports/builder/saved — save a report definition.
+///
+/// Reference: `{ name: z.string().min(1).max(120) }.and(reportConfigSchema)`
+/// → parse errors surface as Zod 422 issues; `saveSaved(name, config)`.
+pub async fn builder_saved_create(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    // Name validation first (reference: the intersection schema validates the
+    // name AND the config together; name issues surface with path "name").
+    let name = match body.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() && n.len() <= 120 => n.to_string(),
+        Some(n) if n.is_empty() => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "name: String must contain at least 1 character(s)"
+                })),
+            );
+        }
+        Some(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "name: String must contain at most 120 character(s)"
+                })),
+            );
+        }
+        None => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "name: Required"
+                })),
+            );
+        }
+    };
+    match crate::reports::parse_report_config(&body) {
+        Err(issues) => {
+            let message = issues
+                .iter()
+                .map(|(path, msg)| format!("{path}: {msg}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": message
+                })),
+            )
+        }
+        Ok(config) => {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            match crate::reports::save_report(&conn, &name, &config) {
+                Ok(saved) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true,
+                        "saved": serde_json::to_value(&saved).unwrap_or(json!({}))
+                    })),
+                ),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": e.to_string()})),
+                ),
+            }
+        }
+    }
+}
+
+/// DELETE /api/reports/builder/saved/:id — delete a saved report.
+pub async fn builder_saved_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let id_num = crate::conversation_ops::js_number(&id);
+    let Some(idv) = id_num.filter(|v| v.fract() == 0.0 && *v > 0.0) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Report id must be a positive integer."
+            })),
+        );
+    };
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match crate::reports::delete_saved_report(&conn, idv as i64) {
+        Ok(true) => (StatusCode::OK, Json(json!({"ok": true}))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Saved report not found."
+            })),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

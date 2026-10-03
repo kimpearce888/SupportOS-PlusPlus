@@ -589,6 +589,19 @@ impl HttpServer {
                 get(routes::analytics::metric_definitions),
             )
             .route(
+                "/api/reports/builder/run",
+                post(routes::analytics::builder_run),
+            )
+            .route(
+                "/api/reports/builder/saved",
+                get(routes::analytics::builder_saved_list)
+                    .post(routes::analytics::builder_saved_create),
+            )
+            .route(
+                "/api/reports/builder/saved/:id",
+                axum::routing::delete(routes::analytics::builder_saved_delete),
+            )
+            .route(
                 "/api/reports/effectiveness",
                 get(routes::analytics::effectiveness),
             )
@@ -640,6 +653,10 @@ impl HttpServer {
                 "/api/issues/known/:id",
                 axum::routing::delete(routes::issues::delete_known),
             )
+            .route(
+                "/api/issues/known/:id/impact",
+                get(routes::issues::known_impact),
+            )
             .route("/api/issues/cases", get(routes::issues::list_cases))
             .route(
                 "/api/issues/cases/from-conversation/:conversationId",
@@ -672,6 +689,10 @@ impl HttpServer {
             .route(
                 "/api/automation/rules/:id",
                 axum::routing::delete(routes::automation::delete_rule),
+            )
+            .route(
+                "/api/automation/rules/:id/trigger/:conversationId",
+                post(routes::automation::trigger),
             )
             // Collaboration (side threads)
             .route(
@@ -718,6 +739,10 @@ impl HttpServer {
                 axum::routing::delete(routes::copilot::delete_session),
             )
             .route("/api/copilot/tools", get(routes::copilot::tools))
+            .route(
+                "/api/copilot/starter-questions/:conversationId",
+                get(routes::copilot::starter_questions),
+            )
             // Knowledge
             .route(
                 "/api/knowledge/sources",
@@ -958,6 +983,22 @@ impl HttpServer {
                 "/api/incidents/:id/conversations/:conversationId",
                 post(routes::incidents::link_conversation),
             )
+            .route(
+                "/api/incidents/:id/conversations/:conversationId",
+                axum::routing::delete(routes::incidents::unlink_conversation),
+            )
+            .route(
+                "/api/incidents/:id/refs/:refId",
+                axum::routing::delete(routes::incidents::delete_ref),
+            )
+            .route(
+                "/api/incidents/from-cluster/:clusterId",
+                post(routes::incidents::from_cluster),
+            )
+            .route(
+                "/api/incidents/from-known-issue/:knownIssueId",
+                post(routes::incidents::from_known_issue),
+            )
             // Graph
             .route("/api/graph/stats", get(routes::graph::stats))
             .route("/api/graph/meta", get(routes::graph::meta))
@@ -983,7 +1024,23 @@ impl HttpServer {
                 "/api/attributes/conversation/:id",
                 get(routes::attributes::conversation_attributes),
             )
+            .route(
+                "/api/attributes/conversation/:id/history/:attribute",
+                get(routes::attributes::conversation_attribute_history),
+            )
+            .route(
+                "/api/attributes/conversation/:id/recompute",
+                post(routes::attributes::recompute),
+            )
+            .route(
+                "/api/attributes/conversations",
+                get(routes::attributes::conversations),
+            )
             .route("/api/attributes/report", get(routes::attributes::report))
+            .route(
+                "/api/attributes/values/:attribute",
+                get(routes::attributes::values),
+            )
             // Coaching
             .route("/api/coaching/meta", get(routes::coaching::meta))
             .route(
@@ -1012,6 +1069,10 @@ impl HttpServer {
                 "/api/memory/:customerId/entries",
                 post(routes::memory::add_entry),
             )
+            .route(
+                "/api/memory/:customerId/entries/:entryId",
+                axum::routing::delete(routes::memory::delete_entry),
+            )
             // Interactions
             .route(
                 "/api/interaction/:conversationId",
@@ -1029,11 +1090,27 @@ impl HttpServer {
                 "/api/interaction/profile/:customerId",
                 get(routes::interactions::profile),
             )
+            .route(
+                "/api/interaction/profile/:customerId/override",
+                post(routes::interactions::set_override),
+            )
+            .route(
+                "/api/interaction/profile/:customerId/override/:field",
+                axum::routing::delete(routes::interactions::clear_override),
+            )
             // Quality (QA, friction, gaps)
             .route("/api/knowledge/gaps", get(routes::quality::list_gaps))
             .route(
                 "/api/knowledge/gaps/rebuild",
                 post(routes::quality::rebuild_gaps),
+            )
+            .route(
+                "/api/knowledge/gaps/candidates/:id/decide",
+                post(routes::quality::decide_candidate),
+            )
+            .route(
+                "/api/knowledge/gaps/candidates/:id/draft",
+                get(routes::quality::draft_candidate),
             )
             .route("/api/qa/overview", get(routes::quality::qa_overview))
             .route("/api/qa/rebuild", post(routes::quality::qa_rebuild))
@@ -1052,6 +1129,10 @@ impl HttpServer {
             .route(
                 "/api/friction/rebuild",
                 post(routes::quality::friction_rebuild),
+            )
+            .route(
+                "/api/friction/:conversationId",
+                get(routes::quality::friction_conversation),
             )
             // Docs
             .route("/api/docs/collections", get(routes::docs::collections))

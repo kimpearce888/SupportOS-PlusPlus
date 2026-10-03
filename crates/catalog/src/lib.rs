@@ -30,7 +30,7 @@ pub mod workspace;
 
 // Re-export the most-used items at the catalog root for ergonomics.
 pub use activity::{ActivityField, ConditionKind, DateMode, ResponseState};
-pub use attributes::AiAttributeKey;
+pub use attributes::{AiAttributeKey, AttributeValueType, AI_ATTRIBUTE_SCHEMA_VERSION};
 pub use copilot::CopilotTool;
 pub use graph::GraphNodeKind;
 pub use notifications::NotificationType;

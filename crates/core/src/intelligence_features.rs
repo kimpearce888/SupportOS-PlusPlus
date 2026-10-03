@@ -6,6 +6,7 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::catalog::{IncidentSeverity, IncidentSource, IncidentStatus};
 use crate::error::Result;
@@ -498,6 +499,307 @@ pub fn count_stale_docs(conn: &Connection) -> Result<u32> {
         |r| r.get(0),
     )?;
     Ok(u32::try_from(count).unwrap_or(0))
+}
+
+// ─── M035: reference-shaped incident workspace + gap candidates ──────────
+//
+// The v1.x port created only the bare `incidents` table (M017) while its
+// HTTP routes referenced `incident_conversations` / `incident_timeline`
+// without ever creating them. This batch brings the reference's migration
+// 014 (m4_intelligence_workspace) link/ref/related tables into existence,
+// adds the reference's `title`/`code`/`known_issue_id` columns, and creates
+// the v2.1.0 knowledge-gap candidate pipeline table, the v1.x interaction
+// override table, the automation run log, and the memory `source` column.
+
+/// Apply the M035 batch. Idempotent.
+pub fn apply_m035(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS incident_conversations (
+            incident_id     INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
+            conversation_id INTEGER NOT NULL,
+            linked_by       TEXT NOT NULL DEFAULT 'human',
+            linked_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (incident_id, conversation_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_incident_conversations_conversation
+            ON incident_conversations (conversation_id);
+
+        CREATE TABLE IF NOT EXISTS incident_related (
+            incident_id     INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
+            target_kind     TEXT NOT NULL,
+            target_local_id INTEGER NOT NULL,
+            note            TEXT,
+            linked_at       TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (incident_id, target_kind, target_local_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS incident_refs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
+            system      TEXT NOT NULL,
+            reference   TEXT NOT NULL,
+            url         TEXT,
+            title       TEXT,
+            status      TEXT,
+            notes       TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_incident_refs_incident
+            ON incident_refs (incident_id);
+
+        -- v2.1.0 (M5, plan Phase 26) knowledge-gap candidate pipeline.
+        -- `status` is the task-specified port vocabulary: an undecided
+        -- candidate is 'open' (the reference calls it 'candidate').
+        CREATE TABLE IF NOT EXISTS knowledge_gap_candidates (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            query_text       TEXT NOT NULL,
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            kind             TEXT,
+            status           TEXT NOT NULL DEFAULT 'open'
+                CHECK (status IN ('open','approved','rejected')),
+            decision_note    TEXT,
+            decided_at       TEXT,
+            created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+
+        -- v1.x interaction overrides (spec #22, #45, #56): a human
+        -- response-preference override takes precedence over AI inference.
+        CREATE TABLE IF NOT EXISTS interaction_overrides (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            field       TEXT NOT NULL,
+            value       TEXT NOT NULL,
+            reason      TEXT,
+            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            UNIQUE (customer_id, field)
+        );
+
+        -- Automation run log (reference engine.record → automation_runs).
+        CREATE TABLE IF NOT EXISTS automation_runs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id         INTEGER NOT NULL REFERENCES automation_rules (id) ON DELETE CASCADE,
+            conversation_id INTEGER,
+            triggered_by    TEXT NOT NULL DEFAULT 'manual',
+            outcome         TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_automation_runs_rule
+            ON automation_runs (rule_id);",
+    )?;
+    // Reference 014 columns the legacy table lacked (PRAGMA-guarded).
+    add_column_if_missing(conn, "incidents", "title", "TEXT")?;
+    add_column_if_missing(conn, "incidents", "code", "TEXT")?;
+    add_column_if_missing(conn, "issue_clusters", "known_issue_id", "INTEGER")?;
+    // Reference 003 customer_memories.source ('ai' default; 'human' rows
+    // are the only ones a human may delete).
+    add_column_if_missing(
+        conn,
+        "customer_memory",
+        "source",
+        "TEXT NOT NULL DEFAULT 'ai'",
+    )?;
+    let _ = conn.execute("UPDATE app_state SET schema_version = 35 WHERE id = 1", []);
+    Ok(())
+}
+
+/// `ALTER TABLE ... ADD COLUMN` guarded by a PRAGMA table_info check
+/// (the same idempotency pattern as M032 / reference migration 016).
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let cols: Vec<String> = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !cols.iter().any(|c| c == column) {
+        let _ = conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        );
+    }
+    Ok(())
+}
+
+/// Reference incidentRepo.nextCode: `INC-###` — max numeric suffix + 1,
+/// zero-padded to 3 (INC-001 when no coded incidents exist yet).
+fn next_incident_code(conn: &Connection) -> String {
+    let maxn: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(CAST(substr(code, 5) AS INTEGER)) AS maxn FROM incidents
+             WHERE code LIKE 'INC-%' AND length(code) >= 5
+               AND substr(code, 5) GLOB '[0-9]*'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+    format!("INC-{:03}", maxn.unwrap_or(0) + 1)
+}
+
+/// Reference incidentRepo.create, reduced to the columns the port stores:
+/// generates the INC code, inserts the row, and links every conversation
+/// id (`linked_by = 'human'`, INSERT OR IGNORE). Returns the new row id.
+#[allow(clippy::too_many_arguments)]
+pub fn create_incident_from_source(
+    conn: &Connection,
+    known_issue_id: Option<i64>,
+    severity: &str,
+    status: &str,
+    source: &str,
+    title: &str,
+    description: Option<&str>,
+    conversation_ids: &[i64],
+) -> Result<i64> {
+    let code = next_incident_code(conn);
+    let resolved_at = if status == "resolved" {
+        "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "INSERT INTO incidents (known_issue_id, status, severity, source, description, title, code, resolved_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {resolved_at})"
+    );
+    conn.execute(
+        &sql,
+        params![
+            known_issue_id,
+            status,
+            severity,
+            source,
+            description,
+            title,
+            code
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    for conv_id in conversation_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id, linked_by)
+             VALUES (?1, ?2, 'human')",
+            params![id, conv_id],
+        )?;
+    }
+    Ok(id)
+}
+
+/// The full incident row as JSON (id, code, title, known_issue_id, status,
+/// severity, source, description, created_at, updated_at, resolved_at) —
+/// the reference `repo().get(id)` record shape.
+pub fn incident_row_json(conn: &Connection, id: i64) -> Option<Value> {
+    conn.query_row(
+        "SELECT id, code, title, known_issue_id, status, severity, source,
+                description, created_at, updated_at, resolved_at
+         FROM incidents WHERE id = ?1",
+        params![id],
+        |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "code": r.get::<_, Option<String>>(1)?,
+                "title": r.get::<_, Option<String>>(2)?,
+                "known_issue_id": r.get::<_, Option<i64>>(3)?,
+                "status": r.get::<_, String>(4)?,
+                "severity": r.get::<_, String>(5)?,
+                "source": r.get::<_, String>(6)?,
+                "description": r.get::<_, Option<String>>(7)?,
+                "created_at": r.get::<_, String>(8)?,
+                "updated_at": r.get::<_, String>(9)?,
+                "resolved_at": r.get::<_, Option<String>>(10)?,
+            }))
+        },
+    )
+    .ok()
+}
+
+/// Reference incidentRepo.linkConversation (minus the caller-side
+/// existence checks): INSERT OR IGNORE + bump `updated_at`.
+/// Returns whether a new link was created.
+pub fn link_incident_conversation(
+    conn: &Connection,
+    incident_id: i64,
+    conversation_id: i64,
+    linked_by: &str,
+) -> Result<bool> {
+    let created = conn.execute(
+        "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id, linked_by)
+         VALUES (?1, ?2, ?3)",
+        params![incident_id, conversation_id, linked_by],
+    )? > 0;
+    if created {
+        conn.execute(
+            "UPDATE incidents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            params![incident_id],
+        )?;
+    }
+    Ok(created)
+}
+
+/// Reference incidentRepo.unlinkConversation: DELETE + bump `updated_at`.
+/// Returns whether a link was removed.
+pub fn unlink_incident_conversation(
+    conn: &Connection,
+    incident_id: i64,
+    conversation_id: i64,
+) -> Result<bool> {
+    let removed = conn.execute(
+        "DELETE FROM incident_conversations WHERE incident_id = ?1 AND conversation_id = ?2",
+        params![incident_id, conversation_id],
+    )? > 0;
+    if removed {
+        conn.execute(
+            "UPDATE incidents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            params![incident_id],
+        )?;
+    }
+    Ok(removed)
+}
+
+/// Reference incidentRepo.deleteRef. Returns whether a ref was removed.
+pub fn delete_incident_ref(conn: &Connection, incident_id: i64, ref_id: i64) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM incident_refs WHERE incident_id = ?1 AND id = ?2",
+        params![incident_id, ref_id],
+    )? > 0)
+}
+
+/// Reference incidentRepo.addRelated (INSERT OR IGNORE).
+pub fn add_incident_related(
+    conn: &Connection,
+    incident_id: i64,
+    target_kind: &str,
+    target_local_id: i64,
+    note: Option<&str>,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO incident_related (incident_id, target_kind, target_local_id, note)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![incident_id, target_kind, target_local_id, note],
+    )? > 0)
+}
+
+/// Reference issueRepo.getCluster().conversation_ids — every conversation
+/// id linked to the cluster, oldest link first.
+pub fn cluster_conversation_ids(conn: &Connection, cluster_id: i64) -> Vec<i64> {
+    conn.prepare(
+        "SELECT conversation_id FROM issue_cluster_members WHERE cluster_id = ?1 ORDER BY rowid",
+    )
+    .map(|mut stmt| {
+        stmt.query_map(params![cluster_id], |r| r.get::<_, i64>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
+/// Reference `SELECT conversation_id FROM known_issue_conversations WHERE
+/// known_issue_id = ?` — the port stores the same links in
+/// `known_issue_links` (M015).
+pub fn known_issue_conversation_ids(conn: &Connection, known_issue_id: i64) -> Vec<i64> {
+    conn.prepare("SELECT conversation_id FROM known_issue_links WHERE known_issue_id = ?1")
+        .map(|mut stmt| {
+            stmt.query_map(params![known_issue_id], |r| r.get::<_, i64>(0))
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
