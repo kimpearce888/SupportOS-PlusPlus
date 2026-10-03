@@ -7,8 +7,9 @@ Canonical audit record: **PARITY.md** (F-IDs + evidence).
 
 - Reference: https://github.com/kimpearce888/supportos — HEAD `c346fb5`
   (TypeScript v2.2.1, 310 routes, 16 migrations, 672 tests, 26 UI routes)
-- Port: https://github.com/kimpearce888/SupportOS-PlusPlus — audit started
-  at HEAD `ac80872`
+- Port: https://github.com/kimpearce888/SupportOS-PlusPlus — Session C
+  ended at local HEAD `e00443b` (12 unpushed commits through 38adb87 +
+  Session-C commits; push pending)
 
 ## Current phase
 

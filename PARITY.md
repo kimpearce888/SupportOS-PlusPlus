@@ -608,3 +608,45 @@ root — CI jobs exist, local .deb/.AppImage verification still pending).
 
 This file is updated as fixes land; each F-ID gains evidence + verification
 command + result.
+
+---
+
+## Session-C record (2026-10-03, reference c346fb5, port 53bdeaa → e00443b)
+
+### Phase 0 (re-frozen)
+- REFERENCE_HEAD = `c346fb51466e237a89e70156ae20a3386be0b322` (unchanged)
+- PORT_HEAD at Session-C start = `53bdeaa` on GitHub + **12 unpushed local commits through `38adb87`** (Session B/C continuation work: T9 sync-engine wiring, T11 security invariants, T15/T17 conversation write ops, T18 operations tiles, T19/T6 ticket-states, T23 outreach, OAuth flows, .sosync cross-verification, +33 WIP registrations) — all preserved and consolidated as the working base.
+
+### Phase 3 — repository cleanup (Session C, commit 0d609cc)
+- Removed stale doc generations: `docs/MASTER-SPEC.md` (3-OS/RPM founding spec), `docs/original-notes/` (7 files), `docs/PARITY-MATRIX.md` (superseded duplicate matrix), `docs/audit/` (5 oldest-generation audit reports).
+- `docs/DEVIATIONS.md` rewritten with stable IDs + tombstones: DEV-003 (macOS tests) and DEV-005 (InMemoryVectorStore-in-production) recorded as REMOVED with resolution pointers; DEV-002 updated to the accurate qdrant state; DEV-006 Linux-only scope retained.
+- `docs/DECISIONS.md`: D-005/D-011/D-012 narrowed to deb+AppImage/Linux-only reality; D-013/D-014/D-019 detached from the deleted spec file; D-014 output moved to `target/discovery/`.
+- `AGENTS.md` precedence rewritten (reference repo + PARITY.md are the authorities); `README.md`, `REFERENCE-VERSION.md`, `MANUAL-VERIFICATION.md`, `docs/architecture/VECTORSTORE.md` cross-references refreshed.
+- `cargo xtask discover` now writes `target/discovery/inventory.json` (generated artifact out of the source tree).
+- Removed the `windows_subsystem` cfg attribute from the Tauri main; `headless_boot.rs` stale Windows/macOS CI comments rewritten.
+- Final cleanliness scan (git grep across windows/macos/darwin/apple/msi/nsis/dmg/ico/icns/rpm/powershell/node/npm/typescript/javascript/python/docker): **zero unsupported-platform files, zero .py/.ps1/.js/.ts/.exe/.icns/.ico files**; only `bootstrap.sh` (Linux/apt-only); remaining text hits are guard-list assertions (CI forbids .rpm/.msi/.exe artifacts), honest scope statements (DEV-006), and historical F-ID records below.
+
+### Route surface — FULL PARITY (Session C, commit e00443b)
+- **311/311 reference routes registered, 0 missing, 0 extra** (verified by `scripts/count_routes.py`, multiline/chained-method-aware, against the 311-route reference inventory).
+- Session-C additions: reports builder (POST run / GET+POST saved / DELETE saved/:id — reference Zod 422 issue joining, save/list/delete via the M034 `report_definitions` machinery), GET /api/issues/known/:id/impact (reference impact.ts computation: counts, orgs, first/last seen, open/closed/waiting, 7-day growth ratio + direction, new/rising/falling/stable trend, top-10 inboxes), GET /api/friction/:conversationId (deterministic span-based engine port: repeated_customer_explanations with 6-word n-gram matching + repeated_agent_questions, evidence-pinned, "heuristic, not a judgment" wording), GET /api/copilot/starter-questions/:conversationId (reference conversation-facts-derived question set).
+- Landed from the consolidated unpushed work: attributes domain (M033 reference-shaped `ai_attributes` with superseded_at versioning + full repo: save_snapshot/current/history/conversations_matching/distributions/distinct_values + all 7 routes reference-exact), incidents from-cluster/from-known-issue/unlink-conversation/delete-ref, interaction overrides (POST/DELETE response_preference, immutable-AI semantics), knowledge-gap candidates decide/draft, automation manual trigger (automation_runs), memory entry delete (403 AI-immutable).
+
+### Phase 4 — execution audit (Session C)
+- `cargo check --workspace --exclude app` — PASS (app crate needs GTK/WebKit2GTK dev headers not installable in this sandbox; CI builds it on ubuntu runners — same class of limitation documented since M1-T02).
+- `cargo check -p ui --target wasm32-unknown-unknown` — PASS.
+- `cargo fmt --all -- --check` — PASS.
+- `cargo clippy --workspace --all-targets --exclude app -- -D warnings` — PASS.
+- `cargo test --workspace --exclude app` — **1034 passed / 0 failed / 1 ignored** (30 catalog + 907 core + 71 ui + 18+8 xtask; the 1 ignored is the cross-compat harness test requiring the Node reference harness).
+
+### Honest remaining gaps (drive the verdict below)
+1. **Sync data landing** — engine state/checkpoints/routes are wired, but resource handlers still return `success_with_data` which discards fetched rows (`sync.rs:376-390`); no 3-phase reconcile; no real-provider OAuth token exchange (only `test_code`). F-027/F-028/F-032/F-034 remain PARTIAL.
+2. **Background workers** — none of the 8 reference timers exist; `/api/system/status` reports the reference interval block as static JSON. F-047 MISSING.
+3. **FTS breadth** — 2 of 8 FTS5 tables; indexing callers exist on limited paths; knowledge/docs/saved-replies/custom-object FTS absent. F-018 PARTIAL.
+4. **Semantic search** — qdrant feature off by default; Float32-in-SQLite cosine fallback + hybrid RRF wiring into /api/search not landed; `used_semantic` honestly reports false. F-017 PARTIAL (DEV-002).
+5. **Demo mode** — no fake-provider world, no seedDemoData (15 categories). F-052 PARTIAL.
+6. **UI** — 8 of 26 routes wired; 17 page components unrouted; no sidebar/palette/shortcuts/theme toggle/polling; `withGlobalTauri` IPC bridge unverified in the packaged app. F-109..F-139 PARTIAL/MISSING.
+7. **Database breadth** — 66+2 FTS5 tables vs reference 133; Help Scout sub-record mirror tables absent. F-054 PARTIAL.
+8. **Packaging execution proof** — deb/AppImage CI jobs exist (with format assertions + smoke-install), but no local artifact was built in this sandbox (no GTK headers, no root). F-148/F-149 verify-in-CI only.
+
+### Session-C verdict
+**Full parity not achieved.** Route surface: 311/311 MATCH (registration level — per-route behavioral differentials were verified live for the Session-B batches recorded above; the Session-C additions follow the same reference-exact contract pattern and carry unit-level machinery tests, but were not live-differentially tested against a running reference in this session). The blockers above (sync data landing, workers, FTS breadth, semantic wiring, demo seed, UI wiring, DB breadth, local packaging proof) remain the ordered work list for the next session. No EXTRA functionality remains (0 extra routes; EXTRA AI providers removed; bundle targets exactly deb+appimage).
