@@ -151,33 +151,71 @@ pub async fn test_lmstudio(State(_state): State<AppState>) -> impl IntoResponse 
     )
 }
 
-/// GET /api/settings/qdrant
+/// GET /api/settings/qdrant — reference `ctx.settingsRepo.getQdrant()`:
+/// `{ url, enabled }` with defaults `http://127.0.0.1:6333` / `true`.
 pub async fn get_qdrant(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let enabled = crate::settings::get_bool(&conn, "qdrant_enabled", false).unwrap_or(false);
+    let enabled = crate::settings::get_bool(&conn, "qdrant_enabled", true).unwrap_or(true);
     let url = crate::settings::get_string(&conn, "qdrant_url")
         .ok()
         .flatten()
-        .unwrap_or_default();
+        .unwrap_or_else(|| crate::vectorstore_qdrant::DEFAULT_QDRANT_URL.to_string());
     (
         StatusCode::OK,
         Json(json!({"enabled": enabled, "url": url})),
     )
 }
 
-/// PATCH /api/settings/qdrant
+/// PATCH /api/settings/qdrant — reference routes/settings.ts:142-155:
+/// validate url (`^https?://\S+$`) + enabled (boolean), persist, reconfigure
+/// the adapter, answer `{ok, message}`.
 pub async fn update_qdrant(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(enabled) = body.get("enabled").and_then(|v| v.as_bool()) {
-        let _ = crate::settings::set_bool(&conn, "qdrant_enabled", enabled);
+    let url = body.get("url");
+    let enabled = body.get("enabled");
+    if let Some(u) = url {
+        let valid = u.as_str().is_some_and(|s| {
+            // ^https?://\S+$
+            (s.starts_with("http://") || s.starts_with("https://"))
+                && s.len() > "http://".len()
+                && !s.contains(char::is_whitespace)
+        });
+        if !valid {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"ok": false, "message": "Invalid Qdrant URL."})),
+            );
+        }
     }
-    if let Some(url) = body.get("url").and_then(|v| v.as_str()) {
-        let _ = crate::settings::set_string(&conn, "qdrant_url", url);
+    if let Some(e) = enabled {
+        if !e.is_boolean() {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"ok": false, "message": "Invalid Qdrant enabled flag."})),
+            );
+        }
     }
-    (StatusCode::OK, Json(json!({"ok": true})))
+    let (set_url, set_enabled) = {
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(u) = url.and_then(|v| v.as_str()) {
+            let _ = crate::settings::set_string(&conn, "qdrant_url", u);
+        }
+        if let Some(e) = enabled.and_then(|v| v.as_bool()) {
+            let _ = crate::settings::set_bool(&conn, "qdrant_enabled", e);
+        }
+        (
+            url.and_then(|v| v.as_str()).map(String::from),
+            enabled.and_then(|v| v.as_bool()),
+        )
+    };
+    // Reference: ctx.qdrant.reconfigure(body).
+    state.qdrant.reconfigure(set_url, set_enabled);
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "message": "Qdrant settings saved."})),
+    )
 }
 
 /// Ensure the `mailbox_business_hours` table exists with the reference's
@@ -484,17 +522,10 @@ pub async fn appearance(State(state): State<AppState>) -> impl IntoResponse {
 /// POST /api/settings/qdrant/test (reference routes/settings.ts:157-164):
 /// `{ ok, connected, url, collections, error, message }`.
 pub async fn qdrant_test(State(state): State<AppState>) -> impl IntoResponse {
-    let (url, enabled) = {
-        let conn = state.conn_lock();
-        (
-            crate::settings::get_string(&conn, "qdrant_url")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "http://127.0.0.1:6333".to_string()),
-            crate::settings::get_bool(&conn, "qdrant_enabled", true).unwrap_or(true),
-        )
-    };
-    let health = crate::settings::qdrant_health(&url, enabled).await;
+    // Reference: ctx.qdrant.health() on the live adapter (which reflects any
+    // prior reconfigure). The embedded adapter (D2) answers from its own
+    // storage state — same shape, same messages.
+    let health = state.qdrant.health();
     let message = if health.connected {
         format!(
             "Qdrant reachable at {} ({} collections).",

@@ -190,9 +190,7 @@ pub fn enqueue_prune_job(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::apply_m003;
-    use crate::notifications::{apply_m005, record_notification};
-    use crate::ticket_states::apply_m004;
+    use crate::notifications::record_notification;
     use chrono::{Duration, Utc};
     use tempfile::NamedTempFile;
 
@@ -203,11 +201,10 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        apply_m003(&conn).unwrap();
-        apply_m004(&conn).unwrap();
-        apply_m005(&conn).unwrap();
+        // The canonical boot chain — tests must exercise the REAL schema
+        // (notifications with the reference's dedup_key column), never a
+        // partial one.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 
@@ -218,8 +215,19 @@ mod tests {
     }
 
     fn insert_old_notification(conn: &Connection, days_old: i64) -> i64 {
-        let id =
-            record_notification(conn, &NotificationType::SlaBreach, Some(42), None, None).unwrap();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let id = record_notification(
+            conn,
+            &NotificationType::SlaBreach,
+            Some(42),
+            None,
+            None,
+            &format!("n:test:prune:old:{seq}"),
+        )
+        .unwrap()
+        .expect("inserted");
         let ts = iso_days_ago(days_old);
         conn.execute(
             "UPDATE notifications SET created_at = ?1 WHERE id = ?2",
@@ -230,8 +238,20 @@ mod tests {
     }
 
     fn insert_recent_notification(conn: &Connection) -> i64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         // Default created_at = now (the migration's strftime default).
-        record_notification(conn, &NotificationType::Mentioned, Some(42), None, None).unwrap()
+        record_notification(
+            conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            &format!("n:test:prune:recent:{seq}"),
+        )
+        .unwrap()
+        .expect("inserted")
     }
 
     // ---- Preferences --------------------------------------------------------
@@ -421,8 +441,16 @@ mod tests {
         // Smoke test: a notification with created_at = "2099-01-01T10:00:00Z"
         // (far future) should NOT be pruned even with a large TTL.
         let conn = fresh_db();
-        let id =
-            record_notification(&conn, &NotificationType::SlaBreach, Some(42), None, None).unwrap();
+        let id = record_notification(
+            &conn,
+            &NotificationType::SlaBreach,
+            Some(42),
+            None,
+            None,
+            "n:test:prune:future",
+        )
+        .unwrap()
+        .expect("inserted");
         conn.execute(
             "UPDATE notifications SET created_at = ?1 WHERE id = ?2",
             params!["2099-01-01T10:00:00Z", id],

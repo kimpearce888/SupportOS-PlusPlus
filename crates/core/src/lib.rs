@@ -38,6 +38,7 @@ pub mod audit;
 pub mod automation;
 pub mod backup;
 pub mod backup_service;
+pub mod bootstrap;
 pub mod config;
 pub mod connectors;
 pub mod conversation_ops;
@@ -90,7 +91,6 @@ pub mod ticket_ops;
 pub mod ticket_states;
 pub mod vectorstore;
 pub mod vectorstore_contract;
-#[cfg(feature = "qdrant")]
 pub mod vectorstore_qdrant;
 pub mod webhook;
 pub mod webhook_handler;

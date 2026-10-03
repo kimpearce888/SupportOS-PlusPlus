@@ -119,7 +119,7 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
     };
 
     // Subsystem: Qdrant — reference health(): {connected,url,collections,error}.
-    let (qdrant_url, qdrant_enabled, qdrant_indexed) = {
+    let qdrant_indexed = {
         let conn = state.conn_lock();
         let conv_indexed: i64 = conn
             .query_row(
@@ -149,21 +149,16 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        (
-            crate::settings::get_string(&conn, "qdrant_url")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "http://127.0.0.1:6333".to_string()),
-            crate::settings::get_bool(&conn, "qdrant_enabled", true).unwrap_or(true),
-            json!({
-                "conversations_indexed": conv_indexed,
-                "chunks_indexed": chunks_indexed,
-                "chunks_pending": chunks_pending,
-                "chunks_failed": chunks_failed,
-            }),
-        )
+        json!({
+            "conversations_indexed": conv_indexed,
+            "chunks_indexed": chunks_indexed,
+            "chunks_pending": chunks_pending,
+            "chunks_failed": chunks_failed,
+        })
     };
-    let qdrant = crate::settings::qdrant_health(&qdrant_url, qdrant_enabled).await;
+    // Embedded Qdrant (D2): the reference asks the adapter for health(); the
+    // port's in-process adapter answers from its own storage state.
+    let qdrant = state.qdrant.health();
 
     let (
         sync_state,

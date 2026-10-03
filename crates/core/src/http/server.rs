@@ -68,9 +68,32 @@ pub struct AppState {
     /// The background WorkerManager (8 timers), when the server owns it.
     /// `None` in unit tests and before `serve()` starts the workers.
     pub workers: Option<Arc<crate::workers::WorkerManager>>,
+    /// The embedded Qdrant adapter (reference `ctx.qdrant`, deviation D2):
+    /// in-process vector engine replacing the reference's local Qdrant
+    /// server. Constructed from persisted settings at boot; reconfigured by
+    /// the settings routes.
+    pub qdrant: Arc<crate::vectorstore_qdrant::EmbeddedQdrant>,
 }
 
 impl AppState {
+    /// Build the embedded Qdrant adapter from persisted settings — the
+    /// reference's `new QdrantAdapter({ url: settingsRepo.getQdrant().url,
+    /// enabled: settingsRepo.getQdrant().enabled })`. Defaults match the
+    /// reference: `http://127.0.0.1:6333`, enabled.
+    pub fn qdrant_from_settings(
+        conn: &rusqlite::Connection,
+        data_dir: &std::path::Path,
+    ) -> Arc<crate::vectorstore_qdrant::EmbeddedQdrant> {
+        let url = crate::settings::get_string(conn, "qdrant_url")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| crate::vectorstore_qdrant::DEFAULT_QDRANT_URL.to_string());
+        let enabled = crate::settings::get_bool(conn, "qdrant_enabled", true).unwrap_or(true);
+        Arc::new(crate::vectorstore_qdrant::EmbeddedQdrant::new(
+            data_dir, &url, enabled,
+        ))
+    }
+
     /// Lock the SQLite connection, recovering from a poisoned mutex
     /// instead of panicking. This is the safe way to get the conn
     /// from route handlers — use `state.conn_lock()` instead of
@@ -1186,6 +1209,7 @@ impl HttpServer {
             provider,
             self.state.bus.clone(),
             self.state.data_dir.clone(),
+            Some(self.state.qdrant.clone()),
         );
         // Demo mode with an empty database: run the initial demo sync
         // automatically (reference index.ts) — the seed pass lands with the

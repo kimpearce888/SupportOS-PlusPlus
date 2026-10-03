@@ -42,16 +42,8 @@ ammonia = "4.2.0"
 [dev-dependencies]
 tempfile = "3"
 
-[features]
-# Enable the Qdrant Edge embedded vector store adapter (spec A4).
-# Off by default — adds ~400 deps + significant build time. The InMemoryVectorStore
-# (Fake adapter, spec A12) is always available; the Qdrant adapter is only needed
-# for production deployments that want true vector persistence.
-# CI enables this feature in a separate job to verify it builds + the contract passes.
-default = []
-qdrant = ["dep:qdrant-edge"]
-
 [dependencies.qdrant-edge]
+# Embedded vector engine (deviation D2): replaces the reference's local
+# Qdrant server. In-process, in the DEFAULT build — not behind a feature
+# flag. Pinned: a minor bump could change on-disk segment formats.
 version = "=0.8.0"
-optional = true
-default-features = false

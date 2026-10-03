@@ -110,6 +110,10 @@ pub fn run() {
             .with_bus(http_bus.clone()),
     );
 
+    let qdrant = spp_core::http::server::AppState::qdrant_from_settings(
+        &http_conn.lock().unwrap_or_else(|p| p.into_inner()),
+        &app_config.data_dir,
+    );
     let http_state = spp_core::http::server::AppState {
         conn: http_conn,
         data_dir: app_config.data_dir.clone(),
@@ -122,6 +126,7 @@ pub fn run() {
         real,
         provider_kind,
         workers: None,
+        qdrant,
     };
 
     let http_server = spp_core::http::HttpServer::new(http_state);
@@ -150,41 +155,17 @@ pub fn run() {
         .expect("error while running SupportOS++");
 }
 
-/// Open the SQLite DB and apply the full migration chain (verbatim from the
-/// pre-thin-shell app bootstrap).
+/// Open the SQLite DB and apply the full migration chain.
+///
+/// Single entry point for DB initialization at boot — the port of the
+/// reference's `applyMigrations(db)`. The chain lives in
+/// `spp_core::bootstrap::apply_all` so the Tauri shell, the standalone HTTP
+/// example and the tests can never drift apart.
 fn open_db_with_all_migrations(
     path: &std::path::Path,
 ) -> spp_core::error::Result<rusqlite::Connection> {
     let mut conn = spp_core::db::open(path)?;
-    spp_core::db::ensure_migrations_table(&conn)?;
-    spp_core::migrations::run_all(&mut conn)?;
-
-    // Apply all incremental migrations (M003–M028).
-    spp_core::activity::apply_m003(&conn)?;
-    spp_core::ticket_states::apply_m004(&conn)?;
-    spp_core::notifications::apply_m005(&conn)?;
-    spp_core::side_threads::apply_m006(&conn)?;
-    spp_core::automation::apply_m007(&conn)?;
-    spp_core::embeddings::apply_m008(&conn)?;
-    spp_core::ai_center::apply_m009(&conn)?;
-    spp_core::ai_analysis::apply_m010(&conn)?;
-    spp_core::ai_features::apply_m011_to_m013(&conn)?;
-    spp_core::intelligence::apply_m014(&conn)?;
-    spp_core::intelligence_features::apply_m015_to_m019(&conn)?;
-    spp_core::reports::apply_m020_to_m022(&conn)?;
-    spp_core::outreach::apply_m023_to_m025(&conn)?;
-    spp_core::data_tools::apply_m026_to_m027(&conn)?;
-    spp_core::inbox::apply_m028(&conn)?;
-    spp_core::conversation_ops::apply_m030(&conn)?;
-    spp_core::outreach::apply_m031(&conn)?;
-    spp_core::ticket_states::apply_m032(&conn)?;
-    spp_core::ai_attributes::apply_m033(&conn)?;
-    spp_core::intelligence_features::apply_m035(&conn)?;
-    spp_core::customer_events::apply_m036(&conn)?;
-    spp_core::maintenance::apply_m037(&conn)?;
-    spp_core::connectors::apply_m038(&conn)?;
-    spp_core::db_breadth::apply_m040(&conn)?;
-
+    spp_core::bootstrap::apply_all(&mut conn)?;
     tracing::info!("All migrations applied successfully");
     Ok(conn)
 }

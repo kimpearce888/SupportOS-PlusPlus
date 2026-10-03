@@ -229,14 +229,21 @@ pub fn emit_mention_notifications(
                             "author_user_id": author_user_id,
                         })
                         .to_string();
-                        record_notification(
+                        // Reference dedup key: `n:mention:{scope}:{user}` —
+                        // the same mention never notifies twice.
+                        let dedup =
+                            format!("n:mention:{conversation_id}:{}:{uid}", mention.display());
+                        let created = record_notification(
                             conn,
                             &NotificationType::Mentioned,
                             Some(uid),
                             Some(conversation_id),
                             Some(&payload),
+                            &dedup,
                         )?;
-                        result.user_notifications_emitted += 1;
+                        if created.is_some() {
+                            result.user_notifications_emitted += 1;
+                        }
                     }
                     None => {
                         result.unresolved_mentions += 1;
@@ -270,14 +277,21 @@ pub fn emit_mention_notifications(
                             "author_user_id": author_user_id,
                         })
                         .to_string();
-                        record_notification(
+                        let dedup = format!(
+                            "n:mention:{conversation_id}:{}:team:{tid}",
+                            mention.display()
+                        );
+                        let created = record_notification(
                             conn,
                             &NotificationType::TeamMentioned,
                             None, // broadcast — M4-T10 wires per-member fanout.
                             Some(conversation_id),
                             Some(&payload),
+                            &dedup,
                         )?;
-                        result.team_notifications_emitted += 1;
+                        if created.is_some() {
+                            result.team_notifications_emitted += 1;
+                        }
                     }
                     None => {
                         result.unresolved_mentions += 1;
@@ -293,9 +307,7 @@ pub fn emit_mention_notifications(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::apply_m003;
-    use crate::notifications::{apply_m005, count_unread_for_user};
-    use crate::ticket_states::apply_m004;
+    use crate::notifications::count_unread_for_user;
     use rusqlite::params;
     use tempfile::NamedTempFile;
 
@@ -306,11 +318,10 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        apply_m003(&conn).unwrap();
-        apply_m004(&conn).unwrap();
-        apply_m005(&conn).unwrap();
+        // The canonical boot chain — mention emission writes notifications,
+        // which only have their dedup_key column + unique index under the
+        // full schema.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 

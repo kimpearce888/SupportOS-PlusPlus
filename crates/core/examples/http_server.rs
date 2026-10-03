@@ -28,55 +28,22 @@ async fn main() -> std::io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3001);
 
-    // Open SQLite with all migrations applied.
+    // Open SQLite with the full migration chain (the same canonical
+    // bootstrap the Tauri shell uses — one chain, no drift).
     let app_config = AppConfig::default();
     let db_path = app_config.data_dir.join("supportos-plusplus.db");
-    let mut conn = match spp_core::db::open_with_migrations(&db_path) {
+    let mut conn = match spp_core::db::open(&db_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "failed to open DB; falling back to in-memory");
             let mut in_mem = rusqlite::Connection::open_in_memory().expect("in-memory fallback");
-            let _ = spp_core::db::ensure_migrations_table(&in_mem);
-            let _ = spp_core::migrations::run_all(&mut in_mem);
+            let _ = spp_core::bootstrap::apply_all(&mut in_mem);
             in_mem
         }
     };
-    let _ = spp_core::db::ensure_migrations_table(&conn);
-    let _ = spp_core::migrations::run_all(&mut conn);
-
-    // Apply per-module migrations (these create the tables the HTTP routes query).
-    let _ = spp_core::search::apply_fts_migration(&conn);
-    let _ = spp_core::activity::apply_m003(&conn);
-    let _ = spp_core::ticket_states::apply_m004(&conn);
-    let _ = spp_core::notifications::apply_m005(&conn);
-    let _ = spp_core::side_threads::apply_m006(&conn);
-    let _ = spp_core::automation::apply_m007(&conn);
-    let _ = spp_core::embeddings::apply_m008(&conn);
-    let _ = spp_core::ai_center::apply_m009(&conn);
-    let _ = spp_core::ai_analysis::apply_m010(&conn);
-    let _ = spp_core::ai_features::apply_m011_to_m013(&conn);
-    let _ = spp_core::intelligence::apply_m014(&conn);
-    let _ = spp_core::intelligence_features::apply_m015_to_m019(&conn);
-    let _ = spp_core::reports::apply_m020_to_m022(&conn);
-    let _ = spp_core::outreach::apply_m023_to_m025(&conn);
-    let _ = spp_core::data_tools::apply_m026_to_m027(&conn);
-    let _ = spp_core::inbox::apply_m028(&conn);
-    let _ = spp_core::sync_schema::apply_m029(&conn);
-    let _ = spp_core::conversation_ops::apply_m030(&conn);
-    let _ = spp_core::outreach::apply_m031(&conn);
-    let _ = spp_core::ticket_states::apply_m032(&conn);
-    let _ = spp_core::ai_attributes::apply_m033(&conn);
-    let _ = spp_core::intelligence_features::apply_m035(&conn);
-    let _ = spp_core::customer_events::apply_m036(&conn);
-    let _ = spp_core::maintenance::apply_m037(&conn);
-    let _ = spp_core::connectors::apply_m038(&conn);
-    let _ = spp_core::db_breadth::apply_m040(&conn);
-    let _ = spp_core::webhook::ensure_webhook_events_table(&conn);
-    let _ = spp_core::saved_views::ensure_saved_views_table(&conn);
-    let _ = spp_core::oauth_state::ensure_oauth_states_table(&conn);
-    let _ = spp_core::jobs::ensure_jobs_table(&conn);
-    // Recover jobs stuck in running (reference recoverStaleJobs at boot).
-    let _ = spp_core::jobs::recover_stale_jobs(&conn);
+    if let Err(e) = spp_core::bootstrap::apply_all(&mut conn) {
+        tracing::error!(error = %e, "migration chain failed");
+    }
 
     // Mark first run done + enable demo mode (so demo endpoints work).
     let _ = spp_core::settings::mark_first_run_done(&conn);
@@ -123,6 +90,10 @@ async fn main() -> std::io::Result<()> {
         spp_core::sync_engine::SyncEngine::new(conn.clone(), provider).with_bus(bus.clone()),
     );
 
+    let qdrant = AppState::qdrant_from_settings(
+        &conn.lock().unwrap_or_else(|p| p.into_inner()),
+        &app_config.data_dir,
+    );
     let state = AppState {
         conn,
         data_dir: app_config.data_dir.clone(),
@@ -135,6 +106,7 @@ async fn main() -> std::io::Result<()> {
         real,
         provider_kind,
         workers: None,
+        qdrant,
     };
 
     let server = HttpServer::new(state);

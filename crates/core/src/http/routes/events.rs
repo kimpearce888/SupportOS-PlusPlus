@@ -147,6 +147,11 @@ mod tests {
             real: None,
             provider_kind: "fake".into(),
             workers: None,
+            qdrant: std::sync::Arc::new(crate::vectorstore_qdrant::EmbeddedQdrant::new(
+                "/tmp/spp-test-qdrant",
+                "http://127.0.0.1:6333",
+                false,
+            )),
         }
     }
 

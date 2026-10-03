@@ -39,6 +39,10 @@ pub struct WorkerManager {
     provider: Arc<dyn HelpScoutProvider>,
     bus: EventBus,
     data_dir: PathBuf,
+    /// The embedded Qdrant adapter (reference `ctx.qdrant`, deviation D2) —
+    /// the same `Arc` the AppState holds, so settings reconfigures reach
+    /// the workers. `None` in unit tests.
+    qdrant: Option<Arc<crate::vectorstore_qdrant::EmbeddedQdrant>>,
     running: AtomicBool,
     stopped: AtomicBool,
     processing: AtomicBool,
@@ -57,6 +61,7 @@ impl WorkerManager {
         provider: Arc<dyn HelpScoutProvider>,
         bus: EventBus,
         data_dir: PathBuf,
+        qdrant: Option<Arc<crate::vectorstore_qdrant::EmbeddedQdrant>>,
     ) -> Self {
         Self {
             conn,
@@ -64,6 +69,7 @@ impl WorkerManager {
             provider,
             bus,
             data_dir,
+            qdrant,
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             processing: AtomicBool::new(false),
@@ -710,17 +716,29 @@ impl WorkerManager {
                 // ---------- embeddings queue ----------
                 "embed_knowledge_chunks" => {
                     let conn = self.lock();
-                    let n = crate::embeddings::embed_pending_knowledge(&conn).unwrap_or(0);
+                    let n = crate::embeddings::embed_pending_knowledge(
+                        &conn,
+                        self.qdrant.as_deref(),
+                    )
+                    .unwrap_or(0);
                     tracing::debug!(operation = kind, embedded = n, "embedding pass");
                 }
                 "embed_docs_chunks" => {
                     let conn = self.lock();
-                    let n = crate::embeddings::embed_pending_docs(&conn).unwrap_or(0);
+                    let n = crate::embeddings::embed_pending_docs(
+                        &conn,
+                        self.qdrant.as_deref(),
+                    )
+                    .unwrap_or(0);
                     tracing::debug!(operation = kind, embedded = n, "embedding pass");
                 }
                 "embed_conversation_chunks" => {
                     let conn = self.lock();
-                    let n = crate::embeddings::embed_pending_conversation_chunks(&conn).unwrap_or(0);
+                    let n = crate::embeddings::embed_pending_conversation_chunks(
+                        &conn,
+                        self.qdrant.as_deref(),
+                    )
+                    .unwrap_or(0);
                     tracing::debug!(operation = kind, embedded = n, "embedding pass");
                 }
                 // ---------- maintenance queue ----------
@@ -920,8 +938,11 @@ pub fn start_workers(
     provider: Arc<dyn HelpScoutProvider>,
     bus: EventBus,
     data_dir: PathBuf,
+    qdrant: Option<Arc<crate::vectorstore_qdrant::EmbeddedQdrant>>,
 ) -> Arc<WorkerManager> {
-    let manager = Arc::new(WorkerManager::new(conn, engine, provider, bus, data_dir));
+    let manager = Arc::new(WorkerManager::new(
+        conn, engine, provider, bus, data_dir, qdrant,
+    ));
     manager.start();
     manager
 }

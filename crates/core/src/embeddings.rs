@@ -258,13 +258,10 @@ pub fn clear_cache(conn: &Connection) -> Result<u32> {
 // configured the embed passes are a documented no-op (FTS remains).
 
 /// How many pending chunks one embed pass pulls (reference
-/// `listConversationChunksNeedingEmbedding(60)` / docs / knowledge).
+/// `listConversationChunksNeedingEmbedding(60)` / docs / knowledge). The
+/// whole list is embedded in ONE `/v1/embeddings` call, exactly like the
+/// reference's `aiProvider.embed(texts)`.
 pub const EMBED_PASS_LIMIT: i64 = 60;
-
-/// How many texts go into one LM Studio `/v1/embeddings` call. The reference
-/// sends its whole 60-chunk batch in a single call; the port batches smaller
-/// so a single huge request cannot blow the local server's context.
-pub const EMBED_BATCH_SIZE: usize = 16;
 
 /// Is `c` whitespace per the JS `\s` character class? (Unicode White_Space
 /// plus U+FEFF, which JS counts but Rust's `char::is_whitespace` does not.)
@@ -758,22 +755,130 @@ fn embed_texts_blocking(
         .map_err(|_| Error::Config("LM Studio embedding worker thread panicked".into()))?
 }
 
-/// One embed pass shared by the conversation/docs/knowledge chunk tables:
-/// pull up to [`EMBED_PASS_LIMIT`] pending chunks, embed in batches of
-/// [`EMBED_BATCH_SIZE`], store Float32 LE + model + `indexed` state. When no
-/// embedding model is configured this is a documented no-op (`Ok(0)`). When
-/// the embed endpoint errors the pass stops and returns the count embedded
-/// so far, leaving the remaining chunks in their prior state (retried on the
-/// next pass).
-fn embed_pending_chunks(conn: &Connection, table: &str) -> Result<usize> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id, content FROM {table} WHERE embedding_state = 'not_indexed' LIMIT {EMBED_PASS_LIMIT}"
-    ))?;
-    let pending: Vec<(i64, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+/// Per-table chunk metadata for the vector payload (reference `workers.ts`
+/// embedPending{Docs,ConversationChunks,Knowledge}: each entity type carries
+/// its parent's title/visibility in the Qdrant payload).
+struct PendingChunk {
+    id: i64,
+    /// The parent entity id (document / article / conversation).
+    entity_id: i64,
+    content: String,
+    title: String,
+    visibility: String,
+    /// Conversations only: the ticket number for the payload.
+    number: Option<i64>,
+}
+
+/// The entity_type tag stored in the vector payload (reference constants).
+fn entity_type_for(table: &str) -> &'static str {
+    match table {
+        "knowledge_chunks" => "knowledge_chunk",
+        "docs_chunks" => "docs_chunk",
+        _ => "conversation_chunk",
+    }
+}
+
+/// List up to [`EMBED_PASS_LIMIT`] chunks needing embedding (reference
+/// `list*NeedingEmbedding`): state `not_indexed` OR `failed`; docs +
+/// conversation chunks cap retries at `embedding_attempts < 5`
+/// (reference migration 010); knowledge retries without a cap.
+fn list_pending_chunks(conn: &Connection, table: &str) -> Result<Vec<PendingChunk>> {
+    let sql = match table {
+        "knowledge_chunks" => format!(
+            "SELECT c.id, c.document_id, c.content, d.title, d.visibility
+             FROM knowledge_chunks c JOIN knowledge_documents d ON d.id = c.document_id
+             WHERE c.embedding_state = 'not_indexed' OR c.embedding_state = 'failed'
+             LIMIT {EMBED_PASS_LIMIT}"
+        ),
+        "docs_chunks" => format!(
+            "SELECT c.id, c.article_id, c.content, a.name,
+                    CASE WHEN a.status = 'published' THEN 'customer_safe' ELSE 'internal_only' END
+             FROM docs_chunks c JOIN docs a ON a.id = c.article_id
+             WHERE (c.embedding_state = 'not_indexed' OR c.embedding_state = 'failed')
+               AND c.embedding_attempts < 5
+             LIMIT {EMBED_PASS_LIMIT}"
+        ),
+        _ => format!(
+            "SELECT c.id, c.conversation_id, c.content,
+                    COALESCE(substr(v.subject, 1, 300), '#' || v.number), v.number
+             FROM conversation_chunks c JOIN conversations v ON v.id = c.conversation_id
+             WHERE (c.embedding_state = 'not_indexed' OR c.embedding_state = 'failed')
+               AND c.embedding_attempts < 5
+             LIMIT {EMBED_PASS_LIMIT}"
+        ),
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(PendingChunk {
+                id: r.get(0)?,
+                entity_id: r.get(1)?,
+                content: r.get(2)?,
+                title: r.get(3)?,
+                visibility: r
+                    .get::<_, Option<String>>(4)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "internal_only".to_string()),
+                number: r
+                    .get::<_, Option<i64>>(4)
+                    .ok()
+                    .flatten()
+                    .filter(|_| table == "conversation_chunks"),
+            })
+        })?
         .filter_map(|r| r.ok())
         .collect();
     drop(stmt);
+    Ok(rows)
+}
+
+/// Mark a chunk failed (reference `mark*Failed`: state + attempt counter for
+/// docs/conversation chunks; knowledge has no counter).
+fn mark_chunk_failed(conn: &Connection, table: &str, chunk_id: i64) -> Result<()> {
+    if table == "docs_chunks" || table == "conversation_chunks" {
+        conn.execute(
+            &format!(
+                "UPDATE {table} SET embedding_state = 'failed',
+                 embedding_attempts = embedding_attempts + 1 WHERE id = ?1"
+            ),
+            params![chunk_id],
+        )?;
+    } else {
+        conn.execute(
+            &format!("UPDATE {table} SET embedding_state = 'failed' WHERE id = ?1"),
+            params![chunk_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// One embed pass shared by the conversation/docs/knowledge chunk tables —
+/// the port of the reference's three `embedPending*` workers
+/// (`workers.ts:780-908`):
+///
+/// - The whole pending list is embedded in ONE provider call; on provider
+///   failure every chunk in the list is marked failed (the reference's
+///   catch block over the whole chunk list).
+/// - docs + conversation chunks: each non-empty vector is ALWAYS stored
+///   locally (`*_chunks.embedding`, Float32 LE, state `indexed`) so semantic
+///   search works without the vector store; empty vectors mark the chunk
+///   failed (attempts +1). When Qdrant is connected the non-empty vectors
+///   are additionally upserted in one `ensureCollection` + `upsert` pair
+///   (results do not affect the local states).
+/// - knowledge chunks: when Qdrant is connected (and the first vector is
+///   non-empty) the vectors go to the store in one
+///   `ensureCollection` + `upsert` pair and every chunk's state is set from
+///   the single upsert result (`indexed`/`failed`); when it is not, they
+///   are stored locally (keyword search remains primary).
+/// - No embedding model configured: documented no-op (`Ok(0)`) — FTS
+///   remains the search path.
+fn embed_pending_chunks(
+    conn: &Connection,
+    table: &str,
+    qdrant: Option<&crate::vectorstore_qdrant::EmbeddedQdrant>,
+) -> Result<usize> {
+    let pending = list_pending_chunks(conn, table)?;
     if pending.is_empty() {
         return Ok(0);
     }
@@ -782,45 +887,170 @@ fn embed_pending_chunks(conn: &Connection, table: &str) -> Result<usize> {
         return Ok(0); // no embedding model configured — FTS remains the search path
     };
 
-    let mut embedded = 0_usize;
-    for batch in pending.chunks(EMBED_BATCH_SIZE) {
-        let texts: Vec<String> = batch
-            .iter()
-            .map(|(_, content)| utf16_slice(content, 0, 4000))
-            .collect();
-        match embed_texts_blocking(
-            settings.base_url.clone(),
-            model.clone(),
-            texts,
-            settings.timeout_ms,
-        ) {
-            Ok(vectors) => {
-                for (i, (id, _)) in batch.iter().enumerate() {
-                    if let Some(v) = vectors.get(i) {
-                        if v.is_empty() {
-                            continue; // reference marks the chunk failed; port leaves state
-                        }
-                        update_chunk_embedding(conn, table, *id, &model, v)?;
-                        embedded += 1;
-                    }
-                }
+    // Reference: the health check gates the Qdrant legs for the whole pass.
+    let qdrant_connected = qdrant.is_some_and(|q| q.health().connected);
+
+    // One provider call over the whole list (reference
+    // `aiProvider.embed(chunks.map(c => c.content.slice(0, 4000))`).
+    let texts: Vec<String> = pending
+        .iter()
+        .map(|c| utf16_slice(&c.content, 0, 4000))
+        .collect();
+    let vectors = match embed_texts_blocking(
+        settings.base_url.clone(),
+        model.clone(),
+        texts,
+        settings.timeout_ms,
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            // Reference catch: the whole chunk list is marked failed.
+            for chunk in &pending {
+                mark_chunk_failed(conn, table, chunk.id)?;
             }
-            Err(_) => return Ok(embedded),
+            return Ok(0);
+        }
+    };
+
+    if table == "knowledge_chunks" {
+        // Reference embedPendingKnowledge: Qdrant upsert when connected,
+        // local storage when not.
+        if qdrant_connected && vectors.first().is_some_and(|v| !v.is_empty()) {
+            let dim = vectors[0].len();
+            let points: Vec<crate::vectorstore_qdrant::VectorPoint> = pending
+                .iter()
+                .enumerate()
+                .map(|(i, chunk)| {
+                    let empty: Vec<f32> = Vec::new();
+                    let vector = vectors.get(i).unwrap_or(&empty);
+                    vector_point(table, chunk, vector, &model)
+                })
+                .collect();
+            let q = qdrant.expect("checked is_some above");
+            // Reference order: ensureCollection(dimension) then upsert(points).
+            let _ = q.ensure_collection(dim);
+            let ok = q.upsert(&points);
+            let state = if ok { "indexed" } else { "failed" };
+            for chunk in &pending {
+                set_chunk_state(conn, table, chunk.id, state, Some(&model))?;
+            }
+            return Ok(if ok { pending.len() } else { 0 });
+        }
+        // Qdrant unavailable: store embeddings locally (keyword search
+        // remains primary).
+        let mut embedded = 0_usize;
+        for (i, chunk) in pending.iter().enumerate() {
+            match vectors.get(i) {
+                Some(v) if !v.is_empty() => {
+                    update_chunk_embedding(conn, table, chunk.id, &model, v)?;
+                    embedded += 1;
+                }
+                _ => set_chunk_state(conn, table, chunk.id, "failed", None)?,
+            }
+        }
+        return Ok(embedded);
+    }
+
+    // Reference embedPending{Docs,ConversationChunks}: ALWAYS store locally
+    // first (empty vectors mark failed), then one bulk upsert when
+    // Qdrant is connected.
+    let mut embedded = 0_usize;
+    for (i, chunk) in pending.iter().enumerate() {
+        match vectors.get(i) {
+            Some(v) if !v.is_empty() => {
+                update_chunk_embedding(conn, table, chunk.id, &model, v)?;
+                embedded += 1;
+            }
+            // Empty/missing vector: reference marks failed.
+            _ => mark_chunk_failed(conn, table, chunk.id)?,
+        }
+    }
+    if qdrant_connected {
+        let points: Vec<crate::vectorstore_qdrant::VectorPoint> = pending
+            .iter()
+            .enumerate()
+            .filter_map(|(i, chunk)| {
+                let v = vectors.get(i)?;
+                if v.is_empty() {
+                    return None;
+                }
+                Some(vector_point(table, chunk, v, &model))
+            })
+            .collect();
+        if !points.is_empty() {
+            // Reference order: ensureCollection(points[0].vector.length)
+            // then upsert(points) — both results ignored for these tables.
+            let q = qdrant.expect("checked is_some above");
+            let _ = q.ensure_collection(points[0].vector.len());
+            let _ = q.upsert(&points);
         }
     }
     Ok(embedded)
 }
 
+/// Build the reference `VectorPoint` payload for a chunk.
+fn vector_point(
+    table: &str,
+    chunk: &PendingChunk,
+    vector: &[f32],
+    model: &str,
+) -> crate::vectorstore_qdrant::VectorPoint {
+    let mut payload = serde_json::json!({
+        "entity_type": entity_type_for(table),
+        "entity_id": chunk.entity_id,
+        "chunk_id": chunk.id,
+        "title": chunk.title,
+        "text": utf16_slice(&chunk.content, 0, 2000),
+        "visibility": chunk.visibility,
+        "embedding_model": model,
+        "index_version": 1
+    });
+    if table == "conversation_chunks" {
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .insert("number".to_string(), chunk.number.into());
+    }
+    crate::vectorstore_qdrant::VectorPoint {
+        id: chunk.id,
+        vector: vector.to_vec(),
+        payload,
+    }
+}
+
+/// Set the embedding state without touching the stored vector (reference
+/// `setChunkEmbeddingState`).
+fn set_chunk_state(
+    conn: &Connection,
+    table: &str,
+    chunk_id: i64,
+    state: &str,
+    model: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        &format!(
+            "UPDATE {table} SET embedding_state = ?1,
+             embedding_model = COALESCE(?2, embedding_model) WHERE id = ?3"
+        ),
+        params![state, model, chunk_id],
+    )?;
+    Ok(())
+}
+
 /// `embed_knowledge_chunks` — embed pending knowledge chunks. No-op (0)
-/// until an embedding model is configured. Vectors are stored locally in
-/// `knowledge_chunks.embedding` (Float32 LE) so the Qdrant-less fallback
-/// scan works.
+/// until an embedding model is configured. Vectors go to the embedded
+/// Qdrant store when connected (`indexed`/`failed` by the upsert result)
+/// or locally to `knowledge_chunks.embedding` (Float32 LE) so the
+/// Qdrant-less fallback scan works.
 ///
 /// # Errors
 ///
 /// Returns `Error::Sqlite` on database failures.
-pub fn embed_pending_knowledge(conn: &Connection) -> Result<usize> {
-    embed_pending_chunks(conn, "knowledge_chunks")
+pub fn embed_pending_knowledge(
+    conn: &Connection,
+    qdrant: Option<&crate::vectorstore_qdrant::EmbeddedQdrant>,
+) -> Result<usize> {
+    embed_pending_chunks(conn, "knowledge_chunks", qdrant)
 }
 
 /// `embed_docs_chunks` — embed pending docs chunks (semantic docs search).
@@ -829,8 +1059,11 @@ pub fn embed_pending_knowledge(conn: &Connection) -> Result<usize> {
 /// # Errors
 ///
 /// Returns `Error::Sqlite` on database failures.
-pub fn embed_pending_docs(conn: &Connection) -> Result<usize> {
-    embed_pending_chunks(conn, "docs_chunks")
+pub fn embed_pending_docs(
+    conn: &Connection,
+    qdrant: Option<&crate::vectorstore_qdrant::EmbeddedQdrant>,
+) -> Result<usize> {
+    embed_pending_chunks(conn, "docs_chunks", qdrant)
 }
 
 /// `embed_conversation_chunks` — embed pending ticket chunks (semantic
@@ -840,15 +1073,17 @@ pub fn embed_pending_docs(conn: &Connection) -> Result<usize> {
 /// # Errors
 ///
 /// Returns `Error::Sqlite` on database failures.
-pub fn embed_pending_conversation_chunks(conn: &Connection) -> Result<usize> {
-    embed_pending_chunks(conn, "conversation_chunks")
+pub fn embed_pending_conversation_chunks(
+    conn: &Connection,
+    qdrant: Option<&crate::vectorstore_qdrant::EmbeddedQdrant>,
+) -> Result<usize> {
+    embed_pending_chunks(conn, "conversation_chunks", qdrant)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ai_provider::FakeAiProvider;
-    use crate::migrations;
     use tempfile::NamedTempFile;
 
     fn fresh_db() -> Connection {
@@ -858,19 +1093,10 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        migrations::run_all(&mut conn).unwrap();
-        apply_m008(&conn).unwrap();
-        // Semantic layer tables: AI Center settings (ai_settings), threads
-        // (conversation_threads), conversation tags, and the three chunk
-        // tables (knowledge/docs/conversation chunks).
-        crate::ai_center::apply_m009(&conn).unwrap();
-        crate::inbox::apply_m028(&conn).unwrap();
-        crate::conversation_ops::apply_m030(&conn).unwrap();
-        crate::intelligence_features::apply_m015_to_m019(&conn).unwrap();
-        crate::sync_schema::apply_m029(&conn).unwrap();
-        crate::customer_events::apply_m036(&conn).unwrap();
-        crate::mirror_tables::apply_m039(&conn).unwrap();
+        // The canonical boot chain — tests must exercise the REAL schema
+        // (chunk tables with embedding_attempts, mirror tables, guards),
+        // never a partial one.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 
@@ -1564,16 +1790,16 @@ mod tests {
         let conn = fresh_db();
         insert_conv_with_threads(&conn, 5);
         chunk_conversation(&conn, 5).unwrap();
-        assert_eq!(embed_pending_conversation_chunks(&conn).unwrap(), 0);
-        assert_eq!(embed_pending_docs(&conn).unwrap(), 0);
-        assert_eq!(embed_pending_knowledge(&conn).unwrap(), 0);
+        assert_eq!(embed_pending_conversation_chunks(&conn, None).unwrap(), 0);
+        assert_eq!(embed_pending_docs(&conn, None).unwrap(), 0);
+        assert_eq!(embed_pending_knowledge(&conn, None).unwrap(), 0);
         let stats = conversation_chunk_stats(&conn).unwrap();
         assert_eq!(stats.indexed, 0, "state untouched without a model");
         assert_eq!(stats.pending, 1);
     }
 
     #[test]
-    fn embed_pending_leaves_state_when_endpoint_unreachable() {
+    fn embed_pending_marks_failed_when_endpoint_unreachable() {
         let conn = fresh_db();
         insert_conv_with_threads(&conn, 5);
         chunk_conversation(&conn, 5).unwrap();
@@ -1581,10 +1807,21 @@ mod tests {
         crate::settings::set_string(&conn, "lmstudio_base_url", "http://127.0.0.1:9").unwrap();
         crate::settings::set_string(&conn, "lmstudio_embedding_model", "nomic-embed").unwrap();
         crate::settings::set_i64(&conn, "lmstudio_timeout_ms", 500).unwrap();
-        assert_eq!(embed_pending_conversation_chunks(&conn).unwrap(), 0);
+        // Reference catch block: the whole chunk list is marked failed
+        // (attempts +1 for conversation chunks).
+        assert_eq!(embed_pending_conversation_chunks(&conn, None).unwrap(), 0);
         let stats = conversation_chunk_stats(&conn).unwrap();
-        assert_eq!(stats.indexed, 0, "failed pass leaves state");
-        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.indexed, 0);
+        assert_eq!(stats.pending, 0, "chunk left the pending state");
+        assert_eq!(stats.failed, 1);
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT embedding_attempts FROM conversation_chunks",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
     }
 
     #[tokio::test]
@@ -1628,7 +1865,7 @@ mod tests {
         crate::settings::set_string(&conn, "lmstudio_embedding_model", "fake-embed").unwrap();
         crate::settings::set_i64(&conn, "lmstudio_timeout_ms", 2_000).unwrap();
 
-        let embedded = embed_pending_conversation_chunks(&conn).unwrap();
+        let embedded = embed_pending_conversation_chunks(&conn, None).unwrap();
         assert_eq!(embedded, 1);
         let stats = conversation_chunk_stats(&conn).unwrap();
         assert_eq!(stats.indexed, 1);
@@ -1647,7 +1884,7 @@ mod tests {
         assert_eq!(model, "fake-embed");
 
         // Second pass: nothing pending anymore.
-        assert_eq!(embed_pending_conversation_chunks(&conn).unwrap(), 0);
+        assert_eq!(embed_pending_conversation_chunks(&conn, None).unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1689,9 +1926,10 @@ mod tests {
         .unwrap();
         crate::settings::set_string(&conn, "lmstudio_embedding_model", "fake-embed").unwrap();
         // No base_url override -> default http://127.0.0.1:1234 which is not
-        // running in CI: both passes return 0 and leave state.
-        assert_eq!(embed_pending_docs(&conn).unwrap(), 0);
-        assert_eq!(embed_pending_knowledge(&conn).unwrap(), 0);
+        // running in CI: both passes mark their chunks failed (reference
+        // catch block).
+        assert_eq!(embed_pending_docs(&conn, None).unwrap(), 0);
+        assert_eq!(embed_pending_knowledge(&conn, None).unwrap(), 0);
         let docs_state: String = conn
             .query_row("SELECT embedding_state FROM docs_chunks", [], |r| r.get(0))
             .unwrap();
@@ -1700,8 +1938,8 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(docs_state, "not_indexed");
-        assert_eq!(knowledge_state, "not_indexed");
+        assert_eq!(docs_state, "failed");
+        assert_eq!(knowledge_state, "failed");
     }
 
     #[tokio::test]
@@ -1756,8 +1994,7 @@ mod tests {
     }
 
     #[test]
-    fn embed_batch_size_is_sensible() {
-        assert!(EMBED_BATCH_SIZE <= EMBED_PASS_LIMIT as usize);
+    fn embed_pass_limit_matches_reference() {
         assert_eq!(EMBED_PASS_LIMIT, 60);
     }
 }

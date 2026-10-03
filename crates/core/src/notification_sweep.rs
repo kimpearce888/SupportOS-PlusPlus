@@ -6,8 +6,9 @@
 //!
 //! ## The guardrail
 //!
-//! The sweep does NOT initialize its cursor until the first sync has settled
-//! (`sync_runs` has at least one row with `status != 'running'`). Before
+//! The sweep does NOT initialize its cursor until the first sync has
+//! settled — the `sync_state` application setting has left `NEW`,
+//! `INITIALIZING` and `BACKFILLING` (the reference's gate). Before
 //! that, [`sweep_once`] is a no-op and returns [`SkippedReason::FirstSyncNotSettled`].
 //!
 //! Once the first sync settles, the cursor is initialized to the current
@@ -40,10 +41,6 @@ use crate::settings;
 /// the sweep has processed). Stored via the typed settings store.
 pub const SWEEP_CURSOR_KEY: &str = "notifications.sweep.last_processed_event_id";
 
-/// The settings key for the "first sync settled" flag. Stored as a bool
-/// so the guardrail check is cheap (one row read).
-pub const FIRST_SYNC_SETTLED_KEY: &str = "notifications.sweep.first_sync_settled";
-
 /// Why a sweep call was skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,33 +68,24 @@ pub struct SweepResult {
     pub cursor_after: Option<i64>,
 }
 
-/// Check whether the first sync has settled. Per the v1.7.x bug fix:
-/// the sweep cursor must not init until this returns `true`.
+/// Check whether the first sync has settled — the reference's v1.8.0 fix:
+/// the sweep cursor must not init while the mirror is still populating.
 ///
-/// A sync is "settled" when `sync_runs` has at least one row with
-/// `status != 'running'` (i.e., 'completed' or 'failed'). The sweep
-/// doesn't require the sync to have succeeded — only that it has finished.
+/// The reference's `sweep()` reads the `sync_state` application setting
+/// and skips while it is `NEW`, `INITIALIZING` or `BACKFILLING`
+/// (notificationSweep.ts); `CATCHING_UP`, `LIVE` and `ERROR` all mean the
+/// mirror settled — the sweep does not require the sync to have succeeded,
+/// only that it has finished.
 ///
 /// # Errors
 ///
-/// Returns `Error::Sqlite` if the query fails.
+/// Returns `Error::Sqlite` if the settings read fails.
 pub fn first_sync_settled(conn: &Connection) -> Result<bool> {
-    // Cached flag: once we've seen a settled sync, we don't need to re-query.
-    // The flag is set when the first settled sync is observed.
-    if settings::get_bool(conn, FIRST_SYNC_SETTLED_KEY, false)? {
-        return Ok(true);
-    }
-    // No cached flag — query sync_runs.
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sync_runs WHERE status != 'running'",
-        [],
-        |r| r.get(0),
-    )?;
-    if count > 0 {
-        // Cache the result so future sweeps don't re-query.
-        settings::set_bool(conn, FIRST_SYNC_SETTLED_KEY, true)?;
-    }
-    Ok(count > 0)
+    let state = crate::sync_engine::get_state(conn);
+    Ok(!matches!(
+        state.as_str(),
+        "NEW" | "INITIALIZING" | "BACKFILLING"
+    ))
 }
 
 /// Get the current sweep cursor (max event id processed) or `None` if
@@ -175,14 +163,21 @@ pub fn sweep_once(conn: &mut Connection) -> Result<SweepResult> {
 
     // 3. Read new events with id > cursor.
     let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, event_type, actor_type, actor_id
+        "SELECT id, conversation_id, event_type, actor_type, actor_id, dedup_key
          FROM activity_events
          WHERE id > ?1
          ORDER BY id ASC",
     )?;
-    let new_events: Vec<(i64, i64, String, String, Option<i64>)> = stmt
+    let new_events: Vec<(i64, i64, String, String, Option<i64>, String)> = stmt
         .query_map(params![cursor], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
@@ -200,12 +195,15 @@ pub fn sweep_once(conn: &mut Connection) -> Result<SweepResult> {
     let mut emitted = 0u32;
     let mut max_id_seen = cursor;
 
-    for (event_id, conv_id, event_type, actor_type, actor_id) in &new_events {
+    for (event_id, conv_id, event_type, actor_type, actor_id, event_dedup) in &new_events {
         max_id_seen = (*event_id).max(max_id_seen);
         if let Some((notif_type, target_user_id)) =
             map_event_to_notification(&tx, conv_id, event_type, actor_type, actor_id)?
         {
-            record_notification(
+            // Reference dedup keys: `n:evt:customer_replied:{dedup}` /
+            // `n:evt:ticket_assigned:{dedup}` (notificationSweep.ts).
+            let notification_dedup = format!("n:evt:{}:{event_dedup}", notif_type.as_str());
+            let created = record_notification(
                 &tx,
                 &notif_type,
                 target_user_id,
@@ -219,8 +217,11 @@ pub fn sweep_once(conn: &mut Connection) -> Result<SweepResult> {
                     })
                     .to_string(),
                 ),
+                &notification_dedup,
             )?;
-            emitted += 1;
+            if created.is_some() {
+                emitted += 1;
+            }
         }
     }
 
@@ -279,9 +280,8 @@ fn map_event_to_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::{apply_m003, record_event, ActivityEvent};
-    use crate::notifications::{apply_m005, count_unread_for_user};
-    use crate::ticket_states::apply_m004;
+    use crate::activity::{record_event, ActivityEvent};
+    use crate::notifications::count_unread_for_user;
     use rusqlite::params;
     use tempfile::NamedTempFile;
 
@@ -292,11 +292,10 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        apply_m003(&conn).unwrap();
-        apply_m004(&conn).unwrap();
-        apply_m005(&conn).unwrap();
+        // The canonical boot chain — tests must exercise the REAL schema
+        // (reference-shaped sync_runs, chunk tables, guards), never a
+        // partial one.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 
@@ -333,45 +332,36 @@ mod tests {
     }
 
     fn mark_sync_settled(conn: &Connection) {
-        conn.execute("INSERT INTO sync_runs (status) VALUES ('completed')", [])
-            .unwrap();
+        crate::sync_engine::set_state(conn, "LIVE");
     }
 
     // ---- first_sync_settled guardrail ---------------------------------------
 
     #[test]
-    fn first_sync_settled_returns_false_when_no_sync_runs() {
+    fn first_sync_settled_is_false_on_a_fresh_database() {
         let conn = fresh_db();
+        // No sync_state setting -> reference default 'NEW' -> not settled.
         assert!(!first_sync_settled(&conn).unwrap());
     }
 
     #[test]
-    fn first_sync_settled_returns_false_when_sync_still_running() {
-        let conn = fresh_db();
-        conn.execute("INSERT INTO sync_runs (status) VALUES ('running')", [])
-            .unwrap();
-        assert!(!first_sync_settled(&conn).unwrap());
+    fn first_sync_settled_is_false_while_sync_is_populating() {
+        for state in ["NEW", "INITIALIZING", "BACKFILLING"] {
+            let conn = fresh_db();
+            crate::sync_engine::set_state(&conn, state);
+            assert!(!first_sync_settled(&conn).unwrap(), "state {state}");
+        }
     }
 
     #[test]
-    fn first_sync_settled_returns_true_when_sync_completed() {
-        let conn = fresh_db();
-        mark_sync_settled(&conn);
-        assert!(first_sync_settled(&conn).unwrap());
-    }
-
-    #[test]
-    fn first_sync_settled_caches_result() {
-        let conn = fresh_db();
-        mark_sync_settled(&conn);
-        // First call queries sync_runs + caches the flag.
-        assert!(first_sync_settled(&conn).unwrap());
-        // Delete the sync_runs row — the cached flag should still return true.
-        conn.execute("DELETE FROM sync_runs", []).unwrap();
-        assert!(
-            first_sync_settled(&conn).unwrap(),
-            "cached flag should return true even after sync_runs is cleared"
-        );
+    fn first_sync_settled_is_true_once_the_mirror_settles() {
+        // CATCHING_UP, LIVE and ERROR all count as settled (the reference
+        // only skips NEW/INITIALIZING/BACKFILLING).
+        for state in ["CATCHING_UP", "LIVE", "ERROR"] {
+            let conn = fresh_db();
+            crate::sync_engine::set_state(&conn, state);
+            assert!(first_sync_settled(&conn).unwrap(), "state {state}");
+        }
     }
 
     // ---- sweep_once guardrail behavior -------------------------------------
@@ -379,7 +369,7 @@ mod tests {
     #[test]
     fn sweep_once_is_noop_before_first_sync_settles() {
         let mut conn = fresh_db();
-        // No sync_runs yet → guardrail kicks in.
+        // No sync_state setting yet (NEW) → guardrail kicks in.
         let result = sweep_once(&mut conn).unwrap();
         assert_eq!(
             result.skipped_reason,

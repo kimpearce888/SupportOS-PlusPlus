@@ -138,12 +138,11 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> impl IntoResp
                 )
             }
         };
-        // The port's /api/settings/qdrant reports `qdrant_enabled` defaulting
-        // to false; the search gate reads the same key so the two never
-        // disagree. (The reference defaults it to true; the port has no
-        // Qdrant client, so "enabled" only selects the honest mode-note.)
+        // The reference defaults `qdrant_enabled` to true; the embedded
+        // adapter (D2) answers health/search in-process, so the same default
+        // is honest here.
         let qdrant_enabled =
-            crate::settings::get_bool(&conn, "qdrant_enabled", false).unwrap_or(false);
+            crate::settings::get_bool(&conn, "qdrant_enabled", true).unwrap_or(true);
         let stats = embeddings::conversation_chunk_stats(&conn);
         (fts, settings, qdrant_enabled, stats)
     };
@@ -182,30 +181,113 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> impl IntoResp
             };
 
             if let Some(vector) = ticket_query_vector.filter(|v| !v.is_empty()) {
-                let conn = state.conn_lock();
-                match semantic_ticket_retrieval(&conn, &vector) {
-                    Ok(semantic) => {
-                        // Mode note: the port never serves ANN (no Qdrant
-                        // client), so an enabled Qdrant resolves to the
-                        // local scan with the "not reachable" note — the
-                        // message the reference shows when Qdrant is up but
-                        // returns no ticket chunks.
-                        let mode_note = if qdrant_enabled {
-                            MODE_NOTE_LOCAL_QDRANT_DOWN
-                        } else {
-                            MODE_NOTE_LOCAL
+                // Reference: Qdrant ANN first (24 hits, entity-filtered,
+                // first-wins grouping per conversation), local cosine scan
+                // fallback when it serves nothing.
+                let mut semantic: Vec<SemanticTicketHit> = Vec::new();
+                let mut served_by_qdrant = false;
+                if qdrant_enabled {
+                    let hits = state.qdrant.search(&vector, SEMANTIC_TICKET_LIMIT);
+                    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                    for h in &hits {
+                        if h.payload.get("entity_type").and_then(|v| v.as_str())
+                            != Some("conversation_chunk")
+                        {
+                            continue;
+                        }
+                        let Some(conv_id) = h.payload.get("entity_id").and_then(|v| v.as_i64())
+                        else {
+                            continue;
                         };
-                        rebuild_ticket_hits(&conn, &mut fts, &semantic);
-                        fts.used_semantic = true;
-                        fts.semantic_available = true;
-                        fts.mode_note = Some(mode_note.to_string());
-                        let _ = MODE_NOTE_QDRANT; // parity constant, currently unreachable
+                        if seen.insert(conv_id) {
+                            let snippet = h
+                                .payload
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .map(|t| embeddings::utf16_slice(t, 0, 200));
+                            semantic.push(SemanticTicketHit {
+                                conversation_id: conv_id,
+                                rank: semantic.len(),
+                                snippet,
+                            });
+                        }
                     }
-                    Err(_) => {
-                        // Retriever failure: keyword search remains fully
-                        // functional (reference catch block).
-                        fts.semantic_available = false;
+                    served_by_qdrant = !semantic.is_empty();
+                }
+                if semantic.is_empty() {
+                    // Local cosine scan over stored embeddings (the reference's
+                    // no-Qdrant path — identical ranks and snippets).
+                    let conn = state.conn_lock();
+                    match semantic_ticket_retrieval(&conn, &vector) {
+                        Ok(local) => semantic = local,
+                        Err(_) => {
+                            // Retriever failure: keyword search remains fully
+                            // functional (reference catch block).
+                            fts.semantic_available = false;
+                            fts.total = fts.hits.len();
+                            return (
+                                StatusCode::OK,
+                                Json(serde_json::to_value(&fts).unwrap_or(Value::Null)),
+                            );
+                        }
                     }
+                }
+                let mode_note = if served_by_qdrant {
+                    MODE_NOTE_QDRANT
+                } else if qdrant_enabled {
+                    MODE_NOTE_LOCAL_QDRANT_DOWN
+                } else {
+                    MODE_NOTE_LOCAL
+                };
+                let conn = state.conn_lock();
+                rebuild_ticket_hits(&conn, &mut fts, &semantic);
+                fts.used_semantic = true;
+                fts.semantic_available = true;
+                fts.mode_note = Some(mode_note.to_string());
+
+                // Knowledge semantic layer (reference search.ts:137-161):
+                // Qdrant-only, adds knowledge hits the keyword pass missed.
+                if settings.embedding_model.is_some() && qdrant_enabled {
+                    let hits = state.qdrant.search(&vector, 8);
+                    for h in &hits {
+                        if h.payload.get("entity_type").and_then(|v| v.as_str())
+                            != Some("knowledge_chunk")
+                        {
+                            continue;
+                        }
+                        let (Some(entity_id), Some(title), Some(text)) = (
+                            h.payload.get("entity_id").and_then(|v| v.as_i64()),
+                            h.payload.get("title").and_then(|v| v.as_str()),
+                            h.payload.get("text").and_then(|v| v.as_str()),
+                        ) else {
+                            continue;
+                        };
+                        let already = fts
+                            .hits
+                            .iter()
+                            .any(|x| x.scope == "knowledge" && x.id == entity_id);
+                        if already {
+                            continue;
+                        }
+                        let visibility = if h.payload.get("visibility").and_then(|v| v.as_str())
+                            == Some("customer_safe")
+                        {
+                            "customer-safe"
+                        } else {
+                            "internal"
+                        };
+                        fts.hits.push(crate::search::SearchHit {
+                            scope: "knowledge".to_string(),
+                            id: entity_id,
+                            title: title.to_string(),
+                            subtitle: format!("Knowledge · {visibility}"),
+                            snippet: embeddings::utf16_slice(text, 0, 200),
+                            score: h.score as f64,
+                            href: format!("/knowledge/{entity_id}"),
+                            why: vec!["semantic match".to_string()],
+                        });
+                    }
+                    fts.total = fts.hits.len();
                 }
             }
         } else if settings.embedding_model.is_some() && stats.indexed == 0 {
@@ -213,11 +295,6 @@ pub async fn search(State(state): State<AppState>, body: Bytes) -> impl IntoResp
         } else if settings.embedding_model.is_none() {
             fts.mode_note = Some(MODE_NOTE_NO_MODEL.to_string());
         }
-        // Knowledge semantic layer: Qdrant-ONLY in the reference
-        // (`if (settings.embedding_model && qdrantEnabled)` + ctx.qdrant).
-        // The port has no Qdrant client; a Qdrant that cannot be reached
-        // leaves the keyword results unchanged (the reference catch is a
-        // no-op), so the layer is skipped entirely here.
     }
 
     (
@@ -532,6 +609,9 @@ mod tests {
 
     fn make_state() -> (AppState, Arc<Mutex<Connection>>) {
         let conn = fresh_db();
+        // Qdrant disabled in settings AND adapter disabled — a coherent
+        // state (production constructs both from the same setting).
+        crate::settings::set_bool(&conn, "qdrant_enabled", false).unwrap();
         let conn = Arc::new(Mutex::new(conn));
         let state = AppState {
             conn: conn.clone(),
@@ -545,6 +625,11 @@ mod tests {
             real: None,
             provider_kind: "fake".into(),
             workers: None,
+            qdrant: std::sync::Arc::new(crate::vectorstore_qdrant::EmbeddedQdrant::new(
+                "/tmp/spp-test-qdrant",
+                "http://127.0.0.1:6333",
+                false,
+            )),
         };
         (state, conn)
     }

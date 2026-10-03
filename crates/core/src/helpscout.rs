@@ -669,7 +669,11 @@ impl FakeWorld {
                         status: if i % 3 == 0 { "closed" } else { "active" }.into(),
                         mailbox_id: if i <= 5 { 101 } else { 102 },
                         assignee_id: Some((i % 3) + 1),
-                        customer_id: 2000 + i,
+                        // Round-robin over the fake customer list (the
+                        // reference's fake data only ever references real
+                        // customer objects — conversations must never point
+                        // at a customer the provider cannot serve).
+                        customer_id: 2000 + ((i - 1) % 8) + 1,
                         priority: if i == 1 { Some("urgent".into()) } else { None },
                         created_at: Some(format!("2026-01-{:02}T00:00:00Z", i)),
                         updated_at: Some(format!("2026-01-{:02}T12:00:00Z", i)),

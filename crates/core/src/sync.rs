@@ -112,7 +112,25 @@ pub fn upsert_tag(conn: &Connection, t: &HsTag) -> Result<()> {
 }
 
 /// Upsert a conversation into the `conversations` table.
+///
+/// Reference `conversationRepo.upsertConversation` maps every remote id to
+/// its LOCAL mirror id before writing (`localIds.mailbox/customer/user`) —
+/// `conversations.customer_id` etc. are local foreign keys, and the
+/// customer/search/event-timeline queries join on them. The port maps the
+/// same way; when a mirror row is missing (the reference writes NULL, the
+/// port's columns are NOT NULL) the remote id is kept so the landing never
+/// drops a conversation.
 pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> {
+    let mailbox_local = crate::sync_engine::local_id(conn, "mailboxes", c.mailbox_id);
+    let customer_local = if c.customer_id > 0 {
+        crate::sync_engine::local_id(conn, "customers", c.customer_id)
+    } else {
+        None
+    };
+    let assignee_local = c
+        .assignee_id
+        .filter(|rid| *rid > 0)
+        .and_then(|rid| crate::sync_engine::local_id(conn, "users", rid));
     conn.execute(
         "INSERT INTO conversations (remote_id, number, subject, preview, status, mailbox_id,
             assignee_id, customer_id, priority, created_at, updated_at, closed_at)
@@ -135,9 +153,9 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
             c.subject,
             c.preview,
             c.status,
-            c.mailbox_id,
-            c.assignee_id,
-            c.customer_id,
+            mailbox_local.unwrap_or(c.mailbox_id),
+            assignee_local,
+            customer_local.unwrap_or(c.customer_id),
             c.priority,
             c.created_at,
             c.updated_at,
@@ -264,6 +282,153 @@ mod tests {
             .unwrap();
         assert_eq!(subject, Some("Test".into()));
         assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn upsert_conversation_maps_remote_ids_to_local_mirrors() {
+        let conn = fresh_db();
+        // Land the reference data first (reference sync order: users,
+        // mailboxes, customers before conversations).
+        upsert_user(
+            &conn,
+            &HsUser {
+                remote_id: 1,
+                first_name: Some("Demo".into()),
+                last_name: Some("Agent".into()),
+                email: Some("demo@support.test".into()),
+                role: Some("owner".into()),
+                user_type: "user".into(),
+                timezone: None,
+                photo_url: None,
+                initials: None,
+                mention: None,
+                job_title: None,
+                phone: None,
+                alternate_emails: vec![],
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .unwrap();
+        upsert_mailbox(
+            &conn,
+            &HsMailbox {
+                remote_id: 101,
+                name: "Support".into(),
+                slug: Some("support".into()),
+                email: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .unwrap();
+        upsert_customer(
+            &conn,
+            &HsCustomer {
+                remote_id: 2001,
+                first_name: Some("Alice".into()),
+                last_name: Some("Wonderland".into()),
+                email: Some("alice@example.com".into()),
+                organization: None,
+                job_title: None,
+                phone: None,
+                created_at: None,
+                updated_at: None,
+            },
+        )
+        .unwrap();
+        upsert_conversation(
+            &conn,
+            &HsConversation {
+                remote_id: 1001,
+                number: 1001,
+                subject: Some("Local ids".into()),
+                preview: None,
+                status: "active".into(),
+                mailbox_id: 101,
+                assignee_id: Some(1),
+                customer_id: 2001,
+                priority: None,
+                created_at: None,
+                updated_at: None,
+                closed_at: None,
+                tags: vec![],
+            },
+        )
+        .unwrap();
+
+        // The stored ids are the LOCAL mirror ids, so the join the
+        // customer/search/timeline queries rely on resolves.
+        let (mailbox, assignee, customer): (i64, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT mailbox_id, assignee_id, customer_id
+                 FROM conversations WHERE remote_id = 1001",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let mailbox_local: i64 = conn
+            .query_row("SELECT id FROM mailboxes WHERE remote_id = 101", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let user_local: i64 = conn
+            .query_row("SELECT id FROM users WHERE remote_id = 1", [], |r| r.get(0))
+            .unwrap();
+        let customer_local: i64 = conn
+            .query_row("SELECT id FROM customers WHERE remote_id = 2001", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(mailbox, mailbox_local);
+        assert_eq!(assignee, Some(user_local));
+        assert_eq!(customer, customer_local);
+        // And the customer join actually finds the conversation.
+        let joined: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations c
+                 JOIN customers cu ON cu.id = c.customer_id
+                 WHERE cu.remote_id = 2001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined, 1);
+    }
+
+    #[test]
+    fn upsert_conversation_keeps_remote_ids_when_mirror_missing() {
+        let conn = fresh_db();
+        // No customer/mailbox/user rows: the landing must not drop the
+        // conversation (NOT NULL columns keep the remote id).
+        upsert_conversation(
+            &conn,
+            &HsConversation {
+                remote_id: 1002,
+                number: 1002,
+                subject: None,
+                preview: None,
+                status: "active".into(),
+                mailbox_id: 101,
+                assignee_id: None,
+                customer_id: 2002,
+                priority: None,
+                created_at: None,
+                updated_at: None,
+                closed_at: None,
+                tags: vec![],
+            },
+        )
+        .unwrap();
+        let (mailbox, customer): (i64, i64) = conn
+            .query_row(
+                "SELECT mailbox_id, customer_id FROM conversations WHERE remote_id = 1002",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mailbox, 101);
+        assert_eq!(customer, 2002);
     }
 
     #[test]

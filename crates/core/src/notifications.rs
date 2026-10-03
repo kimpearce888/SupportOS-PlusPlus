@@ -104,9 +104,12 @@ fn parse_type(type_str: &str) -> Result<NotificationType> {
     ))
 }
 
-/// Record a notification. Validates the type against the catalog's
-/// `NotificationType::ALL` (single source of truth) — unknown types are
-/// rejected. Severity is copied from `NotificationType::severity()`.
+/// Record a notification — the reference `notificationRepo.insert`:
+/// `INSERT ... ON CONFLICT(dedup_key) DO NOTHING`, returning `None` when a
+/// notification with the same dedup key already exists. Validates the type
+/// against the catalog's `NotificationType::ALL` (single source of truth) —
+/// unknown types are rejected. Severity is copied from
+/// `NotificationType::severity()`.
 ///
 /// # Errors
 ///
@@ -118,18 +121,31 @@ pub fn record_notification(
     target_user_id: Option<i64>,
     conversation_id: Option<i64>,
     payload: Option<&str>,
-) -> Result<i64> {
+    dedup_key: &str,
+) -> Result<Option<i64>> {
     // Validate by construction: the caller passes a typed NotificationType,
     // so the type IS in the catalog. But we still write `as_str()` to the DB
     // and the severity from `severity()`.
     let type_str = notification_type.as_str();
     let severity = notification_type.severity();
-    conn.execute(
-        "INSERT INTO notifications (type, severity, target_user_id, conversation_id, payload)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![type_str, severity, target_user_id, conversation_id, payload],
+    let inserted = conn.execute(
+        "INSERT INTO notifications
+            (type, severity, target_user_id, conversation_id, payload, dedup_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(dedup_key) DO NOTHING",
+        params![
+            type_str,
+            severity,
+            target_user_id,
+            conversation_id,
+            payload,
+            dedup_key
+        ],
     )?;
-    Ok(conn.last_insert_rowid())
+    if inserted == 0 {
+        return Ok(None); // deduped — the reference insert returns null
+    }
+    Ok(Some(conn.last_insert_rowid()))
 }
 
 /// Mark a notification as read. Sets `read_at` to the current time.
@@ -234,8 +250,6 @@ fn row_to_notification(r: &rusqlite::Row<'_>) -> rusqlite::Result<Notification> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::apply_m003;
-    use crate::ticket_states::apply_m004;
     use tempfile::NamedTempFile;
 
     fn fresh_db() -> Connection {
@@ -245,11 +259,10 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        apply_m003(&conn).unwrap();
-        apply_m004(&conn).unwrap();
-        apply_m005(&conn).unwrap();
+        // The canonical boot chain — tests must exercise the REAL schema
+        // (notifications with the reference's dedup_key + unique index),
+        // never a partial one.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 
@@ -297,9 +310,10 @@ mod tests {
             Some(42),
             Some(1001),
             Some(r#"{"reason":"breached"}"#),
+            "n:test:sla_breach:1",
         )
-        .unwrap();
-        assert!(id > 0);
+        .unwrap()
+        .expect("inserted");
 
         let (type_str, severity, target, conv, payload, read_at): (
             String,
@@ -337,8 +351,16 @@ mod tests {
     fn record_notification_all_15_types_round_trip() {
         let conn = fresh_db();
         for t in NotificationType::ALL {
-            let id = record_notification(&conn, &t, Some(42), None, None).unwrap();
-            assert!(id > 0, "failed to insert {t:?}");
+            let id = record_notification(
+                &conn,
+                &t,
+                Some(42),
+                None,
+                None,
+                &format!("n:test:{}", t.as_str()),
+            )
+            .unwrap()
+            .expect("inserted");
 
             let (type_str, severity): (String, String) = conn
                 .query_row(
@@ -361,7 +383,16 @@ mod tests {
     fn record_notification_severity_matches_catalog_severity_map() {
         let conn = fresh_db();
         for t in NotificationType::ALL {
-            let id = record_notification(&conn, &t, None, None, None).unwrap();
+            let id = record_notification(
+                &conn,
+                &t,
+                None,
+                None,
+                None,
+                &format!("n:test:{}", t.as_str()),
+            )
+            .unwrap()
+            .expect("inserted");
             let severity: String = conn
                 .query_row(
                     "SELECT severity FROM notifications WHERE id = ?1",
@@ -380,8 +411,16 @@ mod tests {
     #[test]
     fn record_notification_with_null_target_user_is_broadcast() {
         let conn = fresh_db();
-        let id =
-            record_notification(&conn, &NotificationType::IssueSpike, None, None, None).unwrap();
+        let id = record_notification(
+            &conn,
+            &NotificationType::IssueSpike,
+            None,
+            None,
+            None,
+            "n:test:k1",
+        )
+        .unwrap()
+        .expect("inserted");
         let target: Option<i64> = conn
             .query_row(
                 "SELECT target_user_id FROM notifications WHERE id = ?1",
@@ -397,8 +436,16 @@ mod tests {
     #[test]
     fn mark_as_read_sets_read_at_and_returns_true() {
         let conn = fresh_db();
-        let id =
-            record_notification(&conn, &NotificationType::Mentioned, Some(42), None, None).unwrap();
+        let id = record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            "n:test:k2",
+        )
+        .unwrap()
+        .expect("inserted");
 
         let updated = mark_as_read(&conn, id).unwrap();
         assert!(updated, "first mark_as_read should update");
@@ -419,8 +466,16 @@ mod tests {
     #[test]
     fn mark_as_read_is_idempotent() {
         let conn = fresh_db();
-        let id =
-            record_notification(&conn, &NotificationType::Mentioned, Some(42), None, None).unwrap();
+        let id = record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            "n:test:k3",
+        )
+        .unwrap()
+        .expect("inserted");
 
         let first = mark_as_read(&conn, id).unwrap();
         assert!(first);
@@ -444,16 +499,56 @@ mod tests {
     fn list_unread_for_user_returns_only_unread() {
         let conn = fresh_db();
         // 3 unread for user 42, 1 read, 1 for a different user.
-        let id1 =
-            record_notification(&conn, &NotificationType::Mentioned, Some(42), None, None).unwrap();
-        let _id2 =
-            record_notification(&conn, &NotificationType::SlaRisk, Some(42), None, None).unwrap();
-        let _id3 =
-            record_notification(&conn, &NotificationType::SlaBreach, Some(42), None, None).unwrap();
-        let id4 =
-            record_notification(&conn, &NotificationType::Mentioned, Some(42), None, None).unwrap();
-        let _id5 =
-            record_notification(&conn, &NotificationType::Mentioned, Some(43), None, None).unwrap();
+        let id1 = record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            "n:test:k4",
+        )
+        .unwrap()
+        .expect("inserted");
+        let _id2 = record_notification(
+            &conn,
+            &NotificationType::SlaRisk,
+            Some(42),
+            None,
+            None,
+            "n:test:k5",
+        )
+        .unwrap()
+        .expect("inserted");
+        let _id3 = record_notification(
+            &conn,
+            &NotificationType::SlaBreach,
+            Some(42),
+            None,
+            None,
+            "n:test:k6",
+        )
+        .unwrap()
+        .expect("inserted");
+        let id4 = record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            "n:test:k7",
+        )
+        .unwrap()
+        .expect("inserted");
+        let _id5 = record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(43),
+            None,
+            None,
+            "n:test:k8",
+        )
+        .unwrap()
+        .expect("inserted");
 
         mark_as_read(&conn, id1).unwrap();
         mark_as_read(&conn, id4).unwrap();
@@ -471,8 +566,26 @@ mod tests {
         let conn = fresh_db();
         // A broadcast notification (target_user_id = NULL) should be visible
         // to all users.
-        record_notification(&conn, &NotificationType::IssueSpike, None, None, None).unwrap();
-        record_notification(&conn, &NotificationType::Mentioned, Some(42), None, None).unwrap();
+        record_notification(
+            &conn,
+            &NotificationType::IssueSpike,
+            None,
+            None,
+            None,
+            "n:test:k9",
+        )
+        .unwrap()
+        .expect("inserted");
+        record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            "n:test:k10",
+        )
+        .unwrap()
+        .expect("inserted");
 
         let unread = list_unread_for_user(&conn, 42, 50).unwrap();
         assert_eq!(
@@ -493,7 +606,16 @@ mod tests {
             NotificationType::IssueSpike,
             NotificationType::SyncFailure,
         ] {
-            record_notification(&conn, &t, Some(42), None, None).unwrap();
+            record_notification(
+                &conn,
+                &t,
+                Some(42),
+                None,
+                None,
+                &format!("n:test:{}", t.as_str()),
+            )
+            .unwrap()
+            .expect("inserted");
             // Tiny delay so created_at timestamps differ.
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -525,10 +647,26 @@ mod tests {
     #[test]
     fn list_for_user_includes_read_and_unread() {
         let conn = fresh_db();
-        let id1 =
-            record_notification(&conn, &NotificationType::Mentioned, Some(42), None, None).unwrap();
-        let _id2 =
-            record_notification(&conn, &NotificationType::SlaRisk, Some(42), None, None).unwrap();
+        let id1 = record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            "n:test:k11",
+        )
+        .unwrap()
+        .expect("inserted");
+        let _id2 = record_notification(
+            &conn,
+            &NotificationType::SlaRisk,
+            Some(42),
+            None,
+            None,
+            "n:test:k12",
+        )
+        .unwrap()
+        .expect("inserted");
         mark_as_read(&conn, id1).unwrap();
 
         let all = list_for_user(&conn, 42, 50).unwrap();
@@ -540,9 +678,36 @@ mod tests {
     #[test]
     fn count_unread_for_user_includes_broadcast() {
         let conn = fresh_db();
-        record_notification(&conn, &NotificationType::Mentioned, Some(42), None, None).unwrap();
-        record_notification(&conn, &NotificationType::IssueSpike, None, None, None).unwrap();
-        record_notification(&conn, &NotificationType::SyncFailure, Some(43), None, None).unwrap();
+        record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            "n:test:k13",
+        )
+        .unwrap()
+        .expect("inserted");
+        record_notification(
+            &conn,
+            &NotificationType::IssueSpike,
+            None,
+            None,
+            None,
+            "n:test:k14",
+        )
+        .unwrap()
+        .expect("inserted");
+        record_notification(
+            &conn,
+            &NotificationType::SyncFailure,
+            Some(43),
+            None,
+            None,
+            "n:test:k15",
+        )
+        .unwrap()
+        .expect("inserted");
 
         let count = count_unread_for_user(&conn, 42).unwrap();
         assert_eq!(count, 2, "1 targeted + 1 broadcast = 2 unread for user 42");
@@ -551,9 +716,26 @@ mod tests {
     #[test]
     fn count_unread_excludes_read() {
         let conn = fresh_db();
-        let id1 =
-            record_notification(&conn, &NotificationType::Mentioned, Some(42), None, None).unwrap();
-        record_notification(&conn, &NotificationType::SlaRisk, Some(42), None, None).unwrap();
+        let id1 = record_notification(
+            &conn,
+            &NotificationType::Mentioned,
+            Some(42),
+            None,
+            None,
+            "n:test:k16",
+        )
+        .unwrap()
+        .expect("inserted");
+        record_notification(
+            &conn,
+            &NotificationType::SlaRisk,
+            Some(42),
+            None,
+            None,
+            "n:test:k17",
+        )
+        .unwrap()
+        .expect("inserted");
         mark_as_read(&conn, id1).unwrap();
 
         let count = count_unread_for_user(&conn, 42).unwrap();

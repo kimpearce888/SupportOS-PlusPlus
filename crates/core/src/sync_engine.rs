@@ -1772,6 +1772,36 @@ mod tests {
             .unwrap();
         assert_eq!(convs, 10);
         assert_eq!(threads, 20);
+        // Every conversation's customer/assignee references resolve to
+        // local mirror rows (the reference maps remote ids to local ids
+        // before writing; dangling ids broke customer timelines, search
+        // joins and the customer-event derive).
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations c
+                 LEFT JOIN customers cu ON cu.id = c.customer_id
+                 WHERE c.customer_id IS NOT NULL AND cu.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dangling, 0,
+            "conversations must reference local customer ids"
+        );
+        let dangling_assignee: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations c
+                 LEFT JOIN users u ON u.id = c.assignee_id
+                 WHERE c.assignee_id IS NOT NULL AND u.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dangling_assignee, 0,
+            "conversations must reference local user ids"
+        );
         // Saved replies / workflows / docs mirrored.
         let (replies, workflows, docs): (i64, i64, i64) = conn
             .query_row(
