@@ -18,15 +18,18 @@
 //! ## Milestone dependency map
 //!
 //! Some tiles depend on data sources that ship in later milestones:
-//! - `automation_approvals` → M4-T10 (this milestone)
 //! - `ai_escalation` → T13 (AI analysis wiring)
-//! - `sla_at_risk`, `sla_breached` → T16 (SLA business-minutes engine)
-
 //!
-//! Until their dependencies ship, those tiles return [`TileCount::NotAvailable`]
-//! so the UI can display a "Not yet available" badge rather than a misleading
-//! `0`. The 8 real tiles return [`TileCount::Available(u32)`] backed by real
-//! SQL.
+//! The SLA tiles (`sla_at_risk`, `sla_breached`) went live with the T16
+//! business-minutes engine: they reuse `crate::sla::sla_alerts()` verbatim
+//! (reference operationsCenter.ts: "SLA tiles reuse SlaService.slaAlerts()
+//! verbatim — business-minutes logic exists exactly once in the codebase"),
+//! so a tile can never disagree with the Issue Radar detail.
+//!
+//! Until its dependency ships, the remaining tile returns
+//! [`TileCount::NotAvailable`] so the UI can display a "Not yet available"
+//! badge rather than a misleading `0`. The real tiles return
+//! [`TileCount::Available(u32)`] backed by real SQL or the SLA engine.
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -324,8 +327,11 @@ fn tile_sql(tile: OperationsTileKey, mailbox_id: Option<i64>) -> Option<(String,
                 "SELECT COUNT(*) FROM campaigns WHERE status IN ('queued','sending','paused')";
             Some((sql.to_string(), vec![]))
         }
-        // Still stubbed — their engines land with T16 (SLA business-minutes)
-        // and T13 (AI analysis wiring populating ai_runs).
+        // The SLA tiles are NOT SQL counts — the business-minutes engine
+        // computes them in `count_tile`/`build_snapshot` (the reference's
+        // tileFragments.ts has no fragment for them either).
+        // Still stubbed — its engine lands with T13 (AI analysis wiring
+        // populating ai_runs).
         OperationsTileKey::SlaAtRisk
         | OperationsTileKey::SlaBreached
         | OperationsTileKey::AiEscalation => None,
@@ -355,9 +361,11 @@ fn mailbox_params(mailbox_id: Option<i64>) -> Vec<Box<dyn rusqlite::ToSql>> {
 pub fn tile_milestone(tile: OperationsTileKey) -> Option<u8> {
     match tile {
         OperationsTileKey::AiEscalation => Some(13), // T13 (AI analysis wiring)
-        OperationsTileKey::SlaAtRisk | OperationsTileKey::SlaBreached => Some(16), // T16 (SLA business-minutes)
-        // Real tiles have no pending milestone.
-        OperationsTileKey::Unassigned
+        // Real tiles have no pending milestone (the SLA tiles went live
+        // with the T16 business-minutes engine).
+        OperationsTileKey::SlaAtRisk
+        | OperationsTileKey::SlaBreached
+        | OperationsTileKey::Unassigned
         | OperationsTileKey::NeedsFirstResponse
         | OperationsTileKey::CustomerWaiting
         | OperationsTileKey::WaitingOverThreshold
@@ -373,8 +381,33 @@ pub fn tile_milestone(tile: OperationsTileKey) -> Option<u8> {
     }
 }
 
+/// Count the at-risk / breached state over an SLA alerts result, scoped to a
+/// mailbox (reference operationsCenter.ts:90-109 — both tiles filter the SAME
+/// `slaAlerts()` result by scope, then count by state).
+///
+/// Reference quirk kept verbatim: the tile counts the CAPPED alerts list
+/// (`alerts.slice(0, 50)` inside `slaAlerts()`), so with a very large
+/// backlog the tile is bounded by the cap exactly like the reference's.
+fn sla_tile_count(
+    alerts: &crate::sla::SlaAlerts,
+    state: crate::sla::SlaAlertState,
+    mailbox_id: Option<i64>,
+) -> TileCount {
+    let count = alerts
+        .alerts
+        .iter()
+        .filter(|a| a.state == state)
+        .filter(|a| mailbox_id.is_none_or(|m| a.mailbox_id == m))
+        .count() as u32;
+    TileCount::Available { count }
+}
+
 /// Count a single tile. Returns `TileCount::Available(n)` for real tiles and
 /// `TileCount::NotAvailable { milestone }` for stubbed tiles.
+///
+/// The SLA tiles run the business-minutes engine (one `sla_alerts()` pass
+/// per call); [`build_snapshot`] shares a single pass between both tiles,
+/// exactly like the reference.
 ///
 /// # Errors
 ///
@@ -385,6 +418,19 @@ pub fn count_tile(
     tile: OperationsTileKey,
     mailbox_id: Option<i64>,
 ) -> Result<TileCount> {
+    // SLA tiles: business-minutes engine, not a SQL count.
+    if matches!(
+        tile,
+        OperationsTileKey::SlaAtRisk | OperationsTileKey::SlaBreached
+    ) {
+        let alerts = crate::sla::sla_alerts(conn)?;
+        let state = if tile == OperationsTileKey::SlaAtRisk {
+            crate::sla::SlaAlertState::AtRisk
+        } else {
+            crate::sla::SlaAlertState::Breached
+        };
+        return Ok(sla_tile_count(&alerts, state, mailbox_id));
+    }
     let Some((sql, sql_params)) = tile_sql(tile, mailbox_id) else {
         // Stubbed tile — its data source ships in a later milestone.
         let milestone = tile_milestone(tile).expect("stubbed tile must have a milestone");
@@ -409,9 +455,21 @@ pub fn count_tile(
 ///
 /// Returns the first error encountered (real-tile SQL failures only).
 pub fn build_snapshot(conn: &Connection, mailbox_id: Option<i64>) -> Result<OperationsSnapshot> {
+    // The SLA tiles share ONE engine pass (reference operationsCenter.ts:90
+    // computes slaAlerts() once and feeds both tiles — "business-minutes
+    // logic exists exactly once in the codebase").
+    let sla_alerts = crate::sla::sla_alerts(conn)?;
     let mut tiles = Vec::with_capacity(OperationsTileKey::ALL.len());
     for tile in OperationsTileKey::ALL {
-        let count = count_tile(conn, tile, mailbox_id)?;
+        let count = match tile {
+            OperationsTileKey::SlaAtRisk => {
+                sla_tile_count(&sla_alerts, crate::sla::SlaAlertState::AtRisk, mailbox_id)
+            }
+            OperationsTileKey::SlaBreached => {
+                sla_tile_count(&sla_alerts, crate::sla::SlaAlertState::Breached, mailbox_id)
+            }
+            _ => count_tile(conn, tile, mailbox_id)?,
+        };
         tiles.push((tile, count));
     }
     Ok(OperationsSnapshot {
@@ -895,12 +953,9 @@ mod tests {
     #[test]
     fn stubbed_tiles_return_not_available_with_correct_milestone() {
         let conn = fresh_db();
-        // AutomationApprovals is now wired (M4-T10) — removed from this list.
-        let stubbed: &[(OperationsTileKey, u8)] = &[
-            (OperationsTileKey::AiEscalation, 13),
-            (OperationsTileKey::SlaAtRisk, 16),
-            (OperationsTileKey::SlaBreached, 16),
-        ];
+        // Only ai_escalation remains stubbed — the SLA tiles went live with
+        // the T16 business-minutes engine.
+        let stubbed: &[(OperationsTileKey, u8)] = &[(OperationsTileKey::AiEscalation, 13)];
         for (tile, milestone) in stubbed {
             let count = count_tile(&conn, *tile, None).unwrap();
             assert_eq!(
@@ -925,6 +980,8 @@ mod tests {
             OperationsTileKey::FailedJobs,
             OperationsTileKey::SyncProblems,
             OperationsTileKey::AutomationApprovals,
+            OperationsTileKey::SlaAtRisk,
+            OperationsTileKey::SlaBreached,
         ];
         for tile in real_tiles {
             assert!(
@@ -970,9 +1027,18 @@ mod tests {
             Some(0),
             "AutomationApprovals is real and counts 0"
         );
-        // SlaBreached is still stubbed (ships with T16).
+        // The SLA tiles are real since T16: they count 0 here because the
+        // demo mailbox has no business hours configured (honest, not
+        // NotAvailable).
         let sla_breached = snapshot.get(OperationsTileKey::SlaBreached).unwrap();
-        assert!(sla_breached.is_not_available());
+        assert!(!sla_breached.is_not_available());
+        assert_eq!(sla_breached.count(), Some(0));
+        let sla_at_risk = snapshot.get(OperationsTileKey::SlaAtRisk).unwrap();
+        assert!(!sla_at_risk.is_not_available());
+        assert_eq!(sla_at_risk.count(), Some(0));
+        // Only ai_escalation is still stubbed.
+        let ai = snapshot.get(OperationsTileKey::AiEscalation).unwrap();
+        assert!(ai.is_not_available());
     }
 
     #[test]
@@ -1065,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn tile_filter_returns_none_for_global_and_stubbed_tiles() {
+    fn tile_filter_returns_none_for_global_and_non_conversation_ops_tiles() {
         let conn = fresh_db();
         // Global tiles (no inbox filter applicable).
         for tile in [
@@ -1077,7 +1143,10 @@ mod tests {
                 "global tile {tile:?} should not have a filter fragment"
             );
         }
-        // Stubbed tiles.
+        // Tiles without a conversation-ops drill-down. The SLA tiles are real
+        // since T16 but still have no inbox fragment — the reference's
+        // isConversationOpsTile excludes them (the Issue Radar holds the
+        // detail, not the inbox filter).
         for tile in [
             OperationsTileKey::AutomationApprovals,
             OperationsTileKey::SlaAtRisk,
@@ -1090,10 +1159,130 @@ mod tests {
         ] {
             assert!(
                 tile_filter(tile, None).unwrap().is_none(),
-                "stubbed tile {tile:?} should not have a filter fragment"
+                "tile {tile:?} should not have a filter fragment"
             );
         }
         let _ = conn; // suppress unused
+    }
+
+    // ---- SLA tiles (T16 business-minutes engine) -----------------------------
+
+    /// ISO string `mins` minutes before now (the `toISOString()` shape).
+    fn minutes_ago_iso(mins: i64) -> String {
+        let ts = chrono::Utc::now().timestamp_millis() - mins * 60_000;
+        chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, ts)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    }
+
+    /// Mailbox 101 with a 24/7 UTC schedule, 60-min first-response target;
+    /// two waiting conversations aged `breached` / `at_risk` minutes.
+    fn seed_sla_fixture(conn: &Connection, breached_mins_ago: i64, at_risk_mins_ago: i64) {
+        // The operations test harness boots a narrower migration chain than
+        // the canonical boot; the engine's lazy schema guard fills the gap.
+        crate::sla::ensure_sla_schema(conn).unwrap();
+        conn.execute(
+            "INSERT INTO mailboxes (id, remote_id, name) VALUES (101, 201, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mailbox_business_hours
+                (mailbox_local_id, timezone, days, start_minute, end_minute, first_response_target_min, resolution_target_min, updated_at)
+             VALUES (101, 'UTC', '[0,1,2,3,4,5,6]', 0, 1440, 60, 480, '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        for (remote, mins) in [(5001, breached_mins_ago), (5002, at_risk_mins_ago)] {
+            let at = minutes_ago_iso(mins);
+            conn.execute(
+                "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, created_at, updated_at)
+                 VALUES (?1, ?1, 'active', 101, 2001, ?2, ?2)",
+                params![remote, at],
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM conversations WHERE remote_id = ?1",
+                    [remote],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+                 VALUES (?1, 'customer', 'published', 'b', 'customer', ?2)",
+                params![id, at],
+            )
+            .unwrap();
+        }
+    }
+
+    /// The two SLA tiles count real business-minutes states from the engine:
+    /// 120 waited minutes breaches the 60-minute target; 50 minutes is
+    /// at-risk (>= 80% of it).
+    #[test]
+    fn sla_tiles_count_from_the_business_minutes_engine() {
+        let conn = fresh_db();
+        seed_sla_fixture(&conn, 120, 50);
+
+        let breached = count_tile(&conn, OperationsTileKey::SlaBreached, None).unwrap();
+        assert_eq!(breached.count(), Some(1));
+        let at_risk = count_tile(&conn, OperationsTileKey::SlaAtRisk, None).unwrap();
+        assert_eq!(at_risk.count(), Some(1));
+
+        // Scoped to a mailbox with no alerts: 0 (not NotAvailable).
+        let scoped = count_tile(&conn, OperationsTileKey::SlaBreached, Some(999)).unwrap();
+        assert_eq!(scoped.count(), Some(0));
+    }
+
+    /// The snapshot scopes the SLA tiles by mailbox like every other tile.
+    #[test]
+    fn sla_tiles_are_mailbox_scoped_in_the_snapshot() {
+        let conn = fresh_db();
+        seed_sla_fixture(&conn, 120, 50);
+
+        let snapshot = build_snapshot(&conn, Some(101)).unwrap();
+        assert_eq!(
+            snapshot
+                .get(OperationsTileKey::SlaBreached)
+                .unwrap()
+                .count(),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot.get(OperationsTileKey::SlaAtRisk).unwrap().count(),
+            Some(1)
+        );
+
+        let other = build_snapshot(&conn, Some(102)).unwrap();
+        assert_eq!(
+            other.get(OperationsTileKey::SlaBreached).unwrap().count(),
+            Some(0)
+        );
+        assert_eq!(
+            other.get(OperationsTileKey::SlaAtRisk).unwrap().count(),
+            Some(0)
+        );
+    }
+
+    /// Unconfigured mailboxes keep the tiles honest at 0 (never guessed), and
+    /// the tile still reports Available — "not configured" is not
+    /// "not available".
+    #[test]
+    fn sla_tiles_unconfigured_mailboxes_count_zero_but_available() {
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO mailboxes (id, remote_id, name) VALUES (101, 201, 'Support')",
+            [],
+        )
+        .unwrap();
+        insert_conversation(&conn, 1001, "active", 101, None, None);
+
+        let breached = count_tile(&conn, OperationsTileKey::SlaBreached, None).unwrap();
+        assert!(!breached.is_not_available());
+        assert_eq!(breached.count(), Some(0));
     }
 
     // ---- TileCount helpers ---------------------------------------------------

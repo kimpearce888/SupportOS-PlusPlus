@@ -1,6 +1,7 @@
 //! Issues routes — mirrors src/server/routes/issues.ts
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde_json::{json, Value};
 
@@ -31,79 +32,38 @@ pub async fn list_clusters(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/issues/sla-alerts
 ///
+/// v1.5.0: business-hours-aware SLA alerts for the Issue Radar (reference
+/// routes/issues.ts:9 — `ctx.sla.slaAlerts()` verbatim).
+///
 /// Reference response shape:
 /// ```json
 /// {
 ///   "generated_at": "...",
 ///   "total_breached": N, "total_at_risk": N,
-///   "alerts": [...],
-///   "per_mailbox": [],
-///   "unconfigured_mailboxes": [],
-///   "note": "..."
+///   "alerts": [ { conversation_id, number, subject, status, mailbox_id,
+///                 mailbox_name, assignee_local_id, state,
+///                 waited_business_min, target_min, target_kind,
+///                 overdue_business_min, since } ],
+///   "per_mailbox": [ { mailbox_id, mailbox_name, breached, at_risk, monitored } ],
+///   "unconfigured_mailboxes": ["..."],
+///   "note": "Alerts measure BUSINESS minutes ..."
 /// }
 /// ```
-pub async fn sla_alerts(State(state): State<AppState>) -> Json<Value> {
+pub async fn sla_alerts(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let total_breached: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE response_state = 'sla_breached'",
-            [],
-            |r| r.get(0),
+    match crate::sla::sla_alerts(&conn) {
+        Ok(alerts) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&alerts).unwrap_or(Value::Null)),
         )
-        .unwrap_or(0);
-    let total_at_risk: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE response_state = 'sla_at_risk'",
-            [],
-            |r| r.get(0),
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": e.to_string()})),
         )
-        .unwrap_or(0);
-    // Alerts: a simple per-state rollup.
-    let alerts: Vec<Value> = vec![json!({
-        "state": "breached",
-        "count": total_breached,
-    })];
-    // Per-mailbox: count breached conversations grouped by mailbox_id.
-    let per_mailbox: Vec<Value> = conn
-        .prepare("SELECT mailbox_id, COUNT(*) FROM conversations WHERE response_state = 'sla_breached' GROUP BY mailbox_id ORDER BY 2 DESC")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({
-                    "mailbox_id": r.get::<_, i64>(0)?,
-                    "breached_count": r.get::<_, i64>(1)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    // Unconfigured mailboxes: those without SLA configs.
-    let unconfigured_mailboxes: Vec<Value> = conn
-        .prepare("SELECT DISTINCT m.id, m.name FROM mailboxes m LEFT JOIN sla_configs s ON s.mailbox_id = m.id WHERE s.mailbox_id IS NULL ORDER BY m.id")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "name": r.get::<_, String>(1)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    Json(json!({
-        "generated_at": chrono::Utc::now().to_rfc3339(),
-        "total_breached": total_breached,
-        "total_at_risk": total_at_risk,
-        "alerts": alerts,
-        "per_mailbox": per_mailbox,
-        "unconfigured_mailboxes": unconfigured_mailboxes,
-        "note": "Alerts measure BUSINESS minutes (nights/weekends excluded). SLA configs come from the sla_configs table."
-    }))
+            .into_response(),
+    }
 }
 
 /// GET /api/issues/clusters/:id
@@ -431,4 +391,137 @@ fn linked_count_between(
         rusqlite::params![id],
         |r| r.get(0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::{IntoResponse, Response};
+    use std::sync::{Arc, Mutex};
+
+    fn make_state() -> AppState {
+        let f = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        AppState {
+            conn: Arc::new(Mutex::new(conn)),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            port: 3000,
+            host: "127.0.0.1".into(),
+            demo_mode: false,
+            bus: crate::http::EventBus::new(64),
+            limiter: crate::http::RateLimiter::new(),
+            sync: None,
+            real: None,
+            provider_kind: "fake".into(),
+            workers: None,
+            qdrant: Arc::new(crate::vectorstore_qdrant::EmbeddedQdrant::new(
+                "/tmp/spp-test-qdrant",
+                "http://127.0.0.1:6333",
+                false,
+            )),
+        }
+    }
+
+    async fn body_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        (status, json)
+    }
+
+    fn seed_waiting_conversation(state: &AppState, mins_waiting: i64) {
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+            [],
+        )
+        .unwrap();
+        let ts = chrono::Utc::now().timestamp_millis() - mins_waiting * 60_000;
+        let at = chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, ts)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id, status, created_at, updated_at)
+             VALUES (101, 101, 1, 3001, 'active', ?1, ?1)",
+            rusqlite::params![at],
+        )
+        .unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = 101",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+             VALUES (?1, 'customer', 'published', 'b', 'customer', ?2)",
+            rusqlite::params![id, at],
+        )
+        .unwrap();
+    }
+
+    /// Reference e2e (v15): honest unconfigured state — zero totals, the
+    /// mailbox listed as unconfigured, the note mentions BUSINESS minutes,
+    /// and the full route shape answers 200.
+    #[tokio::test]
+    async fn sla_alerts_route_honest_unconfigured_state() {
+        let state = make_state();
+        seed_waiting_conversation(&state, 300);
+        let response = sla_alerts(State(state)).await;
+        let (status, body) = body_json(response.into_response()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total_breached"], json!(0));
+        assert_eq!(body["total_at_risk"], json!(0));
+        assert_eq!(body["alerts"], json!([]));
+        assert_eq!(body["unconfigured_mailboxes"], json!(["Support"]));
+        assert!(body["note"].as_str().unwrap().contains("BUSINESS minutes"));
+        assert!(
+            body["generated_at"].as_str().unwrap().ends_with('Z'),
+            "toISOString format: {}",
+            body["generated_at"]
+        );
+        assert!(body["per_mailbox"].as_array().is_some());
+    }
+
+    /// Reference e2e (v15): after configuring 24/7 hours + a 60-minute
+    /// first-response target, a conversation waiting 2h shows up breached
+    /// with the full alert row shape.
+    #[tokio::test]
+    async fn sla_alerts_route_live_breach_after_configuration() {
+        let state = make_state();
+        seed_waiting_conversation(&state, 120);
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.execute(
+                "INSERT INTO mailbox_business_hours
+                    (mailbox_local_id, timezone, days, start_minute, end_minute, first_response_target_min, resolution_target_min, updated_at)
+                 VALUES (1, 'UTC', '[0,1,2,3,4,5,6]', 0, 1440, 60, 480, '2026-01-01T00:00:00.000Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let response = sla_alerts(State(state)).await;
+        let (status, body) = body_json(response.into_response()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total_breached"], json!(1));
+        assert_eq!(body["total_at_risk"], json!(0));
+        let alert = &body["alerts"][0];
+        assert_eq!(alert["state"], json!("breached"));
+        assert_eq!(alert["target_kind"], json!("first_response"));
+        assert_eq!(alert["target_min"], json!(60));
+        assert_eq!(alert["waited_business_min"], json!(120));
+        assert_eq!(alert["overdue_business_min"], json!(60));
+        assert_eq!(alert["mailbox_name"], json!("Support"));
+        assert_eq!(body["unconfigured_mailboxes"], json!([]));
+    }
 }

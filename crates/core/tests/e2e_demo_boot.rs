@@ -271,7 +271,7 @@ async fn demo_boot_runtime_verification() {
         ),
     }
 
-    // ── 7. Operations Center: 16 tiles; record real vs unavailable ─────────
+    // ── 7. Operations Center: 16 tiles; SLA tiles real since T16 ────────────
     match client
         .get(format!("{base}/api/operations/center"))
         .send()
@@ -286,10 +286,15 @@ async fn demo_boot_runtime_verification() {
                 .filter(|t| t["available"] == json!(false) || t["count"].is_null())
                 .filter_map(|t| t["key"].as_str().map(String::from))
                 .collect();
+            // The sla_at_risk / sla_breached tiles went live with the T16
+            // business-minutes engine (they count 0 on the unconfigured demo
+            // mailboxes — honest, available). Only ai_escalation (T13)
+            // remains unavailable.
+            let unavailable_ok = unavailable.as_slice() == ["ai_escalation"];
             step(
                 &mut out,
                 "GET /api/operations/center (16 tiles)",
-                status == 200 && tiles.len() == 16,
+                status == 200 && tiles.len() == 16 && unavailable_ok,
                 format!(
                     "status={status} tiles={} unavailable={:?}",
                     tiles.len(),
