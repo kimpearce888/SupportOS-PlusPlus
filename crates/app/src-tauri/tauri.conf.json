@@ -5,7 +5,7 @@
   "identifier": "com.supportos.plusplus",
   "build": {
     "beforeDevCommand": "cargo run -p supportos-plusplus-xtask --bin xtask -- trunk-serve",
-    "beforeBuildCommand": "",
+    "beforeBuildCommand": "cargo run -p supportos-plusplus-xtask --bin xtask -- trunk-build",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../../ui/dist"
   },

@@ -27,15 +27,23 @@ pub async fn handle(
 ) -> impl IntoResponse {
     let raw_body = String::from_utf8_lossy(&body).into_owned();
 
-    // The secret comes from settings (the reference reads it from config at
-    // boot; the port persists it in `application_settings`).
-    let secret = crate::settings::get_string(
-        &state.conn.lock().unwrap_or_else(|p| p.into_inner()),
-        "webhook_secret",
-    )
-    .ok()
-    .flatten()
-    .unwrap_or_default();
+    // The secret comes from the environment (reference config.ts
+    // HELPSCOUT_WEBHOOK_SECRET, consumed at context construction); the
+    // application_settings key remains as a fallback so existing DBs and the
+    // test harness keep working.
+    let secret = std::env::var("HELPSCOUT_WEBHOOK_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            crate::settings::get_string(
+                &state.conn.lock().unwrap_or_else(|p| p.into_inner()),
+                "webhook_secret",
+            )
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
 
     let signature = headers
         .get("x-helpscout-signature")

@@ -206,54 +206,237 @@ pub async fn update_settings(
     )
 }
 
-/// GET /api/settings/lmstudio
+/// GET /api/settings/lmstudio — reference `settingsRepo.getLmStudio()`:
+/// `{base_url, chat_model, embedding_model, timeout_ms, concurrency}` from
+/// the `lmstudio_*` application_settings keys (defaults
+/// `http://127.0.0.1:1234` / null / null / 120000 / 2). Values previously
+/// written to the AI Center table still surface (read fallback) so existing
+/// installations do not lose their selection.
 pub async fn get_lmstudio(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::ai_center::get_ai_status(&conn) {
-        Ok(status) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&status).unwrap_or(json!({}))),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": e.to_string()})),
-        ),
-    }
-}
-
-/// PATCH /api/settings/lmstudio
-pub async fn update_lmstudio(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(provider) = body.get("provider").and_then(|v| v.as_str()) {
-        let kind = crate::ai_center::ProviderKind::parse(provider);
-        if let Some(k) = kind {
-            let _ = crate::ai_center::set_provider_kind(&conn, k);
-        }
-    }
-    if let Some(model) = body.get("chat_model").and_then(|v| v.as_str()) {
-        let _ = crate::ai_center::set_chat_model(&conn, model);
-    }
-    if let Some(model) = body.get("embedding_model").and_then(|v| v.as_str()) {
-        let dim = body
-            .get("embedding_dim")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(384) as usize;
-        let _ = crate::ai_center::set_embedding_model(&conn, model, dim);
-    }
-    (StatusCode::OK, Json(json!({"ok": true})))
-}
-
-/// POST /api/settings/lmstudio/test
-pub async fn test_lmstudio(State(_state): State<AppState>) -> impl IntoResponse {
+    let base_url = crate::settings::get_string(&conn, "lmstudio_base_url")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            crate::ai_center::get_ai_status(&conn)
+                .ok()
+                .and_then(|s| s.base_url)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
+    let chat_model = crate::settings::get_string(&conn, "lmstudio_chat_model")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            crate::ai_center::get_ai_status(&conn)
+                .ok()
+                .and_then(|s| s.chat_model)
+                .filter(|s| !s.is_empty())
+        });
+    let embedding_model = crate::settings::get_string(&conn, "lmstudio_embedding_model")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            crate::ai_center::get_ai_status(&conn)
+                .ok()
+                .and_then(|s| s.embedding_model)
+                .filter(|s| !s.is_empty())
+        });
+    let timeout_ms =
+        crate::settings::get_i64(&conn, "lmstudio_timeout_ms", 120_000).unwrap_or(120_000);
+    let concurrency = crate::settings::get_i64(&conn, "lmstudio_concurrency", 2).unwrap_or(2);
     (
         StatusCode::OK,
-        Json(
-            json!({"connected": false, "models": [], "error": "LM Studio test not implemented in HTTP API yet."}),
-        ),
+        Json(json!({
+            "base_url": base_url,
+            "chat_model": chat_model,
+            "embedding_model": embedding_model,
+            "timeout_ms": timeout_ms,
+            "concurrency": concurrency,
+        })),
     )
+}
+
+/// PATCH /api/settings/lmstudio — reference `updateLmStudio` behind
+/// `lmStudioSettingsSchema.partial()`: present fields validate (base_url a
+/// URL, models string-nullish, timeout_ms int >= 1000, concurrency int >= 1),
+/// invalid input is the v1.6.0-consistent 422, valid input writes the
+/// `lmstudio_*` keys. Settings are read per-request by the pipeline.
+pub async fn update_lmstudio(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    // base_url: z.string().url() — scheme://host shape.
+    let base_url = match body.get("base_url") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let ok = s.contains("://") && s.len() > "://".len() && !s.contains(' ');
+            if !ok {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": "Invalid LM Studio settings."
+                    })),
+                );
+            }
+            Some(s.clone())
+        }
+        Some(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "Invalid LM Studio settings."
+                })),
+            )
+        }
+    };
+    let chat_model = match body.get("chat_model") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(Some(s.clone())),
+        Some(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "Invalid LM Studio settings."
+                })),
+            )
+        }
+    };
+    let embedding_model = match body.get("embedding_model") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(Some(s.clone())),
+        Some(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "Invalid LM Studio settings."
+                })),
+            )
+        }
+    };
+    let timeout_ms = match body.get("timeout_ms") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_f64() {
+            Some(f) if f.fract() == 0.0 && f >= 1000.0 && f <= i64::MAX as f64 => Some(f as i64),
+            _ => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": "Invalid LM Studio settings."
+                    })),
+                )
+            }
+        },
+    };
+    let concurrency = match body.get("concurrency") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_f64() {
+            Some(f) if f.fract() == 0.0 && f >= 1.0 && f <= i64::MAX as f64 => Some(f as i64),
+            _ => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": "Invalid LM Studio settings."
+                    })),
+                )
+            }
+        },
+    };
+    {
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(url) = &base_url {
+            let _ = crate::settings::set_string(&conn, "lmstudio_base_url", url);
+        }
+        if let Some(model) = &chat_model {
+            // null clears the selection (empty string in the text store).
+            let _ = crate::settings::set_string(
+                &conn,
+                "lmstudio_chat_model",
+                model.as_deref().unwrap_or(""),
+            );
+        }
+        if let Some(model) = &embedding_model {
+            let _ = crate::settings::set_string(
+                &conn,
+                "lmstudio_embedding_model",
+                model.as_deref().unwrap_or(""),
+            );
+        }
+        if let Some(ms) = timeout_ms {
+            let _ = crate::settings::set_i64(&conn, "lmstudio_timeout_ms", ms);
+        }
+        if let Some(c) = concurrency {
+            let _ = crate::settings::set_i64(&conn, "lmstudio_concurrency", c);
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "message": "LM Studio settings saved."})),
+    )
+}
+
+/// POST /api/settings/lmstudio/test — reference contract: refresh settings,
+/// probe `GET {base_url}/models`, return `{ok, connected, models, message}`.
+pub async fn test_lmstudio(State(state): State<AppState>) -> axum::response::Response {
+    // Scoped guard: the probe below awaits, so the lock must not live
+    // across it (block scope, not drop() — generator analysis keeps the
+    // guard alive through the await otherwise).
+    let base_url = {
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        crate::settings::get_string(&conn, "lmstudio_base_url")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                crate::ai_center::get_ai_status(&conn)
+                    .ok()
+                    .and_then(|s| s.base_url)
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "http://127.0.0.1:1234".to_string())
+    };
+    let base = crate::embeddings::normalize_lm_base_url(&base_url);
+    let client = crate::ai_lm_studio::OpenAiCompatibleClient::new(format!("{base}/v1"));
+    match client.list_models().await {
+        Ok(models) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "connected": true,
+                "models": models.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+                "message": format!("LM Studio reachable - {} model(s) available.", models.len()),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": false,
+                "connected": false,
+                "models": [],
+                "message": e.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/settings/qdrant — reference `ctx.settingsRepo.getQdrant()`:
@@ -812,5 +995,98 @@ mod tests {
             )
             .unwrap_or(0);
         assert_eq!(audited, 1, "settings_updated audit entry written");
+    }
+
+    /// GET /api/settings/lmstudio — the reference getLmStudio shape with
+    /// the reference defaults on a fresh DB.
+    #[tokio::test]
+    async fn lmstudio_get_reference_shape() {
+        let state = make_state();
+        let (code, body) = body_json(get_lmstudio(State(state)).await.into_response()).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "base_url": "http://127.0.0.1:1234",
+                "chat_model": null,
+                "embedding_model": null,
+                "timeout_ms": 120_000,
+                "concurrency": 2,
+            })
+        );
+    }
+
+    /// PATCH /api/settings/lmstudio — present fields write the lmstudio_*
+    /// keys (updateLmStudio), the response carries the reference message,
+    /// and a subsequent GET round-trips.
+    #[tokio::test]
+    async fn lmstudio_patch_writes_reference_keys() {
+        let state = make_state();
+        let (code, body) = body_json(
+            update_lmstudio(
+                State(state.clone()),
+                Some(Json(json!({
+                    "base_url": "http://127.0.0.1:9999",
+                    "chat_model": "qwen3-8b",
+                    "timeout_ms": 30_000,
+                    "concurrency": 4,
+                }))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["message"], json!("LM Studio settings saved."));
+        let (code, body) = body_json(get_lmstudio(State(state)).await.into_response()).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["base_url"], json!("http://127.0.0.1:9999"));
+        assert_eq!(body["chat_model"], json!("qwen3-8b"));
+        assert_eq!(body["timeout_ms"], json!(30_000));
+        assert_eq!(body["concurrency"], json!(4));
+    }
+
+    /// PATCH /api/settings/lmstudio — invalid input is the v1.6.0-consistent
+    /// 422 (bad URL, timeout below the 1000 floor, concurrency 0).
+    #[tokio::test]
+    async fn lmstudio_patch_invalid_is_422() {
+        let state = make_state();
+        for bad in [
+            json!({ "base_url": "not a url" }),
+            json!({ "timeout_ms": 100 }),
+            json!({ "concurrency": 0 }),
+            json!({ "base_url": 42 }),
+        ] {
+            let (code, body) = body_json(
+                update_lmstudio(State(state.clone()), Some(Json(bad)))
+                    .await
+                    .into_response(),
+            )
+            .await;
+            assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+            assert_eq!(
+                body["message"],
+                json!("Invalid LM Studio settings."),
+                "reference message"
+            );
+        }
+    }
+
+    /// POST /api/settings/lmstudio/test — unreachable LM Studio answers
+    /// 200 {ok:false, connected:false, models:[]} with a message (never a 5xx).
+    #[tokio::test]
+    async fn lmstudio_test_unreachable_is_ok_false() {
+        let state = make_state();
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::settings::set_string(&conn, "lmstudio_base_url", "http://127.0.0.1:9").unwrap();
+        }
+        let (code, body) = body_json(test_lmstudio(State(state)).await.into_response()).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["connected"], json!(false));
+        assert_eq!(body["models"], json!([]));
+        assert!(body["message"].as_str().is_some_and(|m| !m.is_empty()));
     }
 }

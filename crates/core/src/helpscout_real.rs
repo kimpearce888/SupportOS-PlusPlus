@@ -334,18 +334,26 @@ pub struct HsCredentials {
     pub client_secret: String,
     pub redirect_uri: String,
     pub api_base: String,
+    /// Webhook HMAC secret (env-only, reference config.helpscout.webhookSecret).
+    pub webhook_secret: String,
+    /// Docs API key — separate from OAuth (config.helpscout.docsApiKey).
+    pub docs_api_key: String,
+    /// Docs API host (config.helpscout.docsApiBase).
+    pub docs_api_base: String,
 }
 
 impl HsCredentials {
     /// Read credentials from the environment (reference config.ts parity).
     pub fn from_env() -> Self {
+        let env = crate::config::load_env_config();
         Self {
-            client_id: std::env::var("HELPSCOUT_CLIENT_ID").unwrap_or_default(),
-            client_secret: std::env::var("HELPSCOUT_CLIENT_SECRET").unwrap_or_default(),
-            redirect_uri: std::env::var("HELPSCOUT_REDIRECT_URI")
-                .unwrap_or_else(|_| "http://localhost:3000/oauth/callback".to_string()),
-            api_base: std::env::var("HELPSCOUT_API_BASE")
-                .unwrap_or_else(|_| HS_API_BASE.to_string()),
+            client_id: env.helpscout.client_id,
+            client_secret: env.helpscout.client_secret,
+            redirect_uri: env.helpscout.redirect_uri,
+            api_base: env.helpscout.api_base,
+            webhook_secret: env.helpscout.webhook_secret,
+            docs_api_key: env.helpscout.docs_api_key,
+            docs_api_base: env.helpscout.docs_api_base,
         }
     }
 
@@ -361,6 +369,12 @@ impl HsCredentials {
             urlencode(state)
         )
     }
+}
+
+/// `base64(key + ":X")` — the Docs API Basic-auth token (realProvider.ts:119).
+fn base64_of(s: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(s)
 }
 
 fn urlencode(s: &str) -> String {
@@ -412,6 +426,60 @@ impl RealHelpScoutProvider {
 
     fn conn_lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Docs API request: separate host (`credentials.docs_api_base`) with
+    /// HTTP Basic auth using the Docs API key — `Basic base64(key:X)`
+    /// (realProvider.ts:112-123). Without a key the sync is a NO-OP: the
+    /// docs methods return empty sets (the honest-capability note — the
+    /// mirror stays empty rather than erroring).
+    async fn docs_request(&self, path: &str) -> Result<Value> {
+        if self.credentials.docs_api_key.is_empty() {
+            return Ok(Value::Null);
+        }
+        let basic = base64_of(&format!("{}:X", self.credentials.docs_api_key));
+        let url = format!(
+            "{}{path}",
+            self.credentials.docs_api_base.trim_end_matches('/')
+        );
+        let res = self
+            .client
+            .get(url)
+            .header("Authorization", format!("Basic {basic}"))
+            .send()
+            .await
+            .map_err(|e| -> crate::error::Error {
+                HsApiError {
+                    status_code: 0,
+                    message: format!("Network error contacting the Docs API: {e}"),
+                    friendly: "The Help Scout Docs API is unreachable. The docs mirror stays empty; everything else keeps working.".into(),
+                    retryable: true,
+                }
+                .into()
+            })?;
+        let status = res.status().as_u16();
+        let text = res.text().await.unwrap_or_default();
+        if (200..300).contains(&status) {
+            if text.is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_str(&text).map_err(|_| {
+                HsApiError {
+                    status_code: status,
+                    message: "Invalid JSON from the Docs API".into(),
+                    friendly: "The Docs API returned an unexpected response format.".into(),
+                    retryable: false,
+                }
+                .into()
+            });
+        }
+        Err(HsApiError {
+            status_code: status,
+            message: format!("Docs API GET {path} -> {status}"),
+            friendly: friendly_error(status, &text, "GET"),
+            retryable: false,
+        }
+        .into())
     }
 
     // ---------------- Token access ----------------
@@ -1407,7 +1475,8 @@ impl HelpScoutProvider for RealHelpScoutProvider {
     }
 
     async fn list_doc_collections(&self) -> Result<Vec<HsDocCollection>> {
-        let v = self.request("/v2/collections", "GET", None).await?;
+        // Docs API: separate host + Basic auth (docs_request); no key -> empty.
+        let v = self.docs_request("/v2/collections").await?;
         Ok(v["collections"]
             .as_array()
             .map(|a| {
@@ -1427,11 +1496,7 @@ impl HelpScoutProvider for RealHelpScoutProvider {
 
     async fn list_doc_categories(&self, collection_id: i64) -> Result<Vec<HsDocCategory>> {
         let v = self
-            .request(
-                &format!("/v2/collections/{collection_id}/categories"),
-                "GET",
-                None,
-            )
+            .docs_request(&format!("/v2/collections/{collection_id}/categories"))
             .await?;
         Ok(v["categories"]
             .as_array()
@@ -1451,11 +1516,7 @@ impl HelpScoutProvider for RealHelpScoutProvider {
 
     async fn list_doc_articles(&self, collection_id: i64) -> Result<Vec<HsDocArticle>> {
         let v = self
-            .request(
-                &format!("/v2/collections/{collection_id}/articles"),
-                "GET",
-                None,
-            )
+            .docs_request(&format!("/v2/collections/{collection_id}/articles"))
             .await?;
         Ok(v["articles"]
             .as_array()
@@ -1662,6 +1723,9 @@ mod tests {
             client_secret: "s".into(),
             redirect_uri: String::new(),
             api_base: String::new(),
+            webhook_secret: String::new(),
+            docs_api_key: String::new(),
+            docs_api_base: String::new(),
         };
         let url = creds.authorize_url("st&ate");
         assert!(url.starts_with(

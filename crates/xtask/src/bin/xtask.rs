@@ -41,7 +41,10 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Dev => run_dev(),
         Cmd::TrunkServe => run_trunk("serve"),
-        Cmd::TrunkBuild => run_trunk("build"),
+        // Release build: packaging embeds the production bundle (the
+        // reference's beforeBuildCommand builds the production client via
+        // scripts/build-desktop.mjs).
+        Cmd::TrunkBuild => run_trunk_release_build(),
         Cmd::Test => run_tests(),
         Cmd::Lint => run_lint(),
         Cmd::Package => run_package(),
@@ -82,6 +85,19 @@ fn run_trunk(mode: &str) -> anyhow::Result<()> {
         .current_dir(ui_dir)
         .status()?;
     anyhow::ensure!(status.success(), "trunk {mode} failed");
+    Ok(())
+}
+
+/// `trunk build --release` in crates/ui — the beforeBuildCommand payload:
+/// produces the production WASM bundle tauri.conf.json's `frontendDist`
+/// embeds into the deb/AppImage.
+fn run_trunk_release_build() -> anyhow::Result<()> {
+    let ui_dir = workspace_root().join("crates").join("ui");
+    let status = Command::new("trunk")
+        .args(["build", "--release"])
+        .current_dir(ui_dir)
+        .status()?;
+    anyhow::ensure!(status.success(), "trunk build --release failed");
     Ok(())
 }
 

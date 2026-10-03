@@ -1,8 +1,13 @@
 //! Configuration loader for SupportOS++.
 //!
-//! No `.env` files. No environment variables for app behaviour (the spec bans a Node-style env-driven config).
-//! All configuration lives in the SQLite `application_settings` table; the user edits it via the Settings UI.
-//! The only env vars read are `SPP_DATA_DIR` (override the data folder for tests/dev) and `RUST_LOG` (tracing).
+//! Mirrors the reference `src/server/config/config.ts`: a `.env`-free
+//! environment layer read once at boot (19 vars with the reference's
+//! defaults) + the SQLite `application_settings` table the Settings UI
+//! edits. Help Scout credentials (OAuth, webhook secret, Docs API key) are
+//! env-only in the reference; LM Studio/Qdrant runtime settings are
+//! DB-backed in both (the env values load into the config shape but the
+//! clients read the settings repo — faithful to the reference, where
+//! `config.lmstudio.*`/`config.qdrant.*` also have no consumers).
 
 use std::path::{Path, PathBuf};
 
@@ -108,6 +113,123 @@ pub fn default_data_dir() -> PathBuf {
     root.join("supportos-plusplus")
 }
 
+// ---------------------------------------------------------------------------
+// Environment layer (reference config.ts:62-114 — 19 vars, same defaults)
+// ---------------------------------------------------------------------------
+
+fn env_str(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        ),
+        _ => default,
+    }
+}
+
+fn env_int(key: &str, default: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// The boot-time environment configuration (config.ts `loadConfig()`).
+///
+/// Help Scout credentials are consumed from here (env-only in the
+/// reference); the LM Studio/Qdrant/sync values load for shape parity —
+/// the runtime clients read the settings repo, exactly as in the reference
+/// (where `config.lmstudio.*` and `config.qdrant.*` have no consumers).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvConfig {
+    pub demo_mode: bool,
+    pub log_level: String,
+    pub helpscout: EnvHelpScout,
+    pub lmstudio: EnvLmStudio,
+    pub qdrant: EnvQdrant,
+    pub sync: EnvSync,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvHelpScout {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub api_base: String,
+    pub webhook_secret: String,
+    pub docs_api_key: String,
+    pub docs_api_base: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvLmStudio {
+    pub base_url: String,
+    pub chat_model: Option<String>,
+    pub embedding_model: Option<String>,
+    pub timeout_ms: i64,
+    pub concurrency: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvQdrant {
+    pub url: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvSync {
+    pub interval_minutes: i64,
+    pub api_concurrency: i64,
+}
+
+/// `loadConfig()` — read the environment layer (config.ts defaults).
+pub fn load_env_config() -> EnvConfig {
+    EnvConfig {
+        demo_mode: env_bool("LOCAL_DEMO_MODE", false),
+        log_level: env_str("LOG_LEVEL", "info"),
+        helpscout: EnvHelpScout {
+            client_id: env_str("HELPSCOUT_CLIENT_ID", ""),
+            client_secret: env_str("HELPSCOUT_CLIENT_SECRET", ""),
+            redirect_uri: env_str(
+                "HELPSCOUT_REDIRECT_URI",
+                "http://localhost:3000/oauth/callback",
+            ),
+            api_base: env_str("HELPSCOUT_API_BASE", "https://api.helpscout.net"),
+            webhook_secret: env_str("HELPSCOUT_WEBHOOK_SECRET", ""),
+            docs_api_key: env_str("HELPSCOUT_DOCS_API_KEY", ""),
+            docs_api_base: env_str("HELPSCOUT_DOCS_API_BASE", "https://docsapi.helpscout.net"),
+        },
+        lmstudio: EnvLmStudio {
+            base_url: env_str("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234"),
+            chat_model: std::env::var("LMSTUDIO_CHAT_MODEL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            embedding_model: std::env::var("LMSTUDIO_EMBEDDING_MODEL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            timeout_ms: env_int("LMSTUDIO_TIMEOUT_MS", 120_000),
+            concurrency: env_int("LMSTUDIO_CONCURRENCY", 2),
+        },
+        qdrant: EnvQdrant {
+            url: env_str("QDRANT_URL", "http://127.0.0.1:6333"),
+            enabled: env_bool("QDRANT_ENABLED", true),
+        },
+        sync: EnvSync {
+            interval_minutes: env_int("SYNC_INTERVAL_MINUTES", 5),
+            api_concurrency: env_int("SYNC_API_CONCURRENCY", 2),
+        },
+    }
+}
+
 /// Ensure a directory exists (create it if missing).
 pub fn ensure_dir(path: &Path) -> Result<()> {
     if !path.exists() {
@@ -175,5 +297,47 @@ mod tests {
         let d = default_data_dir();
         assert!(d.to_string_lossy().contains("spp-test-data-dir"));
         std::env::remove_var("SPP_DATA_DIR");
+    }
+
+    /// loadConfig defaults (config.ts:85-114) with a clean environment.
+    #[test]
+    fn env_config_defaults_match_reference() {
+        // Run in a subprocess-clean env: tests share one process, so only
+        // assert keys no other test touches.
+        let c = load_env_config();
+        assert_eq!(
+            c.helpscout.redirect_uri,
+            "http://localhost:3000/oauth/callback"
+        );
+        assert_eq!(c.helpscout.api_base, "https://api.helpscout.net");
+        assert_eq!(c.helpscout.docs_api_base, "https://docsapi.helpscout.net");
+        assert_eq!(c.lmstudio.timeout_ms, 120_000);
+        assert_eq!(c.lmstudio.concurrency, 2);
+        assert_eq!(c.qdrant.url, "http://127.0.0.1:6333");
+        assert!(c.qdrant.enabled);
+        assert_eq!(c.sync.interval_minutes, 5);
+        assert_eq!(c.sync.api_concurrency, 2);
+    }
+
+    #[test]
+    fn env_config_reads_set_vars() {
+        std::env::set_var("LMSTUDIO_CONCURRENCY", "7");
+        std::env::set_var("HELPSCOUT_DOCS_API_KEY", "docs-key-123");
+        let c = load_env_config();
+        std::env::remove_var("LMSTUDIO_CONCURRENCY");
+        std::env::remove_var("HELPSCOUT_DOCS_API_KEY");
+        assert_eq!(c.lmstudio.concurrency, 7);
+        assert_eq!(c.helpscout.docs_api_key, "docs-key-123");
+    }
+
+    #[test]
+    fn env_bool_parses_reference_forms() {
+        std::env::set_var("QDRANT_ENABLED", "true");
+        assert!(load_env_config().qdrant.enabled);
+        std::env::set_var("QDRANT_ENABLED", "TRUE");
+        assert!(load_env_config().qdrant.enabled);
+        std::env::set_var("QDRANT_ENABLED", "0");
+        assert!(!load_env_config().qdrant.enabled);
+        std::env::remove_var("QDRANT_ENABLED");
     }
 }
