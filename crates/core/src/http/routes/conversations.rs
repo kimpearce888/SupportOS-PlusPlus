@@ -458,32 +458,191 @@ pub async fn activity_rebuild(State(state): State<AppState>) -> impl IntoRespons
 
 /// GET /api/ticket-states — list custom ticket states.
 pub async fn list_ticket_states(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let mut stmt = match conn.prepare("SELECT id, name, color FROM ticket_states ORDER BY id") {
-        Ok(s) => s,
-        Err(_) => {
-            return (
-                StatusCode::OK,
-                Json(json!({"states": [], "bottlenecks": []})),
-            );
-        }
-    };
-    let states: Vec<Value> = stmt
-        .query_map([], |r| {
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?,
-                "name": r.get::<_, String>(1)?,
-                "color": r.get::<_, String>(2)?,
-            }))
-        })
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-
+    let conn = state.conn_lock();
+    let states: Vec<Value> = crate::ticket_states::list_states(&conn)
+        .iter()
+        .filter_map(|s| serde_json::to_value(s).ok())
+        .collect();
+    let bottlenecks = crate::ticket_states::state_bottlenecks(&conn);
     (
         StatusCode::OK,
-        Json(json!({"states": states, "bottlenecks": []})),
+        Json(json!({ "states": states, "bottlenecks": bottlenecks })),
     )
+}
+
+/// POST /api/ticket-states — create a custom state definition (reference
+/// conversations.ts:303-312 + ticketStateRepo.createState).
+pub async fn create_ticket_state(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    // createStateRequestSchema: name 1..80 required; key optional
+    // /^[a-z0-9-]+$/ <=60; color #rrggbb nullable; sort_order 0..=9999;
+    // is_resolved bool.
+    let Some(name) = body.get("name").and_then(|v| v.as_str()) else {
+        return crate::conversation_ops::zod_422("name", "Required");
+    };
+    if name.is_empty() {
+        return crate::conversation_ops::zod_422(
+            "name",
+            "String must contain at least 1 character(s)",
+        );
+    }
+    if name.len() > 80 {
+        return crate::conversation_ops::zod_422(
+            "name",
+            "String must contain at most 80 character(s)",
+        );
+    }
+    let key = body.get("key").and_then(|v| v.as_str());
+    if let Some(k) = key {
+        if k.is_empty()
+            || k.len() > 60
+            || !k
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return crate::conversation_ops::zod_422(
+                "key",
+                "key must be lowercase letters, digits and dashes",
+            );
+        }
+    }
+    let color = match body.get("color") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(serde_json::Value::String(c)) => {
+            let ok =
+                c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|h| h.is_ascii_hexdigit());
+            if !ok {
+                return crate::conversation_ops::zod_422("color", "color must be a #rrggbb hex");
+            }
+            Some(c.as_str())
+        }
+        Some(_) => {
+            return crate::conversation_ops::zod_422(
+                "color",
+                "Expected string, received non-string",
+            )
+        }
+    };
+    let sort_order = match body.get("sort_order") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(n) if (0..=9999).contains(&n) => Some(n),
+            Some(_) => {
+                return crate::conversation_ops::zod_422(
+                    "sort_order",
+                    "Number must be greater than or equal to 0",
+                )
+            }
+            None => {
+                return crate::conversation_ops::zod_422(
+                    "sort_order",
+                    "Expected number, received non-number",
+                )
+            }
+        },
+    };
+    let is_resolved = body.get("is_resolved").and_then(|v| v.as_bool());
+    let conn = state.conn_lock();
+    match crate::ticket_states::create_state(&conn, name, key, color, sort_order, is_resolved) {
+        Ok(st) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "message": format!("State '{}' created.", st.name),
+                "state": st,
+            })),
+        )
+            .into_response(),
+        Err(msg) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "message": msg })),
+        )
+            .into_response(),
+    }
+}
+
+/// PATCH /api/ticket-states/:id — update a state definition.
+pub async fn update_ticket_state(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(id) = id.parse::<i64>() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "message": "State not found." })),
+        )
+            .into_response();
+    };
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
+        if name.is_empty() {
+            return crate::conversation_ops::zod_422(
+                "name",
+                "String must contain at least 1 character(s)",
+            );
+        }
+        if name.len() > 80 {
+            return crate::conversation_ops::zod_422(
+                "name",
+                "String must contain at most 80 character(s)",
+            );
+        }
+    }
+    if let Some(color) = body.get("color").and_then(|v| v.as_str()) {
+        let ok = color.len() == 7
+            && color.starts_with('#')
+            && color[1..].chars().all(|h| h.is_ascii_hexdigit());
+        if !ok {
+            return crate::conversation_ops::zod_422("color", "color must be a #rrggbb hex");
+        }
+    }
+    let conn = state.conn_lock();
+    match crate::ticket_states::update_state(&conn, id, &body) {
+        Ok(Some(st)) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "message": "State updated.", "state": st })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "message": "State not found." })),
+        )
+            .into_response(),
+        Err(msg) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "message": msg })),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/ticket-states/:id — delete a custom state.
+pub async fn delete_ticket_state(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(id) = id.parse::<i64>() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "ok": false, "message": "State not found." })),
+        )
+            .into_response();
+    };
+    let conn = state.conn_lock();
+    let (ok, message) = crate::ticket_states::delete_state(&conn, id);
+    let code = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    (code, Json(json!({ "ok": ok, "message": message }))).into_response()
 }
 
 /// GET /api/mailboxes — list all mailboxes (reference data for the UI).

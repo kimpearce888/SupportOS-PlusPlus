@@ -308,7 +308,13 @@ impl HttpServer {
             )
             .route(
                 "/api/ticket-states",
-                get(routes::conversations::list_ticket_states),
+                get(routes::conversations::list_ticket_states)
+                    .post(routes::conversations::create_ticket_state),
+            )
+            .route(
+                "/api/ticket-states/:id",
+                axum::routing::patch(routes::conversations::update_ticket_state)
+                    .delete(routes::conversations::delete_ticket_state),
             )
             // Reference data endpoints — used by the React/Leptos UI to
             // populate dropdowns, typeahead, etc. Mirrors the reference's

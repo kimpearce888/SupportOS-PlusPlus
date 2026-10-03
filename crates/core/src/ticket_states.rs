@@ -481,3 +481,387 @@ mod tests {
         apply_m004(&conn).unwrap();
     }
 }
+
+// ===========================================================================
+// Ticket state definitions (reference 011_activity_engine.ts:55-95 +
+// ticketStateRepo.ts CRUD) — v1.7.0 custom workflow states.
+// ===========================================================================
+
+/// Apply the M032 batch: reference-shaped `ticket_states` definition table
+/// (the legacy port stored states as free text) + `state_transitions`
+/// (FK-based) + the 6 built-in states.
+pub fn apply_m032(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ticket_states (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            key         TEXT UNIQUE NOT NULL,
+            name        TEXT NOT NULL,
+            color       TEXT,
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            is_resolved INTEGER NOT NULL DEFAULT 0,
+            built_in    INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT OR IGNORE INTO ticket_states (key, name, color, sort_order, is_resolved, built_in) VALUES
+            ('new', 'New', '#3b82f6', 10, 0, 1),
+            ('investigating', 'Investigating', '#f59e0b', 20, 0, 1),
+            ('waiting-customer', 'Waiting on Customer', '#8b5cf6', 30, 0, 1),
+            ('waiting-engineering', 'Waiting on Engineering', '#ef4444', 40, 0, 1),
+            ('ready-verify', 'Ready to Verify', '#06b6d4', 50, 0, 1),
+            ('resolved', 'Resolved', '#22c55e', 60, 1, 1);
+        CREATE TABLE IF NOT EXISTS state_transitions (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id  INTEGER NOT NULL,
+            previous_state_id INTEGER,
+            new_state_id     INTEGER,
+            actor_type       TEXT NOT NULL DEFAULT 'user',
+            actor_local_id   INTEGER,
+            reason           TEXT,
+            occurred_at      TEXT NOT NULL,
+            source           TEXT NOT NULL DEFAULT 'local',
+            created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_state_transitions_conv
+            ON state_transitions(conversation_id, occurred_at);",
+    )?;
+    // conversations.supportos_state_id (reference 011 addColumn).
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(conversations)")
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .map(|rows| rows.filter_map(|x| x.ok()).collect())
+                .ok()
+        })
+        .unwrap_or_default();
+    if !cols.iter().any(|c| c == "supportos_state_id") {
+        let _ = conn.execute(
+            "ALTER TABLE conversations ADD COLUMN supportos_state_id INTEGER",
+            [],
+        );
+    }
+    let _ = conn.execute("UPDATE app_state SET schema_version = 32 WHERE id = 1", []);
+    Ok(())
+}
+
+/// A ticket-state definition row (reference TicketStateDef).
+#[derive(Debug, Clone, Serialize)]
+pub struct TicketStateDef {
+    pub id: i64,
+    pub key: String,
+    pub name: String,
+    pub color: Option<String>,
+    pub sort_order: i64,
+    pub is_resolved: i64,
+    pub built_in: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn row_to_def(r: &rusqlite::Row<'_>) -> rusqlite::Result<TicketStateDef> {
+    Ok(TicketStateDef {
+        id: r.get(0)?,
+        key: r.get(1)?,
+        name: r.get(2)?,
+        color: r.get(3)?,
+        sort_order: r.get(4)?,
+        is_resolved: r.get(5)?,
+        built_in: r.get(6)?,
+        created_at: r.get(7)?,
+        updated_at: r.get(8)?,
+    })
+}
+
+const STATE_COLS: &str =
+    "id, key, name, color, sort_order, is_resolved, built_in, created_at, updated_at";
+
+/// `listStates()` — ordered by sort_order then name.
+pub fn list_states(conn: &Connection) -> Vec<TicketStateDef> {
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT {STATE_COLS} FROM ticket_states ORDER BY sort_order, name"
+    )) else {
+        return Vec::new();
+    };
+    stmt.query_map([], row_to_def)
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+fn get_state(conn: &Connection, id: i64) -> Option<TicketStateDef> {
+    conn.query_row(
+        &format!("SELECT {STATE_COLS} FROM ticket_states WHERE id = ?1"),
+        [id],
+        row_to_def,
+    )
+    .ok()
+}
+
+fn get_state_by_key(conn: &Connection, key: &str) -> Option<TicketStateDef> {
+    conn.query_row(
+        &format!("SELECT {STATE_COLS} FROM ticket_states WHERE key = ?1"),
+        [key],
+        row_to_def,
+    )
+    .ok()
+}
+
+fn slugify_key(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let mut out = String::new();
+    let mut dash = false;
+    for c in lower.chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            out.push(c);
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// `createState` — key defaults to the slugified name; duplicate keys are
+/// rejected with the reference's exact message.
+pub fn create_state(
+    conn: &Connection,
+    name: &str,
+    key: Option<&str>,
+    color: Option<&str>,
+    sort_order: Option<i64>,
+    is_resolved: Option<bool>,
+) -> std::result::Result<TicketStateDef, String> {
+    let key = key.map(String::from).unwrap_or_else(|| slugify_key(name));
+    let key = if key.is_empty() {
+        format!("state-{}", chrono::Utc::now().timestamp_millis())
+    } else {
+        key
+    };
+    if get_state_by_key(conn, &key).is_some() {
+        return Err(format!("A state with key '{key}' already exists."));
+    }
+    conn.execute(
+        "INSERT INTO ticket_states (key, name, color, sort_order, is_resolved)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![
+            key,
+            name,
+            color,
+            sort_order.unwrap_or(500),
+            i64::from(is_resolved.unwrap_or(false))
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    get_state(conn, conn.last_insert_rowid()).ok_or_else(|| "insert failed".into())
+}
+
+/// `updateState` — built-in states keep their resolved semantics.
+pub fn update_state(
+    conn: &Connection,
+    id: i64,
+    patch: &serde_json::Value,
+) -> std::result::Result<Option<TicketStateDef>, String> {
+    let Some(state) = get_state(conn, id) else {
+        return Ok(None);
+    };
+    if state.built_in == 1 {
+        if let Some(want) = patch.get("is_resolved").and_then(|v| v.as_bool()) {
+            if want != (state.is_resolved == 1) {
+                return Err("The resolved semantics of built-in states cannot be changed.".into());
+            }
+        }
+    }
+    let name = patch
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or(state.name);
+    let color = match patch.get("color") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        _ => state.color,
+    };
+    let sort_order = patch
+        .get("sort_order")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(state.sort_order);
+    let is_resolved = match patch.get("is_resolved").and_then(|v| v.as_bool()) {
+        Some(b) => i64::from(b),
+        None => state.is_resolved,
+    };
+    conn.execute(
+        "UPDATE ticket_states SET name = ?1, color = ?2, sort_order = ?3,
+             is_resolved = ?4, updated_at = datetime('now') WHERE id = ?5",
+        rusqlite::params![name, color, sort_order, is_resolved, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(get_state(conn, id))
+}
+
+/// `deleteState` — built-ins protected; in-use conversations reset to NULL.
+pub fn delete_state(conn: &Connection, id: i64) -> (bool, String) {
+    let Some(state) = get_state(conn, id) else {
+        return (false, "State not found.".into());
+    };
+    if state.built_in == 1 {
+        return (
+            false,
+            format!(
+                "Built-in state '{}' cannot be deleted (it is part of the default workflow).",
+                state.name
+            ),
+        );
+    }
+    let in_use: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE supportos_state_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let _ = conn.execute(
+        "UPDATE conversations SET supportos_state_id = NULL WHERE supportos_state_id = ?1",
+        [id],
+    );
+    let _ = conn.execute(
+        "UPDATE state_transitions SET previous_state_id = NULL WHERE previous_state_id = ?1",
+        [id],
+    );
+    let _ = conn.execute(
+        "DELETE FROM state_transitions WHERE new_state_id = ?1",
+        [id],
+    );
+    let _ = conn.execute("DELETE FROM ticket_states WHERE id = ?1", [id]);
+    if in_use > 0 {
+        (
+            true,
+            format!("State deleted; {in_use} conversation(s) reset to no state."),
+        )
+    } else {
+        (true, "State deleted.".into())
+    }
+}
+
+/// Parse either `YYYY-MM-DD HH:MM:SS` (SQLite datetime) or RFC3339.
+fn parse_ts(raw: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt);
+    }
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|naive| naive.and_utc().fixed_offset())
+}
+
+/// `stateBottlenecks()` — avg/max minutes spent per state from the
+/// FK-based transition log (reference computeBottlenecks).
+pub fn state_bottlenecks(conn: &Connection) -> Vec<serde_json::Value> {
+    // (conversation, state, occurred_at, span_end) spans.
+    let spans: Vec<(i64, i64, String, Option<String>)> = conn
+        .prepare(
+            "SELECT t.conversation_id, t.new_state_id, t.occurred_at,
+                    CASE
+                      WHEN EXISTS (SELECT 1 FROM state_transitions t2
+                                    WHERE t2.conversation_id = t.conversation_id
+                                      AND (t2.occurred_at > t.occurred_at
+                                           OR (t2.occurred_at = t.occurred_at AND t2.id > t.id)))
+                        THEN (SELECT MIN(t2.occurred_at) FROM state_transitions t2
+                               WHERE t2.conversation_id = t.conversation_id
+                                 AND (t2.occurred_at > t.occurred_at
+                                      OR (t2.occurred_at = t.occurred_at AND t2.id > t.id)))
+                      WHEN (SELECT supportos_state_id FROM conversations WHERE id = t.conversation_id) = t.new_state_id
+                        THEN 'now'
+                      ELSE NULL
+                    END AS span_end
+               FROM state_transitions t
+              ORDER BY t.conversation_id, t.occurred_at, t.id",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map(|rows| rows.filter_map(|x| x.ok()).collect())
+            .ok()
+        })
+        .unwrap_or_default();
+    let mut by_state: std::collections::HashMap<i64, Vec<f64>> = std::collections::HashMap::new();
+    let mut convs: std::collections::HashMap<i64, std::collections::HashSet<i64>> =
+        std::collections::HashMap::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    for (conv, state, started, span_end) in spans {
+        let Some(end) = span_end else { continue };
+        let end = if end == "now" { now.clone() } else { end };
+        let (Some(s), Some(e)) = (parse_ts(&started), parse_ts(&end)) else {
+            continue;
+        };
+        let mins = (e - s).num_milliseconds() as f64 / 60_000.0;
+        if !mins.is_finite() || mins < 0.0 {
+            continue;
+        }
+        by_state.entry(state).or_default().push(mins);
+        convs.entry(state).or_default().insert(conv);
+    }
+    // Reference: Math.round avg/max (integers), null when empty, sort by
+    // avg_minutes DESC.
+    let mut out: Vec<serde_json::Value> = by_state
+        .into_iter()
+        .map(|(state_id, minutes)| {
+            let name: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM ticket_states WHERE id = ?1",
+                    [state_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            let name = name.unwrap_or_else(|| format!("#{state_id}"));
+            let conversations = convs.get(&state_id).map_or(0, |s| s.len());
+            let avg = if minutes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(minutes.iter().sum::<f64>().round() as i64)
+            };
+            let max = if minutes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(minutes.iter().cloned().fold(f64::MIN, f64::max).round() as i64)
+            };
+            serde_json::json!({
+                "state_id": state_id,
+                "state_name": name,
+                "conversations": conversations,
+                "avg_minutes": avg,
+                "max_minutes": max,
+            })
+        })
+        .collect();
+    out.sort_by_key(|v| {
+        let avg = v["avg_minutes"].as_f64();
+        std::cmp::Reverse(OrderedF64(avg.unwrap_or(0.0)))
+    });
+    out
+}
+
+/// Ordering helper for the DESC sort above.
+struct OrderedF64(f64);
+impl PartialEq for OrderedF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for OrderedF64 {}
+impl PartialOrd for OrderedF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
