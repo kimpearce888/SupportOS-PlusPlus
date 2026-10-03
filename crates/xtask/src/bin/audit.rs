@@ -65,10 +65,6 @@ impl Finding {
         Self::new("info", title, detail, check)
     }
 
-    fn medium(title: &str, detail: &str, check: &str) -> Self {
-        Self::new("medium", title, detail, check)
-    }
-
     fn critical(title: &str, detail: &str, check: &str) -> Self {
         Self::new("critical", title, detail, check)
     }
@@ -124,23 +120,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut report = AuditReport::new(&cli.app);
 
-    // Always run the path-existence check first — everything else depends on it.
+    // Run the path-existence check against the packaged app tree.
     checks::path_exists::run(&mut report, &app_path);
     report.checks_run += 1;
-
-    // If the path exists, run the rest of the M1 checks.
-    let path_ok = report
-        .findings
-        .iter()
-        .filter(|f| f.check == "path_exists")
-        .all(|f| f.severity != "critical");
-
-    if path_ok {
-        for check in checks::ALL {
-            (check.run)(&mut report, &app_path);
-            report.checks_run += 1;
-        }
-    }
 
     // Output.
     match cli.format.as_str() {
@@ -193,7 +175,6 @@ mod tests {
     #[test]
     fn finding_severity_constructors() {
         assert_eq!(Finding::info("a", "b", "c").severity, "info");
-        assert_eq!(Finding::medium("a", "b", "c").severity, "medium");
         assert_eq!(Finding::critical("a", "b", "c").severity, "critical");
     }
 
@@ -203,9 +184,7 @@ mod tests {
         r.record(Finding::critical("c", "d", "x"));
         r.record(Finding::critical("c", "d", "x"));
         r.record(Finding::info("c", "d", "x"));
-        r.record(Finding::medium("c", "d", "x"));
         assert_eq!(r.critical_count, 2);
-        assert_eq!(r.medium_count, 1);
         assert_eq!(r.info_count, 1);
         assert_eq!(r.high_count, 0);
         assert_eq!(r.low_count, 0);

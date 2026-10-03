@@ -30,8 +30,8 @@ pub fn run(report: &mut AuditReport, app_path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::AuditReport;
     use super::*;
+    use crate::AuditReport;
 
     #[test]
     fn records_info_when_path_exists() {
