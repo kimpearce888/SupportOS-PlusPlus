@@ -790,6 +790,55 @@ impl HttpServer {
                 "/api/outreach/campaigns/:id",
                 get(routes::outreach::get_campaign),
             )
+            // Campaign lifecycle (reference outreach.ts:289-375)
+            .route(
+                "/api/outreach/campaigns/:id/validate",
+                get(routes::outreach::campaign_validate_route),
+            )
+            .route("/api/outreach/render", post(routes::outreach::render_route))
+            .route(
+                "/api/outreach/campaigns/:id/preview",
+                post(routes::outreach::campaign_preview_route),
+            )
+            .route(
+                "/api/outreach/campaigns/:id/queue",
+                post(routes::outreach::campaign_queue_route),
+            )
+            .route(
+                "/api/outreach/campaigns/:id/pause",
+                post(routes::outreach::campaign_pause_route),
+            )
+            .route(
+                "/api/outreach/campaigns/:id/resume",
+                post(routes::outreach::campaign_resume_route),
+            )
+            .route(
+                "/api/outreach/campaigns/:id/cancel",
+                post(routes::outreach::campaign_cancel_route),
+            )
+            .route(
+                "/api/outreach/campaigns/:id/retry",
+                post(routes::outreach::campaign_retry_route),
+            )
+            .route(
+                "/api/outreach/campaigns/:id/reconcile",
+                post(routes::outreach::campaign_reconcile_route),
+            )
+            .route(
+                "/api/outreach/campaigns/:id/report",
+                get(routes::outreach::campaign_report_route),
+            )
+            .route(
+                "/api/outreach/campaigns/:id",
+                axum::routing::delete(routes::outreach::campaign_delete_route),
+            )
+            // Do-Not-Contact (reference outreach.ts:377-405)
+            .route("/api/outreach/dnc", get(routes::outreach::list_dnc_route))
+            .route("/api/outreach/dnc", post(routes::outreach::add_dnc_route))
+            .route(
+                "/api/outreach/dnc/:customerLocalId",
+                axum::routing::delete(routes::outreach::remove_dnc_route),
+            )
             // Custom Objects
             .route(
                 "/api/custom-objects/types",

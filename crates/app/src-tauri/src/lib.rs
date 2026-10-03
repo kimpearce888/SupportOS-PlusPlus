@@ -281,6 +281,7 @@ fn open_db_with_all_migrations(
     spp_core::data_tools::apply_m026_to_m027(&conn)?;
     spp_core::inbox::apply_m028(&conn)?;
     spp_core::conversation_ops::apply_m030(&conn)?;
+    spp_core::outreach::apply_m031(&conn)?;
 
     tracing::info!("All migrations M001–M028 applied successfully");
     Ok(conn)
