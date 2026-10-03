@@ -7,7 +7,7 @@
 //!   - `test`       Run all unit + integration tests across the workspace
 //!   - `lint`       rustfmt --check + clippy -D warnings
 //!   - `package`    Build installers for the host OS (tauri build)
-//!   - `discover`   (M1-T01) Rebuild docs/original-notes/* + PARITY-MATRIX.md from a local reference checkout
+//!   - `discover`   (M1-T01) Rebuild the reference inventory JSON from a local reference checkout
 //!   - `audit`      (M1-T14) Run the black-box audit binary against a packaged app
 
 use std::process::Command;
@@ -44,7 +44,8 @@ enum Cmd {
         #[arg(long)]
         reference: String,
         /// Optional output path for the JSON inventory.
-        /// Defaults to docs/original-notes/inventory.json under the workspace root.
+        /// Defaults to target/discovery/inventory.json under the workspace root
+        /// (generated build artifact; not committed to the source tree).
         #[arg(long)]
         out: Option<String>,
     },
@@ -178,8 +179,8 @@ fn run_discover(reference: &str, out: Option<&str>) -> anyhow::Result<()> {
     let out_path = match out {
         Some(p) => std::path::PathBuf::from(p),
         None => workspace_root()
-            .join("docs")
-            .join("original-notes")
+            .join("target")
+            .join("discovery")
             .join("inventory.json"),
     };
 

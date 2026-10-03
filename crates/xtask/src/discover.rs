@@ -1,8 +1,8 @@
 //! `discover` — scans a local checkout of the reference repo and emits inventories.
 //!
-//! Implements spec amendment A7: extract API routes, tables, migrations, settings keys,
+//! Extracts API routes, tables, migrations, settings keys,
 //! env vars, closed vocabularies, UI pages, and scripts. Writes a machine-readable
-//! `docs/original-notes/inventory.json` and prints a human-readable summary to stdout.
+//! `target/discovery/inventory.json` and prints a human-readable summary to stdout.
 //!
 //! Cross-checks the 8 canonical counts against the spec values; exits non-zero on mismatch
 //! so CI catches reference drift.
@@ -601,7 +601,7 @@ pub fn print_summary(inv: &Inventory) {
     let all_match = inv.canonical_counts.iter().all(|c| c.matches);
     if all_match {
         println!(
-            "All canonical counts match the spec. Inventory written to docs/original-notes/inventory.json"
+            "All canonical counts match the spec. Inventory written to target/discovery/inventory.json"
         );
     } else {
         let mismatches: Vec<_> = inv.canonical_counts.iter().filter(|c| !c.matches).collect();

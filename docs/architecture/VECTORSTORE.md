@@ -82,7 +82,7 @@ a REST client). Key types the adapter will use:
 
 ## Capability matrix (per spec A4: "spec sections 16 to 37")
 
-> Spec sections 16-37 are not present in the condensed `MASTER-SPEC.md`.
+> The original spec's section list (16-37) was removed with `docs/MASTER-SPEC.md` in the Linux-only cleanup; capability requirements now live in `PARITY.md`.
 > The capability list comes from A4's enumeration: "dense/sparse/named
 > vectors, payload filters and indexes, exact search, snapshots and restore,
 > WAL, count/scroll/facet."

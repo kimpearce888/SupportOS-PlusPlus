@@ -51,8 +51,8 @@
 - Date: Session 1
 - Status: ADOPTED
 - Context: Spec bans Node/Python; needs a dev/test/lint/package entry point.
-- Decision: A single `cargo xtask` binary with subcommands: `dev`, `test`, `lint`, `package`, `discover`, `audit`. No `npm` scripts, no shell-script glue beyond `bootstrap.sh` / `bootstrap.ps1` (which only install prerequisites and then call `cargo xtask`).
-- Why: trivially satisfies "no Node" rule; one language; reproducible on all OSes; integrates with CI without extra dependencies.
+- Decision: A single `cargo xtask` binary with subcommands: `dev`, `test`, `lint`, `package`, `discover`, `audit`. No `npm` scripts, no shell-script glue beyond `bootstrap.sh` (Linux-only; installs prerequisites and then calls `cargo xtask`).
+- Why: trivially satisfies "no Node" rule; one language; reproducible; integrates with CI without extra dependencies.
 
 ## D-006 — `com.supportos.plusplus` bundle identifier
 
@@ -96,25 +96,25 @@
 
 ## D-011 — Installer naming fallback rule
 
-- Date: Session 1
-- Status: PROPOSED (confirmed when M1-T10 runs)
-- Context: A0 last paragraph.
-- Decision: Try `SupportOS++` as the product name in every installer format (MSI, NSIS, DMG, DEB, RPM, AppImage). For any format that rejects `+` in the product name (likely DEB/RPM package names — Debian policy restricts package names to `[a-z0-9+.-]` but `+` is unusual), fall back to ASCII `supportos-plusplus` for that format's **file name** only. The in-app product name stays `SupportOS++`. Every fallback is recorded here in M1-T10.
-- Why: satisfies A0 letter and intent; keeps the user-facing name consistent everywhere it can be.
+- Date: Session 1; updated for the Linux-only scope (DEV-006)
+- Status: ADOPTED
+- Context: original spec A0 naming rule, narrowed to the supported formats.
+- Decision: Use `SupportOS++` as the product name in the supported installer formats (DEB, AppImage). If a format rejects `+` in the file name, fall back to ASCII `supportos-plusplus` for that format's **file name** only. The in-app product name stays `SupportOS++`. Every fallback is recorded here. Unsupported formats (MSI, NSIS, DMG, RPM) are out of scope entirely — see DEV-006.
+- Why: satisfies the naming intent; keeps the user-facing name consistent everywhere it can be.
 
 ## D-012 — CI uses native GitHub Actions runners, not containers
 
-- Date: Session 1
+- Date: Session 1; updated for the Linux-only scope (DEV-006)
 - Status: ADOPTED
-- Context: A5.
-- Decision: Three CI jobs — `windows-latest`, `macos-latest`, `ubuntu-22.04` (and `ubuntu-24.04` for the Linux matrix per INSTALL AND PACKAGING). Each job runs the same matrix: `rustfmt --check`, `clippy -D warnings`, `cargo test`, `cargo build --release`, `trunk build` (WASM), and a headless demo-mode boot smoke test.
-- Why: matches A5 ("fresh CI runners"); avoids cross-compilation complexity for the WASM target.
+- Context: original A5 required fresh CI runners; the runner set was later narrowed to Linux-only.
+- Decision: Linux-only CI jobs on `ubuntu-22.04` + `ubuntu-24.04`. Each job runs: `rustfmt --check`, `verify-config`, `clippy -D warnings`, `cargo test`, `trunk build` (WASM), the Tauri Linux build with a bundle-format assertion, `cargo audit`, tauri-driver E2E, and DEB smoke-install/uninstall. No Windows or macOS runners exist (DEV-006).
+- Why: matches the fresh-runner requirement within the supported platform; avoids cross-compilation complexity for the WASM target.
 
 ## D-013 — Compare timestamps via `julianday()`, never lexically (KNOWN PITFALLS enforcement)
 
 - Date: Session 2
 - Status: ADOPTED
-- Context: KNOWN PITFALLS in `docs/MASTER-SPEC.md` explicitly forbids comparing ISO-8601 timestamps against SQLite `datetime('now')` strings lexically. The session-1 jobs crate had a real flaky-test failure (~1 in 5 runs) caused by exactly this: SQLite's `strftime('%fZ','now')` produces 3 fractional digits while chrono's `%f` produces 9, so `"…123Z"` was lexically greater than `"…123456789Z"` and the `available_at <= ?` predicate silently failed.
+- Context: The original project spec's KNOWN PITFALLS section (removed with `docs/MASTER-SPEC.md` in the Linux-only cleanup; the rule stands on its own) explicitly forbids comparing ISO-8601 timestamps against SQLite `datetime('now')` strings lexically. The session-1 jobs crate had a real flaky-test failure (~1 in 5 runs) caused by exactly this: SQLite's `strftime('%fZ','now')` produces 3 fractional digits while chrono's `%f` produces 9, so `"…123Z"` was lexically greater than `"…123456789Z"` and the `available_at <= ?` predicate silently failed.
 - Decision: every SQL predicate that compares two ISO-8601 timestamps in the SupportOS++ codebase MUST use `julianday(col) <= julianday('now')` (or `unixepoch()`), never a direct string comparison. Writes still store ISO-8601 strings (SQLite-friendly, debuggable), but reads compare via the numeric conversion. Documented in `crates/core/src/jobs.rs::claim_next` with the warning inline.
 - Why: removes the format-mismatch class of bugs entirely; aligns with spec mandate.
 - Verification: `cargo test -p supportos-plusplus-core --lib` ran 10× consecutively in session 2; all 10 green. Before the fix, ~1 in 5 runs failed.
@@ -123,12 +123,12 @@
 
 - Date: Session 2
 - Status: ADOPTED
-- Context: A7 requires the discovery xtask to extract inventories and keep `docs/PARITY-MATRIX.md` reproducible.
+- Context: The discovery xtask extracts inventories so reference drift is machine-detectable; PARITY.md is the canonical audit record.
 - Decision: `cargo xtask discover --reference <path>` produces three outputs:
-  1. `docs/original-notes/inventory.json` — the full inventory (surfaces, canonical counts, vocabulary values).
+  1. `target/discovery/inventory.json` — the full inventory (surfaces, canonical counts, vocabulary values). Generated build artifact; not committed to the source tree.
   2. A human-readable summary printed to stdout (the canonical-count cross-check table).
   3. An exit code that is non-zero if any of the 10 canonical counts differs from the spec, so CI catches reference drift.
-- Why: makes reference drift detectable in CI without requiring a human to read the matrix; the JSON is the audit trail.
+- Why: makes reference drift detectable in CI without requiring a human to read a matrix; the JSON is the audit trail. Output moved out of `docs/` in the repository-cleanliness pass (generated artifacts do not belong in the source tree).
 - AC for M1-T01 (per `TASKS.md`): "output diffs to zero against session-1 manual pass" — verified: 10/10 canonical counts match the session-1 manual pass and the spec.
 
 ## D-015 — Migrations live as a single `&[Migration]` const array
@@ -175,7 +175,7 @@
 
 - Date: Session 4
 - Status: ADOPTED
-- Context: KNOWN PITFALLS in `docs/MASTER-SPEC.md` mandates "every view has loading, empty, and error states". The previous dashboard view had none.
+- Context: The parity audit requires every view to have loading, empty, and error states (reference behavior — the original spec's KNOWN PITFALLS section carried the same rule). The previous dashboard view had none.
 - Decision: A single `ViewState` enum with four variants — `Loading`, `Empty { message }`, `Error { message, retry }`, `Loaded` — makes wrong states impossible by construction (an error with no message is unrepresentable). The `<StateView state=... children=...>` component renders the right placeholder for the current state. A `<Button>` with Primary/Ghost styles completes the common-component set.
 - Why: one source of truth for the three states; type system enforces the spec rule; every future view inherits the pattern for free.
 - Verification: 5 unit tests for `ViewState` constructors + clone + debug-repr + retry-callback execution.

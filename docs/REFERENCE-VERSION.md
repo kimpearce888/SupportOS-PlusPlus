@@ -30,8 +30,8 @@ Compare against the SHA above. If it differs:
 
 1. Fetch the new HEAD into a local checkout of the reference (NEVER inside this repo).
 2. Run `cargo xtask discover --reference <path>` (when implemented) to rebuild the inventories.
-3. Diff the new inventories against `docs/original-notes/*.md` and `docs/PARITY-MATRIX.md`.
-4. List every new or changed capability under "Reference delta since last session" at the top of `docs/PARITY-MATRIX.md`, then continue milestone work.
+3. Re-run `cargo xtask discover --reference <path>` and diff `target/discovery/inventory.json` against the recorded counts.
+4. List every new or changed capability under "Reference delta since last session" at the top of `PARITY.md` (root, canonical), then continue parity work.
 
 ## Reference repo at a glance (snapshot of structure on this HEAD)
 

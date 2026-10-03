@@ -1,31 +1,18 @@
 //! Headless demo-mode boot smoke test (M1-T09).
 //!
-//! Per spec A5: "Use fresh CI runners for install-launch-smoke tests on
-//! supported desktop platforms (Linux), plus automated UI end-to-end tests
-//! platform tooling supports them (verify what Tauri supports per OS; do not
-//! assume). All test code in Rust."
-//!
-//! And per the TESTING section: "CI on all three OSes: fmt, clippy with
-//! warnings denied, tests, WASM build, Tauri build, headless demo-mode boot."
-//!
-//! This test boots the SupportOS++ foundation (logging + config + DB with
-//! migrations + loopback listener + catalog) in demo mode against a throwaway
-//! DB, then verifies the boot-critical invariants hold. It does NOT launch a
-//! Tauri window (that needs a display server not available on CI); the actual
-//! GUI launch is verified separately by `cargo xtask package` + the manual
+//! Boots the SupportOS++ foundation (logging + config + DB with migrations +
+//! loopback listener + catalog) in demo mode against a throwaway DB, then
+//! verifies the boot-critical invariants hold. It does NOT launch a Tauri
+//! window (that needs a display server not available on CI); the actual GUI
+//! launch is verified separately by `cargo xtask package` + the manual
 //! verification checklist in `docs/MANUAL-VERIFICATION.md`.
 
 // The core crate's [lib] name is "spp_core" (see crates/core/Cargo.toml),
 // which is the extern crate name. Rust 2021 makes `extern crate` implicit,
 // so no `use` statement is needed — `spp_core::...` just works.
 //
-// NOTE: On macOS, the `tauri::generate_context!()` macro in the lib crate's
-// `run()` function expands to `embed_info_plist_bytes` which causes a
-// duplicate symbol linker error when the integration test links the lib.
-// This is a known Tauri 2 issue. The tests are skipped on macOS; the
-// headless boot is verified on the Linux CI matrix.
+// Port is Linux-only (DEV-006): headless boot smoke runs on the Linux CI matrix.
 #![cfg(target_os = "linux")]
-// Port is Linux-only (DEV-006): headless boot smoke runs on Linux.
 
 /// Boot the foundation in demo mode against a throwaway DB and verify the
 /// boot-critical invariants. This is the "headless demo-mode boot" the spec

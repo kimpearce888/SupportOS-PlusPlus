@@ -1,8 +1,12 @@
 # DEVIATIONS.md — SupportOS++
 
-> Every deviation from the spec or reference goes here with reason and impact.
+> Every deviation from the reference goes here with reason and impact.
 > Status stays **pending owner approval** until the owner approves it.
 > Never approve your own deviations. Never silently narrow scope.
+> Canonical parity status lives in **PARITY.md** — this file records approved
+> or pending *scope* deviations only, not per-feature parity gaps.
+> IDs are stable forever; resolved/moot entries stay as tombstones so
+> historical references (code comments, architecture docs) keep resolving.
 
 ## Format
 
@@ -10,55 +14,56 @@ Each entry:
 - **ID**: `DEV-###`
 - **Date**: when discovered
 - **Where**: file / module / capability
-- **Spec says**: quote or paraphrase
 - **Reference does**: what the reference repo's code does
 - **Deviation**: what SupportOS++ does differently
 - **Reason**: why
 - **Impact**: user-visible / technical
-- **Status**: `pending owner approval` | `approved (date)` | `rejected (date)`
+- **Status**: `pending owner approval` | `approved (date)` | `rejected (date)` | `removed (…)`
 
 ---
 
-## DEV-001 — none yet
+## DEV-002 — Qdrant Edge adapter: default-off, pending owner enable decision
 
-(No deviations in sessions 1–11. The SupportOS++ skeleton matched the spec exactly.)
-
----
-
-## DEV-002 — Qdrant Edge adapter complete; default-off pending owner enable decision
-
-- **Date**: Session 37 (M12)
-- **Where**: `crates/core/src/vectorstore_qdrant.rs` (new, behind `qdrant` cargo feature)
-- **Spec says**: A4 — "Use the `qdrant-edge` Rust crate, embedded and in-process, behind the SupportOS++ VectorStore abstraction; only the adapter module may import it." A4 also requires "Verify every capability required by spec sections 16 to 37 exists in the pinned version (dense/sparse/named vectors, payload filters and indexes, exact search, snapshots and restore, WAL, count/scroll/facet)."
-- **Reference does**: the reference repo's spec assumed `qdrant-edge` exists and is feature-complete.
-- **Deviation**: None in adapter coverage — a 2026-10 audit re-verification found `search_sparse` (vectorstore_qdrant.rs:292), `snapshot` (:360) and `restore` (:406) ARE implemented; the earlier "dense-only" claim was stale. The remaining deviation is only that the feature is OFF by default.
+- **Date**: Session 37 (M12); re-verified Session B audit
+- **Where**: `crates/core/src/vectorstore_qdrant.rs` (behind `qdrant` cargo feature)
+- **Reference does**: the reference keeps Float32 embeddings in SQLite and treats
+  its Qdrant REST integration as an optional accelerator (fail-soft); semantic
+  search always works locally via a linear cosine scan over persisted vectors.
+- **Deviation**: the port embeds `qdrant-edge = "=0.8.0"` behind a cargo feature
+  that is OFF by default. A 2026-10 audit re-verification found `search_sparse`
+  (vectorstore_qdrant.rs:292), `snapshot` (:360) and `restore` (:406) ARE
+  implemented; the earlier "dense-only" claim was stale. The open deviation is
+  that the feature is off by default and the semantic-search fallback that the
+  reference provides (Float32-in-SQLite cosine scan) is not yet wired into the
+  port's production search path (tracked as PARITY.md F-017).
 - **Reason**:
-  1. The `qdrant-edge = "=0.8.0"` crate (published Aug 2026) is real but pulls in 123 direct + 453 transitive deps; building it adds ~5 minutes to CI and >2GB of disk usage. Default builds keep the feature OFF; a dedicated CI job (`smoke-install.yml → qdrant-build`) verifies the feature compiles.
-  2. The sparse-vector API in qdrant-edge requires named sparse vectors configured in `EdgeConfig` at collection-creation time; bridging our `SparseVector` type to qdrant-edge's named sparse vectors requires schema changes that are TODO.
-  3. The snapshot/restore API in qdrant-edge uses its own binary format, not the adapter-agnostic JSON `CollectionSnapshot` that the spec requires; bridging is TODO.
+  1. The `qdrant-edge = "=0.8.0"` crate pulls in 123 direct + 453 transitive
+     deps; building it adds ~5 minutes to CI and >2GB of disk usage. Default
+     builds keep the feature OFF; a dedicated CI job (`smoke-install.yml →
+     qdrant-build`) verifies the feature compiles.
+  2. The sparse-vector API in qdrant-edge requires named sparse vectors
+     configured in `EdgeConfig` at collection-creation time; bridging our
+     `SparseVector` type to qdrant-edge's named sparse vectors requires schema
+     changes that are TODO.
+  3. The snapshot/restore API in qdrant-edge uses its own binary format, not
+     the adapter-agnostic JSON `CollectionSnapshot`; bridging is TODO.
 - **Impact**:
-  - User-visible: hybrid search (dense + sparse) falls back to the `InMemoryVectorStore` (Fake adapter, spec A12) when the qdrant feature is off. Production deployments that need persistent vectors must build with `--features qdrant` AND accept that sparse search + snapshot/restore are not yet available.
-  - Technical: the InMemoryVectorStore passes the full contract test suite (`vectorstore_contract::run_contract_tests`); the QdrantEdgeVectorStore passes only the dense subset.
-- **Status**: resolved (adapter complete; default-off recorded as DEV-005)
+  - User-visible: semantic search is reported as unavailable in default builds
+    until F-017 lands the local cosine fallback (reference-equivalent
+    behavior); building with `--features qdrant` enables persistent vectors.
+  - Technical: the InMemoryVectorStore passes the full contract test suite
+    (`vectorstore_contract::run_contract_tests`) but is demo/test-only;
+    the QdrantEdgeVectorStore passes only the dense subset.
+- **Status**: pending owner approval
 
 ---
 
-## DEV-003 — (MOOT) macOS app-crate tests excluded
+## DEV-003 — REMOVED (was: macOS app-crate tests excluded)
 
-- **Date**: Session 35 (originally documented), Session 37 (M12 honest re-investigation)
-- **Where**: `.github/workflows/ci.yml` — `cargo test --workspace --all-targets --exclude supportos-plusplus-app` on macOS
-- **Spec says**: A11 — CI matrix green on all 3 OSes.
-- **Reference does**: n/a (the reference repo is the original TypeScript `supportos` app; it does not constrain Rust test strategy).
-- **Deviation**: The Tauri shell crate (`supportos-plusplus-app`) is excluded from `cargo test` on macOS only.
-- **Reason**:
-  1. The `tauri::generate_context!()` macro on macOS generates a `_EMBED_INFO_PLIST` symbol used by the macOS linker to embed the `Info.plist` into the binary.
-  2. The app crate's `Cargo.toml` declares `crate-type = ["staticlib", "cdylib", "rlib"]` (standard Tauri template for mobile compatibility). When `cargo test` builds the crate for testing, the symbol is generated once per crate-type, causing a "duplicate symbol `_EMBED_INFO_PLIST`" link error.
-  3. The duplicate-symbol link error is in the test-binary link step, NOT in the actual app build. The app build itself succeeds (verified by Nightly workflow on macOS).
-  4. **The smoke-install workflow (M12 PRIORITY 1) launches the actual built macOS DMG app and verifies the self-check runs** — this is more authoritative than unit tests of the Tauri shell crate would be.
-- **Impact**:
-  - User-visible: none — the macOS app launches correctly (verified by smoke-install).
-  - Technical: the 8 unit tests in `crates/app/src-tauri/src/lib.rs::tests` run on Linux + Windows but NOT on macOS. They verify: `ping_returns_pong`, `version_is_set`, `catalog_counts_match_spec`, `copilot_allowlist_has_22_tools`, `parity_gate_passes`, `first_run_state_reads_false_on_fresh_db`, `first_run_state_marks_done_on_write`, `open_db_with_all_migrations_applies_m003_through_m027`, `self_check_report_is_honest_on_fresh_db`.
-- **Status**: moot — macOS support removed entirely (DEV-006); the `not(target_os = "macos")` gates were deleted in the Linux-only cleanup.
+- **Status**: removed — macOS support was dropped entirely (DEV-006) and the
+  `not(target_os = "macos")` gates were deleted in the Linux-only cleanup.
+  The Tauri 2 macOS `generate_context!` duplicate-symbol link error this
+  entry documented no longer applies to any supported platform.
 
 ---
 
@@ -66,10 +71,9 @@ Each entry:
 
 - **Date**: Session 37 (M12), removed in session 38 per owner directive
 - **Where**: README.md, CI matrix
-- **Spec says**: A4 mentions Linux arm64 "(where feasible)"
 - **Reference does**: n/a
 - **Deviation**: Linux arm64 is NOT supported. The CI matrix is x86_64-only
-  for Linux (Ubuntu 22.04 + Fedora 39). Linux arm64 users must build from
+  for Linux (Ubuntu 22.04 + 24.04). Linux arm64 users must build from
   source. The README documents this.
 - **Reason**: The owner decided not to pursue arm64 CI runners. This is a
   permanent scope decision, not a blocker.
@@ -81,21 +85,13 @@ Each entry:
 
 ---
 
-## DEV-005 — Vector store in production builds is InMemoryVectorStore, not Qdrant Edge
+## DEV-005 — REMOVED (was: production vector store is InMemoryVectorStore)
 
-- **Date**: Session 37 (M12)
-- **Where**: `crates/app/src-tauri/src/lib.rs` (boot path)
-- **Spec says**: A4 — Qdrant Edge is the production vector store.
-- **Reference does**: n/a
-- **Deviation**: The Tauri shell does NOT instantiate a QdrantEdgeVectorStore at boot. The InMemoryVectorStore (Fake adapter, spec A12) is the only adapter wired in. The `self_check` IPC command reports this honestly: `qdrant_feature_enabled: false` (when feature is off) and `adapter: "in_memory"`.
-- **Reason**:
-  1. The QdrantEdgeVectorStore adapter (DEV-002) only implements the dense-vector subset; sparse/snapshot/restore return errors.
-  2. Wiring the adapter into the boot path requires choosing a persistence directory + lifecycle management; deferred until the adapter is feature-complete.
-  3. The startup self-check (M12-P2) now reports the actual adapter kind to the UI + logs, so users can see the truth.
-- **Impact**:
-  - User-visible: hybrid search + vector-backed features work in-memory only; vectors are NOT persisted across restarts in the default build.
-  - Technical: demo mode + tests pass; production deployments need `--features qdrant` + adapter completion (DEV-002).
-- **Status**: pending owner approval
+- **Status**: removed — the claim was stale. InMemoryVectorStore now appears
+  only in demo/test code; production builds wire no vector store at all by
+  default (the `qdrant` feature is off and the search routes report semantic
+  search unavailable). The remaining, accurate record of this situation is
+  DEV-002 (feature default-off) and PARITY.md F-017 (semantic fallback gap).
 
 ---
 
@@ -103,18 +99,16 @@ Each entry:
 
 - **Date**: Session 39 (owner directive)
 - **Where**: `.github/workflows/`, `tauri.conf.json`, `README.md`
-- **Spec says**: A4 — Tauri 2 desktop app for Win/macOS/Linux.
-- **Reference does**: n/a
+- **Reference does**: n/a (the reference ships its own multi-platform matrix;
+  the port's distribution scope is intentionally narrower)
 - **Deviation**: Windows and macOS are excluded from CI, smoke-install, and
-  nightly builds. Only Linux x86_64 is built and tested. The code remains
-  portable (no `#[cfg(target_os)]` gates on business logic); only the CI
-  matrix and installer targets are Linux-only.
-- **Reason**: Owner decision to focus on Linux for initial release.
-  Windows and macOS support can be re-enabled by re-adding the matrix
-  entries to the workflow files.
+  nightly builds. Only Linux x86_64 is built and tested. There are no
+  `#[cfg(target_os)]` gates on business logic and no Windows/macOS platform
+  code remains in the repository; packaging + smoke-testing are Linux-only.
+- **Reason**: Owner decision to focus on Linux for initial release
+  (Linux-only scope: `.deb` + `.AppImage` only).
 - **Impact**:
   - User-visible: No Windows .msi/.exe or macOS .dmg installers are
     produced. Windows/macOS users must build from source.
-  - Technical: The code compiles on all platforms (CI verified this
-    before the exclusion); only packaging + smoke-testing are Linux-only.
+  - Technical: only packaging + smoke-testing are Linux-only.
 - **Status**: approved (owner decision)

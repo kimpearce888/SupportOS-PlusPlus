@@ -10,7 +10,7 @@
 2. Install on a clean machine (no prior SupportOS++ install; fresh user profile).
 3. Walk the checklist below, top to bottom.
 4. For each row, write `✅ verified <date>` or `❌ failed <date>: <one-line symptom>` next to the row.
-5. When a row is verified, the matching capability row in `docs/PARITY-MATRIX.md` may be promoted to VERIFIED.
+5. When a row is verified, the matching F-ID in `PARITY.md` (root, canonical) may be promoted to VERIFIED.
 
 ## Pre-flight
 
@@ -108,4 +108,4 @@ After a run, append a section to this file:
 ...
 ```
 
-Promote corresponding rows in `docs/PARITY-MATRIX.md` to VERIFIED only when there is recorded evidence here.
+Promote corresponding F-IDs in `PARITY.md` to VERIFIED only when there is recorded evidence here.

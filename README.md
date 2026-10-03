@@ -51,7 +51,7 @@ The reference `supportos` is a TypeScript web app that depends on a cloud databa
 
 - **Stays local.** Your Help Scout data lives on your machine, not in a cloud database. Network traffic goes to Help Scout (for sync), your local AI provider (LM Studio, optional), and user-configured connectors — nothing else.
 - **Works offline.** No internet? The app still works. Sync pauses; everything else continues.
-- **Is auditable.** Every line is Rust. No `node_modules` black box. `cargo audit` checks for known vulnerabilities. The spec is committed verbatim in `docs/MASTER-SPEC.md`.
+- **Is auditable.** Every line is Rust. No `node_modules` black box. `cargo audit` checks for known vulnerabilities. The audit record is committed verbatim in `PARITY.md`.
 
 ## How it works (simple terms)
 

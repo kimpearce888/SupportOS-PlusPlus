@@ -28,9 +28,10 @@ Independent Rust/Tauri 2 desktop reimplementation of the existing `supportos` TS
 
 ## Precedence
 
-1. The AMENDMENTS in `docs/MASTER-SPEC.md` override the master spec where they conflict.
-2. The master spec overrides everything else in this prompt.
-3. Where the spec and the reference repo's actual code disagree on facts, the reference code wins; record in `docs/DEVIATIONS.md`.
+1. The actual reference repository (https://github.com/kimpearce888/supportos, HEAD recorded in `docs/REFERENCE-VERSION.md`) is the source of truth for behavior.
+2. `PARITY.md` (root) is the canonical audit record of reference-vs-port status.
+3. Where any documentation and the reference repo's actual code disagree on facts, the reference code wins; record in `docs/DEVIATIONS.md`.
+4. Scope deviations (Linux-only, arm64, vector-store default) are recorded in `docs/DEVIATIONS.md` with owner approval status.
 
 ## Non-negotiable rules
 
@@ -46,7 +47,7 @@ Independent Rust/Tauri 2 desktop reimplementation of the existing `supportos` TS
 1. Read this file, then `PROGRESS.md`, then `PARITY.md` (canonical audit record).
 2. If `PROGRESS.md` does not exist → session 1: state detection, discovery (A7/A8/A9), write matrix + notes, start Milestone 1. Otherwise RESUME: do not redo discovery, do not re-scaffold.
 3. Verify reality: `git status`, `git log --oneline -20`, run `cargo xtask test`. Commit or finish uncommitted work. If `PROGRESS.md` and git disagree, git wins.
-4. Read only the master-spec sections and original-notes relevant to the current milestone.
+4. Read `docs/DECISIONS.md`, `docs/DEVIATIONS.md`, and the PARITY.md sections relevant to the current work.
 5. Announce: `Resuming at <milestone>/<task>. Last commit: <hash>. Next: <task>.` Then continue.
 
 ## Build / test / lint commands
@@ -56,7 +57,7 @@ cargo xtask dev             # run the app in dev mode (Tauri + Leptos trunk)
 cargo xtask test             # run all unit + integration tests across the workspace
 cargo xtask lint             # rustfmt --check + clippy -D warnings
 cargo xtask package          # build installers for the host OS
-cargo xtask discover         # regenerate docs/original-notes/* from a local reference checkout
+cargo xtask discover         # regenerate target/discovery/inventory.json from a local reference checkout
 cargo xtask verify-config    # verify tauri.conf.json meets spec amendment A0 (no system deps needed)
 cargo xtask audit            # black-box audit binary (port of reference audit-phase1)
 ```
