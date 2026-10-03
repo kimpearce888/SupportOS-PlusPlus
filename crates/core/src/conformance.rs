@@ -128,6 +128,7 @@ pub fn verify_migration_idempotency(conn: &Connection) -> Result<()> {
     crate::customer_events::apply_m036(conn)?;
     crate::maintenance::apply_m037(conn)?;
     crate::connectors::apply_m038(conn)?;
+    crate::db_breadth::apply_m040(conn)?;
     Ok(())
 }
 
@@ -183,6 +184,7 @@ mod tests {
         crate::maintenance::apply_m037(&conn).unwrap();
         crate::connectors::apply_m038(&conn).unwrap();
         crate::mirror_tables::apply_m039(&conn).unwrap();
+        crate::db_breadth::apply_m040(&conn).unwrap();
         conn
     }
 

@@ -70,6 +70,7 @@ async fn main() -> std::io::Result<()> {
     let _ = spp_core::customer_events::apply_m036(&conn);
     let _ = spp_core::maintenance::apply_m037(&conn);
     let _ = spp_core::connectors::apply_m038(&conn);
+    let _ = spp_core::db_breadth::apply_m040(&conn);
     let _ = spp_core::webhook::ensure_webhook_events_table(&conn);
     let _ = spp_core::saved_views::ensure_saved_views_table(&conn);
     let _ = spp_core::oauth_state::ensure_oauth_states_table(&conn);

@@ -37,6 +37,8 @@ fn main() {
     let _ = spp_core::customer_events::apply_m036(&conn);
     let _ = spp_core::maintenance::apply_m037(&conn);
     let _ = spp_core::connectors::apply_m038(&conn);
+    let _ = spp_core::mirror_tables::apply_m039(&conn);
+    let _ = spp_core::db_breadth::apply_m040(&conn);
 
     let tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -69,7 +71,11 @@ fn main() {
         if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({t})")) {
             let cols: Vec<String> = stmt
                 .query_map([], |r| {
-                    Ok(format!("{} {}", r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                    Ok(format!(
+                        "{} {}",
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?
+                    ))
                 })
                 .unwrap()
                 .filter_map(|r| r.ok())

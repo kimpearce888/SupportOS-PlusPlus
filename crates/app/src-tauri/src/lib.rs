@@ -289,6 +289,7 @@ fn open_db_with_all_migrations(
     spp_core::customer_events::apply_m036(&conn)?;
     spp_core::maintenance::apply_m037(&conn)?;
     spp_core::connectors::apply_m038(&conn)?;
+    spp_core::db_breadth::apply_m040(&conn)?;
 
     tracing::info!("All migrations M001–M035 applied successfully");
     Ok(conn)
