@@ -10,51 +10,47 @@ use axum::response::IntoResponse;
 
 /// GET /api/operations/center — operations center snapshot.
 ///
+/// Scope: `?mailboxes=1,2` (local ids, comma list, max 50 — duplicate params
+/// arrive as repeated keys and are NOT supported, matching the reference's
+/// array-join normalization); omitted/empty/"all" = all inboxes.
+///
 /// Reference response shape:
 /// ```json
-/// { "generated_at": "...", "mailbox_scope": null, "tiles": [...], "waiting_threshold_minutes": 240 }
+/// { "generated_at": "...", "mailbox_scope": null, "tiles": [
+///     { "key": "unassigned", "label": "Unassigned", "count": 0,
+///       "severity": "info", "drill": {"type":"inbox","params":{...}}, "note": null }
+/// ], "waiting_threshold_minutes": 240 }
 /// ```
 pub async fn center(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let mailbox_id = params.get("mailboxId").and_then(|m| m.parse::<i64>().ok());
-    let waiting_threshold: i64 =
-        crate::settings::get_i64(&conn, "waiting_threshold_minutes", 240).unwrap_or(240);
-    let tiles = match crate::operations::build_snapshot(&conn, mailbox_id) {
-        Ok(snapshot) => snapshot
-            .tiles
-            .iter()
-            .map(|(key, count)| {
-                let key_str = key.as_str();
-                let count_val = match count {
-                    crate::operations::TileCount::Available { count } => {
-                        json!({"count": count, "available": true})
-                    }
-                    crate::operations::TileCount::NotAvailable { .. } => {
-                        json!({"count": 0, "available": false})
-                    }
-                };
-                let mut tile = serde_json::Map::new();
-                tile.insert("key".to_string(), json!(key_str));
-                tile.insert("label".to_string(), json!(key_str));
-                if let serde_json::Value::Object(obj) = count_val {
-                    for (k, v) in obj {
-                        tile.insert(k, v);
-                    }
-                }
-                Value::Object(tile)
-            })
-            .collect::<Vec<_>>(),
-        Err(_) => Vec::new(),
-    };
-    Json(json!({
-        "generated_at": chrono::Utc::now().to_rfc3339(),
-        "mailbox_scope": mailbox_id,
-        "tiles": tiles,
-        "waiting_threshold_minutes": waiting_threshold,
-    }))
+    // Scope: ?mailboxes=1,2 (local ids); omitted/empty/"all" = all inboxes.
+    let mailbox_ids: Option<Vec<i64>> = params
+        .get("mailboxes")
+        .filter(|raw| !raw.is_empty() && *raw != "all")
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|v| v.trim().parse::<i64>().ok())
+                .filter(|v| *v > 0)
+                .take(50)
+                .collect::<Vec<_>>()
+        });
+    match crate::operations::snapshot(&conn, mailbox_ids.as_deref()) {
+        Ok(snap) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&snap).unwrap_or_else(|_| json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string(),
+            })),
+        ),
+    }
 }
 
 /// GET /api/operations/workload
@@ -142,14 +138,34 @@ pub async fn set_capacity(
 }
 
 /// PUT /api/operations/waiting-threshold
+///
+/// Reference `setWaitingThresholdMinutes`: clamped to 1..=20160.
 pub async fn set_waiting_threshold(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let minutes = body.get("minutes").and_then(|v| v.as_i64()).unwrap_or(240);
+    let Some(minutes) = body.get("minutes").and_then(|v| v.as_i64()) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "minutes must be an integer.",
+            })),
+        );
+    };
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = crate::settings::set_i64(&conn, "waiting_threshold_minutes", minutes);
-    Json(json!({"ok": true}))
+    match crate::operations::set_waiting_threshold_minutes(&conn, minutes) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string(),
+            })),
+        ),
+    }
 }
 
 /// GET /api/operations/suggested-assignees

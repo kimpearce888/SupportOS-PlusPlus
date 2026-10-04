@@ -67,23 +67,25 @@ impl OperationsTileKey {
         }
     }
 
-    /// Severity bucket the tile reports under.
+    /// Severity bucket the tile reports under (reference
+    /// operationsCenter.ts:48-183 — `sync_problems` overrides dynamically:
+    /// critical when the sync state is ERROR, else info).
     #[must_use]
     pub fn severity(self) -> &'static str {
         match self {
             Self::Unassigned
-            | Self::NeedsFirstResponse
             | Self::CustomerWaiting
-            | Self::WaitingOverThreshold
             | Self::HighEffort
             | Self::RepeatedIssue
             | Self::KnownIssue
-            | Self::IssueSpike
-            | Self::CampaignActivity
-            | Self::AutomationApprovals => "info",
-            Self::Urgent
+            | Self::CampaignActivity => "info",
+            Self::NeedsFirstResponse
+            | Self::WaitingOverThreshold
+            | Self::Urgent
             | Self::SlaAtRisk
             | Self::AiEscalation
+            | Self::IssueSpike
+            | Self::AutomationApprovals
             | Self::FailedJobs
             | Self::SyncProblems => "warning",
             Self::SlaBreached => "critical",

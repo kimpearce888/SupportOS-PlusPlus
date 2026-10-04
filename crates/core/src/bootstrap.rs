@@ -67,9 +67,10 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     // boot keeps every runtime read (webhooks, saved views, OAuth state,
     // job queue) from depending on call order.
     crate::webhook::ensure_webhook_events_table(conn)?;
-    crate::saved_views::ensure_saved_views_table(conn)?;
+    crate::saved_views::ensure_inbox_views_table(conn)?;
     crate::oauth_state::ensure_oauth_states_table(conn)?;
     crate::jobs::ensure_jobs_table(conn)?;
+    crate::interaction_current::ensure_client_current_signals_table(conn)?;
 
     // Record the reference-equivalent migration set so `migrations_applied`
     // and the .sosync schema guard compare like with like (the reference's
@@ -110,7 +111,8 @@ mod tests {
             "ai_sources",
             // runtime guards
             "webhook_events",
-            "saved_views",
+            "inbox_views",
+            "client_current_signals",
             "oauth_states",
             "jobs",
         ] {

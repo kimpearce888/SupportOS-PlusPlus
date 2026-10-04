@@ -19,6 +19,10 @@ fn eval_rejected(msg: &str) -> (StatusCode, Json<Value>) {
 }
 
 /// GET /api/conversations — list conversations with filters.
+///
+/// v1.8.0 Operations Center drill-down: `?ops=<tileKey>` compiles to the
+/// SAME whitelisted fragment the tile count uses, so a tile can never
+/// disagree with its list (reference conversations.ts:81-93).
 pub async fn list(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -38,6 +42,33 @@ pub async fn list(
     if let Some(limit) = params.get("pageSize") {
         filters.limit = limit.parse().ok();
     }
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(ops) = params.get("ops").filter(|ops| !ops.is_empty()) {
+        if !crate::operations::is_conversation_ops_tile(ops) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": crate::operations::OPS_INVALID_MESSAGE,
+                })),
+            );
+        }
+        let threshold = crate::operations::waiting_threshold_minutes(&conn);
+        let Some((frag_sql, frag_params)) = crate::operations::tile_fragment(ops, threshold) else {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": crate::operations::OPS_INVALID_MESSAGE,
+                })),
+            );
+        };
+        filters.extra_where = Some(frag_sql);
+        filters.extra_params = frag_params;
+        notes.push(format!("Operations Center tile '{ops}' applied."));
+    }
 
     match crate::inbox::list_conversations(&conn, &filters) {
         Ok((items, total)) => {
@@ -53,7 +84,7 @@ pub async fn list(
                     "page": 1,
                     "page_size": 50,
                     "view": params.get("view").cloned().unwrap_or_default(),
-                    "notes": [],
+                    "notes": notes,
                 })),
             )
         }
@@ -1692,7 +1723,7 @@ mod tests {
     use axum::response::{IntoResponse, Response};
     use std::sync::{Arc, Mutex};
 
-    fn make_state() -> AppState {
+    pub(super) fn make_state() -> AppState {
         let f = tempfile::NamedTempFile::new()
             .unwrap()
             .into_temp_path()
@@ -1723,7 +1754,7 @@ mod tests {
     /// A state wired the way the real app wires it: one fake provider shared
     /// by the sync engine and the ops (demo mode), with the demo world
     /// mirrored into the DB so conversations exist locally.
-    async fn make_pipeline_state() -> AppState {
+    pub(super) async fn make_pipeline_state() -> AppState {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("pipeline.db");
         let mut conn = crate::db::open(&db_path).unwrap();
@@ -2472,5 +2503,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audited, 2);
+    }
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use super::*;
+    use axum::response::{IntoResponse, Response};
+    use serde_json::json;
+
+    async fn body_of(r: Response) -> (u16, Value) {
+        let status = r.status().as_u16();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// ?ops=<unknown> -> 422 with the reference's exact message.
+    #[tokio::test]
+    async fn ops_unknown_key_is_422_with_the_reference_message() {
+        let state = super::tests::make_state();
+        let mut params = std::collections::HashMap::new();
+        params.insert("ops".to_string(), "sla_at_risk".to_string());
+        let (status, v) = body_of(list(State(state), Query(params)).await.into_response()).await;
+        assert_eq!(status, 422, "{v}");
+        assert_eq!(v["error"], json!("ValidationError"));
+        assert_eq!(
+            v["message"],
+            json!("ops must be one of: unassigned, needs_first_response, customer_waiting, waiting_over_threshold, urgent, high_effort, repeated_issue, known_issue, ai_escalation.")
+        );
+    }
+
+    /// ?ops=urgent applies the shared fragment, surfaces the note, and the
+    /// list total equals the tile count on the demo DB (v1.7.0 invariant).
+    #[tokio::test]
+    async fn ops_urgent_applies_fragment_with_note() {
+        let state = super::tests::make_pipeline_state().await;
+        let snap = {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::operations::snapshot(&conn, None).unwrap()
+        };
+        let tile_count = snap.count_of("urgent").unwrap_or(0);
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("ops".to_string(), "urgent".to_string());
+        let (status, v) = body_of(list(State(state), Query(params)).await.into_response()).await;
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(
+            v["notes"],
+            json!(["Operations Center tile 'urgent' applied."])
+        );
+        assert_eq!(v["total"], json!(tile_count));
+        // Every returned row is high/urgent priority.
+        for c in v["conversations"].as_array().unwrap() {
+            let p = c["priority"].as_str().unwrap_or("none");
+            assert!(p == "high" || p == "urgent", "row priority: {p}");
+        }
+    }
+
+    /// For EVERY tile key: drill-down total == tile count on the demo DB.
+    #[tokio::test]
+    async fn ops_drill_down_matches_tile_count_for_every_key() {
+        let state = super::tests::make_pipeline_state().await;
+        let snap = {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::operations::snapshot(&conn, None).unwrap()
+        };
+        for key in crate::operations::OPS_TILE_WHITELIST {
+            let expected = snap.count_of(key).unwrap_or(0);
+            let mut params = std::collections::HashMap::new();
+            params.insert("ops".to_string(), key.to_string());
+            params.insert("pageSize".to_string(), "100".to_string());
+            let (status, v) = body_of(
+                list(State(state.clone()), Query(params))
+                    .await
+                    .into_response(),
+            )
+            .await;
+            assert_eq!(status, 200, "{key}: {v}");
+            assert_eq!(
+                v["total"],
+                json!(expected),
+                "{key}: list total vs tile count"
+            );
+            let rows = v["conversations"].as_array().unwrap().len() as u64;
+            assert!(rows <= 100, "{key}: page cap respected");
+        }
+    }
+
+    /// The waiting threshold flows from the setting into the drill-down.
+    #[tokio::test]
+    async fn ops_waiting_threshold_uses_the_setting() {
+        let state = super::tests::make_pipeline_state().await;
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::operations::set_waiting_threshold_minutes(&conn, 1).unwrap();
+        }
+        let snap = {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::operations::snapshot(&conn, None).unwrap()
+        };
+        assert_eq!(snap.waiting_threshold_minutes, 1);
+        let expected = snap.count_of("waiting_over_threshold").unwrap_or(0);
+        let mut params = std::collections::HashMap::new();
+        params.insert("ops".to_string(), "waiting_over_threshold".to_string());
+        let (status, v) = body_of(list(State(state), Query(params)).await.into_response()).await;
+        assert_eq!(status, 200);
+        assert_eq!(v["total"], json!(expected));
     }
 }

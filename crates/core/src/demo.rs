@@ -511,7 +511,7 @@ struct ThreadLite {
 }
 
 /// Reference shared/utils.ts `htmlToText`.
-fn html_to_text(html: &str) -> String {
+pub(crate) fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut in_tag = false;
     let mut tag_name = String::new();

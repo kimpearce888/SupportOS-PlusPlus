@@ -457,6 +457,12 @@ fn upsert_thread(conn: &Connection, conversation_local: i64, t: &HsThread) -> Re
         params![conversation_local, t.kind, t.state, t.body, actor_type, actor_id, t.created_at, t.remote_id],
     )?;
     record_thread_event(conn, conversation_local, t, actor_type, actor_id)?;
+    // Interaction intelligence: refresh the deterministic current-signals
+    // snapshot on customer activity (spec #59; reference workers.ts:744-747
+    // — errors never break the sync).
+    if t.kind == "customer" {
+        let _ = crate::interaction_current::record_current_interaction(conn, conversation_local);
+    }
     Ok(())
 }
 
@@ -761,6 +767,17 @@ impl SyncEngine {
                 );
             }
             let processed: i64 = results.iter().map(|r| r.processed).sum();
+            // Client Interaction Intelligence: build behavioral snapshots from
+            // all history (deterministic — no AI) so profiles are populated
+            // immediately after the first full sync (spec #59; reference
+            // workers.ts:629-636 — wrapped in try/catch, never breaks sync).
+            {
+                let conn = self.lock();
+                let n = crate::interaction_current::backfill_all(&conn).unwrap_or(0);
+                if n > 0 {
+                    tracing::debug!(conversations = n, "interaction snapshots built");
+                }
+            }
             self.emit_sync_completed("initial", processed, failed);
             Ok(())
         }

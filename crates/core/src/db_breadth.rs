@@ -19,7 +19,9 @@
 //!     issue_cluster_conversations→issue_cluster_members,
 //!     conversation_events→activity_events, inbox_views→saved_views,
 //!     segments→saved_segments, knowledge_candidates→knowledge_gap_candidates,
-//!     friction_findings→friction_scores, client_current_signals→interaction_signals,
+//!     friction_findings→friction_scores, interaction_signals (legacy
+//!     per-customer log; the reference-shaped client_current_signals now
+//!     exists 1:1 — see interaction_current.rs),
 //!     client_human_overrides→interaction_overrides,
 //!     client_support_outcomes→friction_scores (per the reports metric-spec
 //!     mapping), support_graph_edges→graph_edges+graph_nodes,
@@ -408,9 +410,10 @@ fn create_missing_reference_tables(conn: &Connection) -> Result<()> {
 // Only genuinely-missing columns are added; the port's intentional renames
 // (customer_id vs customer_local_id, user_type vs type, …) are never touched.
 fn add_missing_reference_columns(conn: &Connection) -> Result<()> {
-    // `saved_views` (the port's inbox_views) is created lazily by its own
-    // module; make sure it exists before the column adds.
-    crate::saved_views::ensure_saved_views_table(conn)?;
+    // `inbox_views` (reference 011, exact name + shape) is created lazily by
+    // its own module; make sure it exists before the column adds.
+    crate::saved_views::ensure_inbox_views_table(conn)?;
+    crate::interaction_current::ensure_client_current_signals_table(conn)?;
 
     // ---- mailboxes (001): mirror bookkeeping columns ----
     add(conn, "mailboxes", "remote_created_at", "TEXT")?;
@@ -741,19 +744,21 @@ fn add_missing_reference_columns(conn: &Connection) -> Result<()> {
     )?;
     add(conn, "activity_events", "metadata", "TEXT")?;
 
-    // ---- saved_views (011 inbox_views) ----
-    add(conn, "saved_views", "description", "TEXT")?;
+    // ---- inbox_views (011) ----
+    // (created with the full reference shape by saved_views::ensure_inbox_views_table;
+    // the adds below are PRAGMA-guarded no-ops that document the migration)
+    add(conn, "inbox_views", "description", "TEXT")?;
     add(
         conn,
-        "saved_views",
+        "inbox_views",
         "sort_order",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    add(conn, "saved_views", "folder", "TEXT")?;
-    add(conn, "saved_views", "version", "INTEGER NOT NULL DEFAULT 1")?;
+    add(conn, "inbox_views", "folder", "TEXT")?;
+    add(conn, "inbox_views", "version", "INTEGER NOT NULL DEFAULT 1")?;
     add(
         conn,
-        "saved_views",
+        "inbox_views",
         "updated_at",
         "TEXT NOT NULL DEFAULT (datetime('now'))",
     )?;
@@ -1682,7 +1687,7 @@ mod tests {
             ("notifications", "dedup_key"),
             ("notifications", "title"),
             ("side_threads", "status"),
-            ("saved_views", "version"),
+            ("inbox_views", "version"),
             ("activity_events", "source"),
             ("saved_segments", "updated_at"),
             ("incidents", "provenance"),

@@ -271,7 +271,7 @@ async fn demo_boot_runtime_verification() {
         ),
     }
 
-    // ── 7. Operations Center: 16 tiles; SLA tiles real since T16 ────────────
+    // ── 7. Operations Center: 16 reference-shaped tiles ────────────────────
     match client
         .get(format!("{base}/api/operations/center"))
         .send()
@@ -281,24 +281,36 @@ async fn demo_boot_runtime_verification() {
             let status = r.status().as_u16();
             let body: Value = r.json().await.unwrap_or(Value::Null);
             let tiles = body["tiles"].as_array().cloned().unwrap_or_default();
-            let unavailable: Vec<String> = tiles
+            // The reference shape: every tile carries key/label/count/
+            // severity/drill (+ optional note); the ai_escalation tile went
+            // live (ai_runs-based fragment) so nothing is unavailable.
+            let shape_ok = tiles.iter().all(|t| {
+                !t["key"].as_str().unwrap_or("").is_empty()
+                    && !t["label"].as_str().unwrap_or("").is_empty()
+                    && t["count"].is_u64()
+                    && matches!(
+                        t["severity"].as_str().unwrap_or(""),
+                        "info" | "warning" | "critical"
+                    )
+                    && t["drill"].is_object()
+            });
+            let has_threshold = body["waiting_threshold_minutes"] == json!(240);
+            let keys: Vec<String> = tiles
                 .iter()
-                .filter(|t| t["available"] == json!(false) || t["count"].is_null())
                 .filter_map(|t| t["key"].as_str().map(String::from))
                 .collect();
-            // The sla_at_risk / sla_breached tiles went live with the T16
-            // business-minutes engine (they count 0 on the unconfigured demo
-            // mailboxes — honest, available). Only ai_escalation (T13)
-            // remains unavailable.
-            let unavailable_ok = unavailable.as_slice() == ["ai_escalation"];
             step(
                 &mut out,
                 "GET /api/operations/center (16 tiles)",
-                status == 200 && tiles.len() == 16 && unavailable_ok,
+                status == 200
+                    && tiles.len() == 16
+                    && shape_ok
+                    && has_threshold
+                    && keys.first().is_some_and(|k| k == "unassigned")
+                    && keys.last().is_some_and(|k| k == "campaign_activity"),
                 format!(
-                    "status={status} tiles={} unavailable={:?}",
-                    tiles.len(),
-                    unavailable
+                    "status={status} tiles={} shape_ok={shape_ok} threshold={has_threshold}",
+                    tiles.len()
                 ),
             );
         }

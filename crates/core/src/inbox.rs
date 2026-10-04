@@ -5,11 +5,10 @@
 //!
 //! This module provides:
 //! - `list_conversations` — paginated list with filters (status, mailbox,
-//!   assignee, priority).
+//!   assignee, priority) + `extra_where` composition point for the
+//!   Operations Center drill-down and saved-view fragments.
 //! - `get_conversation` — full conversation details + thread (activity events
 //!   + customer messages + replies + notes).
-//! - `list_saved_views` / `apply_saved_view` — list + apply saved views
-//!   (delegates to `saved_views`).
 //!
 //! Mutations live in `conversation_ops` (the write-protection pipeline,
 //! operations.ts parity). Reads use parameterized SQL — no string
@@ -19,7 +18,6 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::saved_views::{self, SavedView};
 
 /// Apply the M028 migration: `conversation_threads` table.
 /// Stores customer messages, replies, notes, and system events.
@@ -123,6 +121,15 @@ pub struct InboxFilters {
     pub limit: Option<u32>,
     /// Offset for pagination.
     pub offset: Option<u32>,
+    /// A composed WHERE fragment (no leading WHERE) from the saved-view
+    /// engine or the Operations Center tile fragments (reference
+    /// `extraWhere`/`extraParams` in conversations.ts:79-114). ANDed with the
+    /// simple filters; identifiers inside are compiler-whitelisted literals.
+    #[serde(skip)]
+    pub extra_where: Option<String>,
+    /// The bound parameters matching `extra_where`, in order.
+    #[serde(skip)]
+    pub extra_params: Vec<rusqlite::types::Value>,
 }
 
 /// A thread entry — one item in the conversation timeline.
@@ -206,6 +213,12 @@ pub fn list_conversations(
             .push("(c.subject LIKE ? ESCAPE '\\' OR c.preview LIKE ? ESCAPE '\\')".to_string());
         params_vec.push(q.clone().into());
         params_vec.push(q.into());
+    }
+    // The composed fragment (ops drill-down / saved view): identifiers are
+    // whitelisted literals from the fragment compilers; values stay bound.
+    if let Some(ref extra) = filters.extra_where {
+        where_parts.push(format!("({extra})"));
+        params_vec.extend(filters.extra_params.iter().cloned());
     }
 
     let where_clause = if where_parts.is_empty() {
@@ -353,39 +366,6 @@ pub fn get_conversation(
     detail.thread = thread?;
 
     Ok(Some(detail))
-}
-
-// ─── Saved views ─────────────────────────────────────────────────────────
-
-/// List all saved views.
-pub fn list_saved_views(conn: &Connection) -> Result<Vec<SavedView>> {
-    saved_views::ensure_saved_views_table(conn)?;
-    let mut stmt =
-        conn.prepare("SELECT id, name, conditions, mailbox_id FROM saved_views ORDER BY name")?;
-    let views: Result<Vec<SavedView>> = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let name: String = row.get(1)?;
-            let conditions_json: String = row.get(2)?;
-            let mailbox_id: Option<i64> = row.get(3)?;
-            let conditions: saved_views::ConditionNode = serde_json::from_str(&conditions_json)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-            Ok(SavedView {
-                id: Some(id),
-                name,
-                conditions,
-                mailbox_id,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| e.into());
-    views
-}
-
-/// Apply a saved view: returns the conversation IDs matching the view's conditions.
-pub fn apply_saved_view(conn: &Connection, view_id: i64) -> Result<Vec<i64>> {
-    let view = saved_views::load_view(conn, view_id)?;
-    saved_views::execute_view(conn, &view)
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────
@@ -547,13 +527,6 @@ mod tests {
         let conn = fresh_db();
         let result = get_conversation(&conn, 99999).unwrap();
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn list_saved_views_returns_empty_on_fresh_db() {
-        let conn = fresh_db();
-        let views = list_saved_views(&conn).unwrap();
-        assert!(views.is_empty());
     }
 
     #[test]

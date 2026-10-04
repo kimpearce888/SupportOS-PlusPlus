@@ -61,6 +61,7 @@ pub mod hybrid_search;
 pub mod inbox;
 pub mod intelligence;
 pub mod intelligence_features;
+pub mod interaction_current;
 pub mod jobs;
 pub mod logging;
 pub mod loopback;

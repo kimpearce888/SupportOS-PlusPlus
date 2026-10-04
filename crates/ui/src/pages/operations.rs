@@ -554,10 +554,13 @@ mod tests {
             .count();
         // Critical: only sla_breached (1 tile).
         assert_eq!(critical, 1, "critical: {critical}");
-        // Warning: urgent, sla_at_risk, ai_escalation, failed_jobs, sync_problems (5 tiles).
-        assert_eq!(warning, 5, "warning: {warning}");
-        // Info: the rest (10 tiles).
-        assert_eq!(info, 10, "info: {info}");
+        // Warning (reference operationsCenter.ts): needs_first_response,
+        // waiting_over_threshold, urgent, sla_at_risk, ai_escalation,
+        // issue_spike, automation_approvals, failed_jobs, sync_problems
+        // (9 tiles).
+        assert_eq!(warning, 9, "warning: {warning}");
+        // Info: the rest (6 tiles).
+        assert_eq!(info, 6, "info: {info}");
         // Total: 16.
         assert_eq!(critical + warning + info, 16);
     }
