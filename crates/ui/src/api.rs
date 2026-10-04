@@ -83,6 +83,11 @@ pub async fn patch_json<T: DeserializeOwned>(
     request_json::<T>("PATCH", path, Some(body)).await
 }
 
+/// DELETE `path` and parse the JSON response.
+pub async fn delete_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
+    request_json::<T>("DELETE", path, None).await
+}
+
 async fn request_json<T: DeserializeOwned>(
     method: &str,
     path: &str,

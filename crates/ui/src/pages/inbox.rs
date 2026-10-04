@@ -17,7 +17,16 @@
 
 use leptos::*;
 
+use crate::components::attribute_snapshot::AttributeSnapshotCard;
+use crate::components::coaching_panel::CoachingPanel;
+use crate::components::copilot_panel::CopilotPanel;
+use crate::components::memory_panel::MemoryPanel;
+use crate::components::mention_textarea::MentionTextarea;
+use crate::components::overlays::ConfirmDialog;
+use crate::components::qa_panel::QaPanel;
+use crate::components::side_threads::SideThreadsPanel;
 use crate::components::state_view::{EmptyState, LoadingState};
+use crate::components::translation_panel::TranslationPanel;
 
 /// Percent-encode a query value (the query-string subset that needs it).
 fn urlencode(s: &str) -> String {
@@ -117,6 +126,57 @@ pub enum ComposerMode {
     Note,
 }
 
+/// The context-pane tab (reference ContextPane: 'ai' | 'customer' | 'copilot').
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextTab {
+    Ai,
+    Customer,
+    Copilot,
+}
+
+/// One similar-conversation row (reference AiSidebar / /api/ai/similar/:id).
+#[derive(Debug, Clone, Default)]
+pub struct SimilarConversation {
+    pub conversation_id: i64,
+    pub number: i64,
+    pub subject: String,
+    pub resolution: String,
+    pub score: f64,
+    pub why: Vec<String>,
+}
+
+/// Parse one row of the /api/ai/similar/:id `similar` array.
+#[must_use]
+fn parse_similar_conversation(v: &serde_json::Value) -> SimilarConversation {
+    SimilarConversation {
+        conversation_id: v
+            .get("conversation_id")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0),
+        number: v.get("number").and_then(|x| x.as_i64()).unwrap_or(0),
+        subject: v
+            .get("subject")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        resolution: v
+            .get("resolution")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        score: v.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        why: v
+            .get("why")
+            .and_then(|w| w.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|w| w.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 /// The inbox page — 3-pane layout.
 ///
 /// `conversation_id` is set on the `/inbox/conversation/:id` route (the
@@ -139,6 +199,13 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     let composer_error = create_rw_signal(None::<String>);
     let composer_success = create_rw_signal(None::<String>);
     let selected_ids = create_rw_signal(Vec::<i64>::new());
+    // v1.9.0+ parity: context pane tabs + send confirmation + AI sidebar state.
+    let context_tab = create_rw_signal(ContextTab::Ai);
+    let context_open = create_rw_signal(true);
+    let confirm_send = create_rw_signal(false);
+    let ai_analysis = create_rw_signal(None::<serde_json::Value>);
+    let ai_analyzing = create_rw_signal(false);
+    let similar = create_rw_signal(Vec::<SimilarConversation>::new());
 
     // ── SSE subscription: refresh the list when conversations change ──────
     // Mirrors the reference's ServerEventsBridge — when the server pushes a
@@ -269,8 +336,60 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         }
     });
 
+    // ── Similar conversations + AI analysis reset on selection change ──
+    create_effect(move |_| {
+        let id = selected_id.get();
+        ai_analysis.set(None);
+        similar.set(Vec::new());
+        if let Some(id) = id {
+            let similar = similar;
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(r) =
+                    crate::api::get_json::<serde_json::Value>(&format!("/api/ai/similar/{id}"))
+                        .await
+                {
+                    let rows = r
+                        .get("similar")
+                        .and_then(|s| s.as_array())
+                        .map(|arr| arr.iter().map(parse_similar_conversation).collect())
+                        .unwrap_or_default();
+                    similar.set(rows);
+                }
+            });
+        }
+    });
+
+    // ── Run the AI analysis on demand (reference AiSidebar analyze) ─────
+    let run_analyze = move || {
+        let Some(id) = selected_id.get_untracked() else {
+            return;
+        };
+        if ai_analyzing.get_untracked() {
+            return;
+        }
+        ai_analyzing.set(true);
+        let body = serde_json::json!({ "force": true });
+        let ai_analysis = ai_analysis;
+        let ai_analyzing = ai_analyzing;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(r) = crate::api::post_json::<serde_json::Value>(
+                &format!("/api/ai/analyze/{id}"),
+                Some(&body),
+            )
+            .await
+            {
+                if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                    if let Some(a) = r.get("analysis") {
+                        ai_analysis.set(Some(a.clone()));
+                    }
+                }
+            }
+            ai_analyzing.set(false);
+        });
+    };
+
     // ── Submit composer ────────────────────────────────────────────────
-    let submit_composer = move || {
+    let send_composer = move || {
         let body = composer_body.get();
         if body.trim().is_empty() {
             composer_error.set(Some("Body cannot be empty".to_string()));
@@ -330,6 +449,15 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                 }
             }
         });
+    };
+
+    // Reply sends are customer-visible: confirm first (reference ConfirmDialog).
+    let request_submit = move || {
+        if composer_mode.get() == ComposerMode::Reply {
+            confirm_send.set(true);
+        } else {
+            send_composer();
+        }
     };
 
     // ── Change status ──────────────────────────────────────────────────
@@ -640,6 +768,11 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                             let d_assignee_id = d.assignee_id.unwrap_or(0).to_string();
                             let d_thread = d.thread.clone();
                             let d_thread_clone = d_thread.clone();
+                            // Locals for the domain panels (the view! parser
+                            // can't host brace-expressions in attributes).
+                            let d_id = d.id;
+                            let d_closed = d.status == "closed";
+                            let d_customer_opt = if d.customer_id > 0 { Some(d.customer_id) } else { None };
                             view! {
                                 <div class="spp-inbox__detail-content">
                                     <header class="spp-inbox__detail-header">
@@ -691,6 +824,9 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                         </select>
                                     </div>
 
+                                    // Side collaboration threads (internal only).
+                                    <SideThreadsPanel conversation_id=d_id />
+
                                     // Thread
                                     <div class="spp-inbox__thread">
                                         {if d_thread_clone.is_empty() {
@@ -732,6 +868,15 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                         }}
                                     </div>
 
+                                    // Post-resolution QA + translation + memory panels
+                                    // (reference: after the thread, before the composer).
+                                    <QaPanel conversation_id=d_id closed=d_closed />
+                                    <TranslationPanel conversation_id=d_id />
+                                    <MemoryPanel
+                                        customer_id=d_customer_opt
+                                        conversation_id=d_id
+                                    />
+
                                     // Composer
                                     <div class="spp-inbox__composer">
                                         <div class="spp-inbox__composer-tabs">
@@ -750,19 +895,26 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                                 "Internal note"
                                             </button>
                                         </div>
-                                        <textarea
-                                            class="spp-inbox__composer-body"
-                                            placeholder={move || match composer_mode.get() {
-                                                ComposerMode::Reply => "Type your reply to the customer...",
-                                                ComposerMode::Note => "Type an internal note (visible only to your team)...",
-                                            }}
-                                            prop:value=composer_body
-                                            on:input=move |ev| composer_body.set(event_target_value(&ev))
-                                        ></textarea>
+                                        <Show
+                                            when=move || composer_mode.get() == ComposerMode::Reply
+                                            fallback=move || view! {
+                                                <MentionTextarea
+                                                    value=composer_body
+                                                    placeholder="Type an internal note (visible only to your team) — @ to mention"
+                                                    rows=6
+                                                />
+                                            }
+                                        >
+                                            <MentionTextarea
+                                                value=composer_body
+                                                placeholder="Type your reply to the customer..."
+                                                rows=6
+                                            />
+                                        </Show>
                                         <div class="spp-inbox__composer-actions">
                                             <button
                                                 class="spp-button"
-                                                on:click=move |_| submit_composer()
+                                                on:click=move |_| request_submit()
                                             >
                                                 {move || match composer_mode.get() {
                                                     ComposerMode::Reply => "Send reply",
@@ -770,6 +922,9 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                                 }}
                                             </button>
                                         </div>
+                                        <Show when=move || composer_mode.get() == ComposerMode::Reply fallback=|| ()>
+                                            <CoachingPanel conversation_id=d_id draft=composer_body />
+                                        </Show>
                                         <Show when=move || composer_error.get().is_some() fallback=|| ()>
                                             <div class="spp-state spp-state--error">
                                                 {move || composer_error.get().unwrap_or_default()}
@@ -779,6 +934,29 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                             <div class="spp-state spp-state--success">
                                                 {move || composer_success.get().unwrap_or_default()}
                                             </div>
+                                        </Show>
+                                        <Show when=move || confirm_send.get() fallback=|| ()>
+                                            {move || {
+                                                let email = detail.get()
+                                                    .and_then(|d| d.customer_email)
+                                                    .unwrap_or_else(|| "the customer".to_string());
+                                                let on_confirm = std::sync::Arc::new(move || {
+                                                    confirm_send.set(false);
+                                                    send_composer();
+                                                });
+                                                let on_cancel = std::sync::Arc::new(move || confirm_send.set(false));
+                                                view! {
+                                                    <ConfirmDialog
+                                                        title="Send reply to customer"
+                                                        message=format!(
+                                                            "Send this reply to {email} via Help Scout? This is a customer-visible action."
+                                                        )
+                                                        confirm_label="Send reply"
+                                                        on_confirm
+                                                        on_cancel
+                                                    />
+                                                }
+                                            }}
                                         </Show>
                                     </div>
                                 </div>
@@ -798,55 +976,213 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                         }
                     }
                 >
-                    {move || detail.with(|d| {
-                        let d = match d {
-                            Some(d) => d.clone(),
-                            None => return view! { <div></div> }.into_view(),
-                        };
-                        let c_name = d.customer_name.clone().unwrap_or_else(|| format!("#{}", d.customer_id));
-                        let c_email = d.customer_email.clone();
-                        let c_mailbox = d.mailbox_name.clone().unwrap_or_else(|| format!("#{}", d.mailbox_id));
-                        let c_assignee = d.assignee_name.clone().unwrap_or_else(|| "Unassigned".to_string());
-                        let c_created = d.created_at.clone().unwrap_or_default();
-                        let c_updated = d.updated_at.clone().unwrap_or_default();
-                        let c_tags = d.tags.clone();
-                        let c_tags_clone = c_tags.clone();
+                    {move || {
+                        let conv_id = selected_id.get().unwrap_or(0);
                         view! {
                             <div class="spp-inbox__context-content">
-                                <h3>"Customer"</h3>
-                                <dl class="spp-inbox__context-list">
-                                    <dt>"Name"</dt>
-                                    <dd>{c_name}</dd>
-                                    <dt>"Email"</dt>
-                                    <dd>{c_email.clone().unwrap_or_default()}</dd>
-                                    <dt>"Mailbox"</dt>
-                                    <dd>{c_mailbox}</dd>
-                                    <dt>"Assignee"</dt>
-                                    <dd>{c_assignee}</dd>
-                                    <dt>"Created"</dt>
-                                    <dd>{c_created}</dd>
-                                    <dt>"Updated"</dt>
-                                    <dd>{c_updated}</dd>
-                                </dl>
+                                <div class="spp-inbox__context-tabs">
+                                    <div class="spp-inbox__context-tabbar">
+                                        <button
+                                            class="spp-inbox__context-tab"
+                                            class:is-active=move || context_tab.get() == ContextTab::Ai
+                                            on:click=move |_| context_tab.set(ContextTab::Ai)
+                                        >
+                                            "AI"
+                                        </button>
+                                        <button
+                                            class="spp-inbox__context-tab"
+                                            class:is-active=move || context_tab.get() == ContextTab::Customer
+                                            on:click=move |_| context_tab.set(ContextTab::Customer)
+                                        >
+                                            "Customer"
+                                        </button>
+                                        <button
+                                            class="spp-inbox__context-tab"
+                                            class:is-active=move || context_tab.get() == ContextTab::Copilot
+                                            on:click=move |_| context_tab.set(ContextTab::Copilot)
+                                            title="Ask the Local Copilot about this ticket (read-only, evidence-cited)"
+                                        >
+                                            "Copilot"
+                                        </button>
+                                    </div>
+                                    <button
+                                        class="spp-button spp-button--ghost spp-button--small"
+                                        aria-label="Hide context pane"
+                                        on:click=move |_| context_open.set(false)
+                                    >
+                                        "Hide"
+                                    </button>
+                                </div>
 
-                                {if !c_tags_clone.is_empty() {
-                                    view! {
-                                        <h3>"Tags"</h3>
-                                        <ul class="spp-inbox__tags">
-                                            {c_tags_clone.iter().map(|tag| {
-                                                let tag = tag.clone();
-                                                view! {
-                                                    <li class="spp-inbox__tag">{tag}</li>
+                                <Show
+                                    when=move || !context_open.get()
+                                    fallback=|| ()
+                                >
+                                    <button
+                                        class="spp-button spp-button--small spp-inbox__context-reopen"
+                                        on:click=move |_| context_open.set(true)
+                                    >
+                                        "Show context"
+                                    </button>
+                                </Show>
+
+                                <Show
+                                    when=move || context_open.get() && context_tab.get() == ContextTab::Ai
+                                    fallback=|| ()
+                                >
+                                    <div class="spp-inbox__context-body">
+                                        // Per-ticket AI attribute snapshot (M3).
+                                        <AttributeSnapshotCard conversation_id=conv_id />
+
+                                        // What is the customer asking? (reference AiSidebar)
+                                        <div class="spp-ai-sidebar-section">
+                                            <h4>"What is the customer asking?"</h4>
+                                            <button
+                                                class="spp-button spp-button--small"
+                                                on:click=move |_| run_analyze()
+                                                disabled=move || ai_analyzing.get()
+                                            >
+                                                {move || if ai_analyzing.get() { "Analyzing…" } else { "Analyze" }.to_string()}
+                                            </button>
+                                            {move || {
+                                                match ai_analysis.get() {
+                                                    Some(a) => {
+                                                        let intent = a.get("intent").and_then(|x| x.as_str()).unwrap_or("—").to_string();
+                                                        let confidence = a.get("confidence").and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+                                                        let topics = a.get("topics")
+                                                            .and_then(|t| t.as_array())
+                                                            .map(|rows| rows.iter().filter_map(|t| t.as_str().map(str::to_string)).collect::<Vec<_>>())
+                                                            .unwrap_or_default();
+                                                        view! {
+                                                            <div class="spp-text-sm spp-ai-analysis">
+                                                                <div class="spp-ai-analysis__row">
+                                                                    <strong>"Intent: "</strong>
+                                                                    {intent.clone()}
+                                                                    <span class="spp-badge">{format!("conf: {confidence}")}</span>
+                                                                </div>
+                                                                {if !topics.is_empty() {
+                                                                    view! {
+                                                                        <div class="spp-ai-analysis__row">
+                                                                            <strong>"Topics: "</strong>
+                                                                            {topics.join(", ")}
+                                                                        </div>
+                                                                    }.into_view()
+                                                                } else {
+                                                                    ().into_view()
+                                                                }}
+                                                            </div>
+                                                        }.into_view()
+                                                    }
+                                                    None => ().into_view(),
                                                 }
-                                            }).collect::<Vec<_>>()}
-                                        </ul>
-                                    }.into_view()
-                                } else {
-                                    ().into_view()
-                                }}
+                                            }}
+
+                                            // Similar past cases (evidence-backed).
+                                            <h4>"Similar past cases"</h4>
+                                            {move || {
+                                                let rows = similar.get();
+                                                if rows.is_empty() {
+                                                    view! {
+                                                        <div class="spp-muted spp-text-xs">"No similar conversations found yet."</div>
+                                                    }.into_view()
+                                                } else {
+                                                    rows.iter().map(|s| {
+                                                        let href = format!("/inbox/conversation/{}", s.conversation_id);
+                                                        view! {
+                                                            <div class="spp-ai-similar">
+                                                                <a class="spp-ai-similar__subject" href=href.clone()>
+                                                                    {format!("#{} {}", s.number, s.subject.clone())}
+                                                                </a>
+                                                                <span class="spp-badge">{format!("{:.0}%", s.score * 100.0)}</span>
+                                                                {if !s.why.is_empty() {
+                                                                    view! {
+                                                                        <div class="spp-muted spp-text-xs">{s.why.join(" · ")}</div>
+                                                                    }.into_view()
+                                                                } else {
+                                                                    ().into_view()
+                                                                }}
+                                                                {if !s.resolution.is_empty() {
+                                                                    view! {
+                                                                        <div class="spp-text-xs spp-ai-similar__resolution">{s.resolution.clone()}</div>
+                                                                    }.into_view()
+                                                                } else {
+                                                                    ().into_view()
+                                                                }}
+                                                            </div>
+                                                        }
+                                                    }).collect::<Vec<_>>().into_view()
+                                                }
+                                            }}
+                                        </div>
+                                    </div>
+                                </Show>
+
+                                <Show
+                                    when=move || context_open.get() && context_tab.get() == ContextTab::Customer
+                                    fallback=|| ()
+                                >
+                                    {move || detail.with(|d| {
+                                        let d = match d {
+                                            Some(d) => d.clone(),
+                                            None => return view! { <div></div> }.into_view(),
+                                        };
+                                        let c_name = d.customer_name.clone().unwrap_or_else(|| format!("#{}", d.customer_id));
+                                        let c_email = d.customer_email.clone();
+                                        let c_mailbox = d.mailbox_name.clone().unwrap_or_else(|| format!("#{}", d.mailbox_id));
+                                        let c_assignee = d.assignee_name.clone().unwrap_or_else(|| "Unassigned".to_string());
+                                        let c_created = d.created_at.clone().unwrap_or_default();
+                                        let c_updated = d.updated_at.clone().unwrap_or_default();
+                                        let c_tags = d.tags.clone();
+                                        let c_tags_clone = c_tags.clone();
+                                        view! {
+                                            <div class="spp-inbox__context-body">
+                                                <h3>"Customer"</h3>
+                                                <dl class="spp-inbox__context-list">
+                                                    <dt>"Name"</dt>
+                                                    <dd>{c_name}</dd>
+                                                    <dt>"Email"</dt>
+                                                    <dd>{c_email.clone().unwrap_or_default()}</dd>
+                                                    <dt>"Mailbox"</dt>
+                                                    <dd>{c_mailbox}</dd>
+                                                    <dt>"Assignee"</dt>
+                                                    <dd>{c_assignee}</dd>
+                                                    <dt>"Created"</dt>
+                                                    <dd>{c_created}</dd>
+                                                    <dt>"Updated"</dt>
+                                                    <dd>{c_updated}</dd>
+                                                </dl>
+
+                                                {if !c_tags_clone.is_empty() {
+                                                    view! {
+                                                        <h3>"Tags"</h3>
+                                                        <ul class="spp-inbox__tags">
+                                                            {c_tags_clone.iter().map(|tag| {
+                                                                let tag = tag.clone();
+                                                                view! {
+                                                                    <li class="spp-inbox__tag">{tag}</li>
+                                                                }
+                                                            }).collect::<Vec<_>>()}
+                                                        </ul>
+                                                    }.into_view()
+                                                } else {
+                                                    ().into_view()
+                                                }}
+                                            </div>
+                                        }.into_view()
+                                    })}
+                                </Show>
+
+                                <Show
+                                    when=move || context_open.get() && context_tab.get() == ContextTab::Copilot
+                                    fallback=|| ()
+                                >
+                                    <div class="spp-inbox__context-body">
+                                        <CopilotPanel conversation_id=conv_id />
+                                    </div>
+                                </Show>
                             </div>
                         }.into_view()
-                    })}
+                    }}
                 </Show>
             </aside>
         </div>
