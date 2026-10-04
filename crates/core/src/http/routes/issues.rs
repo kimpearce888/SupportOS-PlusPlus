@@ -239,7 +239,7 @@ pub async fn known_impact(State(state): State<AppState>, Path(id): Path<i64>) ->
     // Base counts over linked, non-deleted conversations.
     let counts_ok = conn.query_row(
         "SELECT COUNT(*),
-                COUNT(DISTINCT c.customer_local_id),
+                COUNT(DISTINCT c.customer_id),
                 MIN(c.remote_created_at),
                 MAX(c.remote_created_at),
                 SUM(CASE WHEN c.status = 'active' THEN 1 ELSE 0 END),
@@ -272,7 +272,7 @@ pub async fn known_impact(State(state): State<AppState>, Path(id): Path<i64>) ->
     let organizations: i64 = conn
         .query_row(
             "SELECT COUNT(DISTINCT cu.organization_id)
-             FROM conversations c JOIN customers cu ON cu.id = c.customer_local_id
+             FROM conversations c JOIN customers cu ON cu.id = c.customer_id
              WHERE c.deleted_at IS NULL AND cu.organization_id IS NOT NULL
                AND c.id IN (
                  SELECT l.conversation_id FROM known_issue_conversations l

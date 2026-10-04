@@ -85,7 +85,10 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
-# Faster dev builds.
+# Faster dev builds. debug = 0: test binaries link the whole workspace
+# (embedded qdrant + zbus + friends) and the sandbox rootfs cannot hold two
+# artifact sets plus line-info binaries; keeping dev and test on one slim
+# profile shares a single dep set and keeps the linker off a full disk.
 [profile.dev]
 opt-level = 0
-debug = 1
+debug = 0

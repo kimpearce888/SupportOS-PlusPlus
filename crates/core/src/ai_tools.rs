@@ -32,9 +32,11 @@ use serde_json::{json, Value};
 use crate::ai_lm_studio::ChatTool;
 use crate::error::Result;
 
-/// Reference DDL for the friction findings table (migration 015). Created
-/// empty here so `get_friction_report` has the reference surface to read;
-/// the friction engine (quality-domain unit) fills it.
+/// Reference DDL for the friction findings table (migration 015), including
+/// the `detail` column and the UNIQUE (conversation_id, kind) target the
+/// quality-domain analyzer's upsert conflicts on. Kept byte-compatible with
+/// `quality::FRICTION_FINDINGS_SQL` — both creators must agree. The analyzer
+/// (quality.rs) fills it; this module only reads it.
 const FRICTION_FINDINGS_SQL: &str = r#"
     CREATE TABLE IF NOT EXISTS friction_findings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,11 +44,16 @@ const FRICTION_FINDINGS_SQL: &str = r#"
         customer_local_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
         kind TEXT NOT NULL,
         severity TEXT NOT NULL DEFAULT 'low',
-        evidence TEXT,
+        evidence TEXT NOT NULL DEFAULT '[]',
+        detail TEXT,
         computed_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
-    CREATE INDEX IF NOT EXISTS idx_friction_findings_conversation
-        ON friction_findings(conversation_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_friction_findings_conv_kind
+        ON friction_findings(conversation_id, kind);
+    CREATE INDEX IF NOT EXISTS idx_friction_findings_kind_severity
+        ON friction_findings(kind, severity);
+    CREATE INDEX IF NOT EXISTS idx_friction_findings_customer_ref
+        ON friction_findings(customer_local_id);
 "#;
 
 /// Ensure the tool-read tables exist (idempotent; called from the Copilot

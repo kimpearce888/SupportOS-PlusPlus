@@ -82,6 +82,7 @@ pub mod oauth_state;
 pub mod operations;
 pub mod outreach;
 pub mod perf_guards;
+pub mod quality;
 pub mod reports;
 pub mod response_state_sql;
 pub mod runner;

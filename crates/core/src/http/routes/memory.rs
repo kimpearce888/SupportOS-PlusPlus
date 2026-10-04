@@ -53,53 +53,256 @@ pub async fn meta(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// GET /api/memory/:customerId — list memory entries for a customer.
-pub async fn get(State(state): State<AppState>, Path(customer_id): Path<i64>) -> Json<Value> {
+/// Reference memory.ts:24-36 — 422 on a non-positive-integer id, 404 on an
+/// unknown customer. Entries matching the psychological/personality
+/// quarantine are never returned as usable memory.
+pub async fn get(State(state): State<AppState>, Path(customer_id): Path<String>) -> Response {
+    let Some(id) = crate::conversation_ops::js_number(&customer_id)
+        .filter(|v| v.fract() == 0.0 && *v > 0.0)
+    else {
+        return memory_id_422_customer();
+    };
+    let id = id as i64;
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let entries: Vec<Value> = conn
-        .prepare("SELECT id, customer_id, key, value, source, created_at FROM customer_memory WHERE customer_id = ?1 ORDER BY created_at DESC")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![customer_id], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "customer_id": r.get::<_, i64>(1)?,
-                    "key": r.get::<_, String>(2)?,
-                    "value": r.get::<_, String>(3)?,
-                    "source": r.get::<_, String>(4)?,
-                    "created_at": r.get::<_, String>(5)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    Json(json!({"entries": entries, "customerId": customer_id}))
-}
-
-/// POST /api/memory/:customerId/entries — add a memory entry.
-pub async fn add_entry(
-    State(state): State<AppState>,
-    Path(customer_id): Path<i64>,
-    Json(body): Json<Value>,
-) -> Json<Value> {
-    let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("note");
-    let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("");
-    let source = body
-        .get("source")
-        .and_then(|v| v.as_str())
-        .unwrap_or("manual");
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let inserted = conn
-        .execute(
-            "INSERT INTO customer_memory (customer_id, key, value, source, created_at)
-             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            rusqlite::params![customer_id, key, value, source],
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM customers WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |_| Ok(()),
         )
         .is_ok();
-    drop(conn);
-    if inserted {}
-    Json(json!({"ok": inserted, "customerId": customer_id}))
+    if !exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Customer not found."
+            })),
+        )
+            .into_response();
+    }
+    // The port's customer_memory columns are memory_key/memory_value
+    // (the reference key/value); the wire shape keeps the reference names.
+    let rows: Vec<(i64, String, Option<String>, String, String)> = conn
+        .prepare(
+            "SELECT id, memory_key, memory_value, source, created_at
+             FROM customer_memory WHERE customer_id = ?1 ORDER BY created_at DESC",
+        )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .ok()
+        })
+        .unwrap_or_default();
+    let entries: Vec<Value> = rows
+        .into_iter()
+        .filter(|(_, key, value, _, _)| !is_quarantined(key, value.as_deref()))
+        .map(|(entry_id, key, value, source, created_at)| {
+            json!({
+                "id": entry_id,
+                "customer_id": id,
+                "key": key,
+                "value": value,
+                "source": source,
+                "created_at": created_at,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "entries": entries, "customerId": id })),
+    )
+        .into_response()
+}
+
+/// The reference `kindSchema` enum (shared/memory.ts MEMORY_ENTRY_KINDS).
+const MEMORY_ENTRY_KINDS: [&str; 5] = [
+    "fact",
+    "account",
+    "preference",
+    "issue_history",
+    "context",
+];
+
+/// POST /api/memory/:customerId/entries — upsert a HUMAN memory entry
+/// (reference memory.ts:38-76 + customerMemoryService.upsertHumanEntry).
+/// The red-line quarantine refuses psychological/personality judgments.
+pub async fn add_entry(
+    State(state): State<AppState>,
+    Path(customer_id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let Some(id) = crate::conversation_ops::js_number(&customer_id)
+        .filter(|v| v.fract() == 0.0 && *v > 0.0)
+    else {
+        return memory_id_422_customer();
+    };
+    let id = id as i64;
+    let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
+    // z.object({ key: string 1..120, value: string max 2000 nullable
+    // optional, kind: enum default 'fact', conversation_id: int nullable
+    // optional }).parse
+    let key: String = match body.get("key") {
+        Some(Value::String(s)) => {
+            let n = s.chars().count();
+            if n < 1 || n > 120 {
+                return crate::conversation_ops::zod_422(
+                    "key",
+                    "String must contain at most 120 character(s)",
+                );
+            }
+            s.trim().to_string()
+        }
+        _ => return crate::conversation_ops::zod_422("key", "Required"),
+    };
+    let value: Option<String> = match body.get("value") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(v)) => {
+            if v.chars().count() > 2000 {
+                return crate::conversation_ops::zod_422(
+                    "value",
+                    "String must contain at most 2000 character(s)",
+                );
+            }
+            // Reference upsertHumanEntry keeps the ORIGINAL value (only the
+            // key is trimmed): `body.value?.trim() ? body.value : body.value ?? null`.
+            Some(v.clone())
+        }
+        Some(_) => {
+            return crate::conversation_ops::zod_422(
+                "value",
+                "Expected string, received non-string",
+            );
+        }
+    };
+    let kind: &str = match body.get("kind") {
+        None | Some(Value::Null) => "fact",
+        Some(Value::String(k)) => {
+            if !MEMORY_ENTRY_KINDS.contains(&k.as_str()) {
+                return crate::conversation_ops::zod_422(
+                    "kind",
+                    &crate::conversation_ops::zod_enum_message(&MEMORY_ENTRY_KINDS, k),
+                );
+            }
+            MEMORY_ENTRY_KINDS
+                .iter()
+                .find(|k2| **k2 == *k)
+                .copied()
+                .unwrap_or("fact")
+        }
+        Some(_) => {
+            return crate::conversation_ops::zod_422(
+                "kind",
+                "Expected string, received non-string",
+            );
+        }
+    };
+    let conversation_id: Option<i64> = match body.get("conversation_id") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let Some(n) = v.as_i64() else {
+                return crate::conversation_ops::zod_422(
+                    "conversation_id",
+                    "Expected number, received non-number",
+                );
+            };
+            if n < 1 {
+                return crate::conversation_ops::zod_422(
+                    "conversation_id",
+                    "Number must be greater than or equal to 1",
+                );
+            }
+            Some(n)
+        }
+    };
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let customer_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM customers WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![id],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !customer_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Customer not found."
+            })),
+        )
+            .into_response();
+    }
+    if let Some(conv) = conversation_id {
+        let conv_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+                rusqlite::params![conv],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !conv_exists {
+            return crate::conversation_ops::zod_422(
+                "conversation_id",
+                "Linked conversation not found.",
+            );
+        }
+    }
+    if is_quarantined(&key, value.as_deref()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "SupportOS policy: psychological/personality judgments are never stored as customer memory. Rephrase as an observable fact."
+            })),
+        )
+            .into_response();
+    }
+    // upsertHumanEntry: INSERT ... ON CONFLICT (customer_id, memory_key)
+    // DO UPDATE — the port table's unique index (customer_id, memory_key)
+    // is the reference (customer_id, key) target.
+    let inserted = conn.execute(
+        "INSERT INTO customer_memory (customer_id, memory_key, memory_value, source, origin,
+                                     first_seen_at, last_seen_at, confidence, provenance, kind)
+         VALUES (?1, ?2, ?3, 'human', 'manual', datetime('now'), datetime('now'), 'high',
+                 'human_local', ?4)
+         ON CONFLICT (customer_id, memory_key) DO UPDATE SET
+             memory_value = excluded.memory_value,
+             source = 'human',
+             origin = 'manual',
+             last_seen_at = datetime('now'),
+             confidence = 'high',
+             provenance = 'human_local',
+             kind = excluded.kind",
+        rusqlite::params![id, key, value, kind],
+    );
+    match inserted {
+        Ok(_) => {
+            let entry_id = conn.last_insert_rowid();
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "entry_id": entry_id })),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "customerId": id })),
+        )
+            .into_response(),
+    }
 }
 
 // ─── Entry deletion (reference memory.ts:78-100 + shared/memory.ts) ──────
@@ -283,6 +486,18 @@ fn memory_ids_422() -> Response {
             "statusCode": 422,
             "error": "ValidationError",
             "message": "Customer id and entry id must be positive integers."
+        })),
+    )
+        .into_response()
+}
+
+fn memory_id_422_customer() -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "statusCode": 422,
+            "error": "ValidationError",
+            "message": "Customer id must be a positive integer."
         })),
     )
         .into_response()

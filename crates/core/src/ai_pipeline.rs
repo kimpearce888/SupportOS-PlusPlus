@@ -168,6 +168,37 @@ impl AiBackend {
             model: res.model,
         })
     }
+
+    /// The raw-options chat the QA AI layer uses (reference
+    /// `QaChatFn` = `(opts) => lmStudio.chat(opts)`): content may be None,
+    /// and the caller does its own JSON parsing so it can blame unparseable
+    /// output honestly. Disabled surfaces the AI-disabled error.
+    pub async fn chat_qa(
+        &self,
+        messages: Vec<crate::ai_provider::ChatMessage>,
+        temperature: f64,
+        max_tokens: u32,
+        json_mode: bool,
+    ) -> std::result::Result<crate::ai_lm_studio::ChatOptsResult, LmStudioError> {
+        let (client, model) = match self {
+            AiBackend::LmStudio { client, model } => (client, model.as_deref()),
+            AiBackend::Disabled => {
+                return Err(LmStudioError::new(AI_DISABLED_MESSAGE, false));
+            }
+        };
+        client
+            .chat_with_opts(
+                model,
+                &messages,
+                ChatOpts {
+                    temperature: Some(temperature),
+                    max_tokens: Some(max_tokens),
+                    json_mode,
+                },
+            )
+            .await
+            .map_err(|e| LmStudioError::new(e.to_string(), true))
+    }
 }
 
 /// Result of the JSON-mode chat (reference `chatJson` return).

@@ -79,6 +79,10 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     // call order.
     crate::ai_pipeline::ensure_pipeline_schema(conn)?;
     crate::copilot::ensure_copilot_schema(conn)?;
+    // Quality-domain tables (reference migration 015 shapes): the friction
+    // findings table with its (conversation_id, kind) upsert target and the
+    // QA computed_at stamp.
+    crate::quality::ensure_quality_tables(conn)?;
 
     // Record the reference-equivalent migration set so `migrations_applied`
     // and the .sosync schema guard compare like with like (the reference's
