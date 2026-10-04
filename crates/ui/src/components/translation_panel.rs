@@ -7,6 +7,8 @@
 
 use leptos::*;
 
+use crate::toasts;
+
 /// The language summary of a conversation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConversationLanguageSummary {
@@ -236,24 +238,30 @@ pub fn TranslationPanel(conversation_id: i64) -> impl IntoView {
         spawn_local(async move {
             // v2.2.1 audit fix: only attach an inbound result to the
             // message that is STILL active and whose text matches.
-            if let Ok(v) = crate::api::post_json::<serde_json::Value>(
+            match crate::api::post_json::<serde_json::Value>(
                 "/api/translation/translate",
                 Some(&body),
             )
             .await
             {
-                let r = parse_translation_result(&v);
-                if r.purpose == "customer_inbound" {
-                    active_message.update(|m| {
-                        if let Some(m) = m {
-                            if m.text == r.source_text {
-                                m.translated = Some(r);
+                Ok(v) => {
+                    let r = parse_translation_result(&v);
+                    if r.purpose == "customer_inbound" {
+                        active_message.update(|m| {
+                            if let Some(m) = m {
+                                if m.text == r.source_text {
+                                    m.translated = Some(r);
+                                }
                             }
-                        }
-                    });
-                } else if r.purpose == "agent_draft" {
-                    translated_draft.set(Some(r));
+                        });
+                    } else if r.purpose == "agent_draft" {
+                        translated_draft.set(Some(r));
+                    }
+                    if v.get("cached").and_then(|c| c.as_bool()).unwrap_or(false) {
+                        toasts::info("Served from the local translation cache.");
+                    }
                 }
+                Err(e) => toasts::error(e),
             }
             translating.set(false);
         });

@@ -28,6 +28,7 @@ use crate::components::safe_html::SafeHtml;
 use crate::components::side_threads::SideThreadsPanel;
 use crate::components::state_view::{EmptyState, LoadingState};
 use crate::components::translation_panel::TranslationPanel;
+use crate::toasts;
 
 /// Percent-encode a query value (the query-string subset that needs it).
 fn urlencode(s: &str) -> String {
@@ -198,7 +199,6 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     let composer_mode = create_rw_signal(ComposerMode::Reply);
     let composer_body = create_rw_signal(String::new());
     let composer_error = create_rw_signal(None::<String>);
-    let composer_success = create_rw_signal(None::<String>);
     let selected_ids = create_rw_signal(Vec::<i64>::new());
     // v1.9.0+ parity: context pane tabs + send confirmation + AI sidebar state.
     let context_tab = create_rw_signal(ContextTab::Ai);
@@ -373,17 +373,27 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         let ai_analysis = ai_analysis;
         let ai_analyzing = ai_analyzing;
         wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(r) = crate::api::post_json::<serde_json::Value>(
+            match crate::api::post_json::<serde_json::Value>(
                 &format!("/api/ai/analyze/{id}"),
                 Some(&body),
             )
             .await
             {
-                if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
-                    if let Some(a) = r.get("analysis") {
-                        ai_analysis.set(Some(a.clone()));
+                Ok(r) => {
+                    if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        toasts::success("AI analysis completed.");
+                        if let Some(a) = r.get("analysis") {
+                            ai_analysis.set(Some(a.clone()));
+                        }
+                    } else {
+                        let reason = r
+                            .get("error")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("Analysis failed");
+                        toasts::error(reason);
                     }
                 }
+                Err(e) => toasts::error(e),
             }
             ai_analyzing.set(false);
         });
@@ -412,23 +422,29 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
             ComposerMode::Reply => "reply",
             ComposerMode::Note => "note",
         };
+        // Reference composer onError: the toast tells the user their typed
+        // text survives the failure (spec #20 — state survives async failures).
+        let is_reply = mode == ComposerMode::Reply;
         let path = format!("/api/conversations/{conv_local_id}/{sub_path}");
         // replyRequestSchema / noteRequestSchema field name: `text`.
         let body_payload = serde_json::json!({ "text": body });
-        let composer_success = composer_success;
         let composer_error = composer_error;
         let composer_body = composer_body;
         let selected_id = selected_id;
         wasm_bindgen_futures::spawn_local(async move {
             match crate::api::post_json::<serde_json::Value>(&path, Some(&body_payload)).await {
                 Ok(result) => {
-                    if result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                        let msg = result
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Sent")
-                            .to_string();
-                        composer_success.set(Some(msg));
+                    let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let message = result
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if ok { "Sent" } else { "Operation rejected" })
+                        .to_string();
+                    let detail = result
+                        .get("detail")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    if ok {
                         composer_error.set(None);
                         composer_body.set(String::new());
                         // Refresh the detail by re-selecting it.
@@ -436,17 +452,21 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                             selected_id.set(None);
                             selected_id.set(Some(id));
                         }
-                    } else {
-                        let reason = result
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Operation rejected")
-                            .to_string();
-                        composer_error.set(Some(reason));
                     }
+                    let kind = if ok {
+                        crate::toasts::ToastKind::Success
+                    } else {
+                        crate::toasts::ToastKind::Error
+                    };
+                    crate::toasts::push(kind, message, detail);
                 }
                 Err(e) => {
-                    composer_error.set(Some(e));
+                    let prefix = if is_reply {
+                        "Your text is preserved in the composer. "
+                    } else {
+                        "Your text is preserved. "
+                    };
+                    toasts::error(format!("{prefix}{e}"));
                 }
             }
         });
@@ -465,30 +485,37 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     let change_status = move |new_status: String| {
         let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
         if let Some(conv_local_id) = conv_local_id {
-            let detail_error = detail_error;
             let selected_id = selected_id;
             wasm_bindgen_futures::spawn_local(async move {
                 let path = format!("/api/conversations/{conv_local_id}/status");
                 let payload = serde_json::json!({ "status": new_status });
                 match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
                     Ok(result) => {
-                        if !result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            let reason = result
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Status change rejected");
-                            detail_error.set(Some(reason.to_string()));
-                        } else {
+                        let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let message = result
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(if ok {
+                                "Status updated."
+                            } else {
+                                "Status change rejected"
+                            })
+                            .to_string();
+                        if ok {
                             // Refresh detail.
                             if let Some(id) = selected_id.get() {
                                 selected_id.set(None);
                                 selected_id.set(Some(id));
                             }
                         }
+                        let kind = if ok {
+                            crate::toasts::ToastKind::Success
+                        } else {
+                            crate::toasts::ToastKind::Error
+                        };
+                        crate::toasts::push(kind, message, None);
                     }
-                    Err(e) => {
-                        detail_error.set(Some(e));
-                    }
+                    Err(e) => toasts::error(e),
                 }
             });
         }
@@ -498,7 +525,6 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     let assign_to = move |assignee_id: Option<i64>| {
         let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
         if let Some(conv_local_id) = conv_local_id {
-            let detail_error = detail_error;
             let selected_id = selected_id;
             wasm_bindgen_futures::spawn_local(async move {
                 let path = format!("/api/conversations/{conv_local_id}/assign");
@@ -507,20 +533,30 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                 let payload = serde_json::json!({ "userId": assignee_id });
                 match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
                     Ok(result) => {
-                        if !result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            let reason = result
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Assignment rejected");
-                            detail_error.set(Some(reason.to_string()));
-                        } else if let Some(id) = selected_id.get() {
-                            selected_id.set(None);
-                            selected_id.set(Some(id));
+                        let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let message = result
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(if ok {
+                                "Assignee updated."
+                            } else {
+                                "Assignment rejected"
+                            })
+                            .to_string();
+                        if ok {
+                            if let Some(id) = selected_id.get() {
+                                selected_id.set(None);
+                                selected_id.set(Some(id));
+                            }
                         }
+                        let kind = if ok {
+                            crate::toasts::ToastKind::Success
+                        } else {
+                            crate::toasts::ToastKind::Error
+                        };
+                        crate::toasts::push(kind, message, None);
                     }
-                    Err(e) => {
-                        detail_error.set(Some(e));
-                    }
+                    Err(e) => toasts::error(e),
                 }
             });
         }
@@ -691,31 +727,60 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                         <button
                             class="spp-button spp-button--ghost"
                             on:click=move |_| {
-                                // Bulk close: for each selected conversation, call inbox_change_status.
-                                // We need the remote_id, which we look up from conversations.
+                                // Bulk close (reference: one POST /api/conversations/bulk
+                                // with action "close"; the queue applies it per
+                                // conversation). Outcomes surface as a toast like
+                                // the reference's bulk mutation.
                                 let ids = selected_ids.get();
-                                let convs = conversations.get();
-                                for id in ids {
-                                    if let Some(item) = convs.iter().find(|c| c.id == id) {
-                                        let local_id = item.id;
-                                        wasm_bindgen_futures::spawn_local(async move {
-                                            let path =
-                                                format!("/api/conversations/{local_id}/status");
-                                            let payload =
-                                                serde_json::json!({ "status": "closed" });
-                                            let _ = crate::api::post_json::<serde_json::Value>(
-                                                &path,
-                                                Some(&payload),
-                                            )
-                                            .await;
-                                        });
+                                let selected_id = selected_id;
+                                let filters = filters;
+                                let open_in_selection = selected_id
+                                    .get()
+                                    .is_some_and(|open| ids.contains(&open));
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    let body = serde_json::json!({
+                                        "conversationIds": ids,
+                                        "action": "close",
+                                        "params": {},
+                                    });
+                                    match crate::api::post_json::<serde_json::Value>(
+                                        "/api/conversations/bulk",
+                                        Some(&body),
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) => {
+                                            let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                                            let message = r
+                                                .get("message")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Bulk close failed")
+                                                .to_string();
+                                            if ok {
+                                                // v2.2.1 audit fix: the OPEN detail also
+                                                // showed the pre-bulk state when the
+                                                // selection included it — refresh it too.
+                                                if open_in_selection {
+                                                    if let Some(id) = selected_id.get() {
+                                                        selected_id.set(None);
+                                                        selected_id.set(Some(id));
+                                                    }
+                                                }
+                                                let current = filters.get();
+                                                filters.set(InboxFilters::default());
+                                                filters.set(current);
+                                            }
+                                            let kind = if ok {
+                                                crate::toasts::ToastKind::Success
+                                            } else {
+                                                crate::toasts::ToastKind::Error
+                                            };
+                                            crate::toasts::push(kind, message, None);
+                                        }
+                                        Err(e) => toasts::error(e),
                                     }
-                                }
+                                });
                                 selected_ids.set(Vec::new());
-                                // Trigger list refresh by toggling filters.
-                                let current = filters.get();
-                                filters.set(InboxFilters::default());
-                                filters.set(current);
                             }
                         >
                             "Close all"
@@ -929,11 +994,6 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                         <Show when=move || composer_error.get().is_some() fallback=|| ()>
                                             <div class="spp-state spp-state--error">
                                                 {move || composer_error.get().unwrap_or_default()}
-                                            </div>
-                                        </Show>
-                                        <Show when=move || composer_success.get().is_some() fallback=|| ()>
-                                            <div class="spp-state spp-state--success">
-                                                {move || composer_success.get().unwrap_or_default()}
                                             </div>
                                         </Show>
                                         <Show when=move || confirm_send.get() fallback=|| ()>

@@ -7,6 +7,8 @@
 
 use leptos::*;
 
+use crate::toasts;
+
 /// The deterministic QA layer.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct QaDeterministic {
@@ -314,11 +316,23 @@ pub fn QaPanel(conversation_id: i64, #[prop(default = false)] closed: bool) -> i
         let analyzing = analyzing;
         let load = load;
         spawn_local(async move {
-            let _ = crate::api::post_json::<serde_json::Value>(
+            match crate::api::post_json::<serde_json::Value>(
                 &format!("/api/qa/{conversation_id}/analyze"),
                 Some(&body),
             )
-            .await;
+            .await
+            {
+                Ok(r) => {
+                    // Reference: an honest note (e.g. "AI layer disabled") is
+                    // an info toast, not an error.
+                    if let Some(note) = r.get("error").and_then(|v| v.as_str()) {
+                        toasts::info(note);
+                    } else {
+                        toasts::success("QA recomputed.");
+                    }
+                }
+                Err(e) => toasts::error(e),
+            }
             analyzing.set(false);
             load();
         });

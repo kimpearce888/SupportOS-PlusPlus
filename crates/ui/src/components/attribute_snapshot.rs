@@ -8,6 +8,8 @@
 
 use leptos::*;
 
+use crate::toasts;
+
 /// One known attribute row.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AiAttributeRow {
@@ -154,13 +156,24 @@ pub fn AttributeSnapshotCard(conversation_id: i64) -> impl IntoView {
         let recomputing = recomputing;
         let load = load;
         spawn_local(async move {
-            let _ = crate::api::post_json::<serde_json::Value>(
+            match crate::api::post_json::<serde_json::Value>(
                 &format!("/api/attributes/conversation/{conversation_id}/recompute"),
                 Some(&body),
             )
-            .await;
+            .await
+            {
+                Ok(r) => {
+                    let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if ok {
+                        toasts::success("Attribute snapshot recomputed.");
+                        load();
+                    } else {
+                        toasts::error("Recompute failed.");
+                    }
+                }
+                Err(e) => toasts::error(e),
+            }
             recomputing.set(false);
-            load();
         });
     };
 
