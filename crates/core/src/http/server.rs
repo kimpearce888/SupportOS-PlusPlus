@@ -1107,7 +1107,7 @@ impl HttpServer {
             .route("/api/coaching/meta", get(routes::coaching::meta))
             .route(
                 "/api/coaching/:conversationId",
-                get(routes::coaching::get_coaching),
+                get(routes::coaching::get),
             )
             .route(
                 "/api/coaching/:conversationId/review",

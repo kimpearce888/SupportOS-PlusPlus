@@ -1,81 +1,206 @@
 //! Coaching routes — mirrors src/server/routes/coaching.ts
 //!
-//! Per-agent coaching plans + review queue. Coaching entries are
-//! AI-generated (when an AI provider is configured) or manually added.
-//! Stored in the `coaching_plans` table.
+//! M6 coaching routes (v2.2.0, plan Phase 35): OPTIONAL, ADVISORY ONLY.
+//! Nothing here is called by the send path — the agent explicitly asks for
+//! a review. Hostile input is 422'd; AI-unavailable is an honest 503 that
+//! still reports the deterministic layer was computed and stored.
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use crate::coaching;
 
-/// GET /api/coaching/meta — coaching program metadata.
-pub async fn meta(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM coaching_plans", [], |r| r.get(0))
-        .unwrap_or(0);
-    let open: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM coaching_plans WHERE status = 'open'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let resolved: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM coaching_plans WHERE status = 'resolved'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+fn validation_422(message: impl Into<String>) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "statusCode": 422,
+            "error": "ValidationError",
+            "message": message.into(),
+        })),
+    )
+        .into_response()
+}
+
+fn not_found_review() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "statusCode": 404,
+            "error": "NotFound",
+            "message": "No coaching review stored for this conversation yet."
+        })),
+    )
+        .into_response()
+}
+
+fn service_503(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "statusCode": 503,
+            "error": "ServiceUnavailable",
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
+/// `Number(id)` + the reference's explicit positive-integer check.
+fn path_positive_int(raw: &str) -> Result<i64, Response> {
+    match crate::conversation_ops::js_number(raw) {
+        Some(v) if v.fract() == 0.0 && v > 0.0 && v <= i64::MAX as f64 => Ok(v as i64),
+        _ => Err(validation_422(
+            "Conversation id must be a positive integer.",
+        )),
+    }
+}
+
+/// GET /api/coaching/meta — the check catalog + the advisory contract.
+pub async fn meta(State(_state): State<AppState>) -> Response {
     Json(json!({
-        "total": total,
-        "open": open,
-        "resolved": resolved,
-        "checks": [],
+        "checks": coaching::COACHING_CHECK_KINDS,
         "advisory_only": true,
-        "note": "Coaching meta aggregated from the local coaching_plans table. AI-driven checks require a configured AI provider."
+        "note": "Coaching reviews drafts on request and never blocks, delays or modifies the send. Deterministic checks always run; the AI layer needs LM Studio."
     }))
+    .into_response()
 }
 
-/// GET /api/coaching/:userId — coaching plans for a specific user.
-pub async fn get_coaching(State(state): State<AppState>, Path(user_id): Path<i64>) -> Json<Value> {
+/// GET /api/coaching/:conversationId — the last persisted review.
+pub async fn get(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let id = match path_positive_int(&id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let plans: Vec<Value> = conn
-        .prepare("SELECT id, user_id, conversation_id, summary, status, created_at, resolved_at FROM coaching_plans WHERE user_id = ?1 ORDER BY created_at DESC")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![user_id], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "user_id": r.get::<_, i64>(1)?,
-                    "conversation_id": r.get::<_, Option<i64>>(2)?,
-                    "summary": r.get::<_, String>(3)?,
-                    "status": r.get::<_, String>(4)?,
-                    "created_at": r.get::<_, String>(5)?,
-                    "resolved_at": r.get::<_, Option<String>>(6)?,
-                }))
+    let _ = coaching::ensure_coaching_schema(&conn);
+    match coaching::get(&conn, id) {
+        Ok(Some(review)) => Json(review).into_response(),
+        Ok(None) => not_found_review(),
+        Err(e) => service_503(&e.to_string()),
+    }
+}
+
+/// POST /api/coaching/:conversationId/review — review a draft.
+pub async fn review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let id = match path_positive_int(&id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let Some(Json(body)) = body else {
+        return validation_422("body is required.");
+    };
+    // zod: { draft: string 1..=COACHING_MAX_DRAFT_CHARS, includeAi?: boolean }
+    let draft = match body.get("draft") {
+        Some(Value::String(s))
+            if !s.is_empty() && s.chars().count() <= coaching::COACHING_MAX_DRAFT_CHARS =>
+        {
+            s.clone()
+        }
+        _ => {
+            return validation_422(format!(
+                "draft must be a string of 1 to {} characters.",
+                coaching::COACHING_MAX_DRAFT_CHARS
+            ))
+        }
+    };
+    let include_ai = match body.get("includeAi") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return validation_422("includeAi must be a boolean."),
+    };
+    if draft.len() > coaching::COACHING_MAX_DRAFT_BYTES {
+        return validation_422(format!(
+            "Draft exceeds {} bytes.",
+            coaching::COACHING_MAX_DRAFT_BYTES
+        ));
+    }
+    // Honest 503 when AI is requested but disabled: the deterministic layer
+    // still works without it.
+    if include_ai {
+        let ai_enabled = {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::settings::get_bool(&conn, "ai_enabled", true).unwrap_or(true)
+        };
+        if !ai_enabled {
+            return service_503(
+                "AI is disabled in Settings. The deterministic coaching checks work without it; enable LM Studio for the optional AI layer.",
+            );
+        }
+    }
+    // The AI chat holds the SQLite connection across the LM Studio await —
+    // the run_ai bridge (same as the AI pipeline / translation routes).
+    let outcome = state
+        .run_ai(move |conn| {
+            Box::pin(async move {
+                let _ = coaching::ensure_coaching_schema(conn);
+                let backend = crate::ai_pipeline::backend_from_settings(conn);
+                let chat = |messages: Vec<crate::ai_provider::ChatMessage>,
+                            temperature: f64,
+                            max_tokens: u32,
+                            json_mode: bool| {
+                    let backend = &backend;
+                    Box::pin(async move {
+                        backend
+                            .chat_qa(messages, temperature, max_tokens, json_mode)
+                            .await
+                            .map(|res| (res.content, res.model, res.latency_ms))
+                            .map_err(|e| e.message)
+                    }) as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = std::result::Result<
+                                        (Option<String>, String, u64),
+                                        String,
+                                    >,
+                                > + '_,
+                        >,
+                    >
+                };
+                coaching::review_draft(conn, Some(&chat), id, &draft, include_ai).await
             })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
         })
-        .unwrap_or_default();
-    Json(json!({"userId": user_id, "plans": plans}))
-}
-
-/// POST /api/coaching/:planId/review — mark a coaching plan as reviewed.
-pub async fn review(State(state): State<AppState>, Path(plan_id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let rows = conn
-        .execute(
-            "UPDATE coaching_plans SET status = 'reviewed', resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-            rusqlite::params![plan_id],
+        .await;
+    match outcome {
+        Ok(Ok(Ok(review))) => {
+            let ai_error = review
+                .get("ai")
+                .and_then(|a| a.get("error"))
+                .and_then(|e| e.as_str())
+                .map(str::to_string);
+            let mut response = Json(review).into_response();
+            if ai_error.is_some() {
+                // Deterministic layer WAS computed and stored; the AI layer
+                // honestly did not run. Signal it clearly.
+                response.headers_mut().insert(
+                    "x-ai-layer",
+                    axum::http::HeaderValue::from_static("unavailable"),
+                );
+            }
+            response
+        }
+        Ok(Ok(Err("not_found"))) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
+            })),
         )
-        .unwrap_or(0);
-    drop(conn);
-    if rows > 0 {}
-    Json(json!({"ok": rows > 0, "planId": plan_id}))
+            .into_response(),
+        Ok(Ok(Err("empty_draft"))) => validation_422("Draft is empty."),
+        Ok(Ok(Err(_))) => service_503("coaching failure"),
+        Ok(Err(e)) => service_503(&format!(
+            "{e} The deterministic coaching checks were computed and stored."
+        )),
+        Err(join) => service_503(&join),
+    }
 }

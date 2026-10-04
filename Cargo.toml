@@ -89,6 +89,15 @@ strip = true
 # (embedded qdrant + zbus + friends) and the sandbox rootfs cannot hold two
 # artifact sets plus line-info binaries; keeping dev and test on one slim
 # profile shares a single dep set and keeps the linker off a full disk.
+# incremental = false: the incremental cache regrows past 1 GB between test
+# runs and is the single largest disk consumer — disable it outright.
 [profile.dev]
 opt-level = 0
 debug = 0
+incremental = false
+
+# Test binaries inherit dev; keep the same no-incremental rule so `cargo
+# test` does not resurrect the cache under target/debug/incremental.
+[profile.test]
+debug = 0
+incremental = false

@@ -220,9 +220,10 @@ pub fn redacted(conn: &Connection, record: &Value) -> Value {
         "auth": redacted_auth(record),
         "refresh_method": record.get("refresh_method"),
         "refresh_seconds": record.get("refresh_seconds"),
-        "allowed_ai": record.get("allowed_ai"),
-        "enabled": record.get("enabled"),
-        "schema": record.get("schema_json"),
+        // The reference coerces the 0/1 flags to booleans on every read.
+        "allowed_ai": record.get("allowed_ai").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+        "enabled": record.get("enabled").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+        "schema_json": record.get("schema_json"),
         "last_sync_at": record.get("last_sync_at"),
         "last_sync_status": record.get("last_sync_status"),
         "last_sync_error": record.get("last_sync_error"),
@@ -354,7 +355,23 @@ pub fn delete(conn: &Connection, id: i64) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Hydrated `connector_rows` row (shared by the filtered/unfiltered
+/// listRows branches).
+fn connector_row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let data: String = row.get(3)?;
+    Ok(json!({
+        "id": row.get::<_, i64>(0)?,
+        "connector_id": row.get::<_, i64>(1)?,
+        "row_key": row.get::<_, String>(2)?,
+        "data": serde_json::from_str::<Value>(&data).unwrap_or(Value::Null),
+        "fetched_at": row.get::<_, String>(4)?,
+    }))
+}
+
 /// `listRows(id, q, pageSize, offset)` → `{rows, total}` (data hydrated).
+/// The reference filters in SQL (`data LIKE '%q%'`), so pagination AND the
+/// total both respect the query — LIKE is ASCII-case-insensitive in SQLite
+/// just like better-sqlite3's default behavior.
 pub fn list_rows(
     conn: &Connection,
     connector_id: i64,
@@ -364,40 +381,42 @@ pub fn list_rows(
 ) -> Result<(Vec<Value>, i64)> {
     let limit = limit.clamp(1, 200);
     let offset = offset.max(0);
-    let mut stmt = conn.prepare(
-        "SELECT id, connector_id, row_key, data, fetched_at FROM connector_rows
-          WHERE connector_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3",
-    )?;
-    let all: Vec<Value> = stmt
-        .query_map(params![connector_id, limit, offset], |row| {
-            let data: String = row.get(3)?;
-            Ok(json!({
-                "id": row.get::<_, i64>(0)?,
-                "connector_id": row.get::<_, i64>(1)?,
-                "row_key": row.get::<_, String>(2)?,
-                "data": serde_json::from_str::<Value>(&data).unwrap_or(Value::Null),
-                "fetched_at": row.get::<_, String>(4)?,
-            }))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM connector_rows WHERE connector_id = ?1",
-        params![connector_id],
-        |r| r.get(0),
-    )?;
-    let q = q.map(str::to_lowercase);
-    let rows: Vec<Value> = match q {
-        Some(q) if !q.is_empty() => all
-            .into_iter()
-            .filter(|r| {
-                r.get("data")
-                    .and_then(|d| serde_json::to_string(&d).ok())
-                    .map(|s| s.to_lowercase().contains(&q))
-                    .unwrap_or(false)
-            })
-            .collect(),
-        _ => all,
+    let like: Option<String> = q.filter(|q| !q.is_empty()).map(|q| format!("%{q}%"));
+    let rows: Vec<Value> = match &like {
+        Some(like) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, connector_id, row_key, data, fetched_at FROM connector_rows
+                  WHERE connector_id = ?1 AND data LIKE ?2 ORDER BY id LIMIT ?3 OFFSET ?4",
+            )?;
+            let mapped: Vec<Value> = stmt
+                .query_map(params![connector_id, like, limit, offset], connector_row_json)?
+                .filter_map(|r| r.ok())
+                .collect();
+            mapped
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT id, connector_id, row_key, data, fetched_at FROM connector_rows
+                  WHERE connector_id = ?1 ORDER BY id LIMIT ?2 OFFSET ?3",
+            )?;
+            let mapped: Vec<Value> = stmt
+                .query_map(params![connector_id, limit, offset], connector_row_json)?
+                .filter_map(|r| r.ok())
+                .collect();
+            mapped
+        }
+    };
+    let total: i64 = match &like {
+        Some(like) => conn.query_row(
+            "SELECT COUNT(*) FROM connector_rows WHERE connector_id = ?1 AND data LIKE ?2",
+            params![connector_id, like],
+            |r| r.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM connector_rows WHERE connector_id = ?1",
+            params![connector_id],
+            |r| r.get(0),
+        )?,
     };
     Ok((rows, total))
 }
