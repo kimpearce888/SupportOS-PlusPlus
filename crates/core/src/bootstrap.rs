@@ -61,6 +61,9 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     crate::connectors::apply_m038(conn)?;
     crate::mirror_tables::apply_m039(conn)?;
     crate::db_breadth::apply_m040(conn)?;
+    // M041: incident-workspace storage (releases/notes/events — reference
+    // migration 014 shapes the v1.x routes referenced without creating).
+    crate::intelligence_features::apply_m041(conn)?;
 
     // Runtime table guards: tables the reference creates inside its
     // migrations but the port creates lazily on first use. Ensuring them at

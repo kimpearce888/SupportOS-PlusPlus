@@ -612,6 +612,56 @@ pub fn apply_m035(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Apply the M041 batch: the incident-workspace storage the reference
+/// creates in migration 014 — `incident_releases`, `incident_notes` and
+/// `incident_events` — which the v1.x port's routes referenced without ever
+/// creating (status-change and note events were silently dropped; the
+/// refs/releases/notes/related routes were ok-only stubs). Idempotent.
+pub fn apply_m041(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS incident_releases (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id   INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
+            version_label TEXT NOT NULL,
+            notes         TEXT,
+            released_at   TEXT,
+            correlation   TEXT,
+            created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_incident_releases_incident
+            ON incident_releases (incident_id);
+
+        CREATE TABLE IF NOT EXISTS incident_notes (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id        INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
+            author_user_local_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
+            body               TEXT NOT NULL,
+            created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_incident_notes_incident
+            ON incident_notes (incident_id, created_at);
+
+        -- Reference 014 incident_events: the append-only workspace
+        -- timeline. `dedup_key` is UNIQUE so re-recording the same
+        -- transition is a no-op (reference repo.record with INSERT OR
+        -- IGNORE on the dedup key).
+        CREATE TABLE IF NOT EXISTS incident_events (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_id        INTEGER NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
+            event_type         TEXT NOT NULL,
+            actor_user_local_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
+            occurred_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            detail             TEXT,
+            source             TEXT NOT NULL DEFAULT 'local',
+            dedup_key          TEXT NOT NULL UNIQUE
+        );
+        CREATE INDEX IF NOT EXISTS idx_incident_events_incident
+            ON incident_events (incident_id, occurred_at);",
+    )?;
+    let _ = conn.execute("UPDATE app_state SET schema_version = 41 WHERE id = 1", []);
+    Ok(())
+}
+
 /// `ALTER TABLE ... ADD COLUMN` guarded by a PRAGMA table_info check
 /// (the same idempotency pattern as M032 / reference migration 016).
 fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
@@ -860,6 +910,175 @@ pub fn add_incident_related(
         "INSERT OR IGNORE INTO incident_related (incident_id, target_kind, target_local_id, note)
          VALUES (?1, ?2, ?3, ?4)",
         params![incident_id, target_kind, target_local_id, note],
+    )? > 0)
+}
+
+/// Reference incidentRepo.removeRelated: DELETE the (incident, target)
+/// link. Returns whether a link was removed.
+pub fn delete_incident_related(
+    conn: &Connection,
+    incident_id: i64,
+    target_kind: &str,
+    target_local_id: i64,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM incident_related
+         WHERE incident_id = ?1 AND target_kind = ?2 AND target_local_id = ?3",
+        params![incident_id, target_kind, target_local_id],
+    )? > 0)
+}
+
+/// Reference incidentRepo.record — append one workspace event, idempotent
+/// by `dedup_key` (UNIQUE + INSERT OR IGNORE: re-recording the same
+/// transition, e.g. a retried PATCH, is a no-op). `detail` is a JSON
+/// object describing the change (the reference stores the patch body).
+pub fn record_incident_event(
+    conn: &Connection,
+    incident_id: i64,
+    event_type: &str,
+    actor_user_local_id: Option<i64>,
+    detail: Option<&serde_json::Value>,
+    dedup_key: &str,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO incident_events
+             (incident_id, event_type, actor_user_local_id, detail, dedup_key)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            incident_id,
+            event_type,
+            actor_user_local_id,
+            detail.map(|d| d.to_string()),
+            dedup_key
+        ],
+    )? > 0)
+}
+
+/// Reference incidentRepo.addNote — append an operational note row (the
+/// author is the local user; the port has no session user yet, so NULL
+/// renders as "local user" exactly like the reference's fallback).
+/// Also bumps `updated_at` and records a `note` workspace event.
+pub fn add_incident_note(
+    conn: &Connection,
+    incident_id: i64,
+    author_user_local_id: Option<i64>,
+    body: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO incident_notes (incident_id, author_user_local_id, body)
+         VALUES (?1, ?2, ?3)",
+        params![incident_id, author_user_local_id, body],
+    )?;
+    let note_id = conn.last_insert_rowid();
+    let _ = conn.execute(
+        "UPDATE incidents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+        params![incident_id],
+    );
+    let _ = record_incident_event(
+        conn,
+        incident_id,
+        "note",
+        author_user_local_id,
+        Some(&serde_json::json!({ "note_id": note_id })),
+        &format!("incident:{incident_id}:note:{note_id}"),
+    );
+    Ok(note_id)
+}
+
+/// Reference incidentRepo.addRef — one engineering reference
+/// (`system:reference`, e.g. `linear:ENG-4471`). Duplicate
+/// system+reference pairs are ignored (the reference relies on the same
+/// UNIQUE-adjacent INSERT OR IGNORE behaviour).
+pub fn add_incident_ref(
+    conn: &Connection,
+    incident_id: i64,
+    system: &str,
+    reference: &str,
+) -> Result<i64> {
+    let inserted = conn.execute(
+        "INSERT INTO incident_refs (incident_id, system, reference)
+         SELECT ?1, ?2, ?3
+         WHERE NOT EXISTS (
+             SELECT 1 FROM incident_refs
+             WHERE incident_id = ?1 AND system = ?2 AND reference = ?3
+         )",
+        params![incident_id, system, reference],
+    )? > 0;
+    // last_insert_rowid() would return a STALE id when the duplicate guard
+    // blocked the insert — only read it after a real insert.
+    let ref_id = if inserted {
+        conn.last_insert_rowid()
+    } else {
+        0
+    };
+    if inserted {
+        let _ = conn.execute(
+            "UPDATE incidents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            params![incident_id],
+        );
+        let _ = record_incident_event(
+            conn,
+            incident_id,
+            "ref_added",
+            None,
+            Some(&serde_json::json!({ "system": system, "reference": reference })),
+            &format!("incident:{incident_id}:ref:{system}:{reference}"),
+        );
+    }
+    Ok(ref_id)
+}
+
+/// Reference incidentRepo.addRelease — one release row. Returns the new id
+/// (0 when the same version label already exists on the incident).
+pub fn add_incident_release(
+    conn: &Connection,
+    incident_id: i64,
+    version_label: &str,
+    released_at: Option<&str>,
+    notes: Option<&str>,
+) -> Result<i64> {
+    let inserted = conn.execute(
+        "INSERT INTO incident_releases (incident_id, version_label, released_at, notes)
+         SELECT ?1, ?2, ?3, ?4
+         WHERE NOT EXISTS (
+             SELECT 1 FROM incident_releases
+             WHERE incident_id = ?1 AND version_label = ?2
+         )",
+        params![incident_id, version_label, released_at, notes],
+    )? > 0;
+    // 0 when the same version label already exists (stale-rowid guard as
+    // in add_incident_ref).
+    let release_id = if inserted {
+        conn.last_insert_rowid()
+    } else {
+        0
+    };
+    if inserted {
+        let _ = conn.execute(
+            "UPDATE incidents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            params![incident_id],
+        );
+        let _ = record_incident_event(
+            conn,
+            incident_id,
+            "release_added",
+            None,
+            Some(&serde_json::json!({ "version_label": version_label })),
+            &format!("incident:{incident_id}:release:{version_label}"),
+        );
+    }
+    Ok(release_id)
+}
+
+/// Reference incidentRepo.deleteRelease. Returns whether a row was removed.
+pub fn delete_incident_release(
+    conn: &Connection,
+    incident_id: i64,
+    release_id: i64,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM incident_releases WHERE incident_id = ?1 AND id = ?2",
+        params![incident_id, release_id],
     )? > 0)
 }
 
@@ -1241,6 +1460,292 @@ mod tests {
         };
         let s = serde_json::to_string(&inc).unwrap();
         assert!(s.contains("\"severity\":\"sev1\""));
+    }
+
+    // ---- M041: incident workspace storage --------------------------------
+
+    /// fresh_db + M035 (the workspace columns) + M041 (the storage tables).
+    fn workspace_db() -> Connection {
+        let conn = fresh_db();
+        apply_m035(&conn).unwrap();
+        apply_m041(&conn).unwrap();
+        conn
+    }
+
+    /// A fresh boot chain + M041 leaves all three workspace tables present.
+    #[test]
+    fn m041_creates_workspace_tables() {
+        let conn = workspace_db();
+        for t in ["incident_releases", "incident_notes", "incident_events"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{t}'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{t} must exist after M041");
+        }
+        // Idempotent.
+        apply_m041(&conn).unwrap();
+    }
+
+    #[test]
+    fn notes_persist_and_record_events() {
+        let conn = workspace_db();
+        let id = create_manual_incident(
+            &conn,
+            &ManualIncident {
+                title: "Timezone display issue".into(),
+                status: "investigating".into(),
+                severity: "sev3".into(),
+                owner_user_local_id: None,
+                product: None,
+                feature: None,
+                description: None,
+                internal_explanation: None,
+                customer_safe_explanation: None,
+                known_cause: None,
+                workaround: None,
+                resolution: None,
+                started_at: None,
+                conversation_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        let note_id = add_incident_note(&conn, id, None, "Escalated to platform team.").unwrap();
+        assert!(note_id > 0);
+
+        let (body, author): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT body, author_user_local_id FROM incident_notes WHERE id = ?1",
+                params![note_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "Escalated to platform team.");
+        assert_eq!(author, None);
+
+        // The note also recorded a workspace event (deduped by note id).
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM incident_events WHERE incident_id = ?1 AND event_type = 'note'",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+
+        // updated_at is bumped by the note (same-millisecond timestamps make
+        // a string comparison flaky, so assert the row count instead).
+        let events_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM incident_events WHERE incident_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events_after, 1);
+    }
+
+    #[test]
+    fn refs_dedup_by_system_and_reference() {
+        let conn = workspace_db();
+        let id = create_manual_incident(
+            &conn,
+            &ManualIncident {
+                title: "t".into(),
+                status: "investigating".into(),
+                severity: "sev3".into(),
+                owner_user_local_id: None,
+                product: None,
+                feature: None,
+                description: None,
+                internal_explanation: None,
+                customer_safe_explanation: None,
+                known_cause: None,
+                workaround: None,
+                resolution: None,
+                started_at: None,
+                conversation_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        let first = add_incident_ref(&conn, id, "linear", "ENG-4471").unwrap();
+        assert!(first > 0);
+        // Same system+reference again: no second row, no stale rowid.
+        let dup = add_incident_ref(&conn, id, "linear", "ENG-4471").unwrap();
+        assert_eq!(dup, 0, "duplicate ref must return 0, not a stale rowid");
+        // A different reference on the same system is a new row.
+        let second = add_incident_ref(&conn, id, "linear", "ENG-4472").unwrap();
+        assert!(second > 0);
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM incident_refs WHERE incident_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+
+        // delete_incident_ref removes only the targeted row.
+        assert!(delete_incident_ref(&conn, id, first).unwrap());
+        assert!(!delete_incident_ref(&conn, id, first).unwrap());
+    }
+
+    #[test]
+    fn releases_round_trip_and_dedup_by_label() {
+        let conn = workspace_db();
+        let id = create_manual_incident(
+            &conn,
+            &ManualIncident {
+                title: "t".into(),
+                status: "investigating".into(),
+                severity: "sev2".into(),
+                owner_user_local_id: None,
+                product: None,
+                feature: None,
+                description: None,
+                internal_explanation: None,
+                customer_safe_explanation: None,
+                known_cause: None,
+                workaround: None,
+                resolution: None,
+                started_at: None,
+                conversation_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        let r1 = add_incident_release(
+            &conn,
+            id,
+            "v4.12.0",
+            Some("2026-09-30"),
+            Some("rollback attempt"),
+        )
+        .unwrap();
+        assert!(r1 > 0);
+        let dup = add_incident_release(&conn, id, "v4.12.0", None, None).unwrap();
+        assert_eq!(dup, 0, "duplicate label must return 0, not a stale rowid");
+
+        let (label, released_at, notes): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT version_label, released_at, notes FROM incident_releases WHERE id = ?1",
+                params![r1],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(label, "v4.12.0");
+        assert_eq!(released_at.as_deref(), Some("2026-09-30"));
+        assert_eq!(notes.as_deref(), Some("rollback attempt"));
+
+        assert!(delete_incident_release(&conn, id, r1).unwrap());
+        assert!(!delete_incident_release(&conn, id, r1).unwrap());
+    }
+
+    #[test]
+    fn related_links_round_trip() {
+        let conn = workspace_db();
+        let id = create_manual_incident(
+            &conn,
+            &ManualIncident {
+                title: "t".into(),
+                status: "investigating".into(),
+                severity: "sev3".into(),
+                owner_user_local_id: None,
+                product: None,
+                feature: None,
+                description: None,
+                internal_explanation: None,
+                customer_safe_explanation: None,
+                known_cause: None,
+                workaround: None,
+                resolution: None,
+                started_at: None,
+                conversation_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        assert!(
+            add_incident_related(&conn, id, "known_issue", 7, Some("root cause candidate"))
+                .unwrap()
+        );
+        // INSERT OR IGNORE: same target twice is a no-op.
+        assert!(!add_incident_related(&conn, id, "known_issue", 7, None).unwrap());
+        assert!(delete_incident_related(&conn, id, "known_issue", 7).unwrap());
+        assert!(!delete_incident_related(&conn, id, "known_issue", 7).unwrap());
+    }
+
+    #[test]
+    fn events_dedup_by_key() {
+        let conn = workspace_db();
+        let id = create_manual_incident(
+            &conn,
+            &ManualIncident {
+                title: "t".into(),
+                status: "investigating".into(),
+                severity: "sev3".into(),
+                owner_user_local_id: None,
+                product: None,
+                feature: None,
+                description: None,
+                internal_explanation: None,
+                customer_safe_explanation: None,
+                known_cause: None,
+                workaround: None,
+                resolution: None,
+                started_at: None,
+                conversation_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        let detail = serde_json::json!({"from": "investigating", "to": "identified"});
+        assert!(record_incident_event(
+            &conn,
+            id,
+            "status_changed",
+            None,
+            Some(&detail),
+            "incident:1:status:investigating:identified"
+        )
+        .unwrap());
+        // Re-recording the same transition (retried PATCH) is a no-op.
+        assert!(!record_incident_event(
+            &conn,
+            id,
+            "status_changed",
+            None,
+            Some(&detail),
+            "incident:1:status:investigating:identified"
+        )
+        .unwrap());
+        // A different dedup key records.
+        assert!(record_incident_event(
+            &conn,
+            id,
+            "status_changed",
+            None,
+            Some(&detail),
+            "incident:1:status:identified:monitoring"
+        )
+        .unwrap());
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM incident_events WHERE incident_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
     }
 
     #[test]

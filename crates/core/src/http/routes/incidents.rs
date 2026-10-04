@@ -386,16 +386,17 @@ pub async fn update(
             )
             .map(|_| ())
             .ok();
-            conn.execute(
-                "INSERT INTO incident_timeline (incident_id, event_type, description, created_at)
-                 VALUES (?1, 'status_changed', ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                rusqlite::params![
-                    id,
-                    format!("Status moved from {before_status} to {status}.")
-                ],
-            )
-            .map(|_| ())
-            .ok();
+            let _ = crate::intelligence_features::record_incident_event(
+                &conn,
+                id,
+                "status_changed",
+                actor_user_id,
+                Some(&json!({
+                    "from": before_status,
+                    "to": status,
+                })),
+                &format!("incident:{id}:status:{before_status}:{status}"),
+            );
             let body = if status == "resolved" {
                 "Incident resolved.".to_string()
             } else {
@@ -430,16 +431,17 @@ pub async fn update(
             )
             .map(|_| ())
             .ok();
-            conn.execute(
-                "INSERT INTO incident_timeline (incident_id, event_type, description, created_at)
-                 VALUES (?1, 'severity_changed', ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                rusqlite::params![
-                    id,
-                    format!("Severity moved from {before_severity} to {severity}.")
-                ],
-            )
-            .map(|_| ())
-            .ok();
+            let _ = crate::intelligence_features::record_incident_event(
+                &conn,
+                id,
+                "severity_changed",
+                actor_user_id,
+                Some(&json!({
+                    "from": before_severity,
+                    "to": severity,
+                })),
+                &format!("incident:{id}:severity:{before_severity}:{severity}"),
+            );
             notify_incident_update(
                 &conn,
                 Some(&state.bus),
@@ -516,62 +518,190 @@ pub async fn link_conversation(
     Json(json!({"ok": true, "created": created}))
 }
 
-/// POST /api/incidents/:id/notes
+/// POST /api/incidents/:id/notes — the reference `IncidentService.addNote`
+/// (body: `{ body }`, 1..4000 after trim; the reference UI sends `body`).
 pub async fn add_note(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Json<Value> {
-    let note = body.get("note").and_then(|v| v.as_str()).unwrap_or("");
+    let note = body
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if note.is_empty() {
+        return Json(json!({
+            "ok": false,
+            "message": "Note body is required."
+        }));
+    }
+    if note.chars().count() > 4000 {
+        return Json(json!({
+            "ok": false,
+            "message": "Note body must be at most 4000 characters."
+        }));
+    }
+    let author = body.get("authorUserId").and_then(|v| v.as_i64());
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute(
-        "INSERT INTO incident_timeline (incident_id, event_type, description, created_at) VALUES (?1, 'note', ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-        rusqlite::params![id, note],
-    );
-    Json(json!({"ok": true}))
+    match crate::intelligence_features::add_incident_note(&conn, id, author, note) {
+        Ok(_) => Json(json!({ "ok": true })),
+        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+    }
 }
 
-/// POST /api/incidents/:id/refs
+/// POST /api/incidents/:id/refs — the reference addRef (body:
+/// `{ system, reference }`; the reference UI prompts for both).
 pub async fn add_ref(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
-    Json(json!({"ok": true, "incidentId": id}))
+    let system = body.get("system").and_then(|v| v.as_str()).map(str::trim);
+    let reference = body
+        .get("reference")
+        .and_then(|v| v.as_str())
+        .map(str::trim);
+    let (Some(system), Some(reference)) = (system, reference) else {
+        return Json(json!({
+            "ok": false,
+            "message": "Both a reference system and a reference id are required."
+        }));
+    };
+    if system.is_empty()
+        || system.chars().count() > 50
+        || reference.is_empty()
+        || reference.chars().count() > 200
+    {
+        return Json(json!({
+            "ok": false,
+            "message": "Invalid reference system or id."
+        }));
+    }
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match crate::intelligence_features::add_incident_ref(&conn, id, system, reference) {
+        Ok(_) => Json(json!({ "ok": true, "incidentId": id })),
+        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+    }
 }
 
-/// POST /api/incidents/:id/releases
+/// POST /api/incidents/:id/releases — the reference addRelease (body:
+/// `{ versionLabel, releasedAt?, notes? }`; the UI modal sends all three).
 pub async fn add_release(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
-    Json(json!({"ok": true, "incidentId": id}))
+    let label = body
+        .get("versionLabel")
+        .and_then(|v| v.as_str())
+        .map(str::trim);
+    let Some(label) = label.filter(|l| !l.is_empty()) else {
+        return Json(json!({
+            "ok": false,
+            "message": "A version label is required."
+        }));
+    };
+    if label.chars().count() > 100 {
+        return Json(json!({
+            "ok": false,
+            "message": "Version label must be at most 100 characters."
+        }));
+    }
+    let released_at = body
+        .get("releasedAt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let notes = body
+        .get("notes")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match crate::intelligence_features::add_incident_release(&conn, id, label, released_at, notes) {
+        Ok(0) => Json(json!({
+            "ok": false,
+            "message": "That version label is already attached to this incident."
+        })),
+        Ok(_) => Json(json!({ "ok": true, "incidentId": id })),
+        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+    }
 }
 
 /// DELETE /api/incidents/:id/releases/:releaseId
 pub async fn delete_release(
     State(state): State<AppState>,
-    Path((id, _release_id)): Path<(i64, i64)>,
+    Path((id, release_id)): Path<(i64, i64)>,
 ) -> Json<Value> {
-    Json(json!({"ok": true, "incidentId": id}))
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match crate::intelligence_features::delete_incident_release(&conn, id, release_id) {
+        Ok(true) => Json(json!({ "ok": true, "incidentId": id })),
+        Ok(false) => Json(json!({
+            "ok": false,
+            "message": "Release not found on this incident."
+        })),
+        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+    }
 }
 
-/// POST /api/incidents/:id/related
+/// POST /api/incidents/:id/related — the reference addRelated (body:
+/// `{ targetKind, targetLocalId, note? }`).
 pub async fn add_related(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Json<Value> {
-    Json(json!({"ok": true, "incidentId": id}))
+    let Some(kind) = body.get("targetKind").and_then(|v| v.as_str()) else {
+        return Json(json!({
+            "ok": false,
+            "message": "targetKind is required."
+        }));
+    };
+    if !matches!(
+        kind,
+        "known_issue" | "knowledge_doc" | "campaign" | "custom_object"
+    ) {
+        return Json(json!({
+            "ok": false,
+            "message": "Invalid targetKind."
+        }));
+    }
+    let Some(target_local_id) = body.get("targetLocalId").and_then(|v| v.as_i64()) else {
+        return Json(json!({
+            "ok": false,
+            "message": "targetLocalId is required."
+        }));
+    };
+    let note = body
+        .get("note")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match crate::intelligence_features::add_incident_related(&conn, id, kind, target_local_id, note)
+    {
+        Ok(_) => Json(json!({ "ok": true, "incidentId": id })),
+        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+    }
 }
 
 /// DELETE /api/incidents/:id/related/:targetKind/:targetLocalId
 pub async fn delete_related(
     State(state): State<AppState>,
-    Path((id, _target_kind, _target_local_id)): Path<(i64, String, i64)>,
+    Path((id, target_kind, target_local_id)): Path<(i64, String, i64)>,
 ) -> Json<Value> {
-    Json(json!({"ok": true, "incidentId": id}))
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match crate::intelligence_features::delete_incident_related(
+        &conn,
+        id,
+        &target_kind,
+        target_local_id,
+    ) {
+        Ok(true) => Json(json!({ "ok": true, "incidentId": id })),
+        Ok(false) => Json(json!({
+            "ok": false,
+            "message": "That related entity is not linked to this incident."
+        })),
+        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+    }
 }
 
 /// GET /api/incidents/:id/impact
