@@ -74,6 +74,12 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     crate::oauth_state::ensure_oauth_states_table(conn)?;
     crate::jobs::ensure_jobs_table(conn)?;
     crate::interaction_current::ensure_client_current_signals_table(conn)?;
+    // The SLA schema owns `conversations.deleted_at` (reference migration
+    // 003). It used to be ensured lazily by the first SLA report — every
+    // `deleted_at IS NULL` mirror query that ran before that (incident
+    // conversation-link validation, demo snapshots) silently matched
+    // nothing. Ensuring it at boot makes the column invariant.
+    crate::sla::ensure_sla_schema(conn)?;
     // AI pipeline stores (ai_drafts/ai_sources/customer_memory reference
     // shape) + the Copilot session/message tables + the tool-read tables.
     // The reference creates these in migrations 003/013; the port creates
@@ -140,6 +146,18 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "table {t} must exist after apply_all");
         }
+
+        // `conversations.deleted_at` is invariant after boot (the SLA
+        // guard): mirror queries may rely on it from the first request.
+        let conv_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(conversations)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|c| c.ok())
+            .collect();
+        assert!(conv_cols.contains(&"deleted_at".to_string()));
+        assert!(conv_cols.contains(&"customer_waiting_since".to_string()));
 
         // The reference-shaped sync_runs (M029 reshape): `state`, not
         // `status`.

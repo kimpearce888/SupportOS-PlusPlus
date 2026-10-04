@@ -1,12 +1,15 @@
 //! Incidents routes — mirrors src/server/routes/incidents.ts
 
-use axum::extract::{Path, State};
+use std::collections::HashMap;
+
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use crate::incident_workspace::{IncidentListFilters, INCIDENT_SEVERITIES, INCIDENT_STATUSES};
 
 /// The reference `IncidentService.notify` — one `incident_update`
 /// notification through the Notification Center funnel. The dedup key
@@ -44,16 +47,49 @@ fn notify_incident_update(
     );
 }
 
-/// GET /api/incidents
-pub async fn list(State(state): State<AppState>) -> Json<Value> {
+/// GET /api/incidents — the triage board list (reference incidents.ts:16-29):
+/// status/severity enum filters, open-only, code/title search, page +
+/// pageSize (clamped), every row carrying the derived counts.
+pub async fn list(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let status = params
+        .get("status")
+        .filter(|s| INCIDENT_STATUSES.contains(&s.as_str()))
+        .cloned();
+    let severity = params
+        .get("severity")
+        .filter(|s| INCIDENT_SEVERITIES.contains(&s.as_str()))
+        .cloned();
+    let open = matches!(
+        params.get("open").map(String::as_str),
+        Some("true") | Some("1")
+    );
+    let query = params
+        .get("q")
+        .map(|q| q.chars().take(120).collect::<String>());
+    let page_size = clamp_list_param(params.get("pageSize"), 50, 1, 200);
+    let page = clamp_list_param(params.get("page"), 1, 1, 100_000);
+    let filters = IncidentListFilters {
+        status,
+        severity,
+        open,
+        query,
+        limit: page_size,
+        offset: (page - 1) * page_size,
+    };
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let incidents = crate::intelligence_features::list_incidents(&conn, None).unwrap_or_default();
-    let items: Vec<Value> = incidents
-        .iter()
-        .filter_map(|i| serde_json::to_value(i).ok())
-        .collect();
-    let total = items.len() as i64;
+    let (items, total) =
+        crate::incident_workspace::list_incident_rows(&conn, &filters).unwrap_or_default();
     Json(json!({"incidents": items, "total": total}))
+}
+
+/// `clampListParam`: parse-and-clamp a numeric list parameter.
+fn clamp_list_param(raw: Option<&String>, fallback: i64, min: i64, max: i64) -> i64 {
+    raw.and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v.clamp(min, max))
+        .unwrap_or(fallback)
 }
 
 /// POST /api/incidents — create a manual incident (reference incidents.ts:31).
@@ -161,8 +197,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<Value>) -> R
     let started_at = match body.get("startedAt") {
         None | Some(Value::Null) => Some(None),
         Some(Value::String(s)) => {
-            // isoDateish: a parseable date string or null.
-            if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+            // isoDateish: YYYY-MM-DD or a full ISO timestamp.
+            if is_iso_dateish(s) {
                 Some(Some(s.clone()))
             } else {
                 issues.push("startedAt must be an ISO 8601 date string or null.".to_string());
@@ -332,30 +368,55 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<Value>) -> R
     }
 }
 
-/// GET /api/incidents/:id
-pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+/// GET /api/incidents/:id — the full workspace payload (reference
+/// incidents.ts:70-90): the incident row, the computed impact, linked
+/// conversations, derived affected customers/organizations, related
+/// entities, refs, releases, notes and the timeline.
+pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let incidents = crate::intelligence_features::list_incidents(&conn, None).unwrap_or_default();
-    if let Some(incident) = incidents.iter().find(|i| i.id == Some(id)) {
-        Json(serde_json::to_value(incident).unwrap_or(json!({})))
-    } else {
-        Json(json!({"error": "Incident not found"}))
+    match crate::incident_workspace::incident_detail(&conn, id) {
+        Some(payload) => Json(payload).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
+        )
+            .into_response(),
     }
 }
 
-/// PATCH /api/incidents/:id — the reference `IncidentService.patch`
-/// notification-relevant subset: status and severity transitions (with
-/// `incident_update` fan-out + timeline events). Unknown ids 404; unknown
-/// enum values are ignored (the reference zod-parses the whole body and
-/// rejects, but the port's stub accepted everything — the field-level
-/// subset keeps the route honest without widening scope).
+/// PATCH /api/incidents/:id — the full reference `incidentPatchSchema`
+/// field set (title, status, severity, ownerUserId, product, feature,
+/// description, both explanations, knownCause, workaround, resolution,
+/// startedAt). Present-null clears nullable columns; absent fields are
+/// untouched. Status transitions manage `resolved_at`, every meaningful
+/// change appends an idempotent timeline event, and status/severity
+/// transitions fan out `incident_update` notifications (reference
+/// `IncidentService.patch`). Violations are 400 with the joined issue
+/// messages (capped at 300 chars); unknown ids 404.
 pub async fn update(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> Response {
+    let mut issues: Vec<String> = Vec::new();
+    let patch = parse_incident_patch(&body, &mut issues);
+    if !issues.is_empty() {
+        let message: String = issues.join("; ");
+        let message = message.chars().take(300).collect::<String>();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"statusCode": 400, "error": "BadRequest", "message": message})),
+        )
+            .into_response();
+    }
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(before) = crate::intelligence_features::incident_row_json(&conn, id) else {
+    let actor_user_id = body.get("actorUserId").and_then(|v| v.as_i64());
+    let before = crate::intelligence_features::incident_row_json(&conn, id);
+    let Some(before) = before else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -366,125 +427,320 @@ pub async fn update(
         )
             .into_response();
     };
-    let actor_user_id = body.get("actorUserId").and_then(|v| v.as_i64());
-    let status = body
-        .get("status")
-        .and_then(|v| v.as_str())
-        .filter(|s| INCIDENT_STATUSES.contains(s));
-    let severity = body
-        .get("severity")
-        .and_then(|v| v.as_str())
-        .filter(|s| INCIDENT_SEVERITIES.contains(s));
+    let changed_columns = patch.changed_columns();
+    match crate::intelligence_features::patch_incident(&conn, id, &patch, actor_user_id) {
+        Ok(Some(after)) => {
+            let _ = crate::audit::audit(
+                &conn,
+                &crate::audit::AuditEntry::user("incident_updated").with_after_state(json!({
+                    "id": id,
+                    "changes": changed_columns,
+                })),
+            );
+            // Notification fan-out (reference IncidentService.patch).
+            if let Some(status) = &patch.status {
+                let before_status = before.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                if status != before_status {
+                    let body = if status == "resolved" {
+                        "Incident resolved.".to_string()
+                    } else {
+                        format!("Status moved from {before_status} to {status}.")
+                    };
+                    let severity = if status == "resolved" {
+                        "info"
+                    } else {
+                        "warning"
+                    };
+                    notify_incident_update(
+                        &conn,
+                        Some(&state.bus),
+                        id,
+                        &format!("status changed to {status}"),
+                        &body,
+                        severity,
+                        actor_user_id,
+                    );
+                }
+            }
+            if let Some(severity) = &patch.severity {
+                let before_severity = before
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if severity != before_severity {
+                    notify_incident_update(
+                        &conn,
+                        Some(&state.bus),
+                        id,
+                        &format!("severity changed to {severity}"),
+                        &format!("Severity moved from {before_severity} to {severity}."),
+                        "critical",
+                        actor_user_id,
+                    );
+                }
+            }
+            (StatusCode::OK, Json(json!({"ok": true, "incident": after}))).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": format!("Could not update incident: {e}")})),
+        )
+            .into_response(),
+    }
+}
 
-    let mut updated = false;
-    if let Some(status) = status {
-        let before_status = before.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if status != before_status {
-            conn.execute(
-                "UPDATE incidents SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?2",
-                rusqlite::params![status, id],
-            )
-            .map(|_| ())
-            .ok();
-            let _ = crate::intelligence_features::record_incident_event(
-                &conn,
-                id,
-                "status_changed",
-                actor_user_id,
-                Some(&json!({
-                    "from": before_status,
-                    "to": status,
-                })),
-                &format!("incident:{id}:status:{before_status}:{status}"),
-            );
-            let body = if status == "resolved" {
-                "Incident resolved.".to_string()
-            } else {
-                format!("Status moved from {before_status} to {status}.")
-            };
-            let severity = if status == "resolved" {
-                "info"
-            } else {
-                "warning"
-            };
-            notify_incident_update(
-                &conn,
-                Some(&state.bus),
-                id,
-                &format!("status changed to {status}"),
-                &body,
-                severity,
-                actor_user_id,
-            );
-            updated = true;
+/// `isoDateish` (reference shared/workspace.ts:47): `YYYY-MM-DD`,
+/// optionally with a time + zone suffix, at most 32 chars.
+fn is_iso_dateish(s: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}(T[\d:.]+(Z|[+-]\d{2}:?\d{2})?)?$").unwrap()
+    });
+    s.chars().count() <= 32 && re.is_match(s)
+}
+
+/// `incidentPatchSchema.safeParse` reduced to field extraction. Absent =
+/// untouched; `null` is valid only for the nullable fields; every string
+/// is bounds-checked against the reference limits. Any violation pushes
+/// one issue and skips the field.
+fn parse_incident_patch(
+    body: &Value,
+    issues: &mut Vec<String>,
+) -> crate::intelligence_features::IncidentPatch {
+    use crate::intelligence_features::IncidentPatch;
+
+    // nonEmpty(max).optional() — string-only, trimmed, 1..=max.
+    fn required_text(
+        body: &Value,
+        key: &str,
+        max: usize,
+        issues: &mut Vec<String>,
+    ) -> Option<String> {
+        match body.get(key) {
+            None => None,
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    issues.push(format!("{key} must not be empty."));
+                } else if trimmed.chars().count() > max {
+                    issues.push(format!("{key} must be at most {max} characters."));
+                } else {
+                    return Some(trimmed.to_string());
+                }
+                None
+            }
+            Some(_) => {
+                issues.push(format!("Expected string, received non-string for {key}."));
+                None
+            }
         }
     }
-    if let Some(severity) = severity {
-        let before_severity = before
-            .get("severity")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if severity != before_severity {
-            conn.execute(
-                "UPDATE incidents SET severity = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?2",
-                rusqlite::params![severity, id],
-            )
-            .map(|_| ())
-            .ok();
-            let _ = crate::intelligence_features::record_incident_event(
-                &conn,
-                id,
-                "severity_changed",
-                actor_user_id,
-                Some(&json!({
-                    "from": before_severity,
-                    "to": severity,
-                })),
-                &format!("incident:{id}:severity:{before_severity}:{severity}"),
-            );
-            notify_incident_update(
-                &conn,
-                Some(&state.bus),
-                id,
-                &format!("severity changed to {severity}"),
-                &format!("Severity moved from {before_severity} to {severity}."),
-                "critical",
-                actor_user_id,
-            );
-            updated = true;
+
+    // z.string().trim().max(n).nullable().optional()
+    fn trimmed_nullable(
+        body: &Value,
+        key: &str,
+        max: usize,
+        issues: &mut Vec<String>,
+    ) -> Option<Option<String>> {
+        match body.get(key) {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(s)) => {
+                if s.trim().chars().count() > max {
+                    issues.push(format!("{key} must be at most {max} characters."));
+                    None
+                } else {
+                    Some(Some(s.trim().to_string()))
+                }
+            }
+            Some(_) => {
+                issues.push(format!("Expected string, received non-string for {key}."));
+                None
+            }
         }
     }
-    if !updated {
+
+    // z.string().max(n).nullable().optional() — no trim (the reference
+    // keeps description-family whitespace verbatim).
+    fn untrimmed_nullable(
+        body: &Value,
+        key: &str,
+        max: usize,
+        issues: &mut Vec<String>,
+    ) -> Option<Option<String>> {
+        match body.get(key) {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(s)) => {
+                if s.chars().count() > max {
+                    issues.push(format!("{key} must be at most {max} characters."));
+                    None
+                } else {
+                    Some(Some(s.clone()))
+                }
+            }
+            Some(_) => {
+                issues.push(format!("Expected string, received non-string for {key}."));
+                None
+            }
+        }
+    }
+
+    let mut patch = IncidentPatch::default();
+    patch.title = required_text(body, "title", 200, issues);
+    if let Some(Value::String(s)) = body.get("status") {
+        if INCIDENT_STATUSES.contains(&s.as_str()) {
+            patch.status = Some(s.clone());
+        } else {
+            issues.push(format!(
+                "Invalid enum value. Expected 'investigating' | 'identified' | 'fix_in_progress' | 'monitoring' | 'resolved', received '{s}'."
+            ));
+        }
+    } else if let Some(other) = body.get("status") {
+        // Present non-string non-null values are rejected; null is NOT
+        // valid for the enum (optional, not nullable).
+        if !other.is_null() {
+            issues.push("Expected string, received non-string for status.".to_string());
+        }
+    }
+    if let Some(Value::String(s)) = body.get("severity") {
+        if INCIDENT_SEVERITIES.contains(&s.as_str()) {
+            patch.severity = Some(s.clone());
+        } else {
+            issues.push(format!(
+                "Invalid enum value. Expected 'sev1' | 'sev2' | 'sev3' | 'sev4', received '{s}'."
+            ));
+        }
+    } else if let Some(other) = body.get("severity") {
+        if !other.is_null() {
+            issues.push("Expected string, received non-string for severity.".to_string());
+        }
+    }
+    patch.owner_user_local_id = match body.get("ownerUserId") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::Number(n)) if n.as_i64().is_some_and(|v| v > 0) => Some(n.as_i64()),
+        Some(_) => {
+            issues.push("ownerUserId must be a positive integer or null.".to_string());
+            None
+        }
+    };
+    patch.product = trimmed_nullable(body, "product", 120, issues);
+    patch.feature = trimmed_nullable(body, "feature", 120, issues);
+    patch.description = untrimmed_nullable(body, "description", 4000, issues);
+    patch.internal_explanation = untrimmed_nullable(body, "internalExplanation", 8000, issues);
+    patch.customer_safe_explanation =
+        untrimmed_nullable(body, "customerSafeExplanation", 8000, issues);
+    patch.known_cause = untrimmed_nullable(body, "knownCause", 4000, issues);
+    patch.workaround = untrimmed_nullable(body, "workaround", 4000, issues);
+    patch.resolution = untrimmed_nullable(body, "resolution", 4000, issues);
+    patch.started_at = match body.get("startedAt") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => {
+            if is_iso_dateish(s) {
+                Some(Some(s.clone()))
+            } else {
+                issues.push("Dates must be ISO (YYYY-MM-DD or with time).".to_string());
+                None
+            }
+        }
+        Some(_) => {
+            issues.push("Expected string, received non-string for startedAt.".to_string());
+            None
+        }
+    };
+    patch
+}
+
+/// DELETE /api/incidents/:id — remove the LOCAL workspace (reference
+/// incidents.ts:123-132): 404 when unknown, audit `incident_deleted`.
+/// Linked conversations stay untouched (only the incident rows go — the
+/// child tables cascade).
+pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let deleted = conn
+        .execute("DELETE FROM incidents WHERE id = ?1", rusqlite::params![id])
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !deleted {
         return (
-            StatusCode::OK,
-            Json(json!({"ok": true, "incident": before})),
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
         )
             .into_response();
     }
-    let incident =
-        crate::intelligence_features::incident_row_json(&conn, id).unwrap_or(before.clone());
+    let _ = crate::audit::audit(
+        &conn,
+        &crate::audit::AuditEntry::user("incident_deleted").with_after_state(json!({ "id": id })),
+    );
     (
         StatusCode::OK,
-        Json(json!({"ok": true, "incident": incident})),
+        Json(json!({"ok": true, "message": "Incident deleted."})),
     )
         .into_response()
 }
 
-/// DELETE /api/incidents/:id
-pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute("DELETE FROM incidents WHERE id = ?1", rusqlite::params![id]);
-    Json(json!({"ok": true}))
-}
-
 /// POST /api/incidents/:id/conversations/:conversationId — the reference
-/// `IncidentService.linkConversation`: link + `incident_update` fan-out
-/// when a NEW link was created.
+/// `IncidentService.linkConversation`: 404 when the incident or the
+/// (non-deleted) conversation is unknown, then link + `incident_update`
+/// fan-out when a NEW link was created.
 pub async fn link_conversation(
     State(state): State<AppState>,
     Path((id, conversation_id)): Path<(i64, i64)>,
-) -> Json<Value> {
+) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let incident_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM incidents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !incident_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
+        )
+            .into_response();
+    }
+    let conversation: Option<i64> = conn
+        .query_row(
+            "SELECT number FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![conversation_id],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(number) = conversation else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
+            })),
+        )
+            .into_response();
+    };
     let actor_user_id: Option<i64> = None;
     let created = crate::intelligence_features::link_incident_conversation(
         &conn,
@@ -494,17 +750,7 @@ pub async fn link_conversation(
     )
     .unwrap_or(false);
     if created {
-        let number: Option<i64> = conn
-            .query_row(
-                "SELECT number FROM conversations WHERE id = ?1 OR remote_id = ?1",
-                rusqlite::params![conversation_id],
-                |r| r.get(0),
-            )
-            .ok();
-        let body = number.map_or_else(
-            || "A conversation was linked to this incident.".to_string(),
-            |n| format!("Conversation #{n} is now counted in this incident."),
-        );
+        let body = format!("Conversation #{number} is now counted in this incident.");
         notify_incident_update(
             &conn,
             Some(&state.bus),
@@ -515,179 +761,425 @@ pub async fn link_conversation(
             actor_user_id,
         );
     }
-    Json(json!({"ok": true, "created": created}))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "linked": created,
+            "message": if created {
+                "Conversation linked."
+            } else {
+                "Conversation was already linked."
+            },
+        })),
+    )
+        .into_response()
 }
 
-/// POST /api/incidents/:id/notes — the reference `IncidentService.addNote`
-/// (body: `{ body }`, 1..4000 after trim; the reference UI sends `body`).
+/// POST /api/incidents/:id/notes — the reference addNote (body:
+/// `{ body }`, 1..4000 after trim; the reference UI sends `body`).
+/// Returns the created note (with the author label) — the reference UI
+/// does not read it, but the contract carries it.
 pub async fn add_note(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     let note = body
         .get("body")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .unwrap_or("");
-    if note.is_empty() {
-        return Json(json!({
-            "ok": false,
-            "message": "Note body is required."
-        }));
-    }
-    if note.chars().count() > 4000 {
-        return Json(json!({
-            "ok": false,
-            "message": "Note body must be at most 4000 characters."
-        }));
+    if note.is_empty() || note.chars().count() > 4000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400,
+                "error": "BadRequest",
+                "message": "A non-empty note body is required."
+            })),
+        )
+            .into_response();
     }
     let author = body.get("authorUserId").and_then(|v| v.as_i64());
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let incident_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM incidents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !incident_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
+        )
+            .into_response();
+    }
     match crate::intelligence_features::add_incident_note(&conn, id, author, note) {
-        Ok(_) => Json(json!({ "ok": true })),
-        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+        Ok(note_id) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "note": crate::incident_workspace::incident_note_json(&conn, note_id)
+                    .unwrap_or_else(|| json!({"id": note_id, "body": note}))
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 /// POST /api/incidents/:id/refs — the reference addRef (body:
 /// `{ system, reference }`; the reference UI prompts for both).
+/// system: 1..60 after trim; reference: 1..200 after trim.
 pub async fn add_ref(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     let system = body.get("system").and_then(|v| v.as_str()).map(str::trim);
     let reference = body
         .get("reference")
         .and_then(|v| v.as_str())
         .map(str::trim);
     let (Some(system), Some(reference)) = (system, reference) else {
-        return Json(json!({
-            "ok": false,
-            "message": "Both a reference system and a reference id are required."
-        }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400,
+                "error": "BadRequest",
+                "message": "Both a reference system and a reference id are required."
+            })),
+        )
+            .into_response();
     };
     if system.is_empty()
-        || system.chars().count() > 50
+        || system.chars().count() > 60
         || reference.is_empty()
         || reference.chars().count() > 200
     {
-        return Json(json!({
-            "ok": false,
-            "message": "Invalid reference system or id."
-        }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400,
+                "error": "BadRequest",
+                "message": "Invalid reference system or id."
+            })),
+        )
+            .into_response();
     }
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let incident_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM incidents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !incident_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
+        )
+            .into_response();
+    }
     match crate::intelligence_features::add_incident_ref(&conn, id, system, reference) {
-        Ok(_) => Json(json!({ "ok": true, "incidentId": id })),
-        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+        Ok(ref_id) => (StatusCode::OK, Json(json!({"ok": true, "ref_id": ref_id}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 /// POST /api/incidents/:id/releases — the reference addRelease (body:
 /// `{ versionLabel, releasedAt?, notes? }`; the UI modal sends all three).
+/// versionLabel: 1..120 after trim; releasedAt: isoDateish or null; the
+/// port keeps the deliberate duplicate-label guard (a second add of the
+/// same label is `ok: false` with the explanatory message).
 pub async fn add_release(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     let label = body
         .get("versionLabel")
         .and_then(|v| v.as_str())
         .map(str::trim);
     let Some(label) = label.filter(|l| !l.is_empty()) else {
-        return Json(json!({
-            "ok": false,
-            "message": "A version label is required."
-        }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400,
+                "error": "BadRequest",
+                "message": "A version label is required."
+            })),
+        )
+            .into_response();
     };
-    if label.chars().count() > 100 {
-        return Json(json!({
-            "ok": false,
-            "message": "Version label must be at most 100 characters."
-        }));
+    if label.chars().count() > 120 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400,
+                "error": "BadRequest",
+                "message": "Version label must be at most 120 characters."
+            })),
+        )
+            .into_response();
     }
-    let released_at = body
-        .get("releasedAt")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
+    let released_at = match body.get("releasedAt") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.trim().is_empty() => None,
+        Some(Value::String(s)) if is_iso_dateish(s) => Some(s.clone()),
+        Some(Value::String(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "statusCode": 400,
+                    "error": "BadRequest",
+                    "message": "Dates must be ISO (YYYY-MM-DD or with time)."
+                })),
+            )
+                .into_response();
+        }
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "statusCode": 400,
+                    "error": "BadRequest",
+                    "message": "releasedAt must be a string or null."
+                })),
+            )
+                .into_response();
+        }
+    };
     let notes = body
         .get("notes")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::intelligence_features::add_incident_release(&conn, id, label, released_at, notes) {
-        Ok(0) => Json(json!({
-            "ok": false,
-            "message": "That version label is already attached to this incident."
-        })),
-        Ok(_) => Json(json!({ "ok": true, "incidentId": id })),
-        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+    let incident_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM incidents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !incident_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
+        )
+            .into_response();
+    }
+    match crate::intelligence_features::add_incident_release(
+        &conn,
+        id,
+        label,
+        released_at.as_deref(),
+        notes,
+    ) {
+        Ok(0) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": false,
+                "message": "That version label is already attached to this incident."
+            })),
+        )
+            .into_response(),
+        Ok(release_id) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "release_id": release_id})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-/// DELETE /api/incidents/:id/releases/:releaseId
+/// DELETE /api/incidents/:id/releases/:releaseId — 404 when the release
+/// is not on this incident (reference incidents.ts:221-230).
 pub async fn delete_release(
     State(state): State<AppState>,
     Path((id, release_id)): Path<(i64, i64)>,
-) -> Json<Value> {
+) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::intelligence_features::delete_incident_release(&conn, id, release_id) {
-        Ok(true) => Json(json!({ "ok": true, "incidentId": id })),
-        Ok(false) => Json(json!({
-            "ok": false,
-            "message": "Release not found on this incident."
-        })),
-        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "message": "Release removed."})),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Release not found on this incident."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 /// POST /api/incidents/:id/related — the reference addRelated (body:
-/// `{ targetKind, targetLocalId, note? }`).
+/// `{ targetKind, targetLocalId, note? }`). Target existence is checked
+/// BEFORE insert (422, never an FK 500 — the v1.8.0 rule).
 pub async fn add_related(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     let Some(kind) = body.get("targetKind").and_then(|v| v.as_str()) else {
-        return Json(json!({
-            "ok": false,
-            "message": "targetKind is required."
-        }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400,
+                "error": "BadRequest",
+                "message": "targetKind is required."
+            })),
+        )
+            .into_response();
     };
-    if !matches!(
-        kind,
-        "known_issue" | "knowledge_doc" | "campaign" | "custom_object"
-    ) {
-        return Json(json!({
-            "ok": false,
-            "message": "Invalid targetKind."
-        }));
-    }
-    let Some(target_local_id) = body.get("targetLocalId").and_then(|v| v.as_i64()) else {
-        return Json(json!({
-            "ok": false,
-            "message": "targetLocalId is required."
-        }));
+    let table = match kind {
+        "known_issue" => "known_issues",
+        "knowledge_doc" => "knowledge_documents",
+        "campaign" => "outreach_campaigns",
+        "custom_object" => "custom_objects",
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "statusCode": 400,
+                    "error": "BadRequest",
+                    "message": "Invalid targetKind."
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(target_local_id) = body
+        .get("targetLocalId")
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400,
+                "error": "BadRequest",
+                "message": "targetLocalId must be a positive integer."
+            })),
+        )
+            .into_response();
     };
     let note = body
         .get("note")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let incident_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM incidents WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !incident_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
+        )
+            .into_response();
+    }
+    // `table` is one of the four literals above — never user input.
+    let target_exists: bool = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE id = ?1"),
+            rusqlite::params![target_local_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !target_exists {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": format!("{kind} #{target_local_id} does not exist.")
+            })),
+        )
+            .into_response();
+    }
     match crate::intelligence_features::add_incident_related(&conn, id, kind, target_local_id, note)
     {
-        Ok(_) => Json(json!({ "ok": true, "incidentId": id })),
-        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+        Ok(linked) => (StatusCode::OK, Json(json!({"ok": true, "linked": linked}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-/// DELETE /api/incidents/:id/related/:targetKind/:targetLocalId
+/// DELETE /api/incidents/:id/related/:targetKind/:targetLocalId — 400 on
+/// an unknown kind, `{ok, removed}` otherwise (reference incidents.ts:255-265).
 pub async fn delete_related(
     State(state): State<AppState>,
     Path((id, target_kind, target_local_id)): Path<(i64, String, i64)>,
-) -> Json<Value> {
+) -> Response {
+    if !matches!(
+        target_kind.as_str(),
+        "known_issue" | "knowledge_doc" | "campaign" | "custom_object"
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "statusCode": 400,
+                "error": "BadRequest",
+                "message": "Unknown related target kind."
+            })),
+        )
+            .into_response();
+    }
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::intelligence_features::delete_incident_related(
         &conn,
@@ -695,26 +1187,36 @@ pub async fn delete_related(
         &target_kind,
         target_local_id,
     ) {
-        Ok(true) => Json(json!({ "ok": true, "incidentId": id })),
-        Ok(false) => Json(json!({
-            "ok": false,
-            "message": "That related entity is not linked to this incident."
-        })),
-        Err(e) => Json(json!({ "ok": false, "message": e.to_string() })),
+        Ok(removed) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "removed": removed})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "message": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-/// GET /api/incidents/:id/impact
-pub async fn impact(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+/// GET /api/incidents/:id/impact — the shared issue-impact compute
+/// (reference incidents.ts:267-275): derived counts, growth, trend,
+/// inbox/tag/product breakdowns and release-correlation candidates.
+pub async fn impact(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let linked: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM incident_conversations WHERE incident_id = ?1",
-            rusqlite::params![id],
-            |r| r.get(0),
+    match crate::issue_impact::for_incident(&conn, id) {
+        Some(impact) => (StatusCode::OK, Json(json!({"impact": impact}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Incident not found."
+            })),
         )
-        .unwrap_or(0);
-    Json(json!({"impact": {"linked_conversations": linked, "severity": "unknown"}}))
+            .into_response(),
+    }
 }
 
 // ─── Declare-an-incident routes (reference incidents.ts:289-351) ─────────
@@ -729,15 +1231,6 @@ struct IncidentOverrides {
     status: Option<String>,
     description: Option<String>,
 }
-
-const INCIDENT_STATUSES: [&str; 5] = [
-    "investigating",
-    "identified",
-    "fix_in_progress",
-    "monitoring",
-    "resolved",
-];
-const INCIDENT_SEVERITIES: [&str; 4] = ["sev1", "sev2", "sev3", "sev4"];
 
 /// incidentCreateSchema.safeParse reduced to the fields the port persists:
 /// title (trimmed 1..200), status/severity (closed enums), description
@@ -1066,21 +1559,15 @@ pub async fn delete_ref(
 mod tests {
     use super::*;
     use axum::response::IntoResponse;
-    use rusqlite::{params, Connection};
+    use rusqlite::Connection;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     fn fresh_db() -> Connection {
-        let f = tempfile::NamedTempFile::new()
-            .unwrap()
-            .into_temp_path()
-            .keep()
-            .unwrap();
-        let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        crate::intelligence::apply_m014(&conn).unwrap();
-        crate::intelligence_features::apply_m015_to_m019(&conn).unwrap();
-        crate::intelligence_features::apply_m035(&conn).unwrap();
+        // The real production boot chain (includes M035, M041 and the
+        // conversations.deleted_at guard).
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 
@@ -1106,7 +1593,50 @@ mod tests {
         }
     }
 
-    async fn body_json(response: Response) -> (StatusCode, Value) {
+    /// One mirror conversation with a customer in an organization.
+    fn seed_conversation(state: &AppState, id: i64, customer: i64, mailbox: i64) {
+        let conn = state.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+             VALUES (?1, ?1, ?2, 'Broken checkout', 'active', ?3, ?4, '2026-10-01T10:00:00.000Z')",
+            rusqlite::params![id, id + 100, mailbox, customer],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name, last_name, email, organization)
+             VALUES (?1, ?1, 'Ada', 'Lovelace', 'ada@example.com', 'Acme')",
+            rusqlite::params![customer],
+        )
+        .unwrap();
+    }
+
+    async fn declare_incident(state: &AppState, body: Value) -> i64 {
+        let (status, body) = body_json(create(State(state_clone(state)), Json(body)).await).await;
+        assert_eq!(status, StatusCode::OK, "declare failed: {body}");
+        body["incident"]["id"].as_i64().unwrap()
+    }
+
+    /// AppState is not Clone (Arc contents shared) — build a second handle
+    /// over the same connection for sequential route calls in one test.
+    fn state_clone(state: &AppState) -> AppState {
+        AppState {
+            conn: Arc::clone(&state.conn),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            port: 3000,
+            host: "127.0.0.1".into(),
+            demo_mode: false,
+            bus: crate::http::EventBus::new(64),
+            limiter: crate::http::RateLimiter::new(),
+            sync: None,
+            real: None,
+            provider_kind: "fake".into(),
+            workers: None,
+            qdrant: std::sync::Arc::clone(&state.qdrant),
+        }
+    }
+
+    async fn body_json<R: axum::response::IntoResponse>(response: R) -> (StatusCode, Value) {
+        let response = response.into_response();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1152,15 +1682,7 @@ mod tests {
     #[tokio::test]
     async fn create_inserts_with_defaults_and_links_valid_conversations() {
         let state = make_state();
-        {
-            let conn = state.conn.lock().unwrap();
-            conn.execute(
-                "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id)
-                 VALUES (1, 1, 1, 1)",
-                [],
-            )
-            .unwrap();
-        }
+        seed_conversation(&state, 1, 1, 10);
         let (status, body) = body_json(
             create(
                 State(state),
@@ -1168,7 +1690,7 @@ mod tests {
                     "title": "  Checkout down  ",
                     "conversationIds": [1, 999],
                     "product": " Billing ",
-                    "startedAt": "2026-10-01T00:00:00Z"
+                    "startedAt": "2026-10-01"
                 })),
             )
             .await,
@@ -1180,6 +1702,8 @@ mod tests {
         assert_eq!(incident["title"], "Checkout down"); // trimmed
         assert_eq!(incident["status"], "investigating"); // default
         assert_eq!(incident["severity"], "sev3"); // default
+        assert_eq!(incident["product"], "Billing"); // trimmed
+        assert_eq!(incident["started_at"], "2026-10-01"); // date-only accepted
         assert!(incident["code"].as_str().unwrap().starts_with("INC-"));
     }
 
@@ -1188,5 +1712,408 @@ mod tests {
         let state = make_state();
         let (status, _) = body_json(create(State(state), Json(json!({"title": 42}))).await).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn list_filters_and_carries_derived_counts() {
+        let state = make_state();
+        seed_conversation(&state, 1, 1, 10);
+        seed_conversation(&state, 2, 2, 10);
+        let linked_id = declare_incident(
+            &state,
+            json!({"title": "Checkout down", "conversationIds": [1, 2]}),
+        )
+        .await;
+        let newer_id = declare_incident(&state, json!({"title": "Old thing"})).await;
+
+        // No filters: both open, newest-updated first.
+        let mut params = HashMap::new();
+        let (status, body) = body_json(
+            list(
+                State(state_clone(&state)),
+                Query(std::mem::take(&mut params)),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 2);
+        let rows = body["incidents"].as_array().unwrap();
+        assert_eq!(rows[0]["id"], json!(newer_id));
+        let linked_row = rows
+            .iter()
+            .find(|r| r["id"] == json!(linked_id))
+            .expect("linked incident in list");
+        assert_eq!(linked_row["conversation_count"], 2);
+        assert_eq!(linked_row["customer_count"], 2);
+        assert_eq!(linked_row["organization_count"], 1);
+
+        // Resolve the newer incident: open-only keeps the linked one, and
+        // the resolved row sorts last in the unfiltered list.
+        {
+            let conn = state.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE incidents SET status = 'resolved' WHERE id = ?1",
+                rusqlite::params![newer_id],
+            )
+            .unwrap();
+        }
+        let mut params = HashMap::new();
+        params.insert("open".to_string(), "true".to_string());
+        let (_, body) = body_json(
+            list(
+                State(state_clone(&state)),
+                Query(std::mem::take(&mut params)),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["incidents"][0]["id"], json!(linked_id));
+
+        // q= matches the linked incident's title (case-insensitive LIKE).
+        let mut params = HashMap::new();
+        params.insert("q".to_string(), "checkout".to_string());
+        let (_, body) = body_json(
+            list(
+                State(state_clone(&state)),
+                Query(std::mem::take(&mut params)),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["incidents"][0]["id"], json!(linked_id));
+    }
+
+    #[tokio::test]
+    async fn get_returns_full_detail_payload_or_404() {
+        let state = make_state();
+        seed_conversation(&state, 1, 1, 10);
+        let id = declare_incident(
+            &state,
+            json!({"title": "Checkout down", "conversationIds": [1]}),
+        )
+        .await;
+
+        let (status, body) = body_json(get(State(state_clone(&state)), Path(id)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["incident"]["id"], json!(id));
+        assert_eq!(body["incident"]["title"], "Checkout down");
+        assert_eq!(body["impact"]["affected_conversations"], 1);
+        assert_eq!(body["impact"]["affected_customers"], 1);
+        assert_eq!(
+            body["conversations"].as_array().unwrap()[0]["customer_local_id"],
+            1
+        );
+        assert_eq!(
+            body["conversations"].as_array().unwrap()[0]["remote_created_at"],
+            "2026-10-01T10:00:00.000Z"
+        );
+        assert_eq!(
+            body["affected_customers"].as_array().unwrap()[0]["organization"],
+            "Acme"
+        );
+        // The create recorded 'created' + 'conversation_linked' events.
+        let types: Vec<&str> = body["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"created"));
+        assert!(types.contains(&"conversation_linked"));
+
+        let (status, body) = body_json(get(State(state_clone(&state)), Path(999)).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "NotFound");
+    }
+
+    #[tokio::test]
+    async fn impact_route_returns_shared_compute_or_404() {
+        let state = make_state();
+        seed_conversation(&state, 1, 1, 10);
+        let id = declare_incident(
+            &state,
+            json!({"title": "Checkout down", "conversationIds": [1]}),
+        )
+        .await;
+        let (status, body) = body_json(impact(State(state_clone(&state)), Path(id)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["impact"]["subject_kind"], "incident");
+        assert_eq!(body["impact"]["affected_conversations"], 1);
+
+        let (status, _) = body_json(impact(State(state_clone(&state)), Path(999)).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn patch_updates_fields_appends_timeline_and_resolves() {
+        let state = make_state();
+        let id = declare_incident(&state, json!({"title": "Checkout down"})).await;
+
+        // Validation: bad enum 400, empty title 400.
+        let (status, _) = body_json(
+            update(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"status": "explode"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = body_json(
+            update(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"title": "   "})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The resolution-append flow from the reference detail page.
+        let (status, body) = body_json(
+            update(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"resolution": "Mitigated by rollback."})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["incident"]["resolution"], "Mitigated by rollback.");
+
+        // Status transitions manage resolved_at + record timeline events.
+        let (status, body) = body_json(
+            update(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"status": "resolved"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["incident"]["status"], "resolved");
+        assert!(body["incident"]["resolved_at"].as_str().is_some());
+        let (status, body) = body_json(
+            update(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"status": "investigating"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["incident"]["resolved_at"].is_null());
+
+        let (status, body) = body_json(get(State(state_clone(&state)), Path(id)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let types: Vec<&str> = body["timeline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"field_updated"));
+        assert!(types.contains(&"status_changed"));
+
+        // Unknown id 404.
+        let (status, _) = body_json(
+            update(
+                State(state_clone(&state)),
+                Path(999),
+                Json(json!({"status": "resolved"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_route_404s_and_deletes() {
+        let state = make_state();
+        let id = declare_incident(&state, json!({"title": "Bye"})).await;
+        let (status, body) = body_json(delete(State(state_clone(&state)), Path(id)).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        let (status, _) = body_json(delete(State(state_clone(&state)), Path(id)).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn link_conversation_validates_both_sides() {
+        let state = make_state();
+        seed_conversation(&state, 1, 1, 10);
+        let id = declare_incident(&state, json!({"title": "Link me"})).await;
+
+        let (status, _) =
+            body_json(link_conversation(State(state_clone(&state)), Path((999, 1))).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) =
+            body_json(link_conversation(State(state_clone(&state)), Path((id, 999))).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) =
+            body_json(link_conversation(State(state_clone(&state)), Path((id, 1))).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["linked"], true);
+        // Re-linking is ok:true but linked:false.
+        let (_, body) =
+            body_json(link_conversation(State(state_clone(&state)), Path((id, 1))).await).await;
+        assert_eq!(body["linked"], false);
+    }
+
+    #[tokio::test]
+    async fn notes_validate_and_return_the_created_note() {
+        let state = make_state();
+        let id = declare_incident(&state, json!({"title": "Note me"})).await;
+
+        let (status, _) = body_json(
+            add_note(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"body": "  "})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = body_json(
+            add_note(
+                State(state_clone(&state)),
+                Path(999),
+                Json(json!({"body": "x"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = body_json(
+            add_note(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"body": "  Mitigation active.  "})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["note"]["body"], "Mitigation active.");
+    }
+
+    #[tokio::test]
+    async fn related_checks_target_existence_before_insert() {
+        let state = make_state();
+        let id = declare_incident(&state, json!({"title": "Relate me"})).await;
+
+        // Unknown kind 400.
+        let (status, _) = body_json(
+            add_related(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"targetKind": "martian", "targetLocalId": 1})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // Known kind, missing target: 422 (never an FK 500).
+        let (status, body) = body_json(
+            add_related(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"targetKind": "known_issue", "targetLocalId": 42})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["message"].as_str().unwrap().contains("#42"));
+
+        // Real target links.
+        {
+            let conn = state.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO known_issues (id, name) VALUES (7, 'OAuth expiry')",
+                [],
+            )
+            .unwrap();
+        }
+        let (status, body) = body_json(
+            add_related(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"targetKind": "known_issue", "targetLocalId": 7})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["linked"], true);
+
+        // The detail payload labels it.
+        let (_, body) = body_json(get(State(state_clone(&state)), Path(id)).await).await;
+        let related = body["related"].as_array().unwrap();
+        assert_eq!(related[0]["target_label"], "OAuth expiry");
+    }
+
+    #[tokio::test]
+    async fn releases_validate_dates_and_dedup_labels() {
+        let state = make_state();
+        let id = declare_incident(&state, json!({"title": "Release me"})).await;
+
+        let (status, _) = body_json(
+            add_release(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"versionLabel": ""})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = body_json(
+            add_release(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"versionLabel": "v1", "releasedAt": "not-a-date"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = body_json(
+            add_release(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"versionLabel": "v4.12.0", "releasedAt": "2026-10-01"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["release_id"].as_i64().unwrap() > 0);
+
+        // Duplicate label: ok false with the explanatory message.
+        let (status, body) = body_json(
+            add_release(
+                State(state_clone(&state)),
+                Path(id),
+                Json(json!({"versionLabel": "v4.12.0"})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
     }
 }

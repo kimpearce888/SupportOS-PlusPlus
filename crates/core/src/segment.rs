@@ -2607,21 +2607,6 @@ fn renumber_placeholders(sql: &str, counter: &mut usize) -> String {
     out
 }
 
-/// The AI attribute catalog lookup: numeric-typed attributes per the closed
-/// catalog (crate::catalog). Returns true when the key is number-typed.
-fn attr_is_numeric(key: &str) -> bool {
-    crate::catalog::AiAttributeKey::parse(key)
-        .map(|k| k.value_type() == crate::catalog::AttributeValueType::Number)
-        .unwrap_or(false)
-}
-
-/// The closed value vocabulary for an ordinal (enum) AI attribute.
-fn attr_values(key: &str) -> Vec<String> {
-    crate::catalog::AiAttributeKey::parse(key)
-        .map(|k| k.values().iter().map(|v| v.to_string()).collect())
-        .unwrap_or_default()
-}
-
 // ─── NL suggestion (server/ai/segmentSuggest.ts) ──────────────────────────
 
 const KNOWN_CONDITION_KINDS: &[&str] = &[
@@ -3099,7 +3084,6 @@ pub fn suggest_system_prompt() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::params;
 
     fn fresh_db() -> Connection {
         let f = tempfile::NamedTempFile::new()
@@ -3196,7 +3180,7 @@ mod tests {
     #[test]
     fn parse_enforces_node_budget() {
         let cond = json!({"kind": "contact", "field": "email", "op": "equals", "value": "x@y.z"});
-        let many: Vec<Value> = std::iter::repeat(cond).take(51).collect();
+        let many: Vec<Value> = std::iter::repeat_n(cond, 51).collect();
         let body = json!({
             "combinator": "all",
             "conditions": many,
@@ -3531,7 +3515,7 @@ mod tests {
         assert!(validate_segment_tree(&empty_group).is_err());
 
         let cond = json!({"kind": "contact", "field": "email", "op": "equals", "value": "x@y.z"});
-        let many: Vec<Value> = std::iter::repeat(cond).take(21).collect();
+        let many: Vec<Value> = std::iter::repeat_n(cond, 21).collect();
         let oversized = json!({
             "combinator": "all",
             "conditions": many,

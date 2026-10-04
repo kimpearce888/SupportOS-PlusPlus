@@ -202,7 +202,7 @@ mod tests {
             id,
             kind,
             message: format!("m{id}"),
-            detail: if id % 2 == 0 {
+            detail: if id.is_multiple_of(2) {
                 Some("d".to_string())
             } else {
                 None

@@ -730,12 +730,33 @@ pub fn create_incident_from_source(
         ],
     )?;
     let id = conn.last_insert_rowid();
+    // Reference repo.create: the 'created' event plus one
+    // 'conversation_linked' event per linked conversation (idempotent by
+    // dedup key).
+    let _ = record_incident_event(
+        conn,
+        id,
+        "created",
+        None,
+        Some(
+            &serde_json::json!({ "code": code, "title": title, "status": status, "severity": severity }),
+        ),
+        &format!("incident:{id}:created:0"),
+    );
     for conv_id in conversation_ids {
         conn.execute(
             "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id, linked_by)
              VALUES (?1, ?2, 'human')",
             params![id, conv_id],
         )?;
+        let _ = record_incident_event(
+            conn,
+            id,
+            "conversation_linked",
+            None,
+            Some(&serde_json::json!({ "conversation_id": conv_id })),
+            &format!("incident:{id}:conversation_linked:conv:{conv_id}"),
+        );
     }
     Ok(id)
 }
@@ -809,23 +830,46 @@ pub fn create_manual_incident(conn: &Connection, inc: &ManualIncident) -> Result
         ],
     )?;
     let id = conn.last_insert_rowid();
+    // Reference repo.create: the 'created' event plus one
+    // 'conversation_linked' event per linked conversation (idempotent by
+    // dedup key).
+    let _ = record_incident_event(
+        conn,
+        id,
+        "created",
+        None,
+        Some(
+            &serde_json::json!({ "code": code, "title": inc.title, "status": inc.status, "severity": inc.severity }),
+        ),
+        &format!("incident:{id}:created:0"),
+    );
     for conv_id in &inc.conversation_ids {
         conn.execute(
             "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id, linked_by)
              VALUES (?1, ?2, 'human')",
             params![id, conv_id],
         )?;
+        let _ = record_incident_event(
+            conn,
+            id,
+            "conversation_linked",
+            None,
+            Some(&serde_json::json!({ "conversation_id": conv_id })),
+            &format!("incident:{id}:conversation_linked:conv:{conv_id}"),
+        );
     }
     Ok(id)
 }
 
-/// The full incident row as JSON (id, code, title, known_issue_id, status,
-/// severity, source, description, created_at, updated_at, resolved_at) —
-/// the reference `repo().get(id)` record shape.
+/// The full incident row as JSON — the reference `repo().get(id)`
+/// (`SELECT *` on incidents) shape: every column the M035+M041 schema
+/// carries.
 pub fn incident_row_json(conn: &Connection, id: i64) -> Option<Value> {
     conn.query_row(
         "SELECT id, code, title, known_issue_id, status, severity, source,
-                description, created_at, updated_at, resolved_at
+                description, internal_explanation, customer_safe_explanation,
+                known_cause, workaround, resolution, started_at, resolved_at,
+                owner_user_local_id, product, feature, created_at, updated_at
          FROM incidents WHERE id = ?1",
         params![id],
         |r| {
@@ -838,13 +882,288 @@ pub fn incident_row_json(conn: &Connection, id: i64) -> Option<Value> {
                 "severity": r.get::<_, String>(5)?,
                 "source": r.get::<_, String>(6)?,
                 "description": r.get::<_, Option<String>>(7)?,
-                "created_at": r.get::<_, String>(8)?,
-                "updated_at": r.get::<_, String>(9)?,
-                "resolved_at": r.get::<_, Option<String>>(10)?,
+                "internal_explanation": r.get::<_, Option<String>>(8)?,
+                "customer_safe_explanation": r.get::<_, Option<String>>(9)?,
+                "known_cause": r.get::<_, Option<String>>(10)?,
+                "workaround": r.get::<_, Option<String>>(11)?,
+                "resolution": r.get::<_, Option<String>>(12)?,
+                "started_at": r.get::<_, Option<String>>(13)?,
+                "resolved_at": r.get::<_, Option<String>>(14)?,
+                "owner_user_local_id": r.get::<_, Option<i64>>(15)?,
+                "product": r.get::<_, Option<String>>(16)?,
+                "feature": r.get::<_, Option<String>>(17)?,
+                "created_at": r.get::<_, String>(18)?,
+                "updated_at": r.get::<_, String>(19)?,
             }))
         },
     )
     .ok()
+}
+
+/// A validated incident patch (the reference `incidentPatchSchema` field
+/// set the route maps — `resolvedAt` is schema-valid but never mapped by
+/// the reference route, so it is absent here too). Every field encodes
+/// present-in-body semantics: outer `None` = absent (column untouched),
+/// `Some(None)` = present-null (clears a nullable column).
+#[derive(Default)]
+pub struct IncidentPatch {
+    pub title: Option<String>,
+    pub status: Option<String>,
+    pub severity: Option<String>,
+    pub owner_user_local_id: Option<Option<i64>>,
+    pub product: Option<Option<String>>,
+    pub feature: Option<Option<String>>,
+    pub description: Option<Option<String>>,
+    pub internal_explanation: Option<Option<String>>,
+    pub customer_safe_explanation: Option<Option<String>>,
+    pub known_cause: Option<Option<String>>,
+    pub workaround: Option<Option<String>>,
+    pub resolution: Option<Option<String>>,
+    pub started_at: Option<Option<String>>,
+}
+
+impl IncidentPatch {
+    /// The columns this patch would touch (the audit `changes` list —
+    /// reference `Object.keys(changes)`).
+    #[must_use]
+    pub fn changed_columns(&self) -> Vec<String> {
+        let mut cols = Vec::new();
+        if self.title.is_some() {
+            cols.push("title".to_string());
+        }
+        if self.status.is_some() {
+            cols.push("status".to_string());
+        }
+        if self.severity.is_some() {
+            cols.push("severity".to_string());
+        }
+        if self.owner_user_local_id.is_some() {
+            cols.push("owner_user_local_id".to_string());
+        }
+        for (column, slot) in [
+            ("product", &self.product),
+            ("feature", &self.feature),
+            ("description", &self.description),
+            ("internal_explanation", &self.internal_explanation),
+            ("customer_safe_explanation", &self.customer_safe_explanation),
+            ("known_cause", &self.known_cause),
+            ("workaround", &self.workaround),
+            ("resolution", &self.resolution),
+            ("started_at", &self.started_at),
+        ] {
+            if slot.is_some() {
+                cols.push(column.to_string());
+            }
+        }
+        cols
+    }
+}
+
+/// Reference `incidentRepo.patch`: apply the present fields (fixed
+/// whitelist — column names never come from user input), then the
+/// status-transition `resolved_at` bookkeeping and the idempotent
+/// timeline events (status/severity/owner changes + `field_updated` for
+/// the label-mapped text fields). Returns the after row, or `None` when
+/// the incident does not exist. An empty patch is a no-op returning the
+/// current row.
+///
+/// # Errors
+///
+/// Returns [`crate::error::Error::Sqlite`] when a statement fails.
+pub fn patch_incident(
+    conn: &Connection,
+    incident_id: i64,
+    patch: &IncidentPatch,
+    actor_user_id: Option<i64>,
+) -> Result<Option<Value>> {
+    let Some(before) = incident_row_json(conn, incident_id) else {
+        return Ok(None);
+    };
+
+    // (column, value) pairs from the fixed whitelist.
+    let mut sets: Vec<(&'static str, rusqlite::types::Value)> = Vec::new();
+    if let Some(v) = &patch.title {
+        sets.push(("title", v.clone().into()));
+    }
+    if let Some(v) = &patch.status {
+        sets.push(("status", v.clone().into()));
+    }
+    if let Some(v) = &patch.severity {
+        sets.push(("severity", v.clone().into()));
+    }
+    if let Some(v) = &patch.owner_user_local_id {
+        let v = v
+            .map(rusqlite::types::Value::Integer)
+            .unwrap_or(rusqlite::types::Value::Null);
+        sets.push(("owner_user_local_id", v));
+    }
+    for (column, value) in [
+        ("product", &patch.product),
+        ("feature", &patch.feature),
+        ("description", &patch.description),
+        ("internal_explanation", &patch.internal_explanation),
+        (
+            "customer_safe_explanation",
+            &patch.customer_safe_explanation,
+        ),
+        ("known_cause", &patch.known_cause),
+        ("workaround", &patch.workaround),
+        ("resolution", &patch.resolution),
+        ("started_at", &patch.started_at),
+    ] {
+        if let Some(v) = value {
+            let v = v
+                .clone()
+                .map(rusqlite::types::Value::Text)
+                .unwrap_or(rusqlite::types::Value::Null);
+            sets.push((column, v));
+        }
+    }
+    if sets.is_empty() {
+        return Ok(Some(before));
+    }
+
+    let set_sql = sets
+        .iter()
+        .map(|(c, _)| format!("{c} = ?"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut bound: Vec<&dyn rusqlite::ToSql> = sets
+        .iter()
+        .map(|(_, v)| v as &dyn rusqlite::ToSql)
+        .collect();
+    bound.push(&incident_id);
+    conn.execute(
+        &format!(
+            "UPDATE incidents SET {set_sql}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?"
+        ),
+        bound.as_slice(),
+    )?;
+
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    // Status-transition bookkeeping + event.
+    if let Some(status) = &patch.status {
+        let before_status = before.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status != before_status {
+            if status == "resolved" {
+                conn.execute(
+                    "UPDATE incidents SET resolved_at = COALESCE(resolved_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id = ?1",
+                    params![incident_id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE incidents SET resolved_at = NULL WHERE id = ?1",
+                    params![incident_id],
+                )?;
+            }
+            let _ = record_incident_event(
+                conn,
+                incident_id,
+                "status_changed",
+                actor_user_id,
+                Some(&serde_json::json!({ "from": before_status, "to": status })),
+                &format!("incident:{incident_id}:status_changed:{before_status}->{status}"),
+            );
+        }
+    }
+    if let Some(severity) = &patch.severity {
+        let before_severity = before
+            .get("severity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if severity != before_severity {
+            let _ = record_incident_event(
+                conn,
+                incident_id,
+                "severity_changed",
+                actor_user_id,
+                Some(&serde_json::json!({ "from": before_severity, "to": severity })),
+                &format!("incident:{incident_id}:severity_changed:{before_severity}->{severity}"),
+            );
+        }
+    }
+    if let Some(owner) = &patch.owner_user_local_id {
+        let before_owner = before.get("owner_user_local_id").and_then(|v| v.as_i64());
+        if *owner != before_owner {
+            let _ = record_incident_event(
+                conn,
+                incident_id,
+                "owner_changed",
+                actor_user_id,
+                Some(&serde_json::json!({ "from": before_owner, "to": owner })),
+                &format!("incident:{incident_id}:owner_changed:{before_owner:?}->{owner:?}"),
+            );
+        }
+    }
+    // field_updated for the label-mapped text fields (dedup suffix carries
+    // the edit timestamp, so distinct edits are distinct events).
+    let field_updated = |column: &str, label: &str, new_value: Option<Option<&str>>| {
+        if let Some(value) = new_value {
+            let before_value = before.get(column).and_then(|v| v.as_str());
+            if before_value != value {
+                let _ = record_incident_event(
+                    conn,
+                    incident_id,
+                    "field_updated",
+                    actor_user_id,
+                    Some(&serde_json::json!({ "field": label })),
+                    &format!("incident:{incident_id}:field_updated:{column}:{now}"),
+                );
+            }
+        }
+    };
+    field_updated("title", "Title", patch.title.as_deref().map(Some));
+    field_updated(
+        "product",
+        "Product",
+        patch.product.as_ref().map(|v| v.as_deref()),
+    );
+    field_updated(
+        "feature",
+        "Feature",
+        patch.feature.as_ref().map(|v| v.as_deref()),
+    );
+    field_updated(
+        "description",
+        "Description",
+        patch.description.as_ref().map(|v| v.as_deref()),
+    );
+    field_updated(
+        "internal_explanation",
+        "Internal explanation",
+        patch.internal_explanation.as_ref().map(|v| v.as_deref()),
+    );
+    field_updated(
+        "customer_safe_explanation",
+        "Customer-safe explanation",
+        patch
+            .customer_safe_explanation
+            .as_ref()
+            .map(|v| v.as_deref()),
+    );
+    field_updated(
+        "known_cause",
+        "Known cause",
+        patch.known_cause.as_ref().map(|v| v.as_deref()),
+    );
+    field_updated(
+        "workaround",
+        "Workaround",
+        patch.workaround.as_ref().map(|v| v.as_deref()),
+    );
+    field_updated(
+        "resolution",
+        "Resolution",
+        patch.resolution.as_ref().map(|v| v.as_deref()),
+    );
+    field_updated(
+        "started_at",
+        "Start date",
+        patch.started_at.as_ref().map(|v| v.as_deref()),
+    );
+
+    Ok(incident_row_json(conn, incident_id))
 }
 
 /// Reference incidentRepo.linkConversation (minus the caller-side
@@ -866,6 +1185,14 @@ pub fn link_incident_conversation(
             "UPDATE incidents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
             params![incident_id],
         )?;
+        let _ = record_incident_event(
+            conn,
+            incident_id,
+            "conversation_linked",
+            None,
+            Some(&serde_json::json!({ "conversation_id": conversation_id })),
+            &format!("incident:{incident_id}:conversation_linked:conv:{conversation_id}"),
+        );
     }
     Ok(created)
 }
@@ -886,6 +1213,14 @@ pub fn unlink_incident_conversation(
             "UPDATE incidents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
             params![incident_id],
         )?;
+        let _ = record_incident_event(
+            conn,
+            incident_id,
+            "conversation_unlinked",
+            None,
+            Some(&serde_json::json!({ "conversation_id": conversation_id })),
+            &format!("incident:{incident_id}:conversation_unlinked:conv:{conversation_id}"),
+        );
     }
     Ok(removed)
 }
@@ -906,11 +1241,28 @@ pub fn add_incident_related(
     target_local_id: i64,
     note: Option<&str>,
 ) -> Result<bool> {
-    Ok(conn.execute(
+    let created = conn.execute(
         "INSERT OR IGNORE INTO incident_related (incident_id, target_kind, target_local_id, note)
          VALUES (?1, ?2, ?3, ?4)",
         params![incident_id, target_kind, target_local_id, note],
-    )? > 0)
+    )? > 0;
+    if created {
+        let _ = conn.execute(
+            "UPDATE incidents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            params![incident_id],
+        );
+        let _ = record_incident_event(
+            conn,
+            incident_id,
+            "related_linked",
+            None,
+            Some(
+                &serde_json::json!({ "target_kind": target_kind, "target_local_id": target_local_id }),
+            ),
+            &format!("incident:{incident_id}:related_linked:{target_kind}:{target_local_id}"),
+        );
+    }
+    Ok(created)
 }
 
 /// Reference incidentRepo.removeRelated: DELETE the (incident, target)
@@ -921,11 +1273,24 @@ pub fn delete_incident_related(
     target_kind: &str,
     target_local_id: i64,
 ) -> Result<bool> {
-    Ok(conn.execute(
+    let removed = conn.execute(
         "DELETE FROM incident_related
          WHERE incident_id = ?1 AND target_kind = ?2 AND target_local_id = ?3",
         params![incident_id, target_kind, target_local_id],
-    )? > 0)
+    )? > 0;
+    if removed {
+        let _ = record_incident_event(
+            conn,
+            incident_id,
+            "related_unlinked",
+            None,
+            Some(
+                &serde_json::json!({ "target_kind": target_kind, "target_local_id": target_local_id }),
+            ),
+            &format!("incident:{incident_id}:related_unlinked:{target_kind}:{target_local_id}"),
+        );
+    }
+    Ok(removed)
 }
 
 /// Reference incidentRepo.record — append one workspace event, idempotent
@@ -977,10 +1342,10 @@ pub fn add_incident_note(
     let _ = record_incident_event(
         conn,
         incident_id,
-        "note",
+        "note_added",
         author_user_local_id,
         Some(&serde_json::json!({ "note_id": note_id })),
-        &format!("incident:{incident_id}:note:{note_id}"),
+        &format!("incident:{incident_id}:note_added:{note_id}"),
     );
     Ok(note_id)
 }
@@ -1532,7 +1897,7 @@ mod tests {
         // The note also recorded a workspace event (deduped by note id).
         let events: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM incident_events WHERE incident_id = ?1 AND event_type = 'note'",
+                "SELECT COUNT(*) FROM incident_events WHERE incident_id = ?1 AND event_type = 'note_added'",
                 params![id],
                 |r| r.get(0),
             )
@@ -1540,7 +1905,8 @@ mod tests {
         assert_eq!(events, 1);
 
         // updated_at is bumped by the note (same-millisecond timestamps make
-        // a string comparison flaky, so assert the row count instead).
+        // a string comparison flaky, so assert the row count instead): the
+        // create-time 'created' event plus this note event.
         let events_after: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM incident_events WHERE incident_id = ?1",
@@ -1548,7 +1914,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(events_after, 1);
+        assert_eq!(events_after, 2);
     }
 
     #[test]
@@ -1745,7 +2111,9 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 2);
+        // The create-time 'created' event plus the two distinct
+        // status_changed transitions.
+        assert_eq!(rows, 3);
     }
 
     #[test]

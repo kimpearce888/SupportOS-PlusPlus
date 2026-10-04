@@ -1221,6 +1221,340 @@ pub fn campaign_delete(conn: &Connection, campaign_id: i64) -> serde_json::Value
     serde_json::json!({ "ok": ok, "message": if ok { "Campaign deleted (audit events and Help Scout conversations are untouched." } else { "Delete failed." } })
 }
 
+// ─── Reference-shaped saved segments (segments table semantics) ────────────
+
+/// Upgrade `saved_segments` to the reference `segments` shape in place:
+/// description + condition_tree + version + updated_at columns
+/// (idempotent; the legacy `criteria_json` column stays but is unused).
+pub fn ensure_segments_v2(conn: &Connection) -> Result<()> {
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        decl: &str,
+    ) -> Result<()> {
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info(?) WHERE name = ?",
+                params![table, column],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+        }
+        Ok(())
+    }
+    add_column_if_missing(conn, "saved_segments", "description", "TEXT")?;
+    add_column_if_missing(conn, "saved_segments", "condition_tree", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "saved_segments",
+        "version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        conn,
+        "saved_segments",
+        "updated_at",
+        "TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+    )?;
+    Ok(())
+}
+
+fn segment_row_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+    let id: i64 = r.get(0)?;
+    let name: String = r.get(1)?;
+    let description: Option<String> = r.get(2)?;
+    let condition_tree: Option<String> = r.get(3)?;
+    let version: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(1);
+    let created_at: String = r.get(5)?;
+    let updated_at: Option<String> = r.get(6)?;
+    // parseTree: any stored JSON with conditions[]+exclude[] arrays, else the
+    // empty tree (never fails the request).
+    let definition = condition_tree
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(|v| {
+            v.get("conditions").and_then(|c| c.as_array()).is_some()
+                && v.get("exclude").and_then(|e| e.as_array()).is_some()
+        })
+        .unwrap_or_else(
+            || serde_json::json!({"combinator": "all", "conditions": [], "exclude": []}),
+        );
+    Ok(serde_json::json!({
+        "id": id,
+        "name": name,
+        "description": description,
+        "definition": definition,
+        "version": version,
+        "created_at": created_at,
+        "updated_at": updated_at.unwrap_or(created_at),
+    }))
+}
+
+/// `outreachRepo.listSegments` — reference shape, newest update first.
+pub fn list_segments_v2(conn: &Connection) -> Result<Vec<serde_json::Value>> {
+    ensure_segments_v2(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, description, condition_tree, version, created_at, updated_at
+           FROM saved_segments ORDER BY updated_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], segment_row_json)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.into())
+}
+
+/// `outreachRepo.getSegment` — the parsed definition for campaign creation.
+pub fn get_segment_v2(conn: &Connection, id: i64) -> Result<Option<serde_json::Value>> {
+    ensure_segments_v2(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, description, condition_tree, version, created_at, updated_at
+           FROM saved_segments WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map([id], segment_row_json)?;
+    Ok(rows.next().transpose()?)
+}
+
+/// `outreachRepo.saveSegment` — insert, or update with version increment.
+pub fn save_segment_v2(
+    conn: &Connection,
+    id: Option<i64>,
+    name: &str,
+    description: Option<&str>,
+    definition_json: &str,
+) -> Result<i64> {
+    ensure_segments_v2(conn)?;
+    if let Some(id) = id.filter(|id| *id > 0) {
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM saved_segments WHERE id = ?1", [id], |_| {
+                Ok(true)
+            })
+            .unwrap_or(false);
+        if exists {
+            conn.execute(
+                "UPDATE saved_segments SET name = ?1, description = ?2, condition_tree = ?3,
+                        version = version + 1, updated_at = datetime('now')
+                  WHERE id = ?4",
+                params![name, description, definition_json, id],
+            )?;
+            return Ok(id);
+        }
+    }
+    conn.execute(
+        "INSERT INTO saved_segments (name, description, condition_tree, version)
+         VALUES (?1, ?2, ?3, 1)",
+        params![name, description, definition_json],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+// ─── Reference-shaped campaign creation + listing ──────────────────────────
+
+/// `outreachRepo.createCampaign` — static recipient snapshot with the
+/// why-selected evidence (spec #33/#34/#17).
+#[allow(clippy::too_many_arguments)]
+pub fn create_outreach_campaign(
+    conn: &Connection,
+    name: &str,
+    subject: &str,
+    body: &str,
+    mailbox_local_id: i64,
+    tags: &[String],
+    segment_id: Option<i64>,
+    segment_snapshot: Option<&str>,
+    recipients: &[serde_json::Value],
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO outreach_campaigns (name, subject, body, mailbox_local_id, tags, status, segment_id, segment_snapshot)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7)",
+        params![name, subject, body, mailbox_local_id, serde_json::to_string(tags).unwrap_or_default(), segment_id, segment_snapshot],
+    )?;
+    let campaign_id = conn.last_insert_rowid();
+    let mut ins = conn.prepare(
+        "INSERT OR IGNORE INTO outreach_recipients
+             (campaign_id, customer_local_id, customer_remote_id, email, snapshot)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for rec in recipients {
+        let snapshot = serde_json::json!({
+            "why": rec.get("why").cloned().unwrap_or(serde_json::json!([])),
+            "matching_tickets": rec.get("matching_tickets").cloned().unwrap_or(serde_json::json!([])),
+            "property_values": rec.get("properties").cloned().unwrap_or(serde_json::json!([])),
+            "selected_at": now_iso(),
+        });
+        ins.execute(params![
+            campaign_id,
+            rec.get("customer_local_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            rec.get("customer_remote_id").and_then(|v| v.as_i64()),
+            rec.get("chosen_email").and_then(|v| v.as_str()),
+            serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string()),
+        ])?;
+    }
+    log_event(
+        conn,
+        campaign_id,
+        None,
+        "campaign_created",
+        Some(&format!("{} recipients snapshotted", recipients.len())),
+    );
+    Ok(campaign_id)
+}
+
+/// nowIso (repos/helpers.ts).
+fn now_iso() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| {
+            let secs = d.as_secs();
+            let days = secs / 86400;
+            let rem = secs % 86400;
+            let (y, mo, da) = civil_from_days(days as i64);
+            format!(
+                "{y:04}-{mo:02}-{da:02}T{:02}:{:02}:{:02}.000Z",
+                rem / 3600,
+                (rem % 3600) / 60,
+                rem % 60
+            )
+        })
+        .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".to_string())
+}
+
+/// days-since-epoch → civil date (Howard Hinnant's algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// `outreachRepo.listCampaigns` — the CAMPAIGN_SELECT rows, newest first.
+pub fn list_outreach_campaigns(conn: &Connection) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(&format!(
+        "{CAMPAIGN_SELECT} ORDER BY oc.created_at DESC, oc.id DESC"
+    ))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(serde_json::json!({
+            "id": r.get::<_, i64>(0)?,
+            "name": r.get::<_, String>(1)?,
+            "subject": r.get::<_, String>(2)?,
+            "status": r.get::<_, String>(6)?,
+            "mailbox_local_id": r.get::<_, Option<i64>>(4)?,
+            "mailbox_name": r.get::<_, Option<String>>(11)?,
+            "segment_id": r.get::<_, Option<i64>>(7)?,
+            "segment_name": r.get::<_, Option<String>>(12)?,
+            "recipients": r.get::<_, i64>(13)?,
+            "sent": r.get::<_, i64>(14)?,
+            "failed": r.get::<_, i64>(15)?,
+            "skipped": r.get::<_, i64>(16)?,
+            "unknown": r.get::<_, i64>(17)?,
+            "replied": r.get::<_, i64>(18)?,
+            "created_at": r.get::<_, String>(8)?,
+            "queued_at": r.get::<_, Option<String>>(9)?,
+            "completed_at": r.get::<_, Option<String>>(10)?,
+        }))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.into())
+}
+
+/// `outreachRepo.listRecipients` — snapshot-backed evidence rows.
+pub fn list_campaign_recipients(
+    conn: &Connection,
+    campaign_id: i64,
+    limit: i64,
+) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.customer_local_id, r.customer_remote_id, r.email, r.snapshot,
+                r.state, r.attempts, r.last_error, r.hs_conversation_remote_id,
+                r.hs_conversation_number, r.sent_at, r.replied_at,
+                c.first_name, c.last_name
+           FROM outreach_recipients r
+           LEFT JOIN customers c ON c.id = r.customer_local_id
+          WHERE r.campaign_id = ?1 ORDER BY r.id LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![campaign_id, limit], |r| {
+        let snapshot_raw: String = r.get(4)?;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&snapshot_raw).unwrap_or(serde_json::json!({}));
+        Ok(serde_json::json!({
+            "id": r.get::<_, i64>(0)?,
+            "customer_local_id": r.get::<_, i64>(1)?,
+            "customer_remote_id": r.get::<_, Option<i64>>(2)?,
+            "first_name": r.get::<_, Option<String>>(12)?,
+            "last_name": r.get::<_, Option<String>>(13)?,
+            "email": r.get::<_, Option<String>>(3)?,
+            "state": r.get::<_, String>(5)?,
+            "attempts": r.get::<_, i64>(6)?,
+            "last_error": r.get::<_, Option<String>>(7)?,
+            "hs_conversation_remote_id": r.get::<_, Option<i64>>(8)?,
+            "hs_conversation_number": r.get::<_, Option<i64>>(9)?,
+            "conversation_local_id": serde_json::Value::Null,
+            "sent_at": r.get::<_, Option<String>>(10)?,
+            "replied_at": r.get::<_, Option<String>>(11)?,
+            "why": snapshot.get("why").cloned().unwrap_or(serde_json::json!([])),
+            "matching_tickets": snapshot.get("matching_tickets").cloned().unwrap_or(serde_json::json!([])),
+        }))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.into())
+}
+
+/// `outreachRepo.getCampaign` — CampaignDetail + tags + snapshot + list.
+pub fn get_campaign_full(conn: &Connection, id: i64) -> Result<Option<serde_json::Value>> {
+    let Some(c) = get_outreach_campaign(conn, id)? else {
+        return Ok(None);
+    };
+    let segment_snapshot: serde_json::Value = conn
+        .query_row(
+            "SELECT segment_snapshot FROM outreach_campaigns WHERE id = ?1",
+            [id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v: &serde_json::Value| {
+            v.get("conditions").and_then(|x| x.as_array()).is_some()
+                && v.get("exclude").and_then(|x| x.as_array()).is_some()
+        })
+        .unwrap_or_else(
+            || serde_json::json!({"combinator": "all", "conditions": [], "exclude": []}),
+        );
+    let recipients_list = list_campaign_recipients(conn, id, 1000)?;
+    Ok(Some(serde_json::json!({
+        "id": c.id,
+        "name": c.name,
+        "subject": c.subject,
+        "body": c.body,
+        "status": c.status,
+        "mailbox_local_id": c.mailbox_local_id,
+        "mailbox_name": c.mailbox_name,
+        "segment_id": c.segment_id,
+        "segment_name": c.segment_name,
+        "tags": c.tags,
+        "segment_snapshot": segment_snapshot,
+        "recipients": c.recipients,
+        "sent": c.sent,
+        "failed": c.failed,
+        "skipped": c.skipped,
+        "unknown": c.unknown,
+        "replied": c.replied,
+        "created_at": c.created_at,
+        "queued_at": c.queued_at,
+        "completed_at": c.completed_at,
+        "recipients_list": recipients_list,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1585,337 +1919,4 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"reply_rate\":0.375"));
     }
-}
-
-// ─── Reference-shaped saved segments (segments table semantics) ────────────
-
-/// Upgrade `saved_segments` to the reference `segments` shape in place:
-/// description + condition_tree + version + updated_at columns
-/// (idempotent; the legacy `criteria_json` column stays but is unused).
-pub fn ensure_segments_v2(conn: &Connection) -> Result<()> {
-    fn add_column_if_missing(
-        conn: &Connection,
-        table: &str,
-        column: &str,
-        decl: &str,
-    ) -> Result<()> {
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info(?) WHERE name = ?",
-                params![table, column],
-                |r| r.get(0),
-            )
-            .unwrap_or(false);
-        if !exists {
-            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
-        }
-        Ok(())
-    }
-    add_column_if_missing(conn, "saved_segments", "description", "TEXT")?;
-    add_column_if_missing(conn, "saved_segments", "condition_tree", "TEXT")?;
-    add_column_if_missing(
-        conn,
-        "saved_segments",
-        "version",
-        "INTEGER NOT NULL DEFAULT 1",
-    )?;
-    add_column_if_missing(
-        conn,
-        "saved_segments",
-        "updated_at",
-        "TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-    )?;
-    Ok(())
-}
-
-fn segment_row_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
-    let id: i64 = r.get(0)?;
-    let name: String = r.get(1)?;
-    let description: Option<String> = r.get(2)?;
-    let condition_tree: Option<String> = r.get(3)?;
-    let version: i64 = r.get::<_, Option<i64>>(4)?.unwrap_or(1);
-    let created_at: String = r.get(5)?;
-    let updated_at: Option<String> = r.get(6)?;
-    // parseTree: any stored JSON with conditions[]+exclude[] arrays, else the
-    // empty tree (never fails the request).
-    let definition = condition_tree
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .filter(|v| {
-            v.get("conditions").and_then(|c| c.as_array()).is_some()
-                && v.get("exclude").and_then(|e| e.as_array()).is_some()
-        })
-        .unwrap_or_else(
-            || serde_json::json!({"combinator": "all", "conditions": [], "exclude": []}),
-        );
-    Ok(serde_json::json!({
-        "id": id,
-        "name": name,
-        "description": description,
-        "definition": definition,
-        "version": version,
-        "created_at": created_at,
-        "updated_at": updated_at.unwrap_or(created_at),
-    }))
-}
-
-/// `outreachRepo.listSegments` — reference shape, newest update first.
-pub fn list_segments_v2(conn: &Connection) -> Result<Vec<serde_json::Value>> {
-    ensure_segments_v2(conn)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, description, condition_tree, version, created_at, updated_at
-           FROM saved_segments ORDER BY updated_at DESC, id DESC",
-    )?;
-    let rows = stmt.query_map([], segment_row_json)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.into())
-}
-
-/// `outreachRepo.getSegment` — the parsed definition for campaign creation.
-pub fn get_segment_v2(conn: &Connection, id: i64) -> Result<Option<serde_json::Value>> {
-    ensure_segments_v2(conn)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, name, description, condition_tree, version, created_at, updated_at
-           FROM saved_segments WHERE id = ?1",
-    )?;
-    let mut rows = stmt.query_map([id], segment_row_json)?;
-    Ok(rows.next().transpose()?)
-}
-
-/// `outreachRepo.saveSegment` — insert, or update with version increment.
-pub fn save_segment_v2(
-    conn: &Connection,
-    id: Option<i64>,
-    name: &str,
-    description: Option<&str>,
-    definition_json: &str,
-) -> Result<i64> {
-    ensure_segments_v2(conn)?;
-    if let Some(id) = id.filter(|id| *id > 0) {
-        let exists: bool = conn
-            .query_row("SELECT 1 FROM saved_segments WHERE id = ?1", [id], |_| {
-                Ok(true)
-            })
-            .unwrap_or(false);
-        if exists {
-            conn.execute(
-                "UPDATE saved_segments SET name = ?1, description = ?2, condition_tree = ?3,
-                        version = version + 1, updated_at = datetime('now')
-                  WHERE id = ?4",
-                params![name, description, definition_json, id],
-            )?;
-            return Ok(id);
-        }
-    }
-    conn.execute(
-        "INSERT INTO saved_segments (name, description, condition_tree, version)
-         VALUES (?1, ?2, ?3, 1)",
-        params![name, description, definition_json],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-// ─── Reference-shaped campaign creation + listing ──────────────────────────
-
-/// `outreachRepo.createCampaign` — static recipient snapshot with the
-/// why-selected evidence (spec #33/#34/#17).
-pub fn create_outreach_campaign(
-    conn: &Connection,
-    name: &str,
-    subject: &str,
-    body: &str,
-    mailbox_local_id: i64,
-    tags: &[String],
-    segment_id: Option<i64>,
-    segment_snapshot: Option<&str>,
-    recipients: &[serde_json::Value],
-) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO outreach_campaigns (name, subject, body, mailbox_local_id, tags, status, segment_id, segment_snapshot)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'draft', ?6, ?7)",
-        params![name, subject, body, mailbox_local_id, serde_json::to_string(tags).unwrap_or_default(), segment_id, segment_snapshot],
-    )?;
-    let campaign_id = conn.last_insert_rowid();
-    let mut ins = conn.prepare(
-        "INSERT OR IGNORE INTO outreach_recipients
-             (campaign_id, customer_local_id, customer_remote_id, email, snapshot)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    )?;
-    for rec in recipients {
-        let snapshot = serde_json::json!({
-            "why": rec.get("why").cloned().unwrap_or(serde_json::json!([])),
-            "matching_tickets": rec.get("matching_tickets").cloned().unwrap_or(serde_json::json!([])),
-            "property_values": rec.get("properties").cloned().unwrap_or(serde_json::json!([])),
-            "selected_at": now_iso(),
-        });
-        ins.execute(params![
-            campaign_id,
-            rec.get("customer_local_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
-            rec.get("customer_remote_id").and_then(|v| v.as_i64()),
-            rec.get("chosen_email").and_then(|v| v.as_str()),
-            serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string()),
-        ])?;
-    }
-    log_event(
-        conn,
-        campaign_id,
-        None,
-        "campaign_created",
-        Some(&format!("{} recipients snapshotted", recipients.len())),
-    );
-    Ok(campaign_id)
-}
-
-/// nowIso (repos/helpers.ts).
-fn now_iso() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| {
-            let secs = d.as_secs();
-            let days = secs / 86400;
-            let rem = secs % 86400;
-            let (y, mo, da) = civil_from_days(days as i64);
-            format!(
-                "{y:04}-{mo:02}-{da:02}T{:02}:{:02}:{:02}.000Z",
-                rem / 3600,
-                (rem % 3600) / 60,
-                rem % 60
-            )
-        })
-        .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".to_string())
-}
-
-/// days-since-epoch → civil date (Howard Hinnant's algorithm).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-/// `outreachRepo.listCampaigns` — the CAMPAIGN_SELECT rows, newest first.
-pub fn list_outreach_campaigns(conn: &Connection) -> Result<Vec<serde_json::Value>> {
-    let mut stmt = conn.prepare(&format!(
-        "{CAMPAIGN_SELECT} ORDER BY oc.created_at DESC, oc.id DESC"
-    ))?;
-    let rows = stmt.query_map([], |r| {
-        Ok(serde_json::json!({
-            "id": r.get::<_, i64>(0)?,
-            "name": r.get::<_, String>(1)?,
-            "subject": r.get::<_, String>(2)?,
-            "status": r.get::<_, String>(6)?,
-            "mailbox_local_id": r.get::<_, Option<i64>>(4)?,
-            "mailbox_name": r.get::<_, Option<String>>(11)?,
-            "segment_id": r.get::<_, Option<i64>>(7)?,
-            "segment_name": r.get::<_, Option<String>>(12)?,
-            "recipients": r.get::<_, i64>(13)?,
-            "sent": r.get::<_, i64>(14)?,
-            "failed": r.get::<_, i64>(15)?,
-            "skipped": r.get::<_, i64>(16)?,
-            "unknown": r.get::<_, i64>(17)?,
-            "replied": r.get::<_, i64>(18)?,
-            "created_at": r.get::<_, String>(8)?,
-            "queued_at": r.get::<_, Option<String>>(9)?,
-            "completed_at": r.get::<_, Option<String>>(10)?,
-        }))
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.into())
-}
-
-/// `outreachRepo.listRecipients` — snapshot-backed evidence rows.
-pub fn list_campaign_recipients(
-    conn: &Connection,
-    campaign_id: i64,
-    limit: i64,
-) -> Result<Vec<serde_json::Value>> {
-    let mut stmt = conn.prepare(
-        "SELECT r.id, r.customer_local_id, r.customer_remote_id, r.email, r.snapshot,
-                r.state, r.attempts, r.last_error, r.hs_conversation_remote_id,
-                r.hs_conversation_number, r.sent_at, r.replied_at,
-                c.first_name, c.last_name
-           FROM outreach_recipients r
-           LEFT JOIN customers c ON c.id = r.customer_local_id
-          WHERE r.campaign_id = ?1 ORDER BY r.id LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![campaign_id, limit], |r| {
-        let snapshot_raw: String = r.get(4)?;
-        let snapshot: serde_json::Value =
-            serde_json::from_str(&snapshot_raw).unwrap_or(serde_json::json!({}));
-        Ok(serde_json::json!({
-            "id": r.get::<_, i64>(0)?,
-            "customer_local_id": r.get::<_, i64>(1)?,
-            "customer_remote_id": r.get::<_, Option<i64>>(2)?,
-            "first_name": r.get::<_, Option<String>>(12)?,
-            "last_name": r.get::<_, Option<String>>(13)?,
-            "email": r.get::<_, Option<String>>(3)?,
-            "state": r.get::<_, String>(5)?,
-            "attempts": r.get::<_, i64>(6)?,
-            "last_error": r.get::<_, Option<String>>(7)?,
-            "hs_conversation_remote_id": r.get::<_, Option<i64>>(8)?,
-            "hs_conversation_number": r.get::<_, Option<i64>>(9)?,
-            "conversation_local_id": serde_json::Value::Null,
-            "sent_at": r.get::<_, Option<String>>(10)?,
-            "replied_at": r.get::<_, Option<String>>(11)?,
-            "why": snapshot.get("why").cloned().unwrap_or(serde_json::json!([])),
-            "matching_tickets": snapshot.get("matching_tickets").cloned().unwrap_or(serde_json::json!([])),
-        }))
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| e.into())
-}
-
-/// `outreachRepo.getCampaign` — CampaignDetail + tags + snapshot + list.
-pub fn get_campaign_full(conn: &Connection, id: i64) -> Result<Option<serde_json::Value>> {
-    let Some(c) = get_outreach_campaign(conn, id)? else {
-        return Ok(None);
-    };
-    let segment_snapshot: serde_json::Value = conn
-        .query_row(
-            "SELECT segment_snapshot FROM outreach_campaigns WHERE id = ?1",
-            [id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .filter(|v: &serde_json::Value| {
-            v.get("conditions").and_then(|x| x.as_array()).is_some()
-                && v.get("exclude").and_then(|x| x.as_array()).is_some()
-        })
-        .unwrap_or_else(
-            || serde_json::json!({"combinator": "all", "conditions": [], "exclude": []}),
-        );
-    let recipients_list = list_campaign_recipients(conn, id, 1000)?;
-    Ok(Some(serde_json::json!({
-        "id": c.id,
-        "name": c.name,
-        "subject": c.subject,
-        "body": c.body,
-        "status": c.status,
-        "mailbox_local_id": c.mailbox_local_id,
-        "mailbox_name": c.mailbox_name,
-        "segment_id": c.segment_id,
-        "segment_name": c.segment_name,
-        "tags": c.tags,
-        "segment_snapshot": segment_snapshot,
-        "recipients": c.recipients,
-        "sent": c.sent,
-        "failed": c.failed,
-        "skipped": c.skipped,
-        "unknown": c.unknown,
-        "replied": c.replied,
-        "created_at": c.created_at,
-        "queued_at": c.queued_at,
-        "completed_at": c.completed_at,
-        "recipients_list": recipients_list,
-    })))
 }

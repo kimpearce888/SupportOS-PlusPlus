@@ -2197,7 +2197,7 @@ mod tests {
     #[test]
     fn add_tag_lowercases_and_dedupes() {
         assert_eq!(
-            add_tag(&[], "  Billing ").map(|t| t),
+            add_tag(&[], "  Billing "),
             Some(vec!["billing".to_string()])
         );
         assert_eq!(add_tag(&["billing".to_string()], "BILLING"), None);
