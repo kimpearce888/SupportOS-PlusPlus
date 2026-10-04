@@ -76,7 +76,10 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if !cols.iter().any(|c| c == column) {
-        let _ = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), []);
+        let _ = conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        );
     }
     Ok(())
 }
@@ -145,7 +148,9 @@ pub(crate) fn is_closing_acknowledgment(text: &str) -> bool {
 
 /// `new Date().toISOString()` — the stamp the in-memory findings carry.
 fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 /// Reference `excerptOf`: collapse whitespace, cap at `max` chars + '...'.
@@ -254,7 +259,10 @@ pub const KNOWLEDGE_GAP_KINDS: [(&str, &str); 5] = [
         "Repeated question, existing docs did not solve it",
     ),
     ("conflicting_knowledge", "Conflicting knowledge documents"),
-    ("missing_troubleshooting_steps", "Missing troubleshooting steps"),
+    (
+        "missing_troubleshooting_steps",
+        "Missing troubleshooting steps",
+    ),
     ("new_issue_undocumented", "New issue with no documentation"),
 ];
 
@@ -932,14 +940,13 @@ fn strip_interrogative_prefix(question: &str) -> &str {
 /// Nothing is created or published.
 pub fn draft_gap(conn: &Connection, candidate_id: i64) -> Option<Value> {
     let candidate = gap_by_id(conn, candidate_id)?;
-    let question = candidate["question"].as_str().unwrap_or_default().to_string();
+    let question = candidate["question"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     let evidence_ids: Vec<i64> = candidate["evidence_conversation_ids"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_i64())
-                .collect::<Vec<i64>>()
-        })
+        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>())
         .unwrap_or_default();
     let evidence: Vec<Value> = if evidence_ids.is_empty() {
         Vec::new()
@@ -1124,7 +1131,11 @@ pub fn analyze_friction(conn: &Connection, conversation_id: i64) -> Vec<Value> {
             let key = norm.join(" ");
             match group_index.get(&key) {
                 Some(&i) => {
-                    if !question_groups[i].1.iter().any(|(tid, _, _)| *tid == m.thread_id) {
+                    if !question_groups[i]
+                        .1
+                        .iter()
+                        .any(|(tid, _, _)| *tid == m.thread_id)
+                    {
                         question_groups[i]
                             .1
                             .push((m.thread_id, m.at.clone(), q.to_string()));
@@ -1207,10 +1218,8 @@ pub fn analyze_friction(conn: &Connection, conversation_id: i64) -> Vec<Value> {
              ORDER BY occurred_at ASC",
         )
         .and_then(|mut stmt| {
-            stmt.query_map(params![conversation_id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            stmt.query_map(params![conversation_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default();
     let history_complete: bool = conn
@@ -1266,13 +1275,7 @@ pub fn analyze_friction(conn: &Connection, conversation_id: i64) -> Vec<Value> {
             )
             .and_then(|mut stmt| {
                 stmt.query_map(params![customer_local, conversation_id], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                    ))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
             })
@@ -1320,8 +1323,7 @@ pub fn analyze_friction(conn: &Connection, conversation_id: i64) -> Vec<Value> {
     let mut dup_requests: Vec<(i64, String, Option<String>)> = Vec::new();
     let mut supplied = (false, false, false); // (digits, email, error)
     let digits_re = regex::Regex::new(r"\b\d{4,}\b").expect("digits regex");
-    let email_re =
-        regex::Regex::new(r"[\w.+-]+@[\w-]+\.[\w.]+").expect("email regex");
+    let email_re = regex::Regex::new(r"[\w.+-]+@[\w-]+\.[\w.]+").expect("email regex");
     let error_re = regex::Regex::new(r"(?i)error|fail|exception|crash").expect("error regex");
     let ask_pattern = regex::Regex::new(
         r"(?i)\?|could you (send|share|provide|confirm)|please (send|share|provide|confirm)",
@@ -1635,15 +1637,7 @@ pub fn compute_qa_deterministic(conn: &Connection, conversation_id: i64) -> Opti
                     first_response_at, activity_history_complete
              FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
             params![conversation_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .ok();
     let (status, closed_at, created_at, first_response_at, history_complete) = conv?;
@@ -1700,17 +1694,15 @@ pub fn compute_qa_deterministic(conn: &Connection, conversation_id: i64) -> Opti
     let repeated_evidence: Vec<Value> = repeated.into_iter().take(5).collect();
 
     // Messages after close (observable avoidable-follow-up signal).
-    let messages_after_close: u32 = closed_at
-        .as_deref()
-        .map_or(0, |closed| {
-            customer
-                .iter()
-                .filter(|m| {
-                    m.at.as_deref()
-                        .is_some_and(|at| !at.is_empty() && string_gt(at, closed))
-                })
-                .count() as u32
-        });
+    let messages_after_close: u32 = closed_at.as_deref().map_or(0, |closed| {
+        customer
+            .iter()
+            .filter(|m| {
+                m.at.as_deref()
+                    .is_some_and(|at| !at.is_empty() && string_gt(at, closed))
+            })
+            .count() as u32
+    });
 
     // Handoffs from the local event history (activity_events keys by LOCAL id).
     let handoffs: i64 = conn
@@ -1995,7 +1987,10 @@ pub async fn compute_qa_ai_layer(
                     _ => "note",
                 };
                 let text = crate::demo::html_to_text(body);
-                format!("[{author} #{id}] {}", text.chars().take(600).collect::<String>())
+                format!(
+                    "[{author} #{id}] {}",
+                    text.chars().take(600).collect::<String>()
+                )
             })
             .collect();
         lines.join("\n").chars().take(8000).collect()
@@ -2123,6 +2118,404 @@ fn finish_qa_ai_layer(
     }
 }
 
+// ─── M5 Phase 28: response effectiveness (analytics/effectiveness.ts) ─────
+//
+// Port of the reference `ResponseEffectivenessService`. The reference reads
+// precomputed `client_support_outcomes` rows; the port derives each outcome
+// on the fly with the exact interaction-engine semantics (computeOutcome:
+// follow-up/clarification counting, effort score, friction, response-style
+// classifier) over the same published-thread inputs the friction analyzer
+// uses — documented substitution, same observable behavior.
+
+/// The reference STYLE_LABELS map (fallback: underscores → spaces).
+fn effectiveness_style_label(style: &str) -> String {
+    match style {
+        "detailed_explanation" => "Detailed explanation".to_string(),
+        "step_by_step" => "Numbered steps".to_string(),
+        "short_answer" => "Concise answer".to_string(),
+        "direct_answer_with_explanation" => "Direct answer with explanation".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// `Number((x).toFixed(2))` — round to two decimals.
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// `Number((x).toFixed(1))` — round to one decimal.
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+
+/// One derived outcome row (the reference's client_support_outcomes shape).
+struct DerivedOutcome {
+    conversation_id: i64,
+    number: i64,
+    subject: Option<String>,
+    response_style: String,
+    follow_up_count: i64,
+    clarification_count: i64,
+    resolved_after_first: Option<i64>,
+    effort_score: Option<f64>,
+    friction: String,
+}
+
+/// The deterministic outcome derivation (interaction engine `computeOutcome`):
+/// follow-ups (closing acknowledgments excluded), clarifications, escalation,
+/// resolved-after-first, effort score and the response-style classifier.
+fn derive_outcome(
+    threads: &[ThreadLite],
+    status: &str,
+    conv: (i64, i64, Option<String>),
+) -> DerivedOutcome {
+    let customer: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "customer").collect();
+    let replies: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "reply").collect();
+    let notes: Vec<&ThreadLite> = threads.iter().filter(|t| t.kind == "note").collect();
+    let customer_texts: Vec<String> = customer
+        .iter()
+        .map(|t| t.text.trim().to_lowercase())
+        .collect();
+    let reply_texts: Vec<String> = replies
+        .iter()
+        .map(|t| t.text.trim().to_lowercase())
+        .collect();
+
+    // Follow-ups: customer messages after the first reply that are not pure
+    // closing acknowledgments.
+    let mut follow_up_count: i64 = 0;
+    let mut saw_reply = false;
+    for t in threads {
+        if t.kind == "reply" {
+            saw_reply = true;
+        } else if t.kind == "customer" && saw_reply && !is_closing_acknowledgment(&t.text) {
+            follow_up_count += 1;
+        }
+    }
+
+    // Clarifications: customer texts after the first matching the reference regex.
+    let clarification_re = regex::Regex::new(
+        r"still|again|re-?send|clarif|you didn'?t|that didn'?t|not what i|same issue|as i (said|mentioned|wrote)",
+    )
+    .expect("clarification regex");
+    let clarification_count: i64 = customer_texts
+        .iter()
+        .skip(1)
+        .filter(|t| clarification_re.is_match(t))
+        .count() as i64;
+
+    // Escalation markers (notes: any; replies: "escalat").
+    let escalated = notes.iter().any(|n| {
+        regex::Regex::new(r"(?i)escalat|urgent|priority|vip")
+            .unwrap()
+            .is_match(&n.text)
+    }) || reply_texts.iter().any(|t| t.contains("escalat"));
+
+    // Resolved after the first response (null when there was no reply).
+    let resolved_after_first: Option<i64> = if replies.is_empty() {
+        None
+    } else {
+        Some(i64::from(follow_up_count == 0 && status == "closed"))
+    };
+
+    // Effort score (spec #52): 0 (low) .. 10 (high).
+    let effort_raw = customer.len() as f64 * 1.2
+        + follow_up_count as f64 * 1.5
+        + clarification_count as f64 * 2.0
+        + if escalated { 2.0 } else { 0.0 };
+    let effort_score = if customer.is_empty() {
+        None
+    } else {
+        Some(round1(effort_raw.min(10.0)))
+    };
+    let friction = match effort_score {
+        None => "none".to_string(),
+        Some(e) if e >= 6.0 => "high".to_string(),
+        Some(e) if e >= 3.5 => "moderate".to_string(),
+        Some(_) => "none".to_string(),
+    };
+
+    // Response-style classifier (spec #16).
+    let total_reply_chars: usize = reply_texts.iter().map(|t| t.len()).sum();
+    let avg_reply_len = if replies.is_empty() {
+        0.0
+    } else {
+        total_reply_chars as f64 / replies.len() as f64
+    };
+    let joined = reply_texts.join(" ");
+    let step_re = regex::Regex::new(r"\b(step|first|then|next|finally)\b|1\.").expect("step regex");
+    let response_style = if replies.is_empty() {
+        String::new()
+    } else if avg_reply_len > 700.0 {
+        "detailed_explanation".to_string()
+    } else if step_re.is_match(&joined) {
+        "step_by_step".to_string()
+    } else if avg_reply_len < 200.0 {
+        "short_answer".to_string()
+    } else {
+        "direct_answer_with_explanation".to_string()
+    };
+
+    DerivedOutcome {
+        conversation_id: conv.0,
+        number: conv.1,
+        subject: conv.2,
+        response_style,
+        follow_up_count,
+        clarification_count,
+        resolved_after_first,
+        effort_score,
+        friction,
+    }
+}
+
+/// GET /api/reports/effectiveness — the observational response-style report
+/// (reference `ResponseEffectivenessService.report(days)`).
+pub fn effectiveness_report(conn: &Connection, days: i64) -> Value {
+    let days = days.clamp(1, 3650);
+    let window = format!("-{days} days");
+
+    // In-window conversations with at least one published reply (= the
+    // reference's outcomes rows with response_style IS NOT NULL), most
+    // recent first, bounded to 1000 (v2.2.0 perf, plan Phase 41).
+    let window_clause = "c.deleted_at IS NULL
+               AND COALESCE(julianday(c.remote_created_at), julianday(c.created_at))
+                   >= julianday('now', ?1)
+               AND EXISTS (SELECT 1 FROM conversation_threads t
+                           WHERE t.conversation_id = c.id AND t.thread_type = 'reply'
+                             AND t.state = 'published' AND t.deleted_at IS NULL)";
+    let total_in_window: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM conversations c WHERE {window_clause}"),
+            params![window],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let convs: Vec<(i64, i64, Option<String>, String)> = conn
+        .prepare(&format!(
+            "SELECT c.id, c.number, c.subject, c.status
+             FROM conversations c
+             WHERE {window_clause}
+             ORDER BY COALESCE(c.remote_created_at, c.created_at) DESC
+             LIMIT 1000"
+        ))
+        .and_then(|mut stmt| {
+            stmt.query_map(params![window], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    // Ratings per conversation (reference: ratings table grouped in JS).
+    let mut ratings_by_conv: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    if !convs.is_empty() {
+        let ids: Vec<String> = convs.iter().map(|c| c.0.to_string()).collect();
+        let sql = format!(
+            "SELECT conversation_id, rating FROM ratings WHERE conversation_id IN ({})",
+            ids.join(",")
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    if let Some(rating) = row.1 {
+                        ratings_by_conv.entry(row.0).or_default().push(rating);
+                    }
+                }
+            }
+        }
+    }
+
+    // Derive each outcome (one pass over each conversation's threads).
+    let outcomes: Vec<DerivedOutcome> = convs
+        .iter()
+        .map(|(id, number, subject, status)| {
+            let threads = published_threads(conn, *id);
+            derive_outcome(&threads, status, (*id, *number, subject.clone()))
+        })
+        .collect();
+
+    // Characteristics per conversation (reply text shape, one pass).
+    let doc_link_re = regex::Regex::new(
+        r"(?i)https?://|docs?\.[a-z]|/help/|knowledge|documentation|\barticle\b|\bguide\b",
+    )
+    .expect("doc-link regex");
+    let technical_re = regex::Regex::new(
+        r"(?i)\b(api|endpoint|json|sdk|webhook|token|oauth|curl|console|stack trace|logs?|http|ssl|css|html|sql|cache)\b",
+    )
+    .expect("technical regex");
+    let mut doc_link: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut technical: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for o in &outcomes {
+        let threads = published_threads(conn, o.conversation_id);
+        for t in threads.iter().filter(|t| t.kind == "reply") {
+            if doc_link_re.is_match(&t.text) {
+                doc_link.insert(o.conversation_id);
+            }
+            if technical_re.is_match(&t.text) {
+                technical.insert(o.conversation_id);
+            }
+        }
+    }
+
+    // Bucket assembly (reference buildBucket).
+    let build_bucket =
+        |key: &str, label: &str, kind: &str, matches: Vec<&DerivedOutcome>| -> Value {
+            let n = matches.len();
+            let rate = |num: usize| -> Option<f64> {
+                if n > 0 {
+                    Some(round2(num as f64 / n as f64))
+                } else {
+                    None
+                }
+            };
+            let with_follow_ups = matches.iter().filter(|o| o.follow_up_count > 0).count();
+            let with_clarifications = matches.iter().filter(|o| o.clarification_count > 0).count();
+            let resolved_first = matches
+                .iter()
+                .filter(|o| o.resolved_after_first == Some(1))
+                .count();
+            let high_friction = matches.iter().filter(|o| o.friction == "high").count();
+            let efforts: Vec<f64> = matches.iter().filter_map(|o| o.effort_score).collect();
+            let rating_distribution: Value = if n > 0 {
+                json!(["great", "okay", "not-good"]
+                    .iter()
+                    .map(|rating| {
+                        let count = matches
+                            .iter()
+                            .filter(|o| {
+                                ratings_by_conv
+                                    .get(&o.conversation_id)
+                                    .is_some_and(|list| list.contains(&rating.to_string()))
+                            })
+                            .count();
+                        json!({ "rating": rating, "count": count })
+                    })
+                    .collect::<Vec<_>>())
+            } else {
+                Value::Null
+            };
+            let sample: Vec<Value> = matches
+                .iter()
+                .take(5)
+                .map(|o| {
+                    let ratings = ratings_by_conv.get(&o.conversation_id);
+                    let mut summary = format!(
+                        "{} follow-up(s), {} clarification(s)",
+                        o.follow_up_count, o.clarification_count
+                    );
+                    if o.resolved_after_first == Some(1) {
+                        summary.push_str(", resolved after first response");
+                    }
+                    if let Some(e) = o.effort_score {
+                        summary.push_str(&format!(", effort {e}/10"));
+                    }
+                    if let Some(first) = ratings.and_then(|list| list.first()) {
+                        summary.push_str(&format!(", rated {first}"));
+                    }
+                    json!({
+                        "conversation_local_id": o.conversation_id,
+                        "number": o.number,
+                        "subject": o.subject,
+                        "outcome_summary": summary,
+                    })
+                })
+                .collect();
+            json!({
+                "style_key": key,
+                "style_label": label,
+                "kind": kind,
+                "conversations": n,
+                "follow_up_rate": rate(with_follow_ups),
+                "clarification_rate": rate(with_clarifications),
+                "resolved_after_first_rate": rate(resolved_first),
+                "avg_effort_score": if efforts.is_empty() {
+                    Value::Null
+                } else {
+                    json!(round1(efforts.iter().sum::<f64>() / efforts.len() as f64))
+                },
+                "high_friction_rate": rate(high_friction),
+                "rating_distribution": rating_distribution,
+                "sample_conversations": sample,
+            })
+        };
+
+    // Styles present (first-appearance order) + the two characteristics.
+    let mut buckets: Vec<Value> = Vec::new();
+    let mut style_order: Vec<String> = Vec::new();
+    for o in &outcomes {
+        if !o.response_style.is_empty() && !style_order.contains(&o.response_style) {
+            style_order.push(o.response_style.clone());
+        }
+    }
+    for style in &style_order {
+        let matches: Vec<&DerivedOutcome> = outcomes
+            .iter()
+            .filter(|o| &o.response_style == style)
+            .collect();
+        buckets.push(build_bucket(
+            style,
+            &effectiveness_style_label(style),
+            "response_style",
+            matches,
+        ));
+    }
+    let doc_matches: Vec<&DerivedOutcome> = outcomes
+        .iter()
+        .filter(|o| doc_link.contains(&o.conversation_id))
+        .collect();
+    if !doc_matches.is_empty() {
+        buckets.push(build_bucket(
+            "documentation_link",
+            "Mentions documentation / links docs",
+            "characteristic",
+            doc_matches,
+        ));
+    }
+    let tech_matches: Vec<&DerivedOutcome> = outcomes
+        .iter()
+        .filter(|o| technical.contains(&o.conversation_id))
+        .collect();
+    if !tech_matches.is_empty() {
+        buckets.push(build_bucket(
+            "technical_explanation",
+            "Contains technical explanation",
+            "characteristic",
+            tech_matches,
+        ));
+    }
+    // Sort by conversations desc (stable, like the reference).
+    buckets.sort_by(|a, b| {
+        let av = a["conversations"].as_i64().unwrap_or(0);
+        let bv = b["conversations"].as_i64().unwrap_or(0);
+        bv.cmp(&av)
+    });
+
+    let mut notes = vec![
+        "These are OBSERVED ASSOCIATIONS between how replies were written and what happened next. They do not show causation: agents may choose detailed replies for harder tickets, so outcomes reflect the mix of situations, not the style alone.".to_string(),
+        "Styles come from the deterministic classifier the interaction engine already stores; characteristics (documentation link, technical explanation) are text-shape detections, not mutually exclusive categories.".to_string(),
+        "Small buckets carry little information: treat any row under 5 conversations as anecdotal.".to_string(),
+    ];
+    if total_in_window > outcomes.len() as i64 {
+        notes.push(format!(
+            "Analysis bounded to the {} most recent of {} in-window conversations (v2.2.0 performance bound, plan Phase 41).",
+            outcomes.len(),
+            total_in_window
+        ));
+    }
+
+    json!({
+        "generated_at": now_iso(),
+        "days": days,
+        "total_analyzed": outcomes.len(),
+        "buckets": buckets,
+        "notes": notes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2177,13 +2570,7 @@ mod tests {
         .unwrap()
     }
 
-    fn insert_thread(
-        conn: &Connection,
-        conv: i64,
-        ttype: &str,
-        body: &str,
-        at: &str,
-    ) -> i64 {
+    fn insert_thread(conn: &Connection, conv: i64, ttype: &str, body: &str, at: &str) -> i64 {
         conn.execute(
             "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, state, created_at)
              VALUES (?1, ?2, ?3, ?4, 'published', ?5)",
@@ -2205,8 +2592,20 @@ mod tests {
     fn friction_detects_repeated_customer_explanations_with_exact_thread_evidence() {
         let conn = fresh_db();
         let conv = insert_conversation(&conn, 9801, 101, Some(1), "2026-09-01 10:00:00", true);
-        insert_thread(&conn, conv, "customer", "My account is completely broken and I cannot log in since yesterday morning at all", "2026-09-01 10:00:00");
-        insert_thread(&conn, conv, "reply", "Thanks for reaching out - could you confirm your account email?", "2026-09-01 11:00:00");
+        insert_thread(
+            &conn,
+            conv,
+            "customer",
+            "My account is completely broken and I cannot log in since yesterday morning at all",
+            "2026-09-01 10:00:00",
+        );
+        insert_thread(
+            &conn,
+            conv,
+            "reply",
+            "Thanks for reaching out - could you confirm your account email?",
+            "2026-09-01 11:00:00",
+        );
         insert_thread(&conn, conv, "customer", "As I already mentioned my account is completely broken and I cannot log in since yesterday morning at all", "2026-09-01 12:00:00");
         let findings = analyze_friction(&conn, conv);
         let repeated = findings
@@ -2233,13 +2632,23 @@ mod tests {
     fn friction_detects_repeated_handoffs_and_nothing_without_events() {
         let conn = fresh_db();
         let conv = insert_conversation(&conn, 9802, 102, Some(1), "2026-09-02 10:00:00", false);
-        insert_thread(&conn, conv, "customer", "Question about the invoice", "2026-09-02 10:00:00");
+        insert_thread(
+            &conn,
+            conv,
+            "customer",
+            "Question about the invoice",
+            "2026-09-02 10:00:00",
+        );
         for i in 0..3 {
             conn.execute(
                 "INSERT INTO activity_events (conversation_id, event_type, actor_type,
                     occurred_at, dedup_key, source, metadata)
                  VALUES (?1, 'assignment_changed', 'user', ?2, ?3, 'local', '{}')",
-                params![conv, format!("2026-09-02 1{i}:00:00"), format!("assign:{conv}:{i}")],
+                params![
+                    conv,
+                    format!("2026-09-02 1{i}:00:00"),
+                    format!("assign:{conv}:{i}")
+                ],
             )
             .unwrap();
         }
@@ -2248,7 +2657,13 @@ mod tests {
             .iter()
             .any(|f| f["kind"].as_str() == Some("repeated_handoffs")));
         let quiet = insert_conversation(&conn, 9803, 103, Some(2), "2026-09-03 10:00:00", false);
-        insert_thread(&conn, quiet, "customer", "Simple one-off question, thanks", "2026-09-03 10:00:00");
+        insert_thread(
+            &conn,
+            quiet,
+            "customer",
+            "Simple one-off question, thanks",
+            "2026-09-03 10:00:00",
+        );
         assert!(analyze_friction(&conn, quiet).is_empty());
     }
 
@@ -2256,8 +2671,20 @@ mod tests {
     fn friction_detects_duplicated_information_requests() {
         let conn = fresh_db();
         let conv = insert_conversation(&conn, 9804, 104, Some(1), "2026-09-04 10:00:00", false);
-        insert_thread(&conn, conv, "customer", "My order 551234 never arrived, please check order 551234", "2026-09-04 10:00:00");
-        insert_thread(&conn, conv, "reply", "Could you please send your order number so I can check?", "2026-09-04 11:00:00");
+        insert_thread(
+            &conn,
+            conv,
+            "customer",
+            "My order 551234 never arrived, please check order 551234",
+            "2026-09-04 10:00:00",
+        );
+        insert_thread(
+            &conn,
+            conv,
+            "reply",
+            "Could you please send your order number so I can check?",
+            "2026-09-04 11:00:00",
+        );
         let findings = analyze_friction(&conn, conv);
         assert!(findings
             .iter()
@@ -2268,8 +2695,20 @@ mod tests {
     fn friction_overview_reports_kinds_and_customers() {
         let conn = fresh_db();
         let conv = insert_conversation(&conn, 9805, 105, Some(1), "2026-09-05 10:00:00", true);
-        insert_thread(&conn, conv, "customer", "My account is completely broken and I cannot log in since yesterday morning at all", "2026-09-05 10:00:00");
-        insert_thread(&conn, conv, "reply", "Could you confirm the account email?", "2026-09-05 11:00:00");
+        insert_thread(
+            &conn,
+            conv,
+            "customer",
+            "My account is completely broken and I cannot log in since yesterday morning at all",
+            "2026-09-05 10:00:00",
+        );
+        insert_thread(
+            &conn,
+            conv,
+            "reply",
+            "Could you confirm the account email?",
+            "2026-09-05 11:00:00",
+        );
         insert_thread(&conn, conv, "customer", "As i said my account is completely broken and I cannot log in since yesterday morning at all", "2026-09-05 12:00:00");
         conn.execute(
             "INSERT INTO customers (remote_id, first_name, last_name) VALUES (901, 'Ada', 'Byron')",
@@ -2291,9 +2730,21 @@ mod tests {
     fn qa_deterministic_layer_computes_honest_signals() {
         let conn = fresh_db();
         let conv = insert_conversation(&conn, 9810, 110, Some(1), "2026-09-05 09:00:00", true);
-        insert_thread(&conn, conv, "customer", "How do I invite a teammate to my workspace? I want to add them as a viewer.", "2026-09-05 09:00:00");
+        insert_thread(
+            &conn,
+            conv,
+            "customer",
+            "How do I invite a teammate to my workspace? I want to add them as a viewer.",
+            "2026-09-05 09:00:00",
+        );
         insert_thread(&conn, conv, "reply", "Go to Settings > Members and click Invite. Viewers can be chosen in the role dropdown.", "2026-09-05 09:30:00");
-        insert_thread(&conn, conv, "customer", "Thanks, that worked perfectly. Closing from my side.", "2026-09-05 10:00:00");
+        insert_thread(
+            &conn,
+            conv,
+            "customer",
+            "Thanks, that worked perfectly. Closing from my side.",
+            "2026-09-05 10:00:00",
+        );
         let det = compute_qa_deterministic(&conn, conv).expect("deterministic layer");
         assert_eq!(det["closed"].as_bool(), Some(true));
         assert_eq!(det["back_and_forth_count"].as_i64(), Some(0)); // closing ack excluded
@@ -2315,14 +2766,16 @@ mod tests {
     async fn qa_ai_layer_disabled_backend_is_honestly_absent() {
         let conn = fresh_db();
         let conv = insert_conversation(&conn, 9811, 111, Some(1), "2026-09-06 09:00:00", true);
-        insert_thread(&conn, conv, "customer", "The export button returns error 500 every time I click it.", "2026-09-06 09:00:00");
-        insert_thread(&conn, conv, "reply", "We identified a bug in release 2.4; a fix ships this week. Meanwhile use the API export.", "2026-09-06 10:00:00");
-        let outcome = compute_qa_ai_layer(
+        insert_thread(
             &conn,
-            &crate::ai_pipeline::AiBackend::Disabled,
             conv,
-        )
-        .await;
+            "customer",
+            "The export button returns error 500 every time I click it.",
+            "2026-09-06 09:00:00",
+        );
+        insert_thread(&conn, conv, "reply", "We identified a bug in release 2.4; a fix ships this week. Meanwhile use the API export.", "2026-09-06 10:00:00");
+        let outcome =
+            compute_qa_ai_layer(&conn, &crate::ai_pipeline::AiBackend::Disabled, conv).await;
         assert!(outcome.ai.is_none());
         let error = outcome.error.expect("honest error");
         assert!(error.contains("honestly absent"), "got: {error}");
@@ -2332,8 +2785,20 @@ mod tests {
     fn qa_ai_layer_records_fake_chat_through_ai_runs() {
         let conn = fresh_db();
         let conv = insert_conversation(&conn, 9812, 112, Some(1), "2026-09-07 09:00:00", true);
-        insert_thread(&conn, conv, "customer", "Billing question about the last invoice.", "2026-09-07 09:00:00");
-        insert_thread(&conn, conv, "reply", "Here is the explanation of the proration.", "2026-09-07 09:20:00");
+        insert_thread(
+            &conn,
+            conv,
+            "customer",
+            "Billing question about the last invoice.",
+            "2026-09-07 09:00:00",
+        );
+        insert_thread(
+            &conn,
+            conv,
+            "reply",
+            "Here is the explanation of the proration.",
+            "2026-09-07 09:20:00",
+        );
         compute_qa_deterministic(&conn, conv).expect("deterministic layer");
         let run_id = crate::ai_pipeline::start_run(
             &conn,
@@ -2372,7 +2837,13 @@ mod tests {
     fn qa_ai_layer_survives_unparseable_output_honestly() {
         let conn = fresh_db();
         let conv = insert_conversation(&conn, 9813, 113, Some(1), "2026-09-08 09:00:00", true);
-        insert_thread(&conn, conv, "customer", "Billing question.", "2026-09-08 09:00:00");
+        insert_thread(
+            &conn,
+            conv,
+            "customer",
+            "Billing question.",
+            "2026-09-08 09:00:00",
+        );
         insert_thread(&conn, conv, "reply", "Explanation.", "2026-09-08 09:20:00");
         compute_qa_deterministic(&conn, conv).expect("deterministic layer");
         let run_id = crate::ai_pipeline::start_run(
@@ -2398,7 +2869,9 @@ mod tests {
             .unwrap();
         assert_eq!(status, "failed");
         let qa = get_qa(&conn, conv, true).expect("qa still present");
-        assert!(qa["deterministic"].as_object().is_some_and(|o| !o.is_empty()));
+        assert!(qa["deterministic"]
+            .as_object()
+            .is_some_and(|o| !o.is_empty()));
     }
 
     // ─── knowledge gaps (Phase 26) ────────────────────────────────────────
@@ -2417,8 +2890,21 @@ mod tests {
         let conn = fresh_db();
         let q = "how do i reset my two factor authentication";
         for (i, remote) in [9821, 9822].iter().enumerate() {
-            let conv = insert_conversation(&conn, *remote, 120 + i as i64, Some(1), &format!("2026-09-1{} 09:00:00", i + 2), true);
-            insert_thread(&conn, conv, "customer", "How do I reset my two factor authentication?", &format!("2026-09-1{} 09:00:00", i + 2));
+            let conv = insert_conversation(
+                &conn,
+                *remote,
+                120 + i as i64,
+                Some(1),
+                &format!("2026-09-1{} 09:00:00", i + 2),
+                true,
+            );
+            insert_thread(
+                &conn,
+                conv,
+                "customer",
+                "How do I reset my two factor authentication?",
+                &format!("2026-09-1{} 09:00:00", i + 2),
+            );
             insert_analysis_run(&conn, conv, q);
         }
         let (total, new) = rebuild_gaps(&conn, 90);
@@ -2435,11 +2921,14 @@ mod tests {
         assert_eq!(row.2, "open");
 
         // Human decision survives the rebuild; deciding twice is a no-op.
-        let decided = decide_gap(&conn, row.0, "approved", Some("document it"), None)
-            .expect("decide works");
+        let decided =
+            decide_gap(&conn, row.0, "approved", Some("document it"), None).expect("decide works");
         assert_eq!(decided["status"], "approved");
         let (_, new_after) = rebuild_gaps(&conn, 90);
-        assert_eq!(new_after, 0, "rebuild must not re-create decided candidates");
+        assert_eq!(
+            new_after, 0,
+            "rebuild must not re-create decided candidates"
+        );
         let status: String = conn
             .query_row(
                 "SELECT status FROM knowledge_gap_candidates WHERE id = ?1",
@@ -2457,8 +2946,21 @@ mod tests {
         let q = "how do i invite a teammate to my workspace";
         let mut evidence_conv = None;
         for (i, remote) in [9831, 9832].iter().enumerate() {
-            let conv = insert_conversation(&conn, *remote, 130 + i as i64, Some(1), &format!("2026-09-2{} 09:00:00", i + 1), true);
-            insert_thread(&conn, conv, "customer", "How do I invite a teammate to my workspace?", &format!("2026-09-2{} 09:00:00", i + 1));
+            let conv = insert_conversation(
+                &conn,
+                *remote,
+                130 + i as i64,
+                Some(1),
+                &format!("2026-09-2{} 09:00:00", i + 1),
+                true,
+            );
+            insert_thread(
+                &conn,
+                conv,
+                "customer",
+                "How do I invite a teammate to my workspace?",
+                &format!("2026-09-2{} 09:00:00", i + 1),
+            );
             insert_analysis_run(&conn, conv, q);
             if i == 0 {
                 evidence_conv = Some(conv);
@@ -2571,5 +3073,130 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows as usize, findings.len());
+    }
+
+    // ─── response effectiveness (Phase 28) ────────────────────────────────
+
+    #[test]
+    fn effectiveness_buckets_styles_and_characteristics() {
+        let conn = fresh_db();
+        // A short-answer conversation: closed, no follow-ups, doc link.
+        let a = insert_conversation(&conn, 9861, 121, Some(1), "2026-09-11 09:00:00", true);
+        insert_thread(
+            &conn,
+            a,
+            "customer",
+            "How do I reset my password?",
+            "2026-09-11 09:00:00",
+        );
+        insert_thread(
+            &conn,
+            a,
+            "reply",
+            "Go to Settings, click reset. See https://docs.example.com/reset",
+            "2026-09-11 09:10:00",
+        );
+        conn.execute(
+            "INSERT INTO ratings (conversation_id, rating) VALUES (?1, 'great')",
+            params![a],
+        )
+        .unwrap();
+
+        // A step-by-step conversation with a clarification follow-up.
+        let b = insert_conversation(&conn, 9862, 122, Some(2), "2026-09-12 09:00:00", false);
+        insert_thread(
+            &conn,
+            b,
+            "customer",
+            "My export fails with error 500",
+            "2026-09-12 09:00:00",
+        );
+        insert_thread(
+            &conn,
+            b,
+            "reply",
+            "First open the export tab, then click CSV, finally retry",
+            "2026-09-12 09:20:00",
+        );
+        insert_thread(
+            &conn,
+            b,
+            "customer",
+            "still not working, same issue again",
+            "2026-09-12 10:00:00",
+        );
+
+        // A direct-answer-with-explanation conversation with a technical reply.
+        let c = insert_conversation(&conn, 9863, 123, Some(1), "2026-09-13 09:00:00", true);
+        insert_thread(
+            &conn,
+            c,
+            "customer",
+            "The webhook returns invalid json",
+            "2026-09-13 09:00:00",
+        );
+        insert_thread(&conn, c, "reply", "The endpoint rejects malformed json payloads when the token header is missing from the incoming webhook request. Your integration sends the payload without the oauth authorization token, so the api rejects it before parsing. Please update your webhook configuration to include the oauth bearer token in the authorization header, resend the payload, and confirm the http response returns a 2xx status code", "2026-09-13 09:30:00");
+
+        let report = effectiveness_report(&conn, 90);
+        assert_eq!(report["days"].as_i64(), Some(90));
+        assert_eq!(report["total_analyzed"].as_i64(), Some(3));
+        let buckets = report["buckets"].as_array().unwrap();
+        // Styles: short_answer (a), step_by_step (b), direct_answer_with_explanation (c)
+        // + characteristics: documentation_link (a), technical_explanation (c).
+        assert_eq!(buckets.len(), 5);
+        let find = |key: &str| {
+            buckets
+                .iter()
+                .find(|b| b["style_key"].as_str() == Some(key))
+                .unwrap_or_else(|| panic!("bucket {key} missing"))
+        };
+        let short = find("short_answer");
+        assert_eq!(short["conversations"].as_i64(), Some(1));
+        assert_eq!(short["kind"].as_str(), Some("response_style"));
+        assert_eq!(short["resolved_after_first_rate"].as_f64(), Some(1.0));
+        assert_eq!(short["follow_up_rate"].as_f64(), Some(0.0));
+        let dist = short["rating_distribution"].as_array().unwrap();
+        assert_eq!(dist[0]["rating"].as_str(), Some("great"));
+        assert_eq!(dist[0]["count"].as_i64(), Some(1));
+        let step = find("step_by_step");
+        assert_eq!(step["follow_up_rate"].as_f64(), Some(1.0));
+        assert_eq!(step["clarification_rate"].as_f64(), Some(1.0));
+        assert_eq!(step["resolved_after_first_rate"].as_f64(), Some(0.0));
+        let doc = find("documentation_link");
+        assert_eq!(doc["kind"].as_str(), Some("characteristic"));
+        assert_eq!(doc["conversations"].as_i64(), Some(1));
+        let tech = find("technical_explanation");
+        assert_eq!(tech["conversations"].as_i64(), Some(1));
+        // Sorted by conversations desc; sample rows carry outcome summaries.
+        let sample = short["sample_conversations"].as_array().unwrap();
+        assert_eq!(sample.len(), 1);
+        assert!(sample[0]["outcome_summary"]
+            .as_str()
+            .unwrap()
+            .contains("resolved after first response"));
+        // The three honesty notes are always present.
+        assert!(report["notes"].as_array().unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn effectiveness_excludes_no_reply_conversations_and_clamps_days() {
+        let conn = fresh_db();
+        // Customer-only conversation: no reply → no response_style → excluded.
+        let a = insert_conversation(&conn, 9871, 131, Some(1), "2026-09-14 09:00:00", false);
+        insert_thread(&conn, a, "customer", "Anyone there?", "2026-09-14 09:00:00");
+        let report = effectiveness_report(&conn, 30);
+        assert_eq!(report["total_analyzed"].as_i64(), Some(0));
+        assert!(report["buckets"].as_array().unwrap().is_empty());
+
+        // Out-of-window conversation is excluded entirely.
+        let b = insert_conversation(&conn, 9872, 132, Some(1), "2020-01-01 09:00:00", true);
+        insert_thread(&conn, b, "customer", "Old ticket", "2020-01-01 09:00:00");
+        insert_thread(&conn, b, "reply", "Old reply", "2020-01-01 10:00:00");
+        let report = effectiveness_report(&conn, 30);
+        assert_eq!(report["total_analyzed"].as_i64(), Some(0));
+
+        // Days clamped into [1, 3650].
+        let clamped = effectiveness_report(&conn, 999_999);
+        assert_eq!(clamped["days"].as_i64(), Some(3650));
     }
 }

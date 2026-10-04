@@ -144,17 +144,152 @@ static SCRIPT_RANGES: &[ScriptRange] = &[
 
 /// Top function words per Latin-script language (deterministic scoring).
 static STOPWORDS: &[(&str, &[&str])] = &[
-    ("en", &["the", "and", "is", "are", "was", "you", "for", "with", "that", "this", "have", "not", "but", "can", "how", "what", "when", "why", "please", "thank", "we", "our", "your", "it", "my", "do", "does", "did", "has", "had", "will", "would", "could", "should", "from", "about"]),
-    ("es", &["el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "por", "con", "para", "no", "se", "lo", "su", "más", "está", "estoy", "hola", "gracias", "cómo", "qué", "cuando", "dónde", "puedo", "necesito", "favor"]),
-    ("fr", &["le", "la", "les", "de", "des", "et", "en", "un", "une", "du", "que", "qui", "pour", "avec", "dans", "pas", "est", "je", "vous", "nous", "merci", "bonjour", "comment", "pourquoi", "peux", "avez", "être"]),
-    ("de", &["der", "die", "das", "und", "ist", "nicht", "mit", "für", "ein", "eine", "auf", "von", "ich", "sie", "wir", "und", "auch", "als", "wie", "danke", "bitte", "hallo", "können", "haben", "sehr", "warum"]),
-    ("it", &["il", "lo", "la", "le", "di", "che", "e", "in", "un", "una", "per", "con", "non", "sono", "ho", "mi", "si", "come", "grazie", "ciao", "perché", "quando", "posso", "molto", "anche", "dove"]),
-    ("pt", &["o", "a", "os", "as", "de", "que", "e", "em", "um", "uma", "para", "com", "não", "por", "do", "da", "estou", "você", "obrigado", "olá", "como", "por", "quando", "posso", "muito", "também"]),
-    ("nl", &["de", "het", "een", "en", "van", "is", "dat", "niet", "met", "voor", "ik", "wij", "jullie", "heb", "hebben", "kan", "niet", "dank", "hallo", "hoe", "waarom", "want", "ook", "maar", "nog", "wel"]),
-    ("pl", &["nie", "jest", "się", "na", "że", "do", "mam", "jak", "ale", "czy", "dziękuję", "cześć", "dlaczego", "kiedy", "można", "bardzo", "proszę", "jeśli", "tego", "dla", "od", "przy", "bez"]),
-    ("tr", &["bir", "ve", "bu", "için", "ile", "değil", "mi", "my", "nasıl", "teşekkür", "merhaba", "neden", "ne", "zaman", "olabilir", "çok", "ama", "gerekli", "lütfen", "var", "yok", "olarak"]),
-    ("sv", &["och", "att", "det", "en", "som", "är", "för", "med", "inte", "har", "den", "jag", "vi", "ni", "tack", "hej", "hur", "varför", "när", "kan", "mycket", "också", "men", "om"]),
-    ("vi", &["của", "và", "là", "có", "không", "được", "cho", "với", "này", "tôi", "bạn", "chúng", "cảm ơn", "xin", "làm", "thế nào", "tại sao", "khi", "có thể", "rất", "nhưng"]),
+    (
+        "en",
+        &[
+            "the", "and", "is", "are", "was", "you", "for", "with", "that", "this", "have", "not",
+            "but", "can", "how", "what", "when", "why", "please", "thank", "we", "our", "your",
+            "it", "my", "do", "does", "did", "has", "had", "will", "would", "could", "should",
+            "from", "about",
+        ],
+    ),
+    (
+        "es",
+        &[
+            "el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "por", "con", "para",
+            "no", "se", "lo", "su", "más", "está", "estoy", "hola", "gracias", "cómo", "qué",
+            "cuando", "dónde", "puedo", "necesito", "favor",
+        ],
+    ),
+    (
+        "fr",
+        &[
+            "le", "la", "les", "de", "des", "et", "en", "un", "une", "du", "que", "qui", "pour",
+            "avec", "dans", "pas", "est", "je", "vous", "nous", "merci", "bonjour", "comment",
+            "pourquoi", "peux", "avez", "être",
+        ],
+    ),
+    (
+        "de",
+        &[
+            "der", "die", "das", "und", "ist", "nicht", "mit", "für", "ein", "eine", "auf", "von",
+            "ich", "sie", "wir", "und", "auch", "als", "wie", "danke", "bitte", "hallo", "können",
+            "haben", "sehr", "warum",
+        ],
+    ),
+    (
+        "it",
+        &[
+            "il", "lo", "la", "le", "di", "che", "e", "in", "un", "una", "per", "con", "non",
+            "sono", "ho", "mi", "si", "come", "grazie", "ciao", "perché", "quando", "posso",
+            "molto", "anche", "dove",
+        ],
+    ),
+    (
+        "pt",
+        &[
+            "o", "a", "os", "as", "de", "que", "e", "em", "um", "uma", "para", "com", "não", "por",
+            "do", "da", "estou", "você", "obrigado", "olá", "como", "por", "quando", "posso",
+            "muito", "também",
+        ],
+    ),
+    (
+        "nl",
+        &[
+            "de", "het", "een", "en", "van", "is", "dat", "niet", "met", "voor", "ik", "wij",
+            "jullie", "heb", "hebben", "kan", "niet", "dank", "hallo", "hoe", "waarom", "want",
+            "ook", "maar", "nog", "wel",
+        ],
+    ),
+    (
+        "pl",
+        &[
+            "nie",
+            "jest",
+            "się",
+            "na",
+            "że",
+            "do",
+            "mam",
+            "jak",
+            "ale",
+            "czy",
+            "dziękuję",
+            "cześć",
+            "dlaczego",
+            "kiedy",
+            "można",
+            "bardzo",
+            "proszę",
+            "jeśli",
+            "tego",
+            "dla",
+            "od",
+            "przy",
+            "bez",
+        ],
+    ),
+    (
+        "tr",
+        &[
+            "bir",
+            "ve",
+            "bu",
+            "için",
+            "ile",
+            "değil",
+            "mi",
+            "my",
+            "nasıl",
+            "teşekkür",
+            "merhaba",
+            "neden",
+            "ne",
+            "zaman",
+            "olabilir",
+            "çok",
+            "ama",
+            "gerekli",
+            "lütfen",
+            "var",
+            "yok",
+            "olarak",
+        ],
+    ),
+    (
+        "sv",
+        &[
+            "och", "att", "det", "en", "som", "är", "för", "med", "inte", "har", "den", "jag",
+            "vi", "ni", "tack", "hej", "hur", "varför", "när", "kan", "mycket", "också", "men",
+            "om",
+        ],
+    ),
+    (
+        "vi",
+        &[
+            "của",
+            "và",
+            "là",
+            "có",
+            "không",
+            "được",
+            "cho",
+            "với",
+            "này",
+            "tôi",
+            "bạn",
+            "chúng",
+            "cảm ơn",
+            "xin",
+            "làm",
+            "thế nào",
+            "tại sao",
+            "khi",
+            "có thể",
+            "rất",
+            "nhưng",
+        ],
+    ),
 ];
 
 /// `Number(x.toFixed(n))` — round to n decimals, back to a JSON number.
@@ -178,9 +313,7 @@ fn clean_for_detection(text: &str) -> String {
     let mut i = 0usize;
     while i < chars.len() {
         // URLs: http(s)://... up to whitespace.
-        if lower_chars[i] == 'h'
-            && lower_chars[i..].starts_with(&['h', 't', 't', 'p'])
-        {
+        if lower_chars[i] == 'h' && lower_chars[i..].starts_with(&['h', 't', 't', 'p']) {
             let rest: String = lower_chars[i..].iter().collect();
             if rest.starts_with("http://") || rest.starts_with("https://") {
                 // consume until whitespace
@@ -373,10 +506,7 @@ pub fn detect_language(text: &str) -> Value {
     let mut scored: Vec<(&str, String, f64, usize)> = STOPWORDS
         .iter()
         .map(|&(code, list)| {
-            let hits = words
-                .iter()
-                .filter(|w| list.iter().any(|s| s == w))
-                .count();
+            let hits = words.iter().filter(|w| list.iter().any(|s| s == w)).count();
             let score = if words.is_empty() {
                 0.0
             } else {
@@ -415,7 +545,9 @@ pub fn detect_language(text: &str) -> Value {
     } else if confidence == "medium" {
         format!(
             "Detected by function-word frequency with limited separation from {}.",
-            second.map(|s| s.1.clone()).unwrap_or_else(|| "other candidates".into())
+            second
+                .map(|s| s.1.clone())
+                .unwrap_or_else(|| "other candidates".into())
         )
     } else {
         "Weak function-word signal; treat the language as a low-confidence guess.".to_string()
@@ -505,10 +637,7 @@ pub fn conversation_languages(conn: &Connection, conversation_id: i64) -> Result
     };
     let per_message: Vec<(i64, Value)> = stmt
         .query_map(params![conversation_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-            ))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })
         .map(|rows| {
             rows.filter_map(|r| r.ok())
@@ -539,12 +668,11 @@ fn conversation_summary(conversation_id: i64, per_message: Vec<(i64, Value)>) ->
     let primary = ranked.first();
     let primary_detection: Option<&Value> = per_message
         .iter()
-        .find(|(_, d)| {
-            d.get("code").and_then(|v| v.as_str()) == primary.map(|(c, _)| c.as_str())
-        })
+        .find(|(_, d)| d.get("code").and_then(|v| v.as_str()) == primary.map(|(c, _)| c.as_str()))
         .map(|(_, d)| d);
     let mut notes = vec![
-        "Detection is deterministic (script ranges + function words) and runs entirely locally.".to_string(),
+        "Detection is deterministic (script ranges + function words) and runs entirely locally."
+            .to_string(),
     ];
     if primary.is_none() {
         notes.push("No customer message had a detectable language.".to_string());
@@ -574,12 +702,7 @@ fn conversation_summary(conversation_id: i64, per_message: Vec<(i64, Value)>) ->
                 .unwrap_or(json!("empty")),
         )
     } else {
-        (
-            Value::Null,
-            Value::Null,
-            json!("unknown"),
-            json!("empty"),
-        )
+        (Value::Null, Value::Null, json!("unknown"), json!("empty"))
     };
     json!({
         "conversation_id": conversation_id,
@@ -631,7 +754,10 @@ pub type ChatFn<'a> = &'a dyn Fn(
     f64,
     u32,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = std::result::Result<(Option<String>, String), String>> + 'a>,
+    Box<
+        dyn std::future::Future<Output = std::result::Result<(Option<String>, String), String>>
+            + 'a,
+    >,
 >;
 
 /// `translate(input)` — LM Studio only, cached, never sent anywhere.
@@ -672,7 +798,10 @@ pub async fn translate(
     let mut source_lang = from.unwrap_or("").trim().to_lowercase();
     if source_lang.is_empty() || source_lang == "auto" {
         let detection = detect_language(text);
-        let code = detection.get("code").and_then(|v| v.as_str()).map(str::to_string);
+        let code = detection
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         source_lang = code.clone().unwrap_or_else(|| "en".into());
         if code.is_none() {
             // Honest: we cannot detect - refuse rather than guess a source.
@@ -697,15 +826,7 @@ pub async fn translate(
             "SELECT source_lang, target_lang, translated_text, model, purpose
              FROM translation_cache WHERE cache_key = ?1",
             params![cache_key],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .ok();
     if let Some((src, tgt, translated, model, purpose)) = cached {
@@ -879,13 +1000,14 @@ mod tests {
                     Some("Bonjour world".to_string()),
                     "fake-translate".to_string(),
                 ))
-            }) as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = std::result::Result<(Option<String>, String), String>,
-                        > + '_,
-                >,
-            >
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = std::result::Result<(Option<String>, String), String>,
+                            > + '_,
+                    >,
+                >
         };
         let r = translate(
             &conn,
@@ -957,16 +1079,17 @@ mod tests {
                             Some("Hello world".to_string()),
                             "fake-translate".to_string(),
                         ))
-                    }) as std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<
-                                    Output = std::result::Result<
-                                        (Option<String>, String),
-                                        String,
-                                    >,
-                                > + '_,
-                        >,
-                    >
+                    })
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = std::result::Result<
+                                            (Option<String>, String),
+                                            String,
+                                        >,
+                                    > + '_,
+                            >,
+                        >
                 };
                 chat
             },
@@ -984,7 +1107,10 @@ mod tests {
     #[test]
     fn agent_language_defaults_and_reads_both_storage_shapes() {
         let conn = fresh_db();
-        assert_eq!(agent_language(&conn), json!({"code": "en", "name": "English"}));
+        assert_eq!(
+            agent_language(&conn),
+            json!({"code": "en", "name": "English"})
+        );
 
         crate::settings::set_string(&conn, "agent_language", "fr").unwrap();
         assert_eq!(

@@ -389,7 +389,10 @@ pub fn list_rows(
                   WHERE connector_id = ?1 AND data LIKE ?2 ORDER BY id LIMIT ?3 OFFSET ?4",
             )?;
             let mapped: Vec<Value> = stmt
-                .query_map(params![connector_id, like, limit, offset], connector_row_json)?
+                .query_map(
+                    params![connector_id, like, limit, offset],
+                    connector_row_json,
+                )?
                 .filter_map(|r| r.ok())
                 .collect();
             mapped

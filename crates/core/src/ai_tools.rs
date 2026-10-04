@@ -75,14 +75,28 @@ fn tool(name: &str, description: &str, parameters: Value) -> ChatTool {
 
 /// A customer-history ticket row (number, subject, status, created, closed,
 /// first message, last reply).
-type HistoryTicket = (i64, Option<String>, String, Option<String>, Option<String>, String, String);
+type HistoryTicket = (
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
 /// A knowledge-gap candidate row (id, kind, question, occurrences, status,
 /// detail).
 type GapRow = (i64, Option<String>, String, i64, String, Option<String>);
 /// A graph edge row (source kind/label, target kind/label, relation).
 type GraphEdgeRow = (String, Option<String>, String, Option<String>, String);
 /// A customer-memory row (key, value, source, confidence, last seen).
-type MemoryRow = (String, Option<String>, String, Option<String>, Option<String>);
+type MemoryRow = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 fn prop(name: &str, kind: &str, description: &str) -> Value {
     json!({ name: { "type": kind, "description": description } })
@@ -350,8 +364,7 @@ fn conv_by_number(conn: &Connection, number: i64) -> Option<(i64, Option<i64>)> 
 /// Execute one tool by name with raw JSON arguments (reference
 /// `AiToolRegistry.execute`). Read-only, bounded, redacted.
 pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
-    let args: serde_json::Map<String, Value> = match serde_json::from_str(if args_json.is_empty()
-    {
+    let args: serde_json::Map<String, Value> = match serde_json::from_str(if args_json.is_empty() {
         "{}"
     } else {
         args_json
@@ -496,7 +509,11 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             row
         }
         "get_support_metrics" => {
-            let days = args.get("days").and_then(Value::as_i64).unwrap_or(30).clamp(1, 365);
+            let days = args
+                .get("days")
+                .and_then(Value::as_i64)
+                .unwrap_or(30)
+                .clamp(1, 365);
             let (conversations, active, closed) = conn
                 .query_row(
                     "SELECT COUNT(*),
@@ -581,8 +598,7 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             let msgs: Vec<Value> = messages
                 .iter()
                 .map(|(author, kind, date, body)| {
-                    let text: String =
-                        crate::demo::html_to_text(body).chars().take(700).collect();
+                    let text: String = crate::demo::html_to_text(body).chars().take(700).collect();
                     json!({
                         "author": author,
                         "type": kind,
@@ -593,7 +609,11 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                 .collect();
             let mut participants: Vec<String> = Vec::new();
             for m in &msgs {
-                let label = format!("{} ({})", m["author"].as_str().unwrap_or(""), m["type"].as_str().unwrap_or(""));
+                let label = format!(
+                    "{} ({})",
+                    m["author"].as_str().unwrap_or(""),
+                    m["type"].as_str().unwrap_or("")
+                );
                 if !participants.contains(&label) {
                     participants.push(label);
                 }
@@ -669,8 +689,9 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             let Some((id, _)) = conv_by_number(conn, num) else {
                 return json!({ "error": "Conversation not found" });
             };
-            let similar = crate::ai_evidence::find_similar(conn, id, limit.clamp(1, 10) as usize, &[])
-                .unwrap_or_default();
+            let similar =
+                crate::ai_evidence::find_similar(conn, id, limit.clamp(1, 10) as usize, &[])
+                    .unwrap_or_default();
             json!(similar
                 .iter()
                 .map(|s| json!({
@@ -689,7 +710,12 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                 .chars()
                 .take(200)
                 .collect();
-            let like = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            let like = format!(
+                "%{}%",
+                q.replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            );
             let sql = format!(
                 "SELECT ic.id, ic.title, ic.summary, ic.category, ic.product, ic.feature, ic.ai_generated,
                         (SELECT GROUP_CONCAT(c.number) FROM issue_cluster_members icc
@@ -708,13 +734,15 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             let rows: Vec<Value> = if q.is_empty() {
                 conn.prepare(&sql)
                     .and_then(|mut stmt| {
-                        stmt.query_map([], |r| map_cluster_row(conn, r)).map(collect_rows)
+                        stmt.query_map([], |r| map_cluster_row(conn, r))
+                            .map(collect_rows)
                     })
                     .unwrap_or_default()
             } else {
                 conn.prepare(&sql)
                     .and_then(|mut stmt| {
-                        stmt.query_map(params![like], |r| map_cluster_row(conn, r)).map(collect_rows)
+                        stmt.query_map(params![like], |r| map_cluster_row(conn, r))
+                            .map(collect_rows)
                     })
                     .unwrap_or_default()
             };
@@ -926,7 +954,8 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                     let customers = r["customer_count"].as_i64().unwrap_or(0);
                     r["affected_conversations"] = json!(conversations);
                     r["affected_customers"] = json!(customers);
-                    r["note"] = json!("Affected customers are distinct customers, never ticket counts.");
+                    r["note"] =
+                        json!("Affected customers are distinct customers, never ticket counts.");
                     r
                 })
                 .collect::<Vec<_>>())
@@ -939,7 +968,10 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                 .chars()
                 .take(200)
                 .collect();
-            let type_slug = args.get("type").and_then(Value::as_str).map(|s| s.chars().take(60).collect::<String>());
+            let type_slug = args
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|s| s.chars().take(60).collect::<String>());
             let type_id: Option<i64> = type_slug.as_deref().and_then(|slug| {
                 conn.query_row(
                     "SELECT id FROM custom_object_types WHERE slug = ?1 AND deleted_at IS NULL",
@@ -959,7 +991,11 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                    JOIN custom_object_types t ON t.id = o.type_id
                   WHERE fts_custom_objects MATCH ?1 {}
                   ORDER BY rank LIMIT ?2",
-                if type_id.is_some() { "AND o.type_id = ?3" } else { "" },
+                if type_id.is_some() {
+                    "AND o.type_id = ?3"
+                } else {
+                    ""
+                },
             );
             let rows: Vec<(i64, String, String, String)> = if let Some(tid) = type_id {
                 conn.prepare(&sql)
@@ -1069,7 +1105,9 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                 .ok();
             let Some((id, name, allowed_ai, enabled)) = row else {
                 let available: Vec<String> = conn
-                    .prepare("SELECT name FROM connectors WHERE allowed_ai = 1 AND enabled = 1 LIMIT 10")
+                    .prepare(
+                        "SELECT name FROM connectors WHERE allowed_ai = 1 AND enabled = 1 LIMIT 10",
+                    )
                     .and_then(|mut stmt| {
                         stmt.query_map([], |r| r.get::<_, String>(0))
                             .map(|rows| rows.filter_map(|t| t.ok()).collect::<Vec<_>>())
@@ -1113,7 +1151,10 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
         }
         // ---------------- v2.1.0 (M5): quality tools ----------------
         "get_knowledge_gaps" => {
-            let kind_filter = args.get("kind").and_then(Value::as_str).map(|s| s.chars().take(60).collect::<String>());
+            let kind_filter = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(|s| s.chars().take(60).collect::<String>());
             let rows: Vec<GapRow> = conn
                 .prepare(
                     "SELECT id, kind, query_text, occurrence_count, status, detail
@@ -1164,7 +1205,11 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                 .collect::<Vec<_>>())
         }
         "get_friction_report" => {
-            let days = args.get("days").and_then(Value::as_i64).unwrap_or(30).clamp(1, 365);
+            let days = args
+                .get("days")
+                .and_then(Value::as_i64)
+                .unwrap_or(30)
+                .clamp(1, 365);
             let rows: Vec<Value> = conn
                 .prepare(
                     "SELECT f.kind, COUNT(*), SUM(CASE WHEN f.severity = 'high' THEN 1 ELSE 0 END)
@@ -1191,14 +1236,31 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
         }
         // ---------------- v2.2.0 (M6): graph + memory tools ----------------
         "get_graph_neighbors" => {
-            let kind = args.get("kind").and_then(Value::as_str).unwrap_or_default().to_string();
-            let Some(local_id) = args.get("local_id").and_then(Value::as_i64).filter(|v| *v > 0) else {
+            let kind = args
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let Some(local_id) = args
+                .get("local_id")
+                .and_then(Value::as_i64)
+                .filter(|v| *v > 0)
+            else {
                 return json!({ "error": "Invalid local_id" });
             };
             let valid_kinds = [
-                "customer", "organization", "conversation", "known_issue", "issue_cluster",
-                "incident", "knowledge_document", "agent", "campaign", "product",
-                "custom_object", "connector_data",
+                "customer",
+                "organization",
+                "conversation",
+                "known_issue",
+                "issue_cluster",
+                "incident",
+                "knowledge_document",
+                "agent",
+                "campaign",
+                "product",
+                "custom_object",
+                "connector_data",
             ];
             if !valid_kinds.contains(&kind.as_str()) {
                 return json!({ "error": format!("Unknown node kind. Valid kinds: {}", valid_kinds.join(", ")) });
@@ -1385,7 +1447,9 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                 "note": "Composed live from the local mirror - human-written entries are the only persisted rows. Psychological/personality judgments are never included."
             })
         }
-        _ => json!({ "error": format!("Unknown tool {name} - allowed tools are read-only search tools") }),
+        _ => {
+            json!({ "error": format!("Unknown tool {name} - allowed tools are read-only search tools") })
+        }
     }
 }
 
@@ -1426,12 +1490,28 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names.len(), 22);
         for expected in [
-            "search_conversations", "search_knowledge", "search_known_issues", "search_saved_replies",
-            "get_conversation", "get_support_metrics", "get_conversation_context", "get_customer_history",
-            "get_similar_conversations", "get_issue_clusters", "get_ai_analysis", "get_supportos_metadata",
-            "get_ai_attributes", "search_incidents", "search_custom_objects", "get_customer_timeline",
-            "search_connector_data", "get_knowledge_gaps", "get_friction_report", "get_graph_neighbors",
-            "get_graph_stats", "get_customer_memory",
+            "search_conversations",
+            "search_knowledge",
+            "search_known_issues",
+            "search_saved_replies",
+            "get_conversation",
+            "get_support_metrics",
+            "get_conversation_context",
+            "get_customer_history",
+            "get_similar_conversations",
+            "get_issue_clusters",
+            "get_ai_analysis",
+            "get_supportos_metadata",
+            "get_ai_attributes",
+            "search_incidents",
+            "search_custom_objects",
+            "get_customer_timeline",
+            "search_connector_data",
+            "get_knowledge_gaps",
+            "get_friction_report",
+            "get_graph_neighbors",
+            "get_graph_stats",
+            "get_customer_memory",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -1440,7 +1520,11 @@ mod tests {
     #[test]
     fn definitions_have_complete_parameter_schemas() {
         for d in definitions() {
-            assert!(d.parameters.get("type").and_then(Value::as_str) == Some("object"), "{} parameters", d.name);
+            assert!(
+                d.parameters.get("type").and_then(Value::as_str) == Some("object"),
+                "{} parameters",
+                d.name
+            );
             assert!(!d.description.is_empty(), "{} description", d.name);
         }
     }
@@ -1498,11 +1582,9 @@ mod tests {
         let none = serde_json::from_str::<Value>("{}").unwrap();
         let map = none.as_object().unwrap().clone();
         assert_eq!(clamp_limit(&map), 5);
-        let big: serde_json::Map<String, Value> =
-            serde_json::from_str(r#"{"limit": 99}"#).unwrap();
+        let big: serde_json::Map<String, Value> = serde_json::from_str(r#"{"limit": 99}"#).unwrap();
         assert_eq!(clamp_limit(&big), 10);
-        let zero: serde_json::Map<String, Value> =
-            serde_json::from_str(r#"{"limit": 0}"#).unwrap();
+        let zero: serde_json::Map<String, Value> = serde_json::from_str(r#"{"limit": 0}"#).unwrap();
         assert_eq!(clamp_limit(&zero), 1);
     }
 }

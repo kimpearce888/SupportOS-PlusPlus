@@ -24,6 +24,7 @@ use crate::components::memory_panel::MemoryPanel;
 use crate::components::mention_textarea::MentionTextarea;
 use crate::components::overlays::ConfirmDialog;
 use crate::components::qa_panel::QaPanel;
+use crate::components::safe_html::SafeHtml;
 use crate::components::side_threads::SideThreadsPanel;
 use crate::components::state_view::{EmptyState, LoadingState};
 use crate::components::translation_panel::TranslationPanel;
@@ -845,7 +846,7 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                                 let entry_type = entry.thread_type.clone();
                                                 let entry_actor = entry.actor_name.clone().unwrap_or_else(|| entry.actor_type.clone());
                                                 let entry_time = entry.created_at.clone();
-                                                let entry_body = entry.body.clone().unwrap_or_default();
+                                                let entry_body = entry.body.clone();
                                                 view! {
                                                     <div class={class}>
                                                         <div class="spp-thread-entry__header">
@@ -859,9 +860,9 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                                                 {entry_time}
                                                             </span>
                                                         </div>
-                                                        <div class="spp-thread-entry__body">
-                                                            {entry_body}
-                                                        </div>
+                                                        // Sanitized server-side (reference SafeHtml:
+                                                        // body_html with body_text fallback).
+                                                        <SafeHtml html=entry_body fallback_text=String::new() />
                                                     </div>
                                                 }
                                             }).collect::<Vec<_>>().into_view()

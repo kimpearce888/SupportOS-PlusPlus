@@ -122,7 +122,8 @@ impl AppState {
         &self,
         f: impl for<'a> FnOnce(
                 &'a rusqlite::Connection,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
             + Send
             + 'static,
     ) -> std::result::Result<T, String>
@@ -1105,10 +1106,7 @@ impl HttpServer {
             )
             // Coaching
             .route("/api/coaching/meta", get(routes::coaching::meta))
-            .route(
-                "/api/coaching/:conversationId",
-                get(routes::coaching::get),
-            )
+            .route("/api/coaching/:conversationId", get(routes::coaching::get))
             .route(
                 "/api/coaching/:conversationId/review",
                 post(routes::coaching::review),

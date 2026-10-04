@@ -355,7 +355,16 @@ pub async fn chat(
     let session_conv_id = session["conversation_id"].as_i64();
 
     let history = list_messages(conn, session["id"].as_i64().unwrap_or_default());
-    let user_message = insert_message(conn, session["id"].as_i64().unwrap_or_default(), "user", &question, "[]", None, 0, None);
+    let user_message = insert_message(
+        conn,
+        session["id"].as_i64().unwrap_or_default(),
+        "user",
+        &question,
+        "[]",
+        None,
+        0,
+        None,
+    );
 
     // ---- Build the model conversation ----
     let context_block = context_block(conn, session_conv_id);
@@ -369,8 +378,17 @@ pub async fn chat(
     // Replay only a bounded window of prior turns (cheap context).
     for m in history.iter().rev().take(8).rev() {
         messages.push(CopilotWireMessage {
-            role: if m["role"] == "tool" { "user".into() } else { m["role"].as_str().unwrap_or("user").into() },
-            content: m["content"].as_str().unwrap_or_default().chars().take(2000).collect(),
+            role: if m["role"] == "tool" {
+                "user".into()
+            } else {
+                m["role"].as_str().unwrap_or("user").into()
+            },
+            content: m["content"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .take(2000)
+                .collect(),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -495,12 +513,27 @@ pub async fn chat(
     if !executed.is_empty() {
         let trace: Vec<Value> = executed
             .iter()
-            .map(|e| {
-                json!({ "tool": e.name, "args": e.args.chars().take(300).collect::<String>() })
-            })
+            .map(
+                |e| json!({ "tool": e.name, "args": e.args.chars().take(300).collect::<String>() }),
+            )
             .collect();
         let trace_str: String = serde_json::to_string(&trace).unwrap_or_default();
-        insert_message(conn, sid, "tool", &trace_str, "[]", Some(&executed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(",")), executed.len() as i64, None);
+        insert_message(
+            conn,
+            sid,
+            "tool",
+            &trace_str,
+            "[]",
+            Some(
+                &executed
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            executed.len() as i64,
+            None,
+        );
     }
     let assistant_message = insert_message(
         conn,
@@ -512,7 +545,10 @@ pub async fn chat(
         executed.len() as i64,
         Some(latency_ms),
     );
-    let _ = conn.execute("UPDATE copilot_sessions SET updated_at = datetime('now') WHERE id = ?1", params![sid]);
+    let _ = conn.execute(
+        "UPDATE copilot_sessions SET updated_at = datetime('now') WHERE id = ?1",
+        params![sid],
+    );
 
     // AI-run accounting (latency/model stats feed the AI analytics).
     let run_id = ai_pipeline::start_run(
@@ -837,21 +873,57 @@ pub fn starter_questions(conn: &Connection, conversation_id: i64) -> Vec<(String
         return Vec::new();
     };
     let mut out: Vec<(String, String)> = vec![
-        ("What is this customer asking?".into(), "Summarizes the current conversation".into()),
-        ("What should I check before replying?".into(), "Pre-reply checklist from local evidence".into()),
-        ("What information has already been provided?".into(), "Avoids asking the customer twice".into()),
-        ("Why is this ticket currently considered urgent?".into(), "Explains urgency from AI attributes + analysis".into()),
+        (
+            "What is this customer asking?".into(),
+            "Summarizes the current conversation".into(),
+        ),
+        (
+            "What should I check before replying?".into(),
+            "Pre-reply checklist from local evidence".into(),
+        ),
+        (
+            "What information has already been provided?".into(),
+            "Avoids asking the customer twice".into(),
+        ),
+        (
+            "Why is this ticket currently considered urgent?".into(),
+            "Explains urgency from AI attributes + analysis".into(),
+        ),
     ];
     if prior_tickets > 0 {
-        out.push(("What happened in their previous tickets?".into(), format!("{prior_tickets} previous ticket(s) in the local archive")));
-        out.push(("What changed since the last interaction?".into(), "Compares with the last conversation".into()));
-        out.push(("Summarize the last three conversations.".into(), "Recent history digest".into()));
+        out.push((
+            "What happened in their previous tickets?".into(),
+            format!("{prior_tickets} previous ticket(s) in the local archive"),
+        ));
+        out.push((
+            "What changed since the last interaction?".into(),
+            "Compares with the last conversation".into(),
+        ));
+        out.push((
+            "Summarize the last three conversations.".into(),
+            "Recent history digest".into(),
+        ));
     }
-    out.push(("Have we seen this issue before?".into(), "Searches similar conversations".into()));
-    out.push(("What solved the previous cases?".into(), "Resolutions from similar tickets".into()));
-    out.push(("Has another customer had the same problem?".into(), "Cross-customer search".into()));
-    out.push(("What documentation applies?".into(), "Local knowledge base search".into()));
-    out.push(("Show evidence for that answer.".into(), "Citations from real tool results".into()));
+    out.push((
+        "Have we seen this issue before?".into(),
+        "Searches similar conversations".into(),
+    ));
+    out.push((
+        "What solved the previous cases?".into(),
+        "Resolutions from similar tickets".into(),
+    ));
+    out.push((
+        "Has another customer had the same problem?".into(),
+        "Cross-customer search".into(),
+    ));
+    out.push((
+        "What documentation applies?".into(),
+        "Local knowledge base search".into(),
+    ));
+    out.push((
+        "Show evidence for that answer.".into(),
+        "Citations from real tool results".into(),
+    ));
     out
 }
 
@@ -972,8 +1044,17 @@ mod copilot_service_tests {
         assert_eq!(citations[0]["index"], json!(1));
         assert_eq!(citations[0]["conversation_id"], json!(1));
         assert_eq!(citations[0]["conversation_number"], json!(100));
-        assert!(citations[0]["label"].as_str().unwrap().contains("conversation #100"));
-        assert!(citations[1]["label"].as_str().unwrap().contains("1 conversation(s)"));
-        assert!(citations[2]["label"].as_str().unwrap().contains("no result"));
+        assert!(citations[0]["label"]
+            .as_str()
+            .unwrap()
+            .contains("conversation #100"));
+        assert!(citations[1]["label"]
+            .as_str()
+            .unwrap()
+            .contains("1 conversation(s)"));
+        assert!(citations[2]["label"]
+            .as_str()
+            .unwrap()
+            .contains("no result"));
     }
 }

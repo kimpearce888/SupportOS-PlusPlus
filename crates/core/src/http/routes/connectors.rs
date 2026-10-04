@@ -139,10 +139,7 @@ fn key_column(config: &Map<String, Value>, issues: &mut Vec<String>) -> Value {
 
 /// `connectorConfigSchema` — discriminated union on `kind`. Returns the
 /// normalized (stripped + defaulted) config object, or pushes issues.
-fn validate_config_schema(
-    body: &Value,
-    issues: &mut Vec<String>,
-) -> Option<Value> {
+fn validate_config_schema(body: &Value, issues: &mut Vec<String>) -> Option<Value> {
     let Value::Object(config) = body else {
         issues.push("config is required.".into());
         return None;
@@ -150,9 +147,7 @@ fn validate_config_schema(
     let kind = match config.get("kind") {
         Some(Value::String(k)) => k.as_str(),
         _ => {
-            issues.push(
-                "config.kind must be one of 'local_json', 'csv', 'sqlite', 'http'.".into(),
-            );
+            issues.push("config.kind must be one of 'local_json', 'csv', 'sqlite', 'http'.".into());
             return None;
         }
     };
@@ -216,8 +211,7 @@ fn validate_config_schema(
                         issues.push("config.url must contain at least 8 characters.".into());
                         None
                     } else if len > 600 {
-                        issues
-                            .push("config.url must contain at most 600 characters.".into());
+                        issues.push("config.url must contain at most 600 characters.".into());
                         None
                     } else {
                         Some(trimmed.to_string())
@@ -260,10 +254,7 @@ fn is_table_identifier(s: &str) -> bool {
 
 /// `connectorAuthSchema` — discriminated union on `mode`. `None` = use the
 /// caller's default `{mode:'none'}` (zod's `.default()`).
-fn validate_auth_schema(
-    body: &Value,
-    issues: &mut Vec<String>,
-) -> Option<Value> {
+fn validate_auth_schema(body: &Value, issues: &mut Vec<String>) -> Option<Value> {
     let Value::Object(auth) = body else {
         issues.push("auth must be an object.".into());
         return None;
@@ -271,8 +262,7 @@ fn validate_auth_schema(
     let mode = match auth.get("mode") {
         Some(Value::String(m)) => m.as_str(),
         _ => {
-            issues
-                .push("auth.mode must be one of 'none', 'header', 'bearer'.".into());
+            issues.push("auth.mode must be one of 'none', 'header', 'bearer'.".into());
             return None;
         }
     };
@@ -282,8 +272,7 @@ fn validate_auth_schema(
             let header_name = match auth.get("headerName") {
                 Some(h @ Value::String(_)) => match non_empty(h, "auth.headerName", 60, issues) {
                     Some(name) if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => {
-                        issues
-                            .push("Header names are token identifiers".into());
+                        issues.push("Header names are token identifiers".into());
                         None
                     }
                     Some(name) => Some(name),
@@ -850,7 +839,9 @@ mod tests {
         let (status, body) = body_json(
             create(
                 State(state.clone()),
-                Some(Json(json!({ "config": { "kind": "csv", "file": "x.csv" } }))),
+                Some(Json(
+                    json!({ "config": { "kind": "csv", "file": "x.csv" } }),
+                )),
             )
             .await,
         )
@@ -861,17 +852,19 @@ mod tests {
 
         // File that does not exist in the jail → 422 ValidationError.
         let (status, body) = body_json(
-            create(State(state.clone()), Some(Json(local_json_body("nope.json")))).await,
+            create(
+                State(state.clone()),
+                Some(Json(local_json_body("nope.json"))),
+            )
+            .await,
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["error"], "ValidationError");
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .starts_with("File not found: create \"connectors/nope.json\" first")
-        );
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("File not found: create \"connectors/nope.json\" first"));
     }
 
     #[tokio::test]
@@ -914,12 +907,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body["ok"], json!(false));
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("already exists")
-        );
+        assert!(body["message"].as_str().unwrap().contains("already exists"));
         // Bearer auth is redacted on read.
         write_jail_file(&dir, "sec.json", r#"[{"id":"a"}]"#);
         let (status, body) = body_json(
@@ -947,7 +935,11 @@ mod tests {
             r#"[{"id":"v1","env":"production"},{"id":"v2","env":"staging"}]"#,
         );
         let (_, created) = body_json(
-            create(State(state.clone()), Some(Json(local_json_body("rows.json")))).await,
+            create(
+                State(state.clone()),
+                Some(Json(local_json_body("rows.json"))),
+            )
+            .await,
         )
         .await;
         let id = created["connector"]["id"].as_i64().unwrap();
@@ -955,7 +947,8 @@ mod tests {
         // site below constructs a fresh Path(id.to_string()).
 
         // Test endpoint: honest wording, no fetch performed.
-        let (status, body) = body_json(test(State(state.clone()), Path(id.to_string())).await).await;
+        let (status, body) =
+            body_json(test(State(state.clone()), Path(id.to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], json!(true));
         assert_eq!(
@@ -964,26 +957,23 @@ mod tests {
         );
 
         // Refresh: snapshot lands.
-        let (status, body) = body_json(refresh(State(state.clone()), Path(id.to_string())).await).await;
+        let (status, body) =
+            body_json(refresh(State(state.clone()), Path(id.to_string())).await).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["ok"], json!(true));
         assert_eq!(body["result"]["rows"], json!(2));
         assert_eq!(body["result"]["pruned"], json!(0));
-        assert!(
-            body["result"]["schema"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s["name"] == json!("env"))
-        );
+        assert!(body["result"]["schema"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == json!("env")));
 
         // Rows: q filter is SQL-level (total respects it) + clamp defaults.
         let mut query = HashMap::new();
         query.insert("q".to_string(), "production".to_string());
-        let (status, body) = body_json(
-            rows(State(state.clone()), Path(id.to_string()), Query(query)).await,
-        )
-        .await;
+        let (status, body) =
+            body_json(rows(State(state.clone()), Path(id.to_string()), Query(query)).await).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["total"], json!(1));
         assert_eq!(body["rows"].as_array().unwrap().len(), 1);
@@ -991,7 +981,8 @@ mod tests {
 
         // Second refresh after the source shrinks prunes the vanished key.
         write_jail_file(&dir, "rows.json", r#"[{"id":"v1","env":"production"}]"#);
-        let (status, body) = body_json(refresh(State(state.clone()), Path(id.to_string())).await).await;
+        let (status, body) =
+            body_json(refresh(State(state.clone()), Path(id.to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["rows"], json!(1));
         assert_eq!(body["result"]["pruned"], json!(1));
@@ -999,7 +990,8 @@ mod tests {
         // Failed refresh (file deleted) is an honest 422 with the result,
         // and never partially overwrites the previous good snapshot.
         std::fs::remove_file(dir.path().join("connectors").join("rows.json")).unwrap();
-        let (status, body) = body_json(refresh(State(state.clone()), Path(id.to_string())).await).await;
+        let (status, body) =
+            body_json(refresh(State(state.clone()), Path(id.to_string())).await).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["ok"], json!(false));
         // Reference wording: "Refresh failed: ENOENT: no such file or
@@ -1012,10 +1004,8 @@ mod tests {
             "{message}"
         );
         let mut no_q = HashMap::new();
-        let (_, body) = body_json(
-            rows(State(state.clone()), Path(id.to_string()), Query(no_q)).await,
-        )
-        .await;
+        let (_, body) =
+            body_json(rows(State(state.clone()), Path(id.to_string()), Query(no_q)).await).await;
         assert_eq!(body["total"], json!(1)); // previous snapshot intact
     }
 
@@ -1040,10 +1030,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = body_json(test(State(state.clone()), Path("999".into())).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) = body_json(
-            delete(State(state.clone()), Path("999".into())).await,
-        )
-        .await;
+        let (status, _) = body_json(delete(State(state.clone()), Path("999".into())).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
@@ -1052,7 +1039,11 @@ mod tests {
         let (dir, state) = make_state();
         write_jail_file(&dir, "rows.json", r#"[{"id":"a"}]"#);
         let (_, created) = body_json(
-            create(State(state.clone()), Some(Json(local_json_body("rows.json")))).await,
+            create(
+                State(state.clone()),
+                Some(Json(local_json_body("rows.json"))),
+            )
+            .await,
         )
         .await;
         let id = created["connector"]["id"].as_i64().unwrap();
@@ -1091,9 +1082,13 @@ mod tests {
 
         // Delete removes connector + cached rows with the reference message.
         refresh(State(state.clone()), Path(id.to_string())).await;
-        let (status, body) = body_json(delete(State(state.clone()), Path(id.to_string())).await).await;
+        let (status, body) =
+            body_json(delete(State(state.clone()), Path(id.to_string())).await).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["message"], json!("Connector and its cached rows deleted."));
+        assert_eq!(
+            body["message"],
+            json!("Connector and its cached rows deleted.")
+        );
         let (status, _) = body_json(get(State(state.clone()), Path(id.to_string())).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
@@ -1121,7 +1116,10 @@ mod tests {
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{url}");
             assert_eq!(body["error"], "ValidationError");
             assert!(
-                body["message"].as_str().unwrap().starts_with("URL refused:"),
+                body["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("URL refused:"),
                 "{url}"
             );
         }

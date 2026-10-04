@@ -20,7 +20,7 @@ use crate::ai_prompts::{
 };
 use crate::error::Result;
 use crate::search::{
-    fts_query_or, search_known_issues, search_knowledge_raw, search_saved_replies,
+    fts_query_or, search_knowledge_raw, search_known_issues, search_saved_replies,
 };
 
 /// A similar past conversation (reference `SimilarConversation`).
@@ -308,7 +308,11 @@ pub fn find_similar(
 
     // Keyword candidates via FTS (conversations + threads).
     let keywords = fts_query_or(
-        &format!("{} {}", me.subject.clone().unwrap_or_default(), me.preview.clone().unwrap_or_default()),
+        &format!(
+            "{} {}",
+            me.subject.clone().unwrap_or_default(),
+            me.preview.clone().unwrap_or_default()
+        ),
         10,
     );
     let fts_rows: Vec<CandidateRow> = if keywords != "\"\"" {
@@ -430,7 +434,11 @@ pub fn find_similar(
         scored.push(SimilarConversation {
             conversation_id: c.row.id,
             number: c.row.number,
-            subject: c.row.subject.clone().unwrap_or_else(|| "(no subject)".into()),
+            subject: c
+                .row
+                .subject
+                .clone()
+                .unwrap_or_else(|| "(no subject)".into()),
             resolution,
             date: c.row.remote_created_at.clone(),
             status: c.row.status.clone(),
@@ -438,7 +446,11 @@ pub fn find_similar(
             why,
         });
     }
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(limit);
     Ok(scored)
 }
@@ -793,7 +805,10 @@ mod tests {
         )
         .unwrap();
         let external = build(&conn, 1, false).unwrap().unwrap();
-        assert!(external.knowledge.iter().all(|k| k.visibility == "customer_safe"));
+        assert!(external
+            .knowledge
+            .iter()
+            .all(|k| k.visibility == "customer_safe"));
         assert!(external.knowledge.iter().any(|k| k.title == "Public doc"));
         let internal = build(&conn, 1, true).unwrap().unwrap();
         assert!(internal.knowledge.iter().any(|k| k.title == "Secret doc"));
@@ -864,12 +879,17 @@ mod tests {
         assert_eq!(similar[0].number, 2);
         assert!(similar[0].why.iter().any(|w| w == "keyword match"));
         assert!(similar[0].why.iter().any(|w| w == "same customer"));
-        assert!(similar[0].why.iter().any(|w| w.starts_with("shared tags: export")));
+        assert!(similar[0]
+            .why
+            .iter()
+            .any(|w| w.starts_with("shared tags: export")));
         assert!(similar[0].why.iter().any(|w| w == "recent"));
         assert!(similar[0].resolution.contains("csv export"));
         // Semantic hits merge into the candidate set.
         let with_semantic = find_similar(&conn, 1, 5, &[(3, 0.9)]).unwrap();
-        assert!(with_semantic.iter().any(|s| s.number == 3 && s.why.contains(&"semantic match".to_string())));
+        assert!(with_semantic
+            .iter()
+            .any(|s| s.number == 3 && s.why.contains(&"semantic match".to_string())));
     }
 
     #[test]
@@ -911,15 +931,15 @@ mod tests {
             ..Default::default()
         };
         let sources = sources_for(&conn, &ctx);
-        assert!(sources
-            .iter()
-            .any(|s| s.source_type == "conversation" && s.source_id == 2 && s.relevance == Some(0.5)));
-        assert!(sources
-            .iter()
-            .any(|s| s.source_type == "known_issue" && s.source_id == 4 && s.visibility == "uncertain"));
-        assert!(sources
-            .iter()
-            .any(|s| s.source_type == "saved_reply" && s.source_id == 9 && s.visibility == "customer_safe"));
+        assert!(sources.iter().any(|s| s.source_type == "conversation"
+            && s.source_id == 2
+            && s.relevance == Some(0.5)));
+        assert!(sources.iter().any(|s| s.source_type == "known_issue"
+            && s.source_id == 4
+            && s.visibility == "uncertain"));
+        assert!(sources.iter().any(|s| s.source_type == "saved_reply"
+            && s.source_id == 9
+            && s.visibility == "customer_safe"));
     }
 
     #[test]

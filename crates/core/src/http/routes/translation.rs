@@ -145,7 +145,9 @@ pub async fn translate(State(state): State<AppState>, body: Option<Json<Value>>)
         None => None,
         Some(Value::Null) => None,
         Some(Value::String(s)) if s.chars().count() <= 8 => Some(s.clone()),
-        Some(_) => return validation_422("from must be a language code (at most 8 characters) or null."),
+        Some(_) => {
+            return validation_422("from must be a language code (at most 8 characters) or null.")
+        }
     };
     let to = match body.get("to") {
         Some(Value::String(s)) if (2..=8).contains(&s.chars().count()) => s.clone(),
@@ -205,35 +207,27 @@ pub async fn translate(State(state): State<AppState>, body: Option<Json<Value>>)
                             .await
                             .map(|res| (res.content, res.model))
                             .map_err(|e| e.message)
-                    }) as std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<
-                                    Output = std::result::Result<
-                                        (Option<String>, String),
-                                        String,
-                                    >,
-                                > + '_,
-                        >,
-                    >
+                    })
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = std::result::Result<
+                                            (Option<String>, String),
+                                            String,
+                                        >,
+                                    > + '_,
+                            >,
+                        >
                 };
-                translation::translate(
-                    conn,
-                    &chat,
-                    &text,
-                    from.as_deref(),
-                    &to,
-                    purpose.as_deref(),
-                )
-                .await
+                translation::translate(conn, &chat, &text, from.as_deref(), &to, purpose.as_deref())
+                    .await
             })
         })
         .await;
     match outcome {
         Ok(Ok(result)) => {
             let mut out = json!({ "ok": true });
-            if let (Value::Object(base), Value::Object(extra)) =
-                (out.clone(), result)
-            {
+            if let (Value::Object(base), Value::Object(extra)) = (out.clone(), result) {
                 let mut merged = base;
                 for (k, v) in extra {
                     merged.insert(k, v);
@@ -242,15 +236,9 @@ pub async fn translate(State(state): State<AppState>, body: Option<Json<Value>>)
             }
             Json(out).into_response()
         }
-        Ok(Err(
-            crate::translation::TranslateError::Client(message),
-        )) => validation_422(message),
-        Ok(Err(crate::translation::TranslateError::Service(message))) => {
-            service_503(&message)
-        }
-        Ok(Err(crate::translation::TranslateError::BadGateway(message))) => {
-            bad_gateway(message)
-        }
+        Ok(Err(crate::translation::TranslateError::Client(message))) => validation_422(message),
+        Ok(Err(crate::translation::TranslateError::Service(message))) => service_503(&message),
+        Ok(Err(crate::translation::TranslateError::BadGateway(message))) => bad_gateway(message),
         Err(join) => bad_gateway(join),
     }
 }
@@ -306,12 +294,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body["languages"].as_array().unwrap().len() >= 18);
         assert_eq!(body["agent_language"]["code"], json!("en"));
-        assert!(
-            body["note"]
-                .as_str()
-                .unwrap()
-                .contains("nothing is ever sent automatically")
-        );
+        assert!(body["note"]
+            .as_str()
+            .unwrap()
+            .contains("nothing is ever sent automatically"));
     }
 
     #[tokio::test]
@@ -336,10 +322,8 @@ mod tests {
         assert_eq!(detections[1]["code"], json!("en"));
 
         // v2.1 e2e hardening: hostile payloads are 422.
-        let (status, _) = body_json(
-            detect(State(state.clone()), Some(Json(json!({ "texts": [] })))).await,
-        )
-        .await;
+        let (status, _) =
+            body_json(detect(State(state.clone()), Some(Json(json!({ "texts": [] })))).await).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let (status, _) = body_json(
             detect(
@@ -397,40 +381,34 @@ mod tests {
         let (status, body) = body_json(
             translate(
                 State(state.clone()),
-                Some(Json(json!({ "text": "Hello, my account is broken", "to": "fr" }))),
+                Some(Json(
+                    json!({ "text": "Hello, my account is broken", "to": "fr" }),
+                )),
             )
             .await,
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("no cloud fallback")
-        );
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("no cloud fallback"));
     }
 
     #[tokio::test]
     async fn conversation_requires_positive_integer_and_existing_conversation() {
         let state = make_state();
         // Non-integer / non-positive → 422.
-        let (status, _) = body_json(
-            conversation(State(state.clone()), Path("abc".into())).await,
-        )
-        .await;
+        let (status, _) =
+            body_json(conversation(State(state.clone()), Path("abc".into())).await).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        let (status, _) = body_json(
-            conversation(State(state.clone()), Path("0".into())).await,
-        )
-        .await;
+        let (status, _) =
+            body_json(conversation(State(state.clone()), Path("0".into())).await).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         // Unknown conversation → 404.
-        let (status, _) = body_json(
-            conversation(State(state.clone()), Path("999999".into())).await,
-        )
-        .await;
+        let (status, _) =
+            body_json(conversation(State(state.clone()), Path("999999".into())).await).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // A conversation with a Spanish customer message reports es primary.
@@ -441,11 +419,9 @@ mod tests {
         )
         .unwrap();
         let customer: i64 = conn
-            .query_row(
-                "SELECT id FROM customers WHERE remote_id = 901",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM customers WHERE remote_id = 901", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let thread_remote = 5001;
         conn.execute(
@@ -456,12 +432,12 @@ mod tests {
         )
         .unwrap();
         let conv_id: i64 = conn
-        .query_row(
-            "SELECT id FROM conversations WHERE remote_id = ?1",
-            rusqlite::params![thread_remote],
-            |r| r.get(0),
-        )
-        .unwrap();
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = ?1",
+                rusqlite::params![thread_remote],
+                |r| r.get(0),
+            )
+            .unwrap();
         conn.execute(
             "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, state, created_at)
              VALUES (?1, 'customer', 'Hola, no puedo entrar en mi cuenta de usuario desde ayer', 'customer', 'published', datetime('now'))",
@@ -469,10 +445,8 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let (status, body) = body_json(
-            conversation(State(state.clone()), Path(conv_id.to_string())).await,
-        )
-        .await;
+        let (status, body) =
+            body_json(conversation(State(state.clone()), Path(conv_id.to_string())).await).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["primary_language"]["code"], json!("es"));
         assert!(body["per_message"].as_array().unwrap().len() >= 1);

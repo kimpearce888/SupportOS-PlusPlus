@@ -57,8 +57,8 @@ pub async fn meta(State(state): State<AppState>) -> Json<Value> {
 /// unknown customer. Entries matching the psychological/personality
 /// quarantine are never returned as usable memory.
 pub async fn get(State(state): State<AppState>, Path(customer_id): Path<String>) -> Response {
-    let Some(id) = crate::conversation_ops::js_number(&customer_id)
-        .filter(|v| v.fract() == 0.0 && *v > 0.0)
+    let Some(id) =
+        crate::conversation_ops::js_number(&customer_id).filter(|v| v.fract() == 0.0 && *v > 0.0)
     else {
         return memory_id_422_customer();
     };
@@ -92,13 +92,7 @@ pub async fn get(State(state): State<AppState>, Path(customer_id): Path<String>)
         .ok()
         .and_then(|mut stmt| {
             stmt.query_map(rusqlite::params![id], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                ))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .ok()
@@ -126,13 +120,7 @@ pub async fn get(State(state): State<AppState>, Path(customer_id): Path<String>)
 }
 
 /// The reference `kindSchema` enum (shared/memory.ts MEMORY_ENTRY_KINDS).
-const MEMORY_ENTRY_KINDS: [&str; 5] = [
-    "fact",
-    "account",
-    "preference",
-    "issue_history",
-    "context",
-];
+const MEMORY_ENTRY_KINDS: [&str; 5] = ["fact", "account", "preference", "issue_history", "context"];
 
 /// POST /api/memory/:customerId/entries — upsert a HUMAN memory entry
 /// (reference memory.ts:38-76 + customerMemoryService.upsertHumanEntry).
@@ -142,8 +130,8 @@ pub async fn add_entry(
     Path(customer_id): Path<String>,
     body: Option<Json<Value>>,
 ) -> Response {
-    let Some(id) = crate::conversation_ops::js_number(&customer_id)
-        .filter(|v| v.fract() == 0.0 && *v > 0.0)
+    let Some(id) =
+        crate::conversation_ops::js_number(&customer_id).filter(|v| v.fract() == 0.0 && *v > 0.0)
     else {
         return memory_id_422_customer();
     };

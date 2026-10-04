@@ -22,12 +22,12 @@ use crate::ai_lm_studio::{ChatOpts, OpenAiCompatibleClient};
 use crate::ai_prompts::{
     build_customer_draft_user, build_draft_verification_user, build_issue_cluster_user,
     build_memory_extraction_user, build_report_narrative_user, build_ticket_analysis_user,
-    truncate, ClusterConversation, DraftVerification,
-    TicketAnalysis, CUSTOMER_DRAFT_SYSTEM, DRAFT_VERIFICATION_SYSTEM,
-    ISSUE_CLUSTER_SYSTEM, MEMORY_EXTRACTION_SYSTEM, PROMPT_VERSIONS_CUSTOMER_DRAFT,
-    PROMPT_VERSIONS_DRAFT_VERIFICATION, PROMPT_VERSIONS_ISSUE_CLUSTER,
-    PROMPT_VERSIONS_MEMORY_EXTRACTION, PROMPT_VERSIONS_REPORT_NARRATIVE,
-    PROMPT_VERSIONS_TICKET_ANALYSIS, REPORT_NARRATIVE_SYSTEM, TICKET_ANALYSIS_SYSTEM,
+    truncate, ClusterConversation, DraftVerification, TicketAnalysis, CUSTOMER_DRAFT_SYSTEM,
+    DRAFT_VERIFICATION_SYSTEM, ISSUE_CLUSTER_SYSTEM, MEMORY_EXTRACTION_SYSTEM,
+    PROMPT_VERSIONS_CUSTOMER_DRAFT, PROMPT_VERSIONS_DRAFT_VERIFICATION,
+    PROMPT_VERSIONS_ISSUE_CLUSTER, PROMPT_VERSIONS_MEMORY_EXTRACTION,
+    PROMPT_VERSIONS_REPORT_NARRATIVE, PROMPT_VERSIONS_TICKET_ANALYSIS, REPORT_NARRATIVE_SYSTEM,
+    TICKET_ANALYSIS_SYSTEM,
 };
 use crate::ai_provider::ChatMessage;
 use crate::error::Result;
@@ -60,7 +60,8 @@ impl std::fmt::Display for LmStudioError {
 
 impl std::error::Error for LmStudioError {}
 
-const AI_DISABLED_MESSAGE: &str = "AI is disabled in Settings. Enable LM Studio in Settings > LM Studio to use AI features.";
+const AI_DISABLED_MESSAGE: &str =
+    "AI is disabled in Settings. Enable LM Studio in Settings > LM Studio to use AI features.";
 
 // ─── Provider selection (reference context.ts:209) ─────────────────────────
 
@@ -315,7 +316,8 @@ pub fn ensure_pipeline_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_ai_runs_conversation ON ai_runs(conversation_id);
         CREATE INDEX IF NOT EXISTS idx_ai_runs_type ON ai_runs(type, status);
         CREATE INDEX IF NOT EXISTS idx_ai_runs_cache ON ai_runs(type, input_hash, prompt_version);
-    ")?;
+    ",
+    )?;
     Ok(())
 }
 
@@ -451,7 +453,10 @@ pub struct LatestAnalysis {
 }
 
 /// Reference `AiRepository.getLatestAnalysis`.
-pub fn get_latest_analysis(conn: &Connection, conversation_id: i64) -> Result<Option<LatestAnalysis>> {
+pub fn get_latest_analysis(
+    conn: &Connection,
+    conversation_id: i64,
+) -> Result<Option<LatestAnalysis>> {
     let row = conn
         .query_row(
             "SELECT id, response_json, model, prompt_version, latency_ms, created_at FROM ai_runs
@@ -603,7 +608,8 @@ pub fn create_draft(
             opts.mode,
             opts.model,
             opts.prompt_version,
-            opts.verification.map(|v| serde_json::to_string(v).unwrap_or_default()),
+            opts.verification
+                .map(|v| serde_json::to_string(v).unwrap_or_default()),
             serde_json::to_string(opts.sources).unwrap_or_else(|_| "[]".into())
         ],
     )?;
@@ -652,8 +658,18 @@ pub fn get_draft(conn: &Connection, id: i64) -> Result<Option<AiDraftRecord>> {
             },
         )
         .ok();
-    let Some((id, conversation_id, content, mode, model, prompt_version, created_at, verification, sources, state)) =
-        row
+    let Some((
+        id,
+        conversation_id,
+        content,
+        mode,
+        model,
+        prompt_version,
+        created_at,
+        verification,
+        sources,
+        state,
+    )) = row
     else {
         return Ok(None);
     };
@@ -678,7 +694,10 @@ pub fn get_draft(conn: &Connection, id: i64) -> Result<Option<AiDraftRecord>> {
 
 /// Reference `AiRepository.setDraftState`.
 pub fn set_draft_state(conn: &Connection, id: i64, state: &str) -> Result<()> {
-    conn.execute("UPDATE ai_drafts SET state = ?1 WHERE id = ?2", params![state, id])?;
+    conn.execute(
+        "UPDATE ai_drafts SET state = ?1 WHERE id = ?2",
+        params![state, id],
+    )?;
     Ok(())
 }
 
@@ -727,7 +746,11 @@ fn levenshtein(a: &str, b: &str) -> usize {
     for i in 1..=m {
         let mut cur = vec![i];
         for j in 1..=n {
-            cur.push((prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + usize::from(a[i - 1] != b[j - 1])));
+            cur.push(
+                (prev[j] + 1)
+                    .min(cur[j - 1] + 1)
+                    .min(prev[j - 1] + usize::from(a[i - 1] != b[j - 1])),
+            );
         }
         prev = cur;
     }
@@ -735,15 +758,17 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 /// Options for the memory upsert (reference `upsertMemory` opts).
 pub struct UpsertMemoryOpts<'a> {
-    pub source: &'a str,        // 'ai' | 'human'
-    pub origin: &'a str,        // 'conversation' | 'manual'
+    pub source: &'a str, // 'ai' | 'human'
+    pub origin: &'a str, // 'conversation' | 'manual'
     pub conversation_id: Option<i64>,
-    pub confidence: &'a str,    // 'high' | 'medium' | 'low' | 'unknown'
+    pub confidence: &'a str, // 'high' | 'medium' | 'low' | 'unknown'
 }
 
 /// Reference `AiRepository.upsertMemory` — source-aware conflict handling:
@@ -838,7 +863,12 @@ pub async fn analyze_ticket(
     let signature = get_analysis_signature(conn, conversation_local_id);
     let hash = input_hash(conversation_local_id, &signature);
     if !force {
-        if let Ok(Some(cached)) = find_cached_run(conn, "ticket_analysis", &hash, PROMPT_VERSIONS_TICKET_ANALYSIS) {
+        if let Ok(Some(cached)) = find_cached_run(
+            conn,
+            "ticket_analysis",
+            &hash,
+            PROMPT_VERSIONS_TICKET_ANALYSIS,
+        ) {
             if let Ok(Some(existing)) = get_latest_analysis(conn, conversation_local_id) {
                 return Ok(AnalyzeOutcome {
                     analysis: existing.analysis,
@@ -878,15 +908,24 @@ pub async fn analyze_ticket(
     let analysis = match parse_ticket_analysis(res.json.as_ref()) {
         Some(a) => a,
         None => {
-            let _ = fail_run(conn, run_id, "AI analysis returned an unparseable structure");
+            let _ = fail_run(
+                conn,
+                run_id,
+                "AI analysis returned an unparseable structure",
+            );
             return Err(LmStudioError::new(
                 "The local model did not return a valid analysis JSON. Try a stronger model or retry.",
                 false,
             ));
         }
     };
-    complete_run(conn, run_id, &serde_json::to_value(&analysis).unwrap_or_default(), res.latency_ms)
-        .map_err(|e| LmStudioError::new(e.to_string(), true))?;
+    complete_run(
+        conn,
+        run_id,
+        &serde_json::to_value(&analysis).unwrap_or_default(),
+        res.latency_ms,
+    )
+    .map_err(|e| LmStudioError::new(e.to_string(), true))?;
     let sources = sources_for(conn, &ctx);
     save_analysis(conn, run_id, conversation_local_id, &analysis, &sources)
         .map_err(|e| LmStudioError::new(e.to_string(), true))?;
@@ -924,8 +963,14 @@ pub fn parse_ticket_analysis(json: Option<&serde_json::Value>) -> Option<TicketA
         get_str(k).filter(|s| allowed.contains(&s.as_str()))
     };
     let urgency = enum_or_none("urgency", &["low", "normal", "high", "critical"]);
-    let sentiment = enum_or_none("sentiment", &["positive", "neutral", "negative", "frustrated"]);
-    let evidence_quality = enum_or_none("evidence_quality", &["strong", "some", "limited", "insufficient"]);
+    let sentiment = enum_or_none(
+        "sentiment",
+        &["positive", "neutral", "negative", "frustrated"],
+    );
+    let evidence_quality = enum_or_none(
+        "evidence_quality",
+        &["strong", "some", "limited", "insufficient"],
+    );
     let evidence_to_confidence = |q: Option<&str>| -> Option<String> {
         q.map(|q| {
             match q {
@@ -968,7 +1013,11 @@ pub async fn generate_draft(
 ) -> std::result::Result<(AiDraftRecord, Option<DraftVerification>), LmStudioError> {
     let analysis = match analysis_override {
         Some(a) => a.clone(),
-        None => analyze_ticket(conn, backend, conversation_local_id, force).await?.analysis,
+        None => {
+            analyze_ticket(conn, backend, conversation_local_id, force)
+                .await?
+                .analysis
+        }
     };
     let mut ctx = build_evidence(conn, conversation_local_id, false)
         .map_err(|e| LmStudioError::new(e.to_string(), true))?
@@ -1041,7 +1090,15 @@ pub async fn generate_draft(
     .map_err(|e| LmStudioError::new(e.to_string(), true))?;
     // Verification pass (spec #35) — failure degrades to an explicit
     // unverified marker, never blocks the draft.
-    let verification = match verify_draft_internal(conn, backend, conversation_local_id, &draft_text, Some(&analysis)).await {
+    let verification = match verify_draft_internal(
+        conn,
+        backend,
+        conversation_local_id,
+        &draft_text,
+        Some(&analysis),
+    )
+    .await
+    {
         Ok(v) => Some(v),
         Err(_) => Some(DraftVerification {
             verified: false,
@@ -1049,9 +1106,7 @@ pub async fn generate_draft(
             missing_questions: vec![],
             internal_leakage: vec![],
             conflicts: vec![],
-            warnings: vec![
-                "Verification pass failed - treat this draft as unverified".to_string(),
-            ],
+            warnings: vec!["Verification pass failed - treat this draft as unverified".to_string()],
         }),
     };
     let sources = sources_for(conn, &ctx);
@@ -1135,9 +1190,7 @@ pub async fn verify_draft_internal(
 fn parse_draft_verification(json: Option<&serde_json::Value>) -> DraftVerification {
     let fallback = || DraftVerification {
         verified: false,
-        warnings: vec![
-            "Verification output could not be parsed - treat as unverified".to_string(),
-        ],
+        warnings: vec!["Verification output could not be parsed - treat as unverified".to_string()],
         ..Default::default()
     };
     let Some(obj) = json.and_then(|j| j.as_object()) else {
@@ -1279,10 +1332,7 @@ pub async fn extract_memories(
         .chat_json(
             conn,
             MEMORY_EXTRACTION_SYSTEM,
-            &build_memory_extraction_user(
-                customer_name.as_deref().unwrap_or("Customer"),
-                &threads,
-            ),
+            &build_memory_extraction_user(customer_name.as_deref().unwrap_or("Customer"), &threads),
             true,
             None,
         )
@@ -1435,7 +1485,12 @@ pub async fn cluster_issues(
         .and_then(|c| c.as_array())
         .cloned()
         .unwrap_or_default();
-    let _ = complete_run(conn, run_id, &serde_json::json!({ "clusters": raw_clusters }), res.latency_ms);
+    let _ = complete_run(
+        conn,
+        run_id,
+        &serde_json::json!({ "clusters": raw_clusters }),
+        res.latency_ms,
+    );
     let mut out: Vec<ClusterOut> = Vec::new();
     for c in raw_clusters {
         let numbers: Vec<i64> = c
@@ -1616,7 +1671,12 @@ pub async fn report_narrative(
         .and_then(|n| n.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| res.raw.clone().unwrap_or_default().trim().to_string());
-    let _ = complete_run(conn, run_id, &serde_json::json!({ "narrative": narrative }), res.latency_ms);
+    let _ = complete_run(
+        conn,
+        run_id,
+        &serde_json::json!({ "narrative": narrative }),
+        res.latency_ms,
+    );
     Ok(narrative)
 }
 
@@ -1744,13 +1804,16 @@ pub fn extract_provided_facts(text: &str) -> Vec<String> {
     if has_version_number(&lower) {
         facts.push(patterns[2].1.to_string());
     }
-    if lower.contains("error message")
-        || lower.contains("error code")
-        || lower.contains("error ")
-    {
+    if lower.contains("error message") || lower.contains("error code") || lower.contains("error ") {
         facts.push(patterns[3].1.to_string());
     }
-    for t in ["api key", "token", "workspace id", "account id", "email address"] {
+    for t in [
+        "api key",
+        "token",
+        "workspace id",
+        "account id",
+        "email address",
+    ] {
         if lower.contains(t) {
             facts.push(patterns[4].1.to_string());
             break;
@@ -1834,8 +1897,8 @@ pub async fn process_new_ticket(
     };
     let mut note_created = false;
     let mut draft_created = false;
-    let automatic_note = crate::settings::get_bool(conn, "automatic_note_enabled", false)
-        .unwrap_or(false);
+    let automatic_note =
+        crate::settings::get_bool(conn, "automatic_note_enabled", false).unwrap_or(false);
     if automatic_note {
         let similar = find_similar(conn, conversation_local_id, 3, &[]).unwrap_or_default();
         let note = build_ai_note(
@@ -1857,12 +1920,19 @@ pub async fn process_new_ticket(
         );
         note_created = true;
     }
-    let automatic_draft = crate::settings::get_bool(conn, "automatic_draft_enabled", false)
-        .unwrap_or(false);
+    let automatic_draft =
+        crate::settings::get_bool(conn, "automatic_draft_enabled", false).unwrap_or(false);
     if automatic_draft
-        && generate_draft(conn, backend, conversation_local_id, "verified_answer", false, Some(&analysis))
-            .await
-            .is_ok()
+        && generate_draft(
+            conn,
+            backend,
+            conversation_local_id,
+            "verified_answer",
+            false,
+            Some(&analysis),
+        )
+        .await
+        .is_ok()
     {
         draft_created = true;
     }
@@ -1946,15 +2016,15 @@ mod tests {
         let bad = serde_json::json!({ "unsupported_claims": ["x"] });
         let v = parse_draft_verification(Some(&bad));
         assert!(!v.verified);
-        assert!(v
-            .warnings
-            .contains(&"Verification output could not be parsed - treat as unverified".to_string()));
+        assert!(v.warnings.contains(
+            &"Verification output could not be parsed - treat as unverified".to_string()
+        ));
 
         let none = parse_draft_verification(None);
         assert!(!none.verified);
-        assert!(none
-            .warnings
-            .contains(&"Verification output could not be parsed - treat as unverified".to_string()));
+        assert!(none.warnings.contains(
+            &"Verification output could not be parsed - treat as unverified".to_string()
+        ));
     }
 
     #[test]
@@ -1985,9 +2055,11 @@ mod tests {
         // Reference-faithful: /(version [0-9.]+|v[0-9]+\.[0-9]+)/ is a
         // SUBSTRING match, so "aversion 3" counts exactly like the reference
         // regex does (no \b in the source pattern).
-        assert!(extract_provided_facts("I have an aversion 3 to forms").contains(&"version numbers".to_string()));
+        assert!(extract_provided_facts("I have an aversion 3 to forms")
+            .contains(&"version numbers".to_string()));
         // ...but a bare word with no trailing digits does not.
-        assert!(!extract_provided_facts("the inversion of control pattern").contains(&"version numbers".to_string()));
+        assert!(!extract_provided_facts("the inversion of control pattern")
+            .contains(&"version numbers".to_string()));
     }
 
     #[test]
@@ -2016,7 +2088,9 @@ mod tests {
             why: vec![],
         }];
         let note = build_ai_note(1, &analysis, &similar, Some("Nightly export crash"));
-        assert!(note.starts_with("[AI Analysis - generated locally by SupportOS AI, not written by a human]"));
+        assert!(note.starts_with(
+            "[AI Analysis - generated locally by SupportOS AI, not written by a human]"
+        ));
         assert!(note.contains("Customer goal: Get export working"));
         assert!(note.contains("Main question: Why does export fail?"));
         assert!(note.contains("Secondary questions: Is there a workaround?"));
@@ -2040,10 +2114,23 @@ mod tests {
     fn storage_lifecycle_start_complete_fail_cache() {
         let conn = Connection::open_in_memory().unwrap();
         setup_tables(&conn);
-        let run = start_run(&conn, "ticket_analysis", Some(5), Some("m"), "v1", Some("hash1"), &serde_json::json!([5])).unwrap();
+        let run = start_run(
+            &conn,
+            "ticket_analysis",
+            Some(5),
+            Some("m"),
+            "v1",
+            Some("hash1"),
+            &serde_json::json!([5]),
+        )
+        .unwrap();
         assert!(run > 0);
         let status: String = conn
-            .query_row("SELECT status FROM ai_runs WHERE id=?1", params![run], |r| r.get(0))
+            .query_row(
+                "SELECT status FROM ai_runs WHERE id=?1",
+                params![run],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(status, "running");
         complete_run(&conn, run, &serde_json::json!({"ok": 1}), 42).unwrap();
@@ -2058,14 +2145,20 @@ mod tests {
         assert_eq!(out, "{\"ok\":1}");
         assert_eq!(latency, 42);
         // Cache lookup finds it.
-        let cached = find_cached_run(&conn, "ticket_analysis", "hash1", "v1").unwrap().unwrap();
+        let cached = find_cached_run(&conn, "ticket_analysis", "hash1", "v1")
+            .unwrap()
+            .unwrap();
         assert_eq!(cached.id, run);
         // A failed run is not cacheable.
         let run2 = start_run(&conn, "x", None, None, "", None, &serde_json::json!([])).unwrap();
         fail_run(&conn, run2, "boom").unwrap();
         assert!(find_cached_run(&conn, "x", "", "").unwrap().is_none());
         let err: String = conn
-            .query_row("SELECT error FROM ai_runs WHERE id=?1", params![run2], |r| r.get(0))
+            .query_row(
+                "SELECT error FROM ai_runs WHERE id=?1",
+                params![run2],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(err, "boom");
     }
@@ -2123,7 +2216,10 @@ mod tests {
         assert_eq!(draft.content, "Draft text");
         assert_eq!(draft.mode, "verified_answer");
         assert_eq!(draft.state, "generated");
-        assert_eq!(draft.verification.as_ref().unwrap().warnings, vec!["tone".to_string()]);
+        assert_eq!(
+            draft.verification.as_ref().unwrap().warnings,
+            vec!["tone".to_string()]
+        );
         set_draft_state(&conn, id, "accepted").unwrap();
         assert_eq!(get_draft(&conn, id).unwrap().unwrap().state, "accepted");
         record_feedback(&conn, id, "Draft text", "Draft text edited", false).unwrap();
@@ -2153,12 +2249,18 @@ mod tests {
     fn memory_upsert_never_overwrites_human_rows() {
         let conn = Connection::open_in_memory().unwrap();
         setup_tables(&conn);
-        upsert_memory(&conn, 1, "prefers_email", "yes", &UpsertMemoryOpts {
-            source: "ai",
-            origin: "conversation",
-            conversation_id: Some(7),
-            confidence: "high",
-        })
+        upsert_memory(
+            &conn,
+            1,
+            "prefers_email",
+            "yes",
+            &UpsertMemoryOpts {
+                source: "ai",
+                origin: "conversation",
+                conversation_id: Some(7),
+                confidence: "high",
+            },
+        )
         .unwrap();
         let (value, source): (String, String) = conn
             .query_row(
@@ -2169,12 +2271,18 @@ mod tests {
             .unwrap();
         assert_eq!((value.as_str(), source.as_str()), ("yes", "ai"));
         // Human write wins and relabels.
-        upsert_memory(&conn, 1, "prefers_email", "no, phone", &UpsertMemoryOpts {
-            source: "human",
-            origin: "manual",
-            conversation_id: None,
-            confidence: "high",
-        })
+        upsert_memory(
+            &conn,
+            1,
+            "prefers_email",
+            "no, phone",
+            &UpsertMemoryOpts {
+                source: "human",
+                origin: "manual",
+                conversation_id: None,
+                confidence: "high",
+            },
+        )
         .unwrap();
         let (value, source, provenance): (String, String, String) = conn
             .query_row(
@@ -2186,12 +2294,18 @@ mod tests {
         assert_eq!((value.as_str(), source.as_str()), ("no, phone", "human"));
         assert_eq!(provenance, "human_local");
         // AI write on the human row is refused.
-        upsert_memory(&conn, 1, "prefers_email", "ai guess", &UpsertMemoryOpts {
-            source: "ai",
-            origin: "conversation",
-            conversation_id: None,
-            confidence: "low",
-        })
+        upsert_memory(
+            &conn,
+            1,
+            "prefers_email",
+            "ai guess",
+            &UpsertMemoryOpts {
+                source: "ai",
+                origin: "conversation",
+                conversation_id: None,
+                confidence: "low",
+            },
+        )
         .unwrap();
         let value: String = conn
             .query_row(
@@ -2202,22 +2316,38 @@ mod tests {
             .unwrap();
         assert_eq!(value, "no, phone");
         // AI-to-AI update works.
-        upsert_memory(&conn, 2, "team", "Alpha", &UpsertMemoryOpts {
-            source: "ai",
-            origin: "conversation",
-            conversation_id: None,
-            confidence: "medium",
-        })
+        upsert_memory(
+            &conn,
+            2,
+            "team",
+            "Alpha",
+            &UpsertMemoryOpts {
+                source: "ai",
+                origin: "conversation",
+                conversation_id: None,
+                confidence: "medium",
+            },
+        )
         .unwrap();
-        upsert_memory(&conn, 2, "team", "Beta", &UpsertMemoryOpts {
-            source: "ai",
-            origin: "conversation",
-            conversation_id: None,
-            confidence: "medium",
-        })
+        upsert_memory(
+            &conn,
+            2,
+            "team",
+            "Beta",
+            &UpsertMemoryOpts {
+                source: "ai",
+                origin: "conversation",
+                conversation_id: None,
+                confidence: "medium",
+            },
+        )
         .unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM customer_memory WHERE customer_id=2", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM customer_memory WHERE customer_id=2",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -2231,7 +2361,16 @@ mod tests {
             [],
         )
         .unwrap();
-        let run = start_run(&conn, "ticket_analysis", Some(1), None, "v", None, &serde_json::json!([])).unwrap();
+        let run = start_run(
+            &conn,
+            "ticket_analysis",
+            Some(1),
+            None,
+            "v",
+            None,
+            &serde_json::json!([]),
+        )
+        .unwrap();
         let analysis = TicketAnalysis {
             intent: Some("question".into()),
             primary_question: Some("q".into()),
@@ -2251,11 +2390,19 @@ mod tests {
         // getLatestAnalysis only reads status='completed' runs.
         complete_run(&conn, run, &serde_json::to_value(&analysis).unwrap(), 10).unwrap();
         let facts: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ai_extracted_facts WHERE conversation_id=1", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM ai_extracted_facts WHERE conversation_id=1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(facts, 3); // intent + primary_question + summary
         let srcs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ai_sources WHERE run_id=?1", params![run], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM ai_sources WHERE run_id=?1",
+                params![run],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(srcs, 1);
         let fts: String = conn
@@ -2279,7 +2426,10 @@ mod tests {
         setup_tables(&conn);
         let backend = AiBackend::Disabled;
         assert_eq!(backend.kind(), "disabled");
-        let err = backend.chat_json(&conn, "s", "u", true, None).await.unwrap_err();
+        let err = backend
+            .chat_json(&conn, "s", "u", true, None)
+            .await
+            .unwrap_err();
         assert_eq!(err.message, AI_DISABLED_MESSAGE);
         assert!(!err.retryable);
     }

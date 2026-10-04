@@ -544,7 +544,6 @@ pub(crate) fn html_to_text(html: &str) -> String {
         .replace("&#39;", "'")
 }
 
-
 /// Reference ai/interaction/engine.ts `computeOutcome` — the deterministic
 /// client-support-outcome layer. The port's `friction_scores` table is the
 /// documented client_support_outcomes analog, so the outcome row lands there
@@ -702,7 +701,6 @@ fn seed_interaction_outcomes(conn: &Connection) -> usize {
     }
     written
 }
-
 
 /// Seed the demo intelligence layer (reference `seedDemoData`). Safety:
 /// never mix demo data with production data — refuses to run unless demo

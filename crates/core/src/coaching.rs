@@ -91,14 +91,15 @@ fn stopwords() -> &'static HashSet<&'static str> {
     static WORDS: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
     WORDS.get_or_init(|| {
         [
-            "the", "a", "an", "and", "or", "but", "if", "then", "than", "that", "this", "these", "those",
-            "is", "are", "was", "were", "be", "been", "being", "am", "do", "does", "did", "doing",
-            "have", "has", "had", "will", "would", "shall", "should", "can", "could", "may", "might",
-            "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them", "my", "your",
-            "our", "their", "his", "its", "of", "to", "in", "on", "at", "for", "with", "from", "by",
-            "as", "about", "into", "over", "after", "before", "again", "there", "here", "what", "when",
-            "where", "who", "why", "how", "all", "any", "both", "each", "few", "more", "most", "other",
-            "some", "such", "no", "not", "only", "own", "same", "so", "too", "very", "just", "now",
+            "the", "a", "an", "and", "or", "but", "if", "then", "than", "that", "this", "these",
+            "those", "is", "are", "was", "were", "be", "been", "being", "am", "do", "does", "did",
+            "doing", "have", "has", "had", "will", "would", "shall", "should", "can", "could",
+            "may", "might", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us",
+            "them", "my", "your", "our", "their", "his", "its", "of", "to", "in", "on", "at",
+            "for", "with", "from", "by", "as", "about", "into", "over", "after", "before", "again",
+            "there", "here", "what", "when", "where", "who", "why", "how", "all", "any", "both",
+            "each", "few", "more", "most", "other", "some", "such", "no", "not", "only", "own",
+            "same", "so", "too", "very", "just", "now",
         ]
         .into_iter()
         .collect()
@@ -245,7 +246,14 @@ fn is_closing_ack(sentence: &str) -> bool {
     let t = sentence.trim().trim_end_matches(['.', '!']).to_lowercase();
     matches!(
         t.as_str(),
-        "ok" | "okay" | "got it" | "thanks" | "thank you" | "great" | "perfect" | "sounds good" | "appreciate it"
+        "ok" | "okay"
+            | "got it"
+            | "thanks"
+            | "thank you"
+            | "great"
+            | "perfect"
+            | "sounds good"
+            | "appreciate it"
     )
 }
 
@@ -358,10 +366,7 @@ fn latest_signals(conn: &Connection, conversation_id: i64) -> String {
 }
 
 /// `customerPreference` — human override first, then strongest evidence.
-fn customer_preference(
-    conn: &Connection,
-    customer_id: i64,
-) -> Option<(String, String, bool, i64)> {
+fn customer_preference(conn: &Connection, customer_id: i64) -> Option<(String, String, bool, i64)> {
     // (preference, confidence, overridden, evidence_count)
     let row: Option<(String, String, Option<String>, i64)> = conn
         .query_row(
@@ -519,7 +524,11 @@ fn check_unanswered_questions(conv: &ConvRow, threads: &[ThreadRow], draft: &str
     };
     result(
         kind,
-        if findings.is_empty() { "pass" } else { "flagged" },
+        if findings.is_empty() {
+            "pass"
+        } else {
+            "flagged"
+        },
         detail,
         findings,
         false,
@@ -594,7 +603,11 @@ fn check_duplicated_questions(threads: &[ThreadRow], draft: &str) -> Value {
     };
     result(
         kind,
-        if findings.is_empty() { "pass" } else { "flagged" },
+        if findings.is_empty() {
+            "pass"
+        } else {
+            "flagged"
+        },
         detail,
         findings,
         false,
@@ -699,8 +712,7 @@ fn check_timeframe(conn: &Connection, conv: &ConvRow, draft: &str) -> Value {
 
 fn check_acknowledgment(threads: &[ThreadRow], signals: &str, draft: &str) -> Value {
     let kind = "missing_acknowledgment";
-    let signals_re =
-        Regex::new(r#"(?i)frustration[":\s]*(moderate|strong)"#).unwrap();
+    let signals_re = Regex::new(r#"(?i)frustration[":\s]*(moderate|strong)"#).unwrap();
     let mut frustration: Option<(String, String, Option<i64>)> = None;
     if signals_re.is_match(signals) {
         frustration = Some((
@@ -709,7 +721,12 @@ fn check_acknowledgment(threads: &[ThreadRow], signals: &str, draft: &str) -> Va
             None,
         ));
     } else {
-        for m in threads.iter().filter(|t| t.kind == "customer").rev().take(8) {
+        for m in threads
+            .iter()
+            .filter(|t| t.kind == "customer")
+            .rev()
+            .take(8)
+        {
             if frustration_markers().is_match(&m.text) {
                 frustration = Some((
                     "customer message (frustration markers)".into(),
@@ -751,10 +768,7 @@ fn check_acknowledgment(threads: &[ThreadRow], signals: &str, draft: &str) -> Va
     )
 }
 
-fn check_wording(
-    preference: Option<&(String, String, bool, i64)>,
-    draft: &str,
-) -> Value {
+fn check_wording(preference: Option<&(String, String, bool, i64)>, draft: &str) -> Value {
     let kind = "excessive_wording";
     let words = word_count(draft);
     let paragraphs = draft
@@ -859,13 +873,20 @@ fn check_detail(signals: &str, threads: &[ThreadRow], draft: &str) -> Value {
     result(
         kind,
         "pass",
-        format!("Draft detail is proportionate ({words} words vs {question_count} open question(s))."),
+        format!(
+            "Draft detail is proportionate ({words} words vs {question_count} open question(s))."
+        ),
         vec![],
         false,
     )
 }
 
-fn check_internal_leakage(conn: &Connection, conv: &ConvRow, threads: &[ThreadRow], draft: &str) -> Value {
+fn check_internal_leakage(
+    conn: &Connection,
+    conv: &ConvRow,
+    threads: &[ThreadRow],
+    draft: &str,
+) -> Value {
     let kind = "internal_information_leakage";
     // Internal corpus (bounded): this conversation's agent notes, linked
     // incidents' internal fields, linked known issues' internal fields, and
@@ -873,30 +894,35 @@ fn check_internal_leakage(conn: &Connection, conv: &ConvRow, threads: &[ThreadRo
     let mut corpus: Vec<(String, String)> = Vec::new();
     for note in threads.iter().filter(|t| t.kind == "note").rev().take(100) {
         if !note.text.trim().is_empty() {
-            corpus.push((format!("internal note (thread #{})", note.id), note.text.clone()));
+            corpus.push((
+                format!("internal note (thread #{})", note.id),
+                note.text.clone(),
+            ));
         }
     }
-    let collect_internal = |sql: &str, describe: &dyn Fn(&str, &str, &str) -> String| -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        if let Ok(mut stmt) = conn.prepare(sql) {
-            let rows: Vec<(String, Option<String>, Option<String>)> = stmt
-                .query_map(params![conv.id], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                })
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-            for (name, internal_explanation, known_cause) in rows {
-                for (field, value) in [("internal_explanation", internal_explanation), ("known_cause", known_cause)] {
-                    if let Some(v) = value {
-                        if !v.trim().is_empty() {
-                            out.push((describe(&name, field, &v), v));
+    let collect_internal =
+        |sql: &str, describe: &dyn Fn(&str, &str, &str) -> String| -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            if let Ok(mut stmt) = conn.prepare(sql) {
+                let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+                    .query_map(params![conv.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default();
+                for (name, internal_explanation, known_cause) in rows {
+                    for (field, value) in [
+                        ("internal_explanation", internal_explanation),
+                        ("known_cause", known_cause),
+                    ] {
+                        if let Some(v) = value {
+                            if !v.trim().is_empty() {
+                                out.push((describe(&name, field, &v), v));
+                            }
                         }
                     }
                 }
             }
-        }
-        out
-    };
+            out
+        };
     corpus.extend(collect_internal(
         "SELECT i.code, i.internal_explanation, i.known_cause FROM incident_conversations ic
             JOIN incidents i ON i.id = ic.incident_id WHERE ic.conversation_id = ?1",
@@ -923,7 +949,10 @@ fn check_internal_leakage(conn: &Connection, conv: &ConvRow, threads: &[ThreadRo
         for (title, content) in docs.into_iter().take(10) {
             if let Some(content) = content {
                 if !content.trim().is_empty() {
-                    corpus.push((format!("internal knowledge document \"{title}\""), content.chars().take(8000).collect()));
+                    corpus.push((
+                        format!("internal knowledge document \"{title}\""),
+                        content.chars().take(8000).collect(),
+                    ));
                 }
             }
         }
@@ -977,7 +1006,11 @@ fn check_internal_leakage(conn: &Connection, conv: &ConvRow, threads: &[ThreadRo
     };
     result(
         kind,
-        if findings.is_empty() { "pass" } else { "flagged" },
+        if findings.is_empty() {
+            "pass"
+        } else {
+            "flagged"
+        },
         detail,
         findings,
         false,
@@ -1046,7 +1079,10 @@ fn check_wrong_context(
                 let generic = [
                     "team", "support", "there", "all", "everyone", "sir", "madam", "folks",
                 ];
-                if !generic.contains(&greeted.as_str()) && greeted != first && !first.starts_with(&greeted) {
+                if !generic.contains(&greeted.as_str())
+                    && greeted != first
+                    && !first.starts_with(&greeted)
+                {
                     findings.push(json!({
                         "draft_excerpt": greeting.get(0).map(|m| m.as_str()).unwrap_or("").chars().take(240).collect::<String>(),
                         "evidence": [evidence(
@@ -1071,7 +1107,11 @@ fn check_wrong_context(
     };
     result(
         kind,
-        if findings.is_empty() { "pass" } else { "flagged" },
+        if findings.is_empty() {
+            "pass"
+        } else {
+            "flagged"
+        },
         detail,
         findings,
         false,
@@ -1101,11 +1141,17 @@ fn check_preference_mismatch(
         .filter(|t| t.kind == "customer")
         .rev()
         .take(10)
-        .any(|m| split_sentences(&m.text).iter().any(|s| is_question(s) && !is_closing_ack(s)));
+        .any(|m| {
+            split_sentences(&m.text)
+                .iter()
+                .any(|s| is_question(s) && !is_closing_ack(s))
+        });
     let mismatch = if pref == "concise" && words > 250 {
         Some(format!("concise preference, {words}-word draft"))
     } else if pref == "detailed" && words < 60 && open_question {
-        Some(format!("detailed preference, {words}-word draft on an open question"))
+        Some(format!(
+            "detailed preference, {words}-word draft on an open question"
+        ))
     } else if pref == "step_by_step" && !has_steps && words > 80 && open_question {
         Some("step_by_step preference, no step/list structure detected".to_string())
     } else {
@@ -1137,7 +1183,11 @@ fn check_preference_mismatch(
         "pass",
         format!(
             "Draft shape matches the observed preference ({pref}, confidence {confidence}{}).",
-            if overridden { ", human override active" } else { "" }
+            if overridden {
+                ", human override active"
+            } else {
+                ""
+            }
         ),
         vec![],
         false,
@@ -1156,9 +1206,8 @@ pub type CoachingChatFn<'a> = &'a dyn Fn(
     bool,
 ) -> std::pin::Pin<
     Box<
-        dyn std::future::Future<
-                Output = std::result::Result<(Option<String>, String, u64), String>,
-            > + 'a,
+        dyn std::future::Future<Output = std::result::Result<(Option<String>, String, u64), String>>
+            + 'a,
     >,
 >;
 
@@ -1298,7 +1347,11 @@ async fn compute_ai_layer(
     ]
     .join("\n");
     let user = [
-        format!("CONVERSATION #{} SUBJECT: {}", conv.number, conv.subject.as_deref().unwrap_or("(none)")),
+        format!(
+            "CONVERSATION #{} SUBJECT: {}",
+            conv.number,
+            conv.subject.as_deref().unwrap_or("(none)")
+        ),
         "RECENT MESSAGES:".to_string(),
         recent.join("\n"),
         "DRAFT TO REVIEW:".to_string(),
@@ -1336,7 +1389,11 @@ async fn compute_ai_layer(
             match parsed {
                 None => {
                     if let Some(run_id) = run_id {
-                        let _ = crate::ai_pipeline::fail_run(conn, run_id, "unparseable coaching output");
+                        let _ = crate::ai_pipeline::fail_run(
+                            conn,
+                            run_id,
+                            "unparseable coaching output",
+                        );
                     }
                     (
                         None,
@@ -1347,12 +1404,8 @@ async fn compute_ai_layer(
                 Some(mut layer) => {
                     if let (Some(run_id), Some(obj)) = (run_id, layer.as_object_mut()) {
                         obj.insert("model".into(), json!(model));
-                        let _ = crate::ai_pipeline::complete_run(
-                            conn,
-                            run_id,
-                            &json!(model),
-                            latency,
-                        );
+                        let _ =
+                            crate::ai_pipeline::complete_run(conn, run_id, &json!(model), latency);
                     }
                     (Some(layer), None, run_id)
                 }
@@ -1364,7 +1417,9 @@ async fn compute_ai_layer(
             }
             (
                 None,
-                Some(format!("{e} The deterministic checks were computed and stored.")),
+                Some(format!(
+                    "{e} The deterministic checks were computed and stored."
+                )),
                 None,
             )
         }
@@ -1456,16 +1511,16 @@ pub async fn review_draft(
             conn.query_row(
                 "SELECT first_name, last_name FROM customers WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .ok()
         })
-        .map(|(first, last)| {
-            (
-                first.unwrap_or_default(),
-                last,
-            )
-        });
+        .map(|(first, last)| (first.unwrap_or_default(), last));
     let signals = latest_signals(conn, conversation_id);
     let preference = conv
         .customer_id
@@ -1619,13 +1674,7 @@ mod tests {
         .unwrap()
     }
 
-    fn insert_thread(
-        conn: &Connection,
-        conv: i64,
-        ttype: &str,
-        body: &str,
-        at: &str,
-    ) -> i64 {
+    fn insert_thread(conn: &Connection, conv: i64, ttype: &str, body: &str, at: &str) -> i64 {
         conn.execute(
             "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, state, created_at)
              VALUES (?1, ?2, ?3, ?4, 'published', ?5)",
@@ -1650,7 +1699,9 @@ mod tests {
         )
         .unwrap();
         let cust_ada: i64 = conn
-            .query_row("SELECT id FROM customers WHERE remote_id = 901", [], |r| r.get(0))
+            .query_row("SELECT id FROM customers WHERE remote_id = 901", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         conn.execute(
             "INSERT INTO customers (remote_id, first_name, last_name) VALUES (902, 'Grace', 'Hopper')",
@@ -1658,17 +1709,57 @@ mod tests {
         )
         .unwrap();
         let cust_grace: i64 = conn
-            .query_row("SELECT id FROM customers WHERE remote_id = 902", [], |r| r.get(0))
+            .query_row("SELECT id FROM customers WHERE remote_id = 902", [], |r| {
+                r.get(0)
+            })
             .unwrap();
 
-        let conv1 = insert_conversation(&conn, 9801, 101, Some(cust_ada), "2026-09-01 10:00:00", true);
-        let conv2 = insert_conversation(&conn, 9802, 102, Some(cust_grace), "2026-09-02 10:00:00", false);
+        let conv1 = insert_conversation(
+            &conn,
+            9801,
+            101,
+            Some(cust_ada),
+            "2026-09-01 10:00:00",
+            true,
+        );
+        let conv2 = insert_conversation(
+            &conn,
+            9802,
+            102,
+            Some(cust_grace),
+            "2026-09-02 10:00:00",
+            false,
+        );
 
-        insert_thread(&conn, conv1, "customer", "What is the default timeout for the compute API? Does it retry automatically?", "2026-09-01 10:00:00");
-        insert_thread(&conn, conv1, "reply", "The default timeout is 30 seconds. Could you confirm your account email?", "2026-09-01 11:00:00");
+        insert_thread(
+            &conn,
+            conv1,
+            "customer",
+            "What is the default timeout for the compute API? Does it retry automatically?",
+            "2026-09-01 10:00:00",
+        );
+        insert_thread(
+            &conn,
+            conv1,
+            "reply",
+            "The default timeout is 30 seconds. Could you confirm your account email?",
+            "2026-09-01 11:00:00",
+        );
         insert_thread(&conn, conv1, "note", "Internal: the retry ladder is 3 attempts with exponential backoff and the max ceiling is undocumented", "2026-09-01 11:30:00");
-        insert_thread(&conn, conv2, "customer", "This is unacceptable - the export is still broken after the third time I reported it", "2026-09-02 10:00:00");
-        insert_thread(&conn, conv2, "customer", "What is the default timeout for the compute API?", "2026-09-02 10:05:00");
+        insert_thread(
+            &conn,
+            conv2,
+            "customer",
+            "This is unacceptable - the export is still broken after the third time I reported it",
+            "2026-09-02 10:00:00",
+        );
+        insert_thread(
+            &conn,
+            conv2,
+            "customer",
+            "What is the default timeout for the compute API?",
+            "2026-09-02 10:05:00",
+        );
 
         // Known issue + link.
         conn.execute(
@@ -1716,11 +1807,7 @@ mod tests {
             .unwrap_or_else(|| panic!("check {kind} missing"))
     }
 
-    async fn review(
-        conn: &Connection,
-        conv: i64,
-        draft: &str,
-    ) -> Value {
+    async fn review(conn: &Connection, conv: i64, draft: &str) -> Value {
         review_draft(conn, None, conv, draft, false)
             .await
             .unwrap()
@@ -1730,7 +1817,12 @@ mod tests {
     #[tokio::test]
     async fn flags_unanswered_customer_questions_with_thread_evidence() {
         let (conn, _conv1, conv2) = fixture();
-        let r = review(&conn, conv2, "The export fix is on the way. We will get back to you soon.").await;
+        let r = review(
+            &conn,
+            conv2,
+            "The export fix is on the way. We will get back to you soon.",
+        )
+        .await;
         let check = find_check(&r, "unanswered_customer_questions");
         assert_eq!(check["status"], json!("flagged"));
         assert!(!check["findings"].as_array().unwrap().is_empty());
@@ -1743,38 +1835,45 @@ mod tests {
     #[tokio::test]
     async fn flags_duplicated_questions_the_agent_already_asked() {
         let (conn, conv1, _conv2) = fixture();
-        let r = review(&conn, conv1, "Could you confirm your account email? Thanks.").await;
+        let r = review(
+            &conn,
+            conv1,
+            "Could you confirm your account email? Thanks.",
+        )
+        .await;
         let check = find_check(&r, "duplicated_questions");
         assert_eq!(check["status"], json!("flagged"));
-        assert!(
-            check["findings"][0]["evidence"][0]["description"]
-                .as_str()
-                .unwrap()
-                .contains("earlier agent question")
-        );
+        assert!(check["findings"][0]["evidence"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("earlier agent question"));
     }
 
     #[tokio::test]
     async fn flags_timeframe_promises_against_linked_active_incident() {
         let (conn, conv1, _conv2) = fixture();
-        let r = review(&conn, conv1, "We will fix this within 2 hours and the retry ladder will be adjusted.").await;
+        let r = review(
+            &conn,
+            conv1,
+            "We will fix this within 2 hours and the retry ladder will be adjusted.",
+        )
+        .await;
         let check = find_check(&r, "unsupported_timeframe");
         assert_eq!(check["status"], json!("flagged"));
         let findings = check["findings"].as_array().unwrap();
-        assert!(
-            findings[0]["evidence"]
-                .as_array()
+        assert!(findings[0]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["incident_code"] == json!("INC-900")));
+        assert!(findings[0]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["description"]
+                .as_str()
                 .unwrap()
-                .iter()
-                .any(|e| e["incident_code"] == json!("INC-900"))
-        );
-        assert!(
-            findings[0]["evidence"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|e| e["description"].as_str().unwrap().contains("ACTIVE incident"))
-        );
+                .contains("ACTIVE incident")));
     }
 
     #[tokio::test]
@@ -1783,12 +1882,10 @@ mod tests {
         let r = review(&conn, conv2, "The export bug is fixed in version 2.1.").await;
         let check = find_check(&r, "missing_acknowledgment");
         assert_eq!(check["status"], json!("flagged"));
-        assert!(
-            check["findings"][0]["evidence"][0]["description"]
-                .as_str()
-                .unwrap()
-                .contains("frustration markers")
-        );
+        assert!(check["findings"][0]["evidence"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("frustration markers"));
     }
 
     #[tokio::test]
@@ -1797,41 +1894,41 @@ mod tests {
         let r = review(&conn, conv1, "The retry ladder is 3 attempts with exponential backoff and the max ceiling is undocumented, so expect retries.").await;
         let check = find_check(&r, "internal_information_leakage");
         assert_eq!(check["status"], json!("flagged"));
-        assert!(
-            check["findings"][0]["evidence"][0]["description"]
-                .as_str()
-                .unwrap()
-                .contains("internal note")
-        );
+        assert!(check["findings"][0]["evidence"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("internal note"));
     }
 
     #[tokio::test]
     async fn flags_wrong_customer_context_foreign_number_and_greeting() {
         let (conn, _conv1, conv2) = fixture();
-        let r = review(&conn, conv2, "Hi Ada, about #101 - the fix is confirmed. Thanks, Grace.").await;
+        let r = review(
+            &conn,
+            conv2,
+            "Hi Ada, about #101 - the fix is confirmed. Thanks, Grace.",
+        )
+        .await;
         let check = find_check(&r, "wrong_customer_context");
         assert_eq!(check["status"], json!("flagged"));
         let findings = check["findings"].as_array().unwrap();
         assert!(
             findings.iter().any(|f| {
                 f["draft_excerpt"].as_str().unwrap().contains("#101")
-                    && f["evidence"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|e| e["excerpt"].as_str().unwrap().contains("different customer"))
+                    && f["evidence"].as_array().unwrap().iter().any(|e| {
+                        e["excerpt"]
+                            .as_str()
+                            .unwrap()
+                            .contains("different customer")
+                    })
             }),
             "{findings:?}"
         );
-        assert!(
-            findings
-                .iter()
-                .any(|f| f["evidence"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|e| e["description"] == json!("customer record")))
-        );
+        assert!(findings.iter().any(|f| f["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["description"] == json!("customer record"))));
     }
 
     #[tokio::test]
@@ -1861,8 +1958,16 @@ mod tests {
     #[tokio::test]
     async fn persists_last_review_and_returns_it_via_get() {
         let (conn, conv1, _conv2) = fixture();
-        let r = review(&conn, conv1, "The default timeout is 30 seconds and retries are automatic.").await;
-        assert_eq!(find_check(&r, "unanswered_customer_questions")["status"], json!("pass"));
+        let r = review(
+            &conn,
+            conv1,
+            "The default timeout is 30 seconds and retries are automatic.",
+        )
+        .await;
+        assert_eq!(
+            find_check(&r, "unanswered_customer_questions")["status"],
+            json!("pass")
+        );
         let stored = get(&conn, conv1).unwrap().expect("stored review");
         assert_eq!(
             find_check(&stored, "unanswered_customer_questions")["status"],
@@ -1887,18 +1992,25 @@ mod tests {
                     "fake-coach".to_string(),
                     3,
                 ))
-            }) as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = std::result::Result<(Option<String>, String, u64), String>,
-                        > + '_,
-                >,
-            >
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = std::result::Result<(Option<String>, String, u64), String>,
+                            > + '_,
+                    >,
+                >
         };
-        let r = review_draft(&conn, Some(&good), conv1, "We will fix this by Friday, guaranteed.", true)
-            .await
-            .unwrap()
-            .unwrap();
+        let r = review_draft(
+            &conn,
+            Some(&good),
+            conv1,
+            "We will fix this by Friday, guaranteed.",
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(r["ai"]["available"], json!(true));
         assert_eq!(r["ai"]["model"], json!("fake-coach"));
         let claims = find_check(&r, "unsupported_claims");
@@ -1915,9 +2027,7 @@ mod tests {
             .iter()
             .find(|c| {
                 c["kind"] == json!("wrong_customer_context")
-                    && c["label"]
-                        .as_str()
-                        .is_some_and(|l| l.ends_with("(AI)"))
+                    && c["label"].as_str().is_some_and(|l| l.ends_with("(AI)"))
             })
             .expect("AI wrong-context check");
         assert_eq!(wrong_ctx["label"], json!("Wrong customer context (AI)"));
@@ -1942,13 +2052,14 @@ mod tests {
                     "fake-coach".to_string(),
                     1,
                 ))
-            }) as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = std::result::Result<(Option<String>, String, u64), String>,
-                        > + '_,
-                >,
-            >
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = std::result::Result<(Option<String>, String, u64), String>,
+                            > + '_,
+                    >,
+                >
         };
         let r2 = review_draft(&conn, Some(&garbage), conv1, "A plain answer.", true)
             .await

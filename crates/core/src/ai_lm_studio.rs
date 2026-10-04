@@ -254,10 +254,7 @@ impl OpenAiCompatibleClient {
         let body: ChatCompletionResponse = serde_json::from_str(&text)
             .map_err(|e| Error::Config(format!("LM Studio chat parse failed: {e}")))?;
         let latency_ms = started.elapsed().as_millis() as u64;
-        let content = body
-            .choices
-            .first()
-            .and_then(|c| c.message.content.clone());
+        let content = body.choices.first().and_then(|c| c.message.content.clone());
         let tool_calls = body
             .choices
             .first()

@@ -292,7 +292,8 @@ pub fn build_customer_draft_user(
     // customerSafeOnly: similarCases/knowledge filtered to customer_safe
     // visibility (customerHistory stays — it's the customer's own history).
     let mut safe = ctx.clone();
-    safe.similar_cases.retain(|s| s.visibility == "customer_safe");
+    safe.similar_cases
+        .retain(|s| s.visibility == "customer_safe");
     safe.knowledge.retain(|k| k.visibility == "customer_safe");
     format!(
         "{mode_line}{analysis_line}\n\nDraft a reply to the customer's LATEST message using the evidence below.\n\n{}",
@@ -342,9 +343,7 @@ Rules:
 - Respond ONLY with JSON: {\"clusters\": [{\"title\": \"...\", \"summary\": \"one sentence\", \"category\": \"...\", \"product\": \"...\"|null, \"feature\": \"...\"|null, \"conversation_numbers\": [..]}]}";
 
 /// Reference `buildIssueClusterUser(conversations)`.
-pub fn build_issue_cluster_user(
-    conversations: &[ClusterConversation],
-) -> String {
+pub fn build_issue_cluster_user(conversations: &[ClusterConversation]) -> String {
     let lines: Vec<String> = conversations
         .iter()
         .map(|c| {
@@ -463,9 +462,7 @@ pub fn interaction_strategy_block(
         out.push('\n');
     }
     if !already_provided.is_empty() {
-        out.push_str(
-            "\nALREADY PROVIDED BY THE CUSTOMER (do NOT ask again, do not repeat):\n",
-        );
+        out.push_str("\nALREADY PROVIDED BY THE CUSTOMER (do NOT ask again, do not repeat):\n");
         for a in already_provided {
             out.push_str(&format!("- {a}\n"));
         }
@@ -492,7 +489,10 @@ JSON shape:
 
 /// Reference `buildAttributeExtractionUser(input)`.
 pub fn build_attribute_extraction_user(subject: &str, messages: &[(String, i64)]) -> String {
-    let mut parts = vec![format!("SUBJECT: {}", truncate(subject, 300)), "CUSTOMER MESSAGES (oldest first):".to_string()];
+    let mut parts = vec![
+        format!("SUBJECT: {}", truncate(subject, 300)),
+        "CUSTOMER MESSAGES (oldest first):".to_string(),
+    ];
     for (text, thread_id) in messages {
         parts.push(format!("  [thread {thread_id}] {text}"));
     }
@@ -687,8 +687,7 @@ mod tests {
         );
         assert!(viewing.contains("viewing conversation #5001"));
         assert!(viewing.contains("from Grace Hopper"));
-        let not_viewing =
-            build_copilot_context_block(None, None, None, "2026-10-04");
+        let not_viewing = build_copilot_context_block(None, None, None, "2026-10-04");
         assert!(not_viewing.contains("not viewing a specific conversation"));
     }
 

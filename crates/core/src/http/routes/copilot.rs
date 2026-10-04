@@ -67,10 +67,7 @@ pub async fn list_sessions(
 }
 
 /// GET /api/copilot/sessions/:id — one session + its messages.
-pub async fn get_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let Ok(id) = id.parse::<i64>() else {
         return validation_422("Session id must be a positive integer.");
     };
@@ -97,7 +94,11 @@ pub async fn chat(State(state): State<AppState>, Json(body): Json<Value>) -> Res
     // copilotChatSchema: question 1..=4000 chars, optional ids.
     let question = match body.get("question").and_then(Value::as_str) {
         Some(q) if !q.is_empty() && q.chars().count() <= 4000 => q.to_string(),
-        _ => return validation_422("question must be a non-empty string of at most 4000 characters."),
+        _ => {
+            return validation_422(
+                "question must be a non-empty string of at most 4000 characters.",
+            )
+        }
     };
     let conversation_id = body.get("conversationId").and_then(Value::as_i64);
     let session_id = body.get("sessionId").and_then(Value::as_i64);
@@ -171,10 +172,7 @@ pub async fn delete_session(State(state): State<AppState>, Path(id): Path<String
 
 /// GET /api/copilot/starter-questions/:conversationId — deterministic
 /// starter questions (0 questions = 404, not found).
-pub async fn starter_questions(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn starter_questions(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let Ok(id) = id.parse::<i64>() else {
         return validation_422("Conversation id must be a positive integer.");
     };

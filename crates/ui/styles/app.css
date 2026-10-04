@@ -2113,3 +2113,65 @@ body {
 .spp-inbox__context-body { padding: var(--spp-space-2) var(--spp-space-3); overflow-y: auto; min-height: 0; }
 .spp-inbox__context-reopen { margin: var(--spp-space-2) auto; display: block; }
 .spp-inbox__context-content { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+
+/* ═══ P4 tail: layout utilities (reference flex/gap/margin utilities) ══════ */
+
+.spp-flex { display: flex; align-items: flex-start; gap: var(--spp-space-2, 8px); }
+.spp-flex--col { display: flex; flex-direction: column; gap: var(--spp-space-2, 8px); }
+.spp-flex--between { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--spp-space-2, 8px); }
+.spp-flex--wrap { flex-wrap: wrap; }
+.spp-gap-4 { gap: 4px; }
+.spp-gap-8 { gap: 8px; }
+.spp-gap-12 { gap: 12px; }
+.spp-mt-4 { margin-top: 4px; }
+.spp-mt-8 { margin-top: 8px; }
+.spp-mt-12 { margin-top: 12px; }
+.spp-mt-16 { margin-top: 16px; }
+.spp-mb-8 { margin-bottom: 8px; }
+.spp-mb-12 { margin-bottom: 12px; }
+.spp-ml-4 { margin-left: 4px; }
+.spp-grow { flex: 1 1 auto; min-width: 0; }
+.spp-grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: var(--spp-space-3, 12px); }
+
+.spp-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--spp-border); margin: var(--spp-space-3) 0; flex-wrap: wrap; }
+.spp-tab { background: none; border: none; border-bottom: 2px solid transparent; padding: 6px 12px; color: var(--spp-fg-muted); font-size: var(--spp-text-sm); cursor: pointer; }
+.spp-tab:hover { color: var(--spp-fg); }
+.spp-tab.is-active { color: var(--spp-accent); border-bottom-color: var(--spp-accent); }
+
+.spp-table--compact th, .spp-table--compact td { padding: 4px 8px; font-size: var(--spp-text-xs); }
+
+.spp-alert--ok { background: rgba(63, 185, 80, 0.10); border: 1px solid rgba(63, 185, 80, 0.35); }
+
+/* SafeHtml thread body (server-sanitized HTML) */
+.spp-thread-body { font-size: var(--spp-text-sm); line-height: 1.55; word-break: break-word; }
+.spp-thread-body p { margin: 0 0 var(--spp-space-2, 8px); }
+.spp-thread-body p:last-child { margin-bottom: 0; }
+.spp-thread-body a { color: var(--spp-accent); }
+
+/* ═══ Knowledge gaps tab (v2.1.0, plan Phase 26) ══════════════════════════ */
+
+.spp-gap-tab__notes { margin-top: var(--spp-space-3); }
+.spp-gap-candidate { border: 1px solid var(--spp-border); border-left: 3px solid var(--spp-border); border-radius: 6px; padding: var(--spp-space-2) var(--spp-space-3); background: var(--spp-surface); }
+.spp-gap-candidate--open { border-left-color: var(--spp-warning); }
+.spp-gap-candidate--candidate { border-left-color: var(--spp-warning); }
+.spp-gap-candidate--approved { border-left-color: var(--spp-success); }
+.spp-gap-candidate--rejected { border-left-color: var(--spp-critical); }
+.spp-gap-draft { background: var(--spp-bg-sunken); border: 1px solid var(--spp-border); border-radius: 6px; padding: var(--spp-space-2) var(--spp-space-3); }
+.spp-gap-draft__outline { margin: 4px 0 0 20px; padding: 0; }
+
+/* ═══ Friction tab (v2.1.0, plan Phase 29) ════════════════════════════════ */
+
+.spp-friction-kind { border: 1px solid var(--spp-border); border-radius: 6px; padding: var(--spp-space-2) var(--spp-space-3); background: var(--spp-surface); }
+
+/* ═══ Report builder tab (v2.1.0, plan Phase 33) ══════════════════════════ */
+
+.spp-builder-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--spp-space-2) var(--spp-space-3); }
+.spp-builder-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; font-size: var(--spp-text-xs); }
+.spp-builder-field select, .spp-builder-field input { box-sizing: border-box; width: 100%; }
+
+.spp-barchart { display: flex; flex-direction: column; gap: 6px; }
+.spp-bar-row { display: flex; align-items: center; gap: var(--spp-space-2, 8px); }
+.spp-bar-label { flex: 0 0 160px; font-size: var(--spp-text-xs); color: var(--spp-fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spp-bar-track { flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; background: var(--spp-bg-sunken); border-radius: 4px; overflow: hidden; }
+.spp-bar { background: var(--spp-accent); color: #fff; font-size: var(--spp-text-xs); padding: 3px 8px; border-radius: 4px; min-width: 2%; white-space: nowrap; }
+.spp-bar--compare { background: var(--spp-fg-muted); min-height: 4px; padding: 0; }

@@ -64,7 +64,7 @@ fn service_503(message: &str) -> Response {
 
 /// `clampDaysParam` (reference routes/helpers.ts): Number(value), NaN/garbage
 /// falls back to the default, then clamps [min, max] after truncation.
-fn clamp_days_param(raw: Option<&String>, fallback: i64, min: i64, max: i64) -> i64 {
+pub(crate) fn clamp_days_param(raw: Option<&String>, fallback: i64, min: i64, max: i64) -> i64 {
     let Some(s) = raw.filter(|s| !s.is_empty()) else {
         return fallback;
     };
@@ -85,10 +85,7 @@ pub async fn list_gaps(State(state): State<AppState>) -> Json<Value> {
 }
 
 /// POST /api/knowledge/gaps/rebuild — z.object({ days: int 1..3650 optional }).
-pub async fn rebuild_gaps(
-    State(state): State<AppState>,
-    body: Option<Json<Value>>,
-) -> Response {
+pub async fn rebuild_gaps(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
     let body = body.map(|b| b.0).unwrap_or_else(|| json!({}));
     let days: i64 = match body.get("days") {
         None | Some(Value::Null) => 90,
@@ -232,8 +229,7 @@ pub async fn qa_conversation(
     if !conversation_exists(&conn, id) {
         return not_found("Conversation not found.");
     }
-    let ai_available =
-        crate::settings::get_bool(&conn, "ai_enabled", true).unwrap_or(true);
+    let ai_available = crate::settings::get_bool(&conn, "ai_enabled", true).unwrap_or(true);
     let qa = crate::quality::get_qa(&conn, id, ai_available);
     let friction = crate::quality::analyze_friction(&conn, id);
     Json(json!({ "qa": qa, "friction": friction })).into_response()
@@ -267,8 +263,7 @@ pub async fn qa_analyze(
             return not_found("Conversation not found.");
         }
         if include_ai {
-            let ai_enabled =
-                crate::settings::get_bool(&conn, "ai_enabled", true).unwrap_or(true);
+            let ai_enabled = crate::settings::get_bool(&conn, "ai_enabled", true).unwrap_or(true);
             if !ai_enabled {
                 return service_503(
                     "AI is disabled in Settings. The deterministic QA layer works without it; enable LM Studio for the optional AI layer.",

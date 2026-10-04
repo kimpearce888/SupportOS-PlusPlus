@@ -88,11 +88,17 @@ pub async fn status(State(state): State<AppState>) -> Json<Value> {
                     .ok()
                     .and_then(|s| s.embedding_model)
             });
-        let timeout_ms = crate::settings::get_i64(&conn, "lmstudio_timeout_ms", 120_000)
-            .unwrap_or(120_000);
-        let concurrency =
-            crate::settings::get_i64(&conn, "lmstudio_concurrency", 2).unwrap_or(2);
-        (base_url, chat_model, embedding_model, timeout_ms, concurrency, provider_kind)
+        let timeout_ms =
+            crate::settings::get_i64(&conn, "lmstudio_timeout_ms", 120_000).unwrap_or(120_000);
+        let concurrency = crate::settings::get_i64(&conn, "lmstudio_concurrency", 2).unwrap_or(2);
+        (
+            base_url,
+            chat_model,
+            embedding_model,
+            timeout_ms,
+            concurrency,
+            provider_kind,
+        )
     };
     // Live probe: connected + model list, or the reference error message.
     let client = crate::ai_lm_studio::OpenAiCompatibleClient::new(&base_url);
@@ -123,7 +129,12 @@ pub async fn status(State(state): State<AppState>) -> Json<Value> {
                     SUM(CASE WHEN state = 'failed' THEN 1 ELSE 0 END)
              FROM jobs WHERE kind LIKE 'ai%'",
             [],
-            |r| Ok((r.get::<_, Option<i64>>(0)?.unwrap_or(0), r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                ))
+            },
         )
         .unwrap_or((0, 0));
     let conversations_indexed: i64 = conn
@@ -225,7 +236,8 @@ pub async fn draft(
             Box::pin(async move {
                 ai_pipeline::ensure_pipeline_schema(conn).ok();
                 let backend = ai_pipeline::backend_from_settings(conn);
-                ai_pipeline::generate_draft(conn, &backend, conversation_id, &mode, force, None).await
+                ai_pipeline::generate_draft(conn, &backend, conversation_id, &mode, force, None)
+                    .await
             })
         })
         .await;
@@ -276,10 +288,7 @@ pub async fn rewrite(
 }
 
 /// POST /api/ai/draft/:draftId/verify — verify a draft again.
-pub async fn verify(
-    State(state): State<AppState>,
-    Path(draft_id): Path<i64>,
-) -> Response {
+pub async fn verify(State(state): State<AppState>, Path(draft_id): Path<i64>) -> Response {
     let prepared = {
         let conn = state.conn_lock();
         ai_pipeline::ensure_pipeline_schema(&conn).ok();
@@ -341,7 +350,10 @@ pub async fn feedback(
         Some(a) if ["accept", "reject", "edit"].contains(&a) => a.to_string(),
         _ => return validation_422("action must be 'accept', 'reject' or 'edit'."),
     };
-    let final_text = body.get("finalText").and_then(Value::as_str).map(str::to_string);
+    let final_text = body
+        .get("finalText")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if action == "edit" && body.get("finalText").is_some() && final_text.is_none() {
         return validation_422("finalText must be a string.");
     }
@@ -360,7 +372,13 @@ pub async fn feedback(
         "edit" => {
             let _ = ai_pipeline::set_draft_state(&conn, draft_id, "edited");
             if let Some(final_text) = final_text.as_deref() {
-                let _ = ai_pipeline::record_feedback(&conn, draft_id, &draft.content, final_text, false);
+                let _ = ai_pipeline::record_feedback(
+                    &conn,
+                    draft_id,
+                    &draft.content,
+                    final_text,
+                    false,
+                );
             }
         }
         _ => unreachable!(),
@@ -393,10 +411,7 @@ pub async fn feedback(
 
 /// GET /api/ai/similar/:conversationId — similar conversations (hybrid
 /// relevance).
-pub async fn similar(
-    State(state): State<AppState>,
-    Path(conversation_id): Path<i64>,
-) -> Response {
+pub async fn similar(State(state): State<AppState>, Path(conversation_id): Path<i64>) -> Response {
     if conversation_id <= 0 {
         return validation_422("conversationId must be a positive integer.");
     }
@@ -423,10 +438,7 @@ pub async fn similar(
 
 /// GET /api/ai/memory/:customerId — memories, with quarantined red-line
 /// entries never returned as usable memory.
-pub async fn get_memory(
-    State(state): State<AppState>,
-    Path(customer_id): Path<i64>,
-) -> Response {
+pub async fn get_memory(State(state): State<AppState>, Path(customer_id): Path<i64>) -> Response {
     if customer_id <= 0 {
         return validation_422("customerId must be a positive integer.");
     }
@@ -482,7 +494,10 @@ pub async fn set_memory(
         return validation_422("customerId must be a positive integer.");
     }
     let key = body.get("key").and_then(Value::as_str).unwrap_or_default();
-    let value = body.get("value").and_then(Value::as_str).unwrap_or_default();
+    let value = body
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if key.is_empty() || key.chars().count() > 200 {
         return validation_422("key must be a non-empty string of at most 200 characters.");
     }
@@ -537,10 +552,7 @@ pub async fn set_memory(
 }
 
 /// POST /api/ai/cluster-issues — run the clustering stage.
-pub async fn cluster_issues(
-    State(state): State<AppState>,
-    body: Option<Json<Value>>,
-) -> Response {
+pub async fn cluster_issues(State(state): State<AppState>, body: Option<Json<Value>>) -> Response {
     let days = body
         .map(|Json(b)| b.get("days").and_then(Value::as_i64))
         .unwrap_or(None);
@@ -669,15 +681,60 @@ pub async fn evaluation(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .unwrap_or_else(|| "off".into());
     let tests = [
-        ("simple question", "simple", "What time do you close?", "Hi, what are your support hours?"),
-        ("multi-question ticket", "multi", "Two things: export + timezone", "How do I export data? Also how do I change the timezone for scheduled reports?"),
-        ("ambiguous ticket", "ambiguous", "It does not work", "The thing keeps failing sometimes. Not sure what is wrong."),
-        ("known issue", "known_issue", "Meeting reminders one hour late", "Since the DST change our reminders are all one hour late."),
-        ("customer history", "history", "Follow-up on the export issue", "The export you helped me with last month broke again."),
-        ("timezone issue", "timezone", "Santiago timezone wrong", "Scheduled report sends at 3 AM instead of 8 AM Chile time."),
-        ("integration issue", "integration", "Slack integration broken", "The Slack integration stopped posting updates to our channel."),
-        ("billing question", "billing", "Card declined", "My payment failed but the card works everywhere else."),
-        ("internal escalation", "escalation", "URGENT outage for key account", "Our production access is down, we need this escalated now."),
+        (
+            "simple question",
+            "simple",
+            "What time do you close?",
+            "Hi, what are your support hours?",
+        ),
+        (
+            "multi-question ticket",
+            "multi",
+            "Two things: export + timezone",
+            "How do I export data? Also how do I change the timezone for scheduled reports?",
+        ),
+        (
+            "ambiguous ticket",
+            "ambiguous",
+            "It does not work",
+            "The thing keeps failing sometimes. Not sure what is wrong.",
+        ),
+        (
+            "known issue",
+            "known_issue",
+            "Meeting reminders one hour late",
+            "Since the DST change our reminders are all one hour late.",
+        ),
+        (
+            "customer history",
+            "history",
+            "Follow-up on the export issue",
+            "The export you helped me with last month broke again.",
+        ),
+        (
+            "timezone issue",
+            "timezone",
+            "Santiago timezone wrong",
+            "Scheduled report sends at 3 AM instead of 8 AM Chile time.",
+        ),
+        (
+            "integration issue",
+            "integration",
+            "Slack integration broken",
+            "The Slack integration stopped posting updates to our channel.",
+        ),
+        (
+            "billing question",
+            "billing",
+            "Card declined",
+            "My payment failed but the card works everywhere else.",
+        ),
+        (
+            "internal escalation",
+            "escalation",
+            "URGENT outage for key account",
+            "Our production access is down, we need this escalated now.",
+        ),
     ];
     Json(json!({
         "tests": tests.iter().map(|(name, category, subject, body)| json!({

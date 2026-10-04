@@ -154,16 +154,17 @@ pub async fn review(
                             .await
                             .map(|res| (res.content, res.model, res.latency_ms))
                             .map_err(|e| e.message)
-                    }) as std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<
-                                    Output = std::result::Result<
-                                        (Option<String>, String, u64),
-                                        String,
-                                    >,
-                                > + '_,
-                        >,
-                    >
+                    })
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = std::result::Result<
+                                            (Option<String>, String, u64),
+                                            String,
+                                        >,
+                                    > + '_,
+                            >,
+                        >
                 };
                 coaching::review_draft(conn, Some(&chat), id, &draft, include_ai).await
             })

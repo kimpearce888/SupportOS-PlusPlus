@@ -344,21 +344,33 @@ pub async fn narrative(
         Json(json!({"narrative": "Not implemented."})),
     )
 }
-pub async fn effectiveness(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"effectiveness": []})))
-}
-pub async fn report_catalog(State(state): State<AppState>) -> impl IntoResponse {
+/// GET /api/reports/effectiveness?days=90 — the observational response-style
+/// report (reference `ctx.effectiveness.report(daysParam(q, 90))`).
+pub async fn effectiveness(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let days = super::quality::clamp_days_param(params.get("days"), 90, 1, 3650);
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::reports::get_health_facts(&conn, 7) {
-        Ok(facts) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&facts).unwrap_or(json!({}))),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": e.to_string()})),
-        ),
-    }
+    (
+        StatusCode::OK,
+        Json(crate::quality::effectiveness_report(&conn, days)),
+    )
+}
+
+/// GET /api/reports/builder/catalog — the closed metric/dimension catalog
+/// (reference `ctx.reportBuilder.catalog()`): every entry ships its label,
+/// definition and limitations; `origin: 'local'` labels every number.
+pub async fn report_catalog() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "metrics": crate::catalog::reporting::all_metric_entries(),
+            "dimensions": crate::catalog::reporting::all_dimension_entries(),
+            "origin": "local",
+            "note": "This builder computes local SupportOS metrics only. Native Help Scout reports remain available under the Help Scout tab, clearly labeled as Help Scout-originated."
+        })),
+    )
 }
 
 // ---------------- Report builder (reference analytics.ts builder routes) ----------------
