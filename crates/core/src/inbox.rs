@@ -117,6 +117,9 @@ pub struct InboxFilters {
     pub priority: Option<String>,
     /// Free-text search in subject + preview.
     pub query: Option<String>,
+    /// Exact conversation-number lookup (?number=N — v2.0.0 M4: deep
+    /// links and the incident link-by-number flow). None = no filter.
+    pub number: Option<i64>,
     /// Limit (default 50, max 200).
     pub limit: Option<u32>,
     /// Offset for pagination.
@@ -206,6 +209,12 @@ pub fn list_conversations(
     if let Some(ref priority) = filters.priority {
         where_parts.push("c.priority = ?".to_string());
         params_vec.push(priority.clone().into());
+    }
+    // v2.0.0 (M4): exact number lookup — takes precedence over the
+    // free-text query when present.
+    if let Some(number) = filters.number {
+        where_parts.push("c.number = ?".to_string());
+        params_vec.push(number.into());
     }
     if let Some(ref query) = filters.query {
         let q = format!("%{query}%");
@@ -448,6 +457,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn list_conversations_exact_number_lookup() {
+        // v2.0.0 (M4): ?number=N finds exactly that conversation (deep
+        // links, the incident link-by-number flow); unknown numbers match
+        // nothing.
+        let conn = fresh_db();
+        let mut conn = conn;
+        let _conv_id = seed_test_data(&mut conn);
+        let number: i64 = conn
+            .query_row("SELECT number FROM conversations LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let (items, total) = list_conversations(
+            &conn,
+            &InboxFilters {
+                number: Some(number),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, number);
+
+        let (_, total) = list_conversations(
+            &conn,
+            &InboxFilters {
+                number: Some(987_654),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 0);
     }
 
     #[test]

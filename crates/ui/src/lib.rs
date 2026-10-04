@@ -83,7 +83,7 @@ fn app_view() -> impl IntoView {
                     <Route path="/ai" view=pages::AiCenterPage />
                     <Route path="/issues" view=pages::IssueRadarPage />
                     <Route path="/incidents" view=pages::IncidentsPage />
-                    <Route path="/incidents/:id" view=pages::IncidentsPage />
+                    <Route path="/incidents/:id" view=IncidentDetailRoute />
                     <Route path="/custom-objects" view=pages::CustomObjectsPage />
                     <Route path="/connectors" view=pages::ConnectorsPage />
                     <Route path="/graph" view=pages::SupportGraphPage />
@@ -235,6 +235,28 @@ fn InboxRoute() -> impl IntoView {
                 }
                 Err(_) => {
                     view! { <pages::InboxPage /> }
+                }
+            }
+        }}
+    }
+}
+
+/// `/incidents/:id` — reads the id from the route params and remounts the
+/// workspace when it changes (reference: `useParams().id` drives the query
+/// key; a non-numeric id falls back to the list).
+#[component]
+fn IncidentDetailRoute() -> impl IntoView {
+    let params = use_params_map();
+    view! {
+        {move || {
+            let raw = params.with(|p| p.get("id").cloned().unwrap_or_default());
+            // The reference guards with Number.isFinite(Number(id)).
+            match raw.parse::<i64>() {
+                Ok(id) => {
+                    view! { <pages::IncidentDetailPage incident_id=id /> }
+                }
+                Err(_) => {
+                    view! { <pages::IncidentsPage /> }
                 }
             }
         }}

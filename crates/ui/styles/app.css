@@ -2492,3 +2492,93 @@ body {
   border-color: var(--spp-accent);
   color: var(--spp-accent);
 }
+
+/* ─── Incidents workspace (reference Incidents.tsx) ───────────────────── */
+
+/* The triage-board chips row. */
+.spp-incidents__chips { margin-bottom: var(--spp-space-4); }
+
+/* The list card keeps the table flush with the card edges. */
+.spp-incidents__card { padding: 0; overflow-x: auto; }
+.spp-incidents__card .spp-table { margin: 0; }
+
+.spp-incidents__title { font-size: var(--spp-text-sm); }
+
+/* The header selects (status / severity) on the detail page. */
+.spp-incidents__select { width: 160px; }
+
+/* The link-by-number input next to the conversations heading. */
+.spp-incidents__link-input { width: 160px; }
+
+/* Impact stat blocks (reference .impact-grid / .impact-stat). */
+.spp-impact-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: var(--spp-space-2);
+  margin: var(--spp-space-3) 0;
+}
+.spp-impact-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: var(--spp-space-2);
+  background: var(--spp-bg-sunken, rgba(127, 127, 127, 0.08));
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius-md);
+}
+.spp-impact-value { font-size: var(--spp-text-lg, 18px); font-weight: 700; }
+.spp-impact-label { font-size: var(--spp-text-xs); color: var(--spp-fg-muted); }
+
+.spp-incidents__note { margin: var(--spp-space-2) 0 0; }
+
+/* Explanation field stack (reference: Description / Internal explanation /
+   Customer-safe explanation / Known cause / Workaround / Resolution). */
+.spp-incidents__explanation { margin-bottom: var(--spp-space-2); }
+.spp-incidents__explanation-body {
+  font-size: var(--spp-text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Affected organizations (reference: name left, counts right). */
+.spp-incidents__org-row { padding: 4px 0; }
+.spp-incidents__org-name { font-size: var(--spp-text-sm); font-weight: 600; }
+
+.spp-incidents__customer-name { font-weight: 600; }
+
+/* Refs / releases / related entries. */
+.spp-incidents__ref { margin-bottom: var(--spp-space-2); }
+
+/* Notes. */
+.spp-incidents__note { margin-top: var(--spp-space-4); }
+
+/* Timeline rows (badge + time + detail on one line). */
+.spp-incidents__timeline-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+  padding: 4px 0;
+  flex-wrap: wrap;
+}
+
+/* The form modals (declare incident / add release). */
+.spp-modal--form { max-width: 520px; width: 100%; }
+.spp-form-grid {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: var(--spp-space-2) var(--spp-space-3);
+  align-items: start;
+  text-align: left;
+}
+.spp-form-grid__label {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+  padding-top: 7px;
+}
+.spp-modal--form .spp-muted.spp-text-xs { margin: var(--spp-space-3) 0 0; }
+
+@media (max-width: 560px) {
+  .spp-form-grid { grid-template-columns: 1fr; }
+  .spp-form-grid__label { padding-top: 0; }
+}

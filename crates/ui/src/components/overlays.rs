@@ -15,8 +15,8 @@ pub fn ConfirmDialog(
     #[prop(into)] message: String,
     #[prop(default = "Confirm".to_string(), into)] confirm_label: String,
     #[prop(default = false)] danger: bool,
-    on_confirm: Arc<dyn Fn()>,
-    on_cancel: Arc<dyn Fn()>,
+    on_confirm: Arc<dyn Fn() + Send + Sync>,
+    on_cancel: Arc<dyn Fn() + Send + Sync>,
 ) -> impl IntoView {
     let confirm = Arc::clone(&on_confirm);
     let cancel = Arc::clone(&on_cancel);

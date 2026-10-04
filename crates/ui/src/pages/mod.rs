@@ -36,7 +36,7 @@ pub use customers::{CustomerProfilePage, CustomerSearchPage};
 pub use dashboard::DashboardPage;
 pub use docs::DocsPage;
 pub use inbox::InboxPage;
-pub use incidents::IncidentsPage;
+pub use incidents::{IncidentDetailPage, IncidentsPage};
 pub use issue_radar::IssueRadarPage;
 pub use knowledge::KnowledgePage;
 pub use not_found::NotFoundPage;

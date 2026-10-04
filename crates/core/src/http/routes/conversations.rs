@@ -39,6 +39,11 @@ pub async fn list(
     if let Some(query) = params.get("q") {
         filters.query = Some(query.clone());
     }
+    // v2.0.0 (M4): exact number lookup (?number=N) for deep links and the
+    // incident link-by-number flow; garbage is ignored, never a 500.
+    if let Some(number) = params.get("number") {
+        filters.number = number.trim().parse::<i64>().ok();
+    }
     if let Some(limit) = params.get("pageSize") {
         filters.limit = limit.parse().ok();
     }
