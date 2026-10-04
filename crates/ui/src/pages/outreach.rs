@@ -547,7 +547,7 @@ pub fn OutreachPage() -> impl IntoView {
                             create_campaign=Rc::new(create_campaign)
                             load_campaigns=Rc::new(load_campaigns)
                             on_back=Rc::new(move || wizard_step.set(WizardStep::Compose))
-                            on_done=Rc::new(move || done_wizard())
+                            on_done=Rc::new(done_wizard)
                         />
                     </Show>
                 </div>
@@ -1919,7 +1919,11 @@ fn CampaignsPanel(
             move || {
                 if open_id.get_untracked().is_some() {
                     tick.update(|t| *t += 1);
-                    load_detail(tick.get_untracked() % 3 == 0);
+                    // `%` rather than `is_multiple_of`: the workspace MSRV is
+                    // 1.80 and is_multiple_of stabilized in 1.87.
+                    #[allow(clippy::manual_is_multiple_of)]
+                    let third = tick.get_untracked() % 3 == 0;
+                    load_detail(third);
                 }
             },
             10_000,

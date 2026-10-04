@@ -105,9 +105,8 @@ pub fn provide_mention_directory() -> RwSignal<MentionDirectory> {
     let dir = create_rw_signal(MentionDirectory::default());
     provide_context(dir);
     spawn_local(async move {
-        match crate::api::get_json::<serde_json::Value>("/api/mention-directory").await {
-            Ok(v) => dir.set(parse_mention_directory(&v)),
-            Err(_) => {}
+        if let Ok(v) = crate::api::get_json::<serde_json::Value>("/api/mention-directory").await {
+            dir.set(parse_mention_directory(&v));
         }
     });
     dir

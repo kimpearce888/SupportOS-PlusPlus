@@ -319,7 +319,9 @@ fn parse_result_row(r: &serde_json::Value) -> ResultRow {
 }
 
 /// Build the run/save request body from the form state (reference `config`).
+/// The 9 parameters mirror the reference builder's form fields one-to-one.
 #[must_use]
+#[allow(clippy::too_many_arguments)] // reference-parity signature (config in BuilderTab.tsx)
 pub fn config_body(
     metric: &str,
     dimension: &str,
@@ -401,7 +403,6 @@ pub fn BuilderTab() -> impl IntoView {
     let chart_bar = create_rw_signal(true);
 
     let load_saved = {
-        let saved = saved;
         move || {
             let saved = saved;
             spawn_local(async move {
@@ -415,8 +416,6 @@ pub fn BuilderTab() -> impl IntoView {
     };
 
     let load_catalog = {
-        let catalog = catalog;
-        let catalog_error = catalog_error;
         move || {
             let catalog = catalog;
             let catalog_error = catalog_error;

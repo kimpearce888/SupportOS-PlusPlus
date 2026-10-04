@@ -481,7 +481,7 @@ pub fn toggle_value(values: &[String], v: &str) -> Vec<String> {
 #[must_use]
 pub fn add_tag(tags: &[String], raw: &str) -> Option<Vec<String>> {
     let v = raw.trim().to_lowercase();
-    if v.is_empty() || tags.iter().any(|t| *t == v) {
+    if v.is_empty() || tags.contains(&v) {
         None
     } else {
         let mut out = tags.to_vec();
@@ -708,7 +708,7 @@ pub fn ConditionEditor(list: NodeList, uid: u64, meta: RwSignal<Option<Value>>) 
             <div class="spp-cond-editor__head">
                 <select
                     class="spp-input spp-cond-editor__kind"
-                    value=move || kind_now()
+                    value=kind_now
                     on:change=move |ev| {
                         let next = event_target_value(&ev);
                         let m = meta.get();
@@ -855,7 +855,7 @@ fn PropertyEditor(list: NodeList, uid: u64, meta: RwSignal<Option<Value>>) -> im
             <FieldRow label="Operator">
                 <select
                     class="spp-input spp-cond-editor__control"
-                    value=move || op_now()
+                    value=op_now
                     on:change=move |ev| set_str(list, uid, "op", &event_target_value(&ev))
                 >
                     {move || {

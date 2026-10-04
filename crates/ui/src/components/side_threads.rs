@@ -175,9 +175,6 @@ pub fn SideThreadsPanel(conversation_id: i64) -> impl IntoView {
     let open_thread_id = create_rw_signal(None::<i64>);
 
     let load = {
-        let threads = threads;
-        let loading = loading;
-        let error_msg = error_msg;
         move || {
             loading.set(true);
             let threads = threads;
@@ -449,9 +446,6 @@ fn SideThreadDetail(thread_id: i64, on_change: impl Fn() + 'static + Copy) -> im
     let directory = super::mention::use_mention_directory();
 
     let load = {
-        let detail = detail;
-        let loading = loading;
-        let error_msg = error_msg;
         move || {
             loading.set(true);
             let detail = detail;

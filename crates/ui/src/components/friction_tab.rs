@@ -186,9 +186,6 @@ pub fn FrictionTab() -> impl IntoView {
     let rebuilding = create_rw_signal(false);
 
     let load = {
-        let overview = overview;
-        let loading = loading;
-        let error_msg = error_msg;
         move |days: i64| {
             loading.set(true);
             let overview = overview;
@@ -250,7 +247,6 @@ pub fn FrictionTab() -> impl IntoView {
                         .iter()
                         .map(|d| {
                             let d = *d;
-                            let load = load;
                             view! {
                                 <button
                                     class="spp-button spp-button--small"

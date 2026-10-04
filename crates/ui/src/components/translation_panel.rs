@@ -234,29 +234,26 @@ pub fn TranslationPanel(conversation_id: i64) -> impl IntoView {
         let active_message = active_message;
         let translated_draft = translated_draft;
         spawn_local(async move {
-            match crate::api::post_json::<serde_json::Value>(
+            // v2.2.1 audit fix: only attach an inbound result to the
+            // message that is STILL active and whose text matches.
+            if let Ok(v) = crate::api::post_json::<serde_json::Value>(
                 "/api/translation/translate",
                 Some(&body),
             )
             .await
             {
-                Ok(v) => {
-                    let r = parse_translation_result(&v);
-                    // v2.2.1 audit fix: only attach an inbound result to the
-                    // message that is STILL active and whose text matches.
-                    if r.purpose == "customer_inbound" {
-                        active_message.update(|m| {
-                            if let Some(m) = m {
-                                if m.text == r.source_text {
-                                    m.translated = Some(r);
-                                }
+                let r = parse_translation_result(&v);
+                if r.purpose == "customer_inbound" {
+                    active_message.update(|m| {
+                        if let Some(m) = m {
+                            if m.text == r.source_text {
+                                m.translated = Some(r);
                             }
-                        });
-                    } else if r.purpose == "agent_draft" {
-                        translated_draft.set(Some(r));
-                    }
+                        }
+                    });
+                } else if r.purpose == "agent_draft" {
+                    translated_draft.set(Some(r));
                 }
-                Err(_) => {}
             }
             translating.set(false);
         });

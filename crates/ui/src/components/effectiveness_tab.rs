@@ -157,9 +157,6 @@ pub fn EffectivenessTab() -> impl IntoView {
     let days = create_rw_signal(90i64);
 
     let load = {
-        let report = report;
-        let loading = loading;
-        let error_msg = error_msg;
         move |days: i64| {
             loading.set(true);
             let report = report;
@@ -194,7 +191,6 @@ pub fn EffectivenessTab() -> impl IntoView {
                             } else {
                                 "spp-button spp-button--small"
                             };
-                            let load = load;
                             view! {
                                 <button
                                     class=class

@@ -212,9 +212,6 @@ pub fn GapsTab() -> impl IntoView {
     let draft = create_rw_signal(None::<GapDraft>);
 
     let load = {
-        let report = report;
-        let loading = loading;
-        let error_msg = error_msg;
         move || {
             loading.set(true);
             let report = report;

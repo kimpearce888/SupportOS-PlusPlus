@@ -36,11 +36,11 @@ pub fn looks_like_html(s: &str) -> bool {
     while i + 3 < bytes.len() {
         if bytes[i] == b'<' && bytes[i + 1].is_ascii_alphabetic() {
             // Find the closing '>' within a sane tag length.
-            for j in i + 2..(i + 120).min(bytes.len()) {
-                if bytes[j] == b'>' {
+            for &b in &bytes[i + 2..(i + 120).min(bytes.len())] {
+                if b == b'>' {
                     return true;
                 }
-                if bytes[j] == b'<' {
+                if b == b'<' {
                     break;
                 }
             }

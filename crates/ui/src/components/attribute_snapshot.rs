@@ -122,9 +122,6 @@ pub fn AttributeSnapshotCard(conversation_id: i64) -> impl IntoView {
     let expanded_attr = create_rw_signal(None::<String>);
 
     let load = {
-        let snapshot = snapshot;
-        let loading = loading;
-        let error_msg = error_msg;
         move || {
             loading.set(true);
             let snapshot = snapshot;
