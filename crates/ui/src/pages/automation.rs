@@ -10,8 +10,10 @@
 /// and action enums come from `spp_core::automation` (mirrored here as
 /// `TriggerView` / `ActionView` for `'static` Leptos lifetimes).
 use leptos::*;
+use std::rc::Rc;
 
 use crate::components::state_view::EmptyState;
+use crate::toasts;
 
 /// A UI-side automation rule. Mirrors `spp_core::automation::AutomationRule`
 /// but with `'static` lifetimes so Leptos signals can hold it.
@@ -132,7 +134,9 @@ impl ActionView {
 
 /// The Automation page component.
 ///
-/// Wired to `GET /api/automation/rules`.
+/// Wired to `GET /api/automation/rules`; write actions (engine toggle,
+/// rule enable/disable, delete) go through the port's CRUD routes and
+/// surface their outcomes as toasts (reference pushToast semantics).
 #[component]
 pub fn AutomationPage() -> impl IntoView {
     let rules = create_rw_signal(Vec::<AutomationRuleView>::new());
@@ -141,7 +145,8 @@ pub fn AutomationPage() -> impl IntoView {
     let loading = create_rw_signal(true);
     let error_msg = create_rw_signal(None::<String>);
 
-    create_effect(move |_| {
+    // Shared reload (the reference's `refetch` on every mutation).
+    let load: Rc<dyn Fn()> = Rc::new(move || {
         let rules = rules;
         let automation_enabled = automation_enabled;
         let risk_tier_note = risk_tier_note;
@@ -164,6 +169,7 @@ pub fn AutomationPage() -> impl IntoView {
                             .unwrap_or("")
                             .to_string(),
                     );
+                    error_msg.set(None);
                     loading.set(false);
                 }
                 Err(e) => {
@@ -172,6 +178,28 @@ pub fn AutomationPage() -> impl IntoView {
                 }
             }
         });
+    });
+    load();
+
+    // Engine toggle (reference: PATCH /api/settings {automation_enabled}
+    // + success toast + refetch).
+    let toggle_engine: Rc<dyn Fn(bool)> = Rc::new({
+        let load = Rc::clone(&load);
+        move |on: bool| {
+            let load = Rc::clone(&load);
+            wasm_bindgen_futures::spawn_local(async move {
+                let body = serde_json::json!({ "automation_enabled": on });
+                match crate::api::patch_json::<serde_json::Value>("/api/settings", &body).await {
+                    Ok(_) => {
+                        toasts::success("Automation engine setting updated.");
+                        load();
+                    }
+                    // v1.6.0 audit fix: surface network failures instead of a
+                    // silent no-op.
+                    Err(e) => toasts::error(e),
+                }
+            });
+        }
     });
 
     view! {
@@ -193,9 +221,19 @@ pub fn AutomationPage() -> impl IntoView {
             <section class="spp-automation-summary">
                 <div class="spp-rule-card__row">
                     <span class="spp-rule-card__label">"Automation:"</span>
-                    <span class="spp-badge">
-                        {move || if automation_enabled.get().unwrap_or(false) { "✅ enabled" } else { "❌ disabled" }}
-                    </span>
+                    <label class="spp-flex spp-gap-4" style="cursor:pointer;">
+                        <input
+                            type="checkbox"
+                            prop:checked=move || automation_enabled.get().unwrap_or(false)
+                            on:change=move |ev| {
+                                let on = event_target_checked(&ev);
+                                toggle_engine(on);
+                            }
+                        />
+                        <span class="spp-text-sm">
+                            {move || format!("Automation engine {}", if automation_enabled.get().unwrap_or(false) { "ON" } else { "OFF" })}
+                        </span>
+                    </label>
                 </div>
                 {move || {
                     let note = risk_tier_note.get();
@@ -216,7 +254,7 @@ pub fn AutomationPage() -> impl IntoView {
                         }
                     }
                 >
-                    <RulesList rules=rules.get() />
+                    <RulesList rules=rules reload=Rc::clone(&load) />
                 </Show>
             </section>
         </div>
@@ -224,30 +262,32 @@ pub fn AutomationPage() -> impl IntoView {
 }
 
 /// The rules list — each rule is a card with name, trigger, action, and
-/// an enabled toggle.
+/// an enabled toggle. Takes the rules SIGNAL so a reload re-renders the
+/// cards (the reference's refetch).
 #[component]
-fn RulesList(rules: Vec<AutomationRuleView>) -> impl IntoView {
-    let rows_fragment = leptos::Fragment::new(
+fn RulesList(rules: RwSignal<Vec<AutomationRuleView>>, reload: Rc<dyn Fn()>) -> impl IntoView {
+    let cards = move || {
         rules
-            .iter()
+            .get()
+            .into_iter()
             .map(|r| {
                 view! {
-                    <RuleCard rule=r.clone() />
+                    <RuleCard rule=r reload=Rc::clone(&reload) />
                 }
                 .into_view()
             })
-            .collect::<Vec<_>>(),
-    );
+            .collect::<Vec<_>>()
+    };
     view! {
         <div class="spp-rules-list">
-            {rows_fragment.clone()}
+            {cards}
         </div>
     }
 }
 
 /// A single rule card.
 #[component]
-fn RuleCard(rule: AutomationRuleView) -> impl IntoView {
+fn RuleCard(rule: AutomationRuleView, reload: Rc<dyn Fn()>) -> impl IntoView {
     let name = rule.name.clone();
     let trigger_label = rule.trigger.label();
     let action_label = rule.action.label();
@@ -255,19 +295,62 @@ fn RuleCard(rule: AutomationRuleView) -> impl IntoView {
     let enabled = rule.enabled;
     let rule_id = rule.id;
 
+    // Rule enable/disable (reference: PATCH /api/automation/rules/:id
+    // {enabled} + refetch; failures surface as error toasts — v1.6.0
+    // audit fix: they were silent no-ops).
+    let toggle_rule = {
+        let reload = Rc::clone(&reload);
+        move |_| {
+            let reload = Rc::clone(&reload);
+            wasm_bindgen_futures::spawn_local(async move {
+                let path = format!("/api/automation/rules/{rule_id}");
+                let body = serde_json::json!({ "enabled": !enabled });
+                match crate::api::patch_json::<serde_json::Value>(&path, &body).await {
+                    Ok(_) => reload(),
+                    Err(e) => toasts::error(e),
+                }
+            });
+        }
+    };
+    // Rule delete (reference: DELETE /api/automation/rules/:id + refetch;
+    // failures surface as error toasts).
+    let delete_rule = {
+        let reload = Rc::clone(&reload);
+        move |_| {
+            let reload = Rc::clone(&reload);
+            wasm_bindgen_futures::spawn_local(async move {
+                let path = format!("/api/automation/rules/{rule_id}");
+                match crate::api::delete_json::<serde_json::Value>(&path).await {
+                    Ok(_) => reload(),
+                    Err(e) => toasts::error(e),
+                }
+            });
+        }
+    };
+
     view! {
         <div class="spp-rule-card">
             <div class="spp-rule-card__header">
                 <span class="spp-rule-card__name">{name}</span>
-                <button
-                    class="spp-rule-card__toggle"
-                    type="button"
-                    role="switch"
-                    aria-checked=enabled
-                    title=move || if enabled { "Click to disable" } else { "Click to enable" }
-                >
-                    {move || if enabled { "Enabled" } else { "Disabled" }}
-                </button>
+                <div class="spp-flex spp-gap-4">
+                    <button
+                        class="spp-rule-card__toggle"
+                        type="button"
+                        role="switch"
+                        aria-checked=enabled
+                        title=move || if enabled { "Click to disable" } else { "Click to enable" }
+                        on:click=toggle_rule
+                    >
+                        {move || if enabled { "Enabled" } else { "Disabled" }}
+                    </button>
+                    <button
+                        class="spp-button spp-button--ghost spp-button--tiny"
+                        type="button"
+                        on:click=delete_rule
+                    >
+                        "Delete"
+                    </button>
+                </div>
             </div>
             <div class="spp-rule-card__body">
                 <div class="spp-rule-card__row">
