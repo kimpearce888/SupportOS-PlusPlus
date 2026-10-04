@@ -2195,6 +2195,52 @@ body {
 .spp-notice--err { border-left-color: var(--spp-critical); }
 .spp-notice--warn { border-left-color: var(--spp-warning); }
 
+/* ── Toast stack (uiStore toasts + overlays.tsx Toasts port) ────────────── */
+
+.spp-toast-container {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-2);
+  z-index: 1000;
+}
+.spp-toast {
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-left: 3px solid var(--spp-accent);
+  border-radius: var(--spp-radius-md);
+  padding: 10px 14px;
+  box-shadow: var(--spp-shadow-lg);
+  max-width: 420px;
+  font-size: var(--spp-text-sm);
+  animation: spp-toast-in 0.18s ease;
+}
+/* The reference defines no .toast.info rule — info keeps the default
+   accent left border (and --spp-info is the accent hue anyway). */
+.spp-toast--success { border-left-color: var(--spp-success); }
+.spp-toast--error { border-left-color: var(--spp-critical); }
+.spp-toast--warning { border-left-color: var(--spp-warning); }
+.spp-toast__row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--spp-space-2);
+}
+.spp-toast__body { min-width: 0; overflow-wrap: anywhere; }
+.spp-toast__details { margin-top: var(--spp-space-1); }
+.spp-toast__details summary { cursor: pointer; }
+.spp-toast__detail-body {
+  margin-top: var(--spp-space-1);
+  font-family: var(--spp-font-mono);
+  white-space: pre-wrap;
+}
+@keyframes spp-toast-in {
+  from { transform: translateY(8px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+
 .spp-wizard-steps { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
 .spp-wizard-step {
   border: 1px solid var(--spp-border);

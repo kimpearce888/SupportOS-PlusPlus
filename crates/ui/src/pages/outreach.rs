@@ -19,9 +19,10 @@
 //! Port mechanics: the definition lives as three signals (combinator,
 //! conditions, exclude) assembled into the wire JSON on demand; condition
 //! nodes carry a client-side `_uid` (see condition_editor.rs) that is
-//! stripped before POSTing. The reference's global toast store is not yet
-//! ported — this page uses an inline notice bar (same information, same
-//! permanence rules: success AND failure messages are always shown).
+//! stripped before POSTing. Mutations and load failures surface through the
+//! global toast store (`crate::toasts`, the reference uiStore's pushToast
+//! with its auto-dismiss + newest-5 semantics); intervals are cleared on
+//! unmount.
 
 use leptos::*;
 use std::rc::Rc;
@@ -30,6 +31,7 @@ use crate::components::condition_editor::{
     default_node, describe_condition, inject_uid, strip_uid, ConditionEditor,
 };
 use crate::components::state_view::{EmptyState, LoadingState};
+use crate::toasts;
 
 /// The page's tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,10 +122,6 @@ fn date_short(iso: &str) -> String {
     }
 }
 
-/// A page-level notice (kind, message) — the port's stand-in for the
-/// reference's toast store on this surface.
-type Notice = RwSignal<Option<(String, String)>>;
-
 /// A browser interval that is cleared (and its closure freed) when the
 /// owning page unmounts — the port's stand-in for the reference's
 /// react-query `refetchInterval`, which stops with the component.
@@ -193,8 +191,6 @@ pub fn OutreachPage() -> impl IntoView {
     let created_campaign_id = create_rw_signal(None::<i64>);
     let creating = create_rw_signal(false);
 
-    let notice: Notice = create_rw_signal(None);
-
     // ── Catalog data (reference: outreach-meta / outreach-segments /
     //    outreach-campaigns queries) ────────────────────────────────────
     let meta = create_rw_signal(None::<serde_json::Value>);
@@ -210,7 +206,7 @@ pub fn OutreachPage() -> impl IntoView {
         spawn_local(async move {
             match crate::api::get_json::<serde_json::Value>("/api/outreach/meta").await {
                 Ok(v) => meta.set(Some(v)),
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
         });
     };
@@ -224,7 +220,7 @@ pub fn OutreachPage() -> impl IntoView {
                         .cloned()
                         .unwrap_or_default(),
                 ),
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
         });
     };
@@ -342,13 +338,10 @@ pub fn OutreachPage() -> impl IntoView {
             match result {
                 Ok(()) => {
                     if (rows.len() as i64) < matched {
-                        notice.set(Some((
-                            "warn".to_string(),
-                            format!(
-                                "Loaded {} of {matched} matching recipients (the rest failed to load) - continue only if that is intended.",
-                                rows.len()
-                            ),
-                        )));
+                        toasts::warning(format!(
+                            "Loaded {} of {matched} matching recipients (the rest failed to load) - continue only if that is intended.",
+                            rows.len()
+                        ));
                     }
                     selected_ids.set(
                         rows.iter()
@@ -364,7 +357,7 @@ pub fn OutreachPage() -> impl IntoView {
                     recipient_rows.set(rows);
                     wizard_step.set(WizardStep::Recipients);
                 }
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             loading_recipients.set(false);
         });
@@ -392,7 +385,6 @@ pub fn OutreachPage() -> impl IntoView {
             ),
             "customer_ids": selected_ids.get_untracked(),
         });
-        let notice = notice;
         let load_campaigns = load_campaigns;
         spawn_local(async move {
             match crate::api::post_json::<serde_json::Value>("/api/outreach/campaigns", Some(&body))
@@ -406,16 +398,16 @@ pub fn OutreachPage() -> impl IntoView {
                         .unwrap_or("Campaign creation failed")
                         .to_string();
                     if !ok {
-                        notice.set(Some(("err".to_string(), message)));
+                        toasts::error(message);
                     } else {
                         if let Some(id) = r.get("id").and_then(|v| v.as_i64()) {
                             created_campaign_id.set(Some(id));
                         }
                         load_campaigns();
-                        notice.set(Some(("ok".to_string(), message)));
+                        toasts::success(message);
                     }
                 }
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             creating.set(false);
         });
@@ -486,24 +478,8 @@ pub fn OutreachPage() -> impl IntoView {
                 </button>
             </div>
 
-            <Show when=move || notice.get().is_some() fallback=|| ()>
-                <div class=move || {
-                    let kind = notice.get().map(|(k, _)| k).unwrap_or_default();
-                    format!("spp-notice spp-notice--{}", if kind.is_empty() { "ok" } else { &kind })
-                }>
-                    <span>{move || notice.get().map(|(_, m)| m).unwrap_or_default()}</span>
-                    <button
-                        class="spp-button spp-button--ghost spp-button--tiny"
-                        aria-label="Dismiss"
-                        on:click=move |_| notice.set(None)
-                    >
-                        "\u{d7}"
-                    </button>
-                </div>
-            </Show>
-
             <Show when=move || tab.get() == Tab::Campaigns fallback=|| ()>
-                <CampaignsPanel campaigns campaigns_error notice load_campaigns=Rc::new(load_campaigns) />
+                <CampaignsPanel campaigns campaigns_error load_campaigns=Rc::new(load_campaigns) />
             </Show>
 
             <Show when=move || tab.get() == Tab::New fallback=|| ()>
@@ -538,7 +514,6 @@ pub fn OutreachPage() -> impl IntoView {
                             preview_error
                             segments
                             saved_segment_id
-                            notice
                             on_apply=Rc::new(move |def| apply_definition(def, None))
                             on_next=Rc::new(go_recipients)
                             loading_recipients
@@ -559,7 +534,6 @@ pub fn OutreachPage() -> impl IntoView {
                             draft
                             preview
                             selected_ids
-                            notice
                             on_back=Rc::new(move || wizard_step.set(WizardStep::Recipients))
                             on_next=Rc::new(move || wizard_step.set(WizardStep::Review))
                         />
@@ -570,7 +544,6 @@ pub fn OutreachPage() -> impl IntoView {
                             selected_ids
                             created_campaign_id
                             creating
-                            notice
                             create_campaign=Rc::new(create_campaign)
                             load_campaigns=Rc::new(load_campaigns)
                             on_back=Rc::new(move || wizard_step.set(WizardStep::Compose))
@@ -583,7 +556,6 @@ pub fn OutreachPage() -> impl IntoView {
             <Show when=move || tab.get() == Tab::Segments fallback=|| ()>
                 <SegmentsPanel
                     segments
-                    notice
                     load_segments=Rc::new(load_segments)
                     on_use=Rc::new(move |s: serde_json::Value| {
                         apply_definition(
@@ -597,7 +569,7 @@ pub fn OutreachPage() -> impl IntoView {
             </Show>
 
             <Show when=move || tab.get() == Tab::Dnc fallback=|| ()>
-                <DncPanel notice />
+                <DncPanel />
             </Show>
         </div>
     }
@@ -617,7 +589,6 @@ fn AudienceStep(
     preview_error: RwSignal<Option<String>>,
     segments: RwSignal<Vec<serde_json::Value>>,
     saved_segment_id: RwSignal<Option<i64>>,
-    notice: Notice,
     on_apply: Rc<dyn Fn(serde_json::Value)>,
     on_next: Rc<dyn Fn()>,
     loading_recipients: RwSignal<bool>,
@@ -661,7 +632,6 @@ fn AudienceStep(
             "name": name,
             "definition": assemble_definition(&combinator.get_untracked(), &conditions.get_untracked(), &exclude.get_untracked()),
         });
-        let notice = notice;
         let load_segments = load_segments.clone();
         spawn_local(async move {
             match crate::api::post_json::<serde_json::Value>("/api/outreach/segments", Some(&body))
@@ -674,15 +644,17 @@ fn AudienceStep(
                         .and_then(|v| v.as_str())
                         .unwrap_or("Request failed.")
                         .to_string();
-                    notice.set(Some(((if ok { "ok" } else { "err" }).to_string(), message)));
                     if ok {
+                        toasts::success(message);
                         save_name.set(String::new());
                         load_segments();
+                    } else {
+                        toasts::error(message);
                     }
                 }
                 // v1.6.0 audit fix: surface network failures instead of a
                 // silent no-op.
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             saving.set(false);
         });
@@ -699,7 +671,7 @@ fn AudienceStep(
                 // model only PROPOSES a definition; the deterministic engine
                 // (the same preview below) selects recipients. Nothing is
                 // saved implicitly.
-                <SuggestBox notice on_apply />
+                <SuggestBox on_apply />
                 <div class="spp-flex spp-flex--wrap spp-gap-8 spp-mb-8">
                     <span class="spp-muted spp-text-xs">"Match"</span>
                     <select
@@ -965,7 +937,7 @@ fn AudienceStep(
 
 /// The natural-language suggestion box (reference SuggestBox).
 #[component]
-fn SuggestBox(notice: Notice, on_apply: Rc<dyn Fn(serde_json::Value)>) -> impl IntoView {
+fn SuggestBox(on_apply: Rc<dyn Fn(serde_json::Value)>) -> impl IntoView {
     let request = create_rw_signal(String::new());
     let result = create_rw_signal(None::<(serde_json::Value, String, Vec<String>)>);
     let pending = create_rw_signal(false);
@@ -980,7 +952,6 @@ fn SuggestBox(notice: Notice, on_apply: Rc<dyn Fn(serde_json::Value)>) -> impl I
         }
         pending.set(true);
         let body = serde_json::json!({ "request": req });
-        let notice = notice;
         spawn_local(async move {
             match crate::api::post_json::<serde_json::Value>(
                 "/api/outreach/segments/suggest",
@@ -1005,7 +976,7 @@ fn SuggestBox(notice: Notice, on_apply: Rc<dyn Fn(serde_json::Value)>) -> impl I
                             .unwrap_or_default(),
                     )));
                 }
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             pending.set(false);
         });
@@ -1079,10 +1050,9 @@ fn SuggestBox(notice: Notice, on_apply: Rc<dyn Fn(serde_json::Value)>) -> impl I
                                     on_apply(definition.clone());
                                     request.set(String::new());
                                     result.set(None);
-                                    notice.set(Some((
-                                        "ok".to_string(),
+                                    toasts::success(
                                         "Definition applied to the builder - review it below.".to_string(),
-                                    )));
+                                    );
                                 }
                             >
                                 "Apply to builder"
@@ -1397,7 +1367,6 @@ fn ComposeStep(
     draft: RwSignal<Draft>,
     preview: RwSignal<Option<serde_json::Value>>,
     selected_ids: RwSignal<Vec<i64>>,
-    notice: Notice,
     on_back: Rc<dyn Fn()>,
     on_next: Rc<dyn Fn()>,
 ) -> impl IntoView {
@@ -1424,13 +1393,12 @@ fn ComposeStep(
         });
         let rendered = rendered;
         let rendering = rendering;
-        let notice = notice;
         spawn_local(async move {
             match crate::api::post_json::<serde_json::Value>("/api/outreach/render", Some(&body))
                 .await
             {
                 Ok(v) => rendered.set(Some(v)),
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             rendering.set(false);
         });
@@ -1676,7 +1644,6 @@ fn ReviewStep(
     selected_ids: RwSignal<Vec<i64>>,
     created_campaign_id: RwSignal<Option<i64>>,
     creating: RwSignal<bool>,
-    notice: Notice,
     create_campaign: Rc<dyn Fn()>,
     load_campaigns: Rc<dyn Fn()>,
     on_back: Rc<dyn Fn()>,
@@ -1692,12 +1659,11 @@ fn ReviewStep(
             return;
         };
         let validation = validation;
-        let notice = notice;
         spawn_local(async move {
             let path = format!("/api/outreach/campaigns/{id}/validate");
             match crate::api::get_json::<serde_json::Value>(&path).await {
                 Ok(v) => validation.set(Some(v)),
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
         });
     });
@@ -1714,7 +1680,6 @@ fn ReviewStep(
             }
             queueing.set(true);
             let path = format!("/api/outreach/campaigns/{id}/queue");
-            let notice = notice;
             let load_campaigns = load_campaigns.clone();
             let on_done = on_done.clone();
             spawn_local(async move {
@@ -1726,15 +1691,17 @@ fn ReviewStep(
                             .and_then(|v| v.as_str())
                             .unwrap_or("Request failed.")
                             .to_string();
-                        notice.set(Some(((if ok { "ok" } else { "err" }).to_string(), message)));
                         if ok {
+                            toasts::success(message);
                             load_campaigns();
                             on_done();
+                        } else {
+                            toasts::error(message);
                         }
                     }
                     // v1.6.0 audit fix: surface network failures instead of a
                     // silent no-op.
-                    Err(e) => notice.set(Some(("err".to_string(), e))),
+                    Err(e) => toasts::error(e),
                 }
                 queueing.set(false);
             });
@@ -1895,7 +1862,6 @@ fn recipient_state_pill_class(state: &str) -> &'static str {
 fn CampaignsPanel(
     campaigns: RwSignal<Vec<serde_json::Value>>,
     campaigns_error: RwSignal<Option<String>>,
-    notice: Notice,
     load_campaigns: Rc<dyn Fn()>,
 ) -> impl IntoView {
     let open_id = create_rw_signal(None::<i64>);
@@ -1911,7 +1877,6 @@ fn CampaignsPanel(
         let detail = detail;
         let events = events;
         let report = report;
-        let notice = notice;
         spawn_local(async move {
             let path = format!("/api/outreach/campaigns/{id}");
             match crate::api::get_json::<serde_json::Value>(&path).await {
@@ -1924,13 +1889,13 @@ fn CampaignsPanel(
                             .unwrap_or_default(),
                     );
                 }
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             if with_report {
                 let rpath = format!("/api/outreach/campaigns/{id}/report");
                 match crate::api::get_json::<serde_json::Value>(&rpath).await {
                     Ok(r) => report.set(Some(r)),
-                    Err(e) => notice.set(Some(("err".to_string(), e))),
+                    Err(e) => toasts::error(e),
                 }
             }
         });
@@ -1968,7 +1933,6 @@ fn CampaignsPanel(
         }
         acting.set(true);
         let path = format!("/api/outreach/campaigns/{id}/{action}");
-        let notice = notice;
         let load_campaigns = load_campaigns.clone();
         let load_detail = load_detail;
         spawn_local(async move {
@@ -1980,17 +1944,19 @@ fn CampaignsPanel(
                         .and_then(|v| v.as_str())
                         .unwrap_or("Request failed.")
                         .to_string();
-                    notice.set(Some(((if ok { "ok" } else { "err" }).to_string(), message)));
                     if ok {
+                        toasts::success(message);
                         load_campaigns();
                         if open_id.get_untracked() == Some(id) {
                             load_detail(true);
                         }
+                    } else {
+                        toasts::error(message);
                     }
                 }
                 // v1.6.0 audit fix: queue/pause/resume/cancel/retry failures
                 // were silent no-ops in the reference until v1.6.0.
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             acting.set(false);
         });
@@ -2393,7 +2359,6 @@ fn CampaignsPanel(
 #[component]
 fn SegmentsPanel(
     segments: RwSignal<Vec<serde_json::Value>>,
-    notice: Notice,
     load_segments: Rc<dyn Fn()>,
     on_use: Rc<dyn Fn(serde_json::Value)>,
 ) -> impl IntoView {
@@ -2404,7 +2369,6 @@ fn SegmentsPanel(
         }
         deleting.set(true);
         let path = format!("/api/outreach/segments/{id}");
-        let notice = notice;
         let load_segments = load_segments.clone();
         spawn_local(async move {
             match crate::api::delete_json::<serde_json::Value>(&path).await {
@@ -2415,14 +2379,16 @@ fn SegmentsPanel(
                         .and_then(|v| v.as_str())
                         .unwrap_or("Request failed.")
                         .to_string();
-                    notice.set(Some(((if ok { "ok" } else { "err" }).to_string(), message)));
                     if ok {
+                        toasts::success(message);
                         load_segments();
+                    } else {
+                        toasts::error(message);
                     }
                 }
                 // v1.6.0 audit fix: surface network failures instead of a
                 // silent no-op.
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             deleting.set(false);
         });
@@ -2551,7 +2517,7 @@ fn SegmentsPanel(
 
 /// The Do-Not-Contact tab (reference DncPanel).
 #[component]
-fn DncPanel(notice: Notice) -> impl IntoView {
+fn DncPanel() -> impl IntoView {
     let dnc = create_rw_signal(Vec::<serde_json::Value>::new());
     let candidates = create_rw_signal(Vec::<serde_json::Value>::new());
     let loading = create_rw_signal(true);
@@ -2560,7 +2526,6 @@ fn DncPanel(notice: Notice) -> impl IntoView {
 
     let load_dnc = move || {
         let dnc = dnc;
-        let notice = notice;
         spawn_local(async move {
             match crate::api::get_json::<serde_json::Value>("/api/outreach/dnc").await {
                 Ok(v) => dnc.set(
@@ -2569,7 +2534,7 @@ fn DncPanel(notice: Notice) -> impl IntoView {
                         .cloned()
                         .unwrap_or_default(),
                 ),
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
         });
     };
@@ -2614,7 +2579,6 @@ fn DncPanel(notice: Notice) -> impl IntoView {
         }
         acting.set(true);
         let body = serde_json::json!({ "customer_local_id": customer_local_id });
-        let notice = notice;
         let load_dnc = load_dnc;
         spawn_local(async move {
             match crate::api::post_json::<serde_json::Value>("/api/outreach/dnc", Some(&body)).await
@@ -2626,12 +2590,14 @@ fn DncPanel(notice: Notice) -> impl IntoView {
                         .and_then(|v| v.as_str())
                         .unwrap_or("Request failed.")
                         .to_string();
-                    notice.set(Some(((if ok { "ok" } else { "err" }).to_string(), message)));
                     if ok {
+                        toasts::success(message);
                         load_dnc();
+                    } else {
+                        toasts::error(message);
                     }
                 }
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             acting.set(false);
         });
@@ -2642,7 +2608,6 @@ fn DncPanel(notice: Notice) -> impl IntoView {
         }
         acting.set(true);
         let path = format!("/api/outreach/dnc/{customer_local_id}");
-        let notice = notice;
         let load_dnc = load_dnc;
         spawn_local(async move {
             match crate::api::delete_json::<serde_json::Value>(&path).await {
@@ -2652,10 +2617,10 @@ fn DncPanel(notice: Notice) -> impl IntoView {
                         .and_then(|v| v.as_str())
                         .unwrap_or("Request failed.")
                         .to_string();
-                    notice.set(Some(("ok".to_string(), message)));
+                    toasts::success(message);
                     load_dnc();
                 }
-                Err(e) => notice.set(Some(("err".to_string(), e))),
+                Err(e) => toasts::error(e),
             }
             acting.set(false);
         });

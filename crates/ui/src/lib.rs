@@ -31,6 +31,7 @@ pub mod pages;
 pub mod shortcuts;
 pub mod sse;
 pub mod state;
+pub mod toasts;
 
 // Re-export the catalog so the UI has type-safe access to closed
 // vocabularies (one source of truth per spec A12). The catalog crate is
@@ -59,6 +60,9 @@ pub fn mount() {
 fn app_view() -> impl IntoView {
     let ui = state::UiState::create();
     provide_context(ui);
+    // The global toast stack (reference uiStore toasts) — created before
+    // the shell mounts so any component can `toasts::push` from the start.
+    toasts::init();
 
     view! {
         <Router>
@@ -95,6 +99,9 @@ fn app_view() -> impl IntoView {
                     <Route path="/*any" view=not_found_from_params />
                 </Route>
             </Routes>
+            // Reference App.tsx mount order: routes, then <Toasts />, then
+            // the event bridge, then the command palette.
+            <toasts::Toasts />
             <components::CommandPalette
                 open=ui.palette_open
                 on_close=move || ui.palette_open.set(false)
