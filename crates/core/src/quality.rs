@@ -2149,22 +2149,22 @@ fn round1(x: f64) -> f64 {
 }
 
 /// One derived outcome row (the reference's client_support_outcomes shape).
-struct DerivedOutcome {
-    conversation_id: i64,
-    number: i64,
-    subject: Option<String>,
-    response_style: String,
-    follow_up_count: i64,
-    clarification_count: i64,
-    resolved_after_first: Option<i64>,
-    effort_score: Option<f64>,
-    friction: String,
+pub(crate) struct DerivedOutcome {
+    pub(crate) conversation_id: i64,
+    pub(crate) number: i64,
+    pub(crate) subject: Option<String>,
+    pub(crate) response_style: String,
+    pub(crate) follow_up_count: i64,
+    pub(crate) clarification_count: i64,
+    pub(crate) resolved_after_first: Option<i64>,
+    pub(crate) effort_score: Option<f64>,
+    pub(crate) friction: String,
 }
 
 /// The deterministic outcome derivation (interaction engine `computeOutcome`):
 /// follow-ups (closing acknowledgments excluded), clarifications, escalation,
 /// resolved-after-first, effort score and the response-style classifier.
-fn derive_outcome(
+pub(crate) fn derive_outcome(
     threads: &[ThreadLite],
     status: &str,
     conv: (i64, i64, Option<String>),

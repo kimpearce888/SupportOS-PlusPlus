@@ -90,6 +90,7 @@ pub mod runner;
 pub mod saved_views;
 pub mod search;
 pub mod security;
+pub mod segment;
 pub mod settings;
 pub mod side_threads;
 pub mod sla;
