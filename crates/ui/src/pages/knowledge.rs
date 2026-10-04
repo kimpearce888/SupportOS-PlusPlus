@@ -8,6 +8,8 @@
 //!
 //! Per KNOWN PITFALLS: every view has loading, empty, and error states.
 
+use std::rc::Rc;
+
 use leptos::*;
 
 use crate::components::state_view::{EmptyState, LoadingState};
@@ -26,13 +28,46 @@ pub enum KnowledgeTab {
 #[component]
 pub fn KnowledgePage() -> impl IntoView {
     let tab = create_rw_signal(KnowledgeTab::Documents);
+    // Documents reload tick: the header Reindex/Import actions refetch the
+    // list through it (signals are Copy — safe to pass as props).
+    let reload_documents = create_rw_signal(0u32);
+    let importing = create_rw_signal(false);
+
+    let do_reindex = move |_| {
+        wasm_bindgen_futures::spawn_local(async move {
+            match crate::api::post_json::<serde_json::Value>("/api/knowledge/reindex", None).await {
+                Ok(r) => {
+                    let message = r
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Reindexing queued.");
+                    crate::toasts::success(message);
+                    reload_documents.update(|t| *t += 1);
+                }
+                Err(e) => crate::toasts::error(e),
+            }
+        });
+    };
 
     view! {
         <div class="spp-page spp-page--knowledge">
-            <h2 class="spp-page__title">"Knowledge"</h2>
-            <p class="spp-page__intro">
-                "Local knowledge base — indexed by FTS and (optionally) vector search. Visibility separates customer-safe from internal-only."
-            </p>
+            <div class="spp-flex spp-flex--between">
+                <div>
+                    <h2 class="spp-page__title">"Knowledge"</h2>
+                    <p class="spp-page__intro">
+                        "Local knowledge base — indexed by FTS and (optionally) vector search. Visibility separates customer-safe from internal-only."
+                    </p>
+                </div>
+                <div class="spp-flex">
+                    <button class="spp-button" on:click=do_reindex>"Reindex"</button>
+                    <button
+                        class="spp-button spp-button--primary"
+                        on:click=move |_| importing.set(true)
+                    >
+                        "+ Import"
+                    </button>
+                </div>
+            </div>
 
             <div class="spp-tabs">
                 <button
@@ -69,7 +104,7 @@ pub fn KnowledgePage() -> impl IntoView {
                 when=move || tab.get() == KnowledgeTab::Documents
                 fallback=|| ()
             >
-                <DocumentsTab />
+                <DocumentsTab reload=reload_documents />
             </Show>
             <Show
                 when=move || tab.get() == KnowledgeTab::Sources
@@ -89,25 +124,38 @@ pub fn KnowledgePage() -> impl IntoView {
             >
                 <GapsTab />
             </Show>
+
+            <Show when=move || importing.get() fallback=|| ()>
+                <ImportKnowledgeModal
+                    on_close=Rc::new(move || importing.set(false))
+                    on_imported=Rc::new(move || {
+                        importing.set(false);
+                        reload_documents.update(|t| *t += 1);
+                    })
+                />
+            </Show>
         </div>
     }
 }
 
-/// The Documents tab — the knowledge document list.
+/// The Documents tab — the knowledge document list (reference
+/// Knowledge.tsx: title + preview, visibility, version, chunks, updated,
+/// delete).
 #[component]
-fn DocumentsTab() -> impl IntoView {
+fn DocumentsTab(reload: RwSignal<u32>) -> impl IntoView {
     let documents = create_rw_signal(Vec::<serde_json::Value>::new());
     let loading = create_rw_signal(true);
     let error_msg = create_rw_signal(None::<String>);
 
+    // (Re)load on mount and on every reload tick.
     create_effect(move |_| {
+        let _tick = reload.get();
         let documents = documents;
         let loading = loading;
         let error_msg = error_msg;
+        loading.set(true);
         wasm_bindgen_futures::spawn_local(async move {
-            match crate::api::get_json::<serde_json::Value>("/api/knowledge/documents?limit=50")
-                .await
-            {
+            match crate::api::get_json::<serde_json::Value>("/api/knowledge/documents").await {
                 Ok(v) => {
                     let items = v
                         .get("documents")
@@ -115,13 +163,11 @@ fn DocumentsTab() -> impl IntoView {
                         .cloned()
                         .unwrap_or_default();
                     documents.set(items);
-                    loading.set(false);
+                    error_msg.set(None);
                 }
-                Err(e) => {
-                    error_msg.set(Some(e));
-                    loading.set(false);
-                }
+                Err(e) => error_msg.set(Some(e)),
             }
+            loading.set(false);
         });
     });
 
@@ -143,62 +189,377 @@ fn DocumentsTab() -> impl IntoView {
                 when=move || !documents.with(|d| d.is_empty())
                 fallback=|| {
                     view! {
-                        <EmptyState message="No knowledge documents yet. Import docs or finish a sync that harvests them." />
+                        <EmptyState message="No knowledge documents yet. Import Markdown/TXT/CSV/JSON/HTML files or paste content directly. Knowledge feeds AI drafts and search." />
                     }
                 }
             >
-                <table class="spp-table">
-                    <thead>
-                        <tr>
-                            <th>"Title"</th>
-                            <th>"Source"</th>
-                            <th>"Freshness"</th>
-                            <th>"Last reviewed"</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {move || {
-                            documents.with(|docs| {
-                                docs.iter()
-                                    .map(|doc| {
-                                        let title = doc
-                                            .get("title")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("(untitled)")
-                                            .to_string();
-                                        let source = doc
-                                            .get("source")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("—")
-                                            .to_string();
-                                        let freshness = doc
-                                            .get("freshness_status")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string();
-                                        let reviewed = doc
-                                            .get("last_reviewed_at")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("never")
-                                            .to_string();
-                                        view! {
-                                            <tr>
-                                                <td>{title}</td>
-                                                <td class="spp-table__cell-muted">{source}</td>
-                                                <td>
-                                                    <span class="spp-badge">{freshness}</span>
-                                                </td>
-                                                <td class="spp-table__cell-muted">{reviewed}</td>
-                                            </tr>
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                        }}
-                    </tbody>
-                </table>
+                <DocumentsTable documents=documents reload=reload />
             </Show>
         </Show>
+    }
+}
+
+/// The documents table — a standalone component so the row closures own
+/// their captures (the RulesList pattern).
+#[component]
+fn DocumentsTable(
+    documents: RwSignal<Vec<serde_json::Value>>,
+    reload: RwSignal<u32>,
+) -> impl IntoView {
+    let rows = move || {
+        documents
+            .get()
+            .into_iter()
+            .map(|doc| {
+                view! {
+                    <DocumentRow doc=doc reload=reload />
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    view! {
+        <div class="spp-card spp-knowledge__card">
+            <table class="spp-table">
+                <thead>
+                    <tr>
+                        <th>"Title"</th>
+                        <th>"Visibility"</th>
+                        <th>"Version"</th>
+                        <th>"Chunks"</th>
+                        <th>"Updated"</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
+    }
+}
+
+/// One document row: the preview under the title, the delete action
+/// (confirm-gated; also removes its search-index entries).
+#[component]
+fn DocumentRow(doc: serde_json::Value, reload: RwSignal<u32>) -> impl IntoView {
+    let id = doc.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+    let title = doc
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(untitled)")
+        .to_string();
+    let preview: String = doc
+        .get("content_preview")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(90)
+        .collect();
+    let visibility = doc
+        .get("visibility")
+        .and_then(|v| v.as_str())
+        .unwrap_or("internal_only")
+        .to_string();
+    let version = doc.get("version").and_then(|v| v.as_i64()).unwrap_or(1);
+    let chunk_count = doc.get("chunk_count").and_then(|v| v.as_i64()).unwrap_or(0);
+    let updated = doc
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let do_delete = move |_| {
+        wasm_bindgen_futures::spawn_local(async move {
+            let path = format!("/api/knowledge/documents/{id}");
+            match crate::api::delete_json::<serde_json::Value>(&path).await {
+                Ok(_) => {
+                    crate::toasts::success("Document deleted.");
+                    reload.update(|t| *t += 1);
+                }
+                Err(e) => crate::toasts::error(e),
+            }
+        });
+    };
+
+    view! {
+        <tr>
+            <td>
+                <strong class="spp-knowledge__title">{title.clone()}</strong>
+                <div class="spp-muted spp-text-xs">{format!("{preview}…")}</div>
+            </td>
+            <td>
+                <span class=if visibility == "customer_safe" {
+                    "spp-badge spp-badge--ok"
+                } else {
+                    "spp-badge"
+                }>
+                    {if visibility == "customer_safe" { "customer-safe" } else { "internal-only" }}
+                </span>
+            </td>
+            <td class="spp-table__cell-muted">{format!("v{version}")}</td>
+            <td>{chunk_count.to_string()}</td>
+            <td class="spp-table__cell-muted">{updated.get(..10).unwrap_or("").to_string()}</td>
+            <td>
+                <button
+                    class="spp-button spp-button--ghost spp-button--tiny"
+                    aria-label=format!("Delete {title}")
+                    on:click=move |ev: leptos::ev::MouseEvent| {
+                        ev.stop_propagation();
+                        // window.confirm — the reference uses confirm() here.
+                        let confirmed = web_sys::window()
+                            .and_then(|w| {
+                                w.confirm_with_message(&format!(
+                                    "Delete \"{title}\"? This also removes its search-index entries."
+                                ))
+                                .ok()
+                            })
+                            .unwrap_or(false);
+                        if confirmed {
+                            do_delete(());
+                        }
+                    }
+                >
+                    "Delete"
+                </button>
+            </td>
+        </tr>
+    }
+}
+
+/// The import modal (reference: paste form + the knowledge-import folder
+/// listing).
+#[component]
+fn ImportKnowledgeModal(on_close: Rc<dyn Fn()>, on_imported: Rc<dyn Fn()>) -> impl IntoView {
+    let title = create_rw_signal(String::new());
+    let content = create_rw_signal(String::new());
+    let visibility = create_rw_signal("internal_only".to_string());
+    let source_name = create_rw_signal("Manual import".to_string());
+    let submitting = create_rw_signal(false);
+    let importable = create_rw_signal(None::<serde_json::Value>);
+    let file_pending = create_rw_signal(None::<String>);
+
+    // Load the importable listing once.
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok(v) = crate::api::get_json::<serde_json::Value>("/api/knowledge/importable").await
+        {
+            importable.set(Some(v));
+        }
+    });
+
+    let submit = {
+        let on_imported = Rc::clone(&on_imported);
+        move |ev: leptos::ev::SubmitEvent| {
+            ev.prevent_default();
+            if submitting.get() {
+                return;
+            }
+            // A pending file import takes precedence (reference: the file
+            // row's Import button).
+            if let Some(file) = file_pending.get() {
+                file_pending.set(None);
+                submitting.set(true);
+                let on_imported = Rc::clone(&on_imported);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let body = serde_json::json!({
+                        "path": file,
+                        "visibility": "internal_only",
+                    });
+                    match crate::api::post_json::<serde_json::Value>(
+                        "/api/knowledge/import-file",
+                        Some(&body),
+                    )
+                    .await
+                    {
+                        Ok(r) if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) => {
+                            let n = r.get("imported").and_then(|v| v.as_i64()).unwrap_or(0);
+                            crate::toasts::success(format!("Imported {n} document(s) from file."));
+                            on_imported();
+                        }
+                        Ok(r) => {
+                            crate::toasts::error(
+                                r.get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Import failed"),
+                            );
+                        }
+                        Err(e) => crate::toasts::error(e),
+                    }
+                });
+                return;
+            }
+            let title_now = title.get();
+            let content_now = content.get();
+            if title_now.trim().is_empty() || content_now.trim().is_empty() {
+                return;
+            }
+            submitting.set(true);
+            let body = serde_json::json!({
+                "sourceName": source_name.get(),
+                "visibility": visibility.get(),
+                "documents": [{
+                    "title": title_now,
+                    "content": content_now,
+                    "format": "markdown",
+                }],
+            });
+            let on_imported = Rc::clone(&on_imported);
+            wasm_bindgen_futures::spawn_local(async move {
+                match crate::api::post_json::<serde_json::Value>(
+                    "/api/knowledge/import",
+                    Some(&body),
+                )
+                .await
+                {
+                    Ok(r) if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) => {
+                        let n = r.get("imported").and_then(|v| v.as_i64()).unwrap_or(0);
+                        crate::toasts::success(format!("Imported {n} document(s)."));
+                        on_imported();
+                    }
+                    Ok(r) => {
+                        crate::toasts::error(
+                            r.get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Import failed"),
+                        );
+                    }
+                    Err(e) => crate::toasts::error(e),
+                }
+            });
+        }
+    };
+
+    view! {
+        <div class="spp-overlay" role="dialog" aria-modal="true">
+            <div class="spp-modal spp-modal--form spp-modal--wide">
+                <h3 class="spp-modal__title">"Import knowledge"</h3>
+                <form on:submit=submit>
+                    <div class="spp-form-grid">
+                        <label class="spp-form-grid__label">"Title *"</label>
+                        <input
+                            class="spp-input"
+                            prop:value=title
+                            on:input=move |ev| title.set(event_target_value(&ev))
+                            required=true
+                        />
+                        <label class="spp-form-grid__label">"Visibility"</label>
+                        <select
+                            class="spp-input"
+                            prop:value=visibility
+                            on:change=move |ev| visibility.set(event_target_value(&ev))
+                        >
+                            <option value="internal_only">"internal-only (never in customer drafts)"</option>
+                            <option value="customer_safe">"customer-safe (may support customer drafts)"</option>
+                        </select>
+                    </div>
+                    <div class="spp-form-grid spp-mt-8">
+                        <label class="spp-form-grid__label">"Source name"</label>
+                        <input
+                            class="spp-input"
+                            prop:value=source_name
+                            on:input=move |ev| source_name.set(event_target_value(&ev))
+                        />
+                        <label class="spp-form-grid__label">"Content (Markdown) *"</label>
+                        <textarea
+                            class="spp-input spp-knowledge__import-textarea"
+                            prop:value=content
+                            on:input=move |ev| content.set(event_target_value(&ev))
+                            required=true
+                        >
+                        </textarea>
+                    </div>
+                    <button
+                        class="spp-button spp-button--primary spp-mt-8"
+                        type="submit"
+                        disabled=move || {
+                            submitting.get()
+                                || (file_pending.get().is_none()
+                                    && (title.get().trim().is_empty()
+                                        || content.get().trim().is_empty()))
+                        }
+                    >
+                        "Import document"
+                    </button>
+                </form>
+
+                <div class="spp-knowledge__import-divider"></div>
+                <h4 class="spp-card__title">"Import from the knowledge-import folder"</h4>
+                <p class="spp-muted spp-text-xs">
+                    "For safety, file imports must live in "
+                    <span class="spp-mono">
+                        {move || {
+                            importable
+                                .get()
+                                .and_then(|v| v.get("dir").and_then(|d| d.as_str()).map(str::to_string))
+                                .unwrap_or_else(|| "./knowledge-import".to_string())
+                        }}
+                    </span>
+                    ". Supported: MD, TXT, CSV, JSON, HTML, PDF, DOCX."
+                </p>
+                {move || {
+                    let listing = importable.get();
+                    let files: Vec<String> = listing
+                        .as_ref()
+                        .and_then(|v| v.get("files").and_then(|f| f.as_array()).cloned())
+                        .map(|rows| {
+                            rows.iter()
+                                .filter_map(|f| f.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if files.is_empty() {
+                        view! {
+                            <span class="spp-muted">
+                                "The folder is empty or does not exist. Create it and copy your documents there."
+                            </span>
+                        }
+                        .into_view()
+                    } else {
+                        files
+                            .into_iter()
+                            .map(|f| {
+                                let file_label = f.clone();
+                                // Two independent pending-checks (class + label
+                                // each own a closure).
+                                let is_pending_class = {
+                                    let f = f.clone();
+                                    move || file_pending.get().as_deref() == Some(f.as_str())
+                                };
+                                let is_pending_label = {
+                                    let f = f.clone();
+                                    move || file_pending.get().as_deref() == Some(f.as_str())
+                                };
+                                view! {
+                                    <div class="spp-flex spp-flex--between spp-knowledge__import-file">
+                                        <span class="spp-mono">{file_label}</span>
+                                        <button
+                                            class=move || {
+                                                format!(
+                                                    "spp-button spp-button--small{}",
+                                                    if is_pending_class() { " spp-button--warn" } else { "" },
+                                                )
+                                            }
+                                            on:click=move |_| {
+                                                file_pending.set(Some(f.clone()));
+                                            }
+                                        >
+                                            {move || {
+                                                if is_pending_label() {
+                                                    "Selected — Import document".to_string()
+                                                } else {
+                                                    "Import".to_string()
+                                                }
+                                            }}
+                                        </button>
+                                    </div>
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .into_view()
+                    }
+                }}
+            </div>
+            <div class="spp-knowledge__modal-close">
+                <button class="spp-button" on:click=move |_| on_close()>"Close"</button>
+            </div>
+        </div>
     }
 }
 
@@ -337,6 +698,14 @@ pub struct FreshnessDocument {
     pub title: String,
     pub freshness_status: String,
     pub last_reviewed_at: Option<String>,
+    pub last_verified_at: Option<String>,
+    pub source_name: Option<String>,
+    pub visibility: String,
+    pub version: i64,
+    pub days_since_update: Option<i64>,
+    pub days_since_review: Option<i64>,
+    pub stale: bool,
+    pub unreviewed_long: bool,
 }
 
 /// Parse the GET /api/knowledge/freshness response.
@@ -366,6 +735,30 @@ pub fn parse_freshness(v: &serde_json::Value) -> FreshnessOverview {
                             .get("last_reviewed_at")
                             .and_then(|x| x.as_str())
                             .map(str::to_string),
+                        last_verified_at: d
+                            .get("last_verified_at")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
+                        source_name: d
+                            .get("source_name")
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string),
+                        visibility: d
+                            .get("visibility")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        version: d.get("version").and_then(|x| x.as_i64()).unwrap_or(1),
+                        days_since_update: d.get("days_since_update").and_then(|x| x.as_i64()),
+                        days_since_review: d.get("days_since_review").and_then(|x| x.as_i64()),
+                        stale: d
+                            .pointer("/flags/stale")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
+                        unreviewed_long: d
+                            .pointer("/flags/unreviewed_long")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
                     })
                     .collect()
             })
@@ -373,28 +766,31 @@ pub fn parse_freshness(v: &serde_json::Value) -> FreshnessOverview {
     }
 }
 
-/// The Freshness tab — stale vs fresh knowledge documents.
+/// The Freshness tab — lifecycle observability over the real store with
+/// the human-only Review/Verify stamps (reference FreshnessTab, reduced
+/// flags shape).
 #[component]
 fn FreshnessTab() -> impl IntoView {
     let overview = create_rw_signal(None::<FreshnessOverview>);
     let loading = create_rw_signal(true);
     let error_msg = create_rw_signal(None::<String>);
+    let reload = create_rw_signal(0u32);
 
     create_effect(move |_| {
+        let _tick = reload.get();
         let overview = overview;
         let loading = loading;
         let error_msg = error_msg;
+        loading.set(true);
         wasm_bindgen_futures::spawn_local(async move {
             match crate::api::get_json::<serde_json::Value>("/api/knowledge/freshness").await {
                 Ok(v) => {
                     overview.set(Some(parse_freshness(&v)));
-                    loading.set(false);
+                    error_msg.set(None);
                 }
-                Err(e) => {
-                    error_msg.set(Some(e));
-                    loading.set(false);
-                }
+                Err(e) => error_msg.set(Some(e)),
             }
+            loading.set(false);
         });
     });
 
@@ -423,28 +819,120 @@ fn FreshnessTab() -> impl IntoView {
                         <span class="spp-badge spp-badge--ok">{format!("{} fresh", o.fresh)}</span>
                     </div>
                     {if o.documents.is_empty() {
-                        view! { <EmptyState message="No documents to review yet." /> }.into_view()
+                        view! { <EmptyState message="Nothing flagged in this view. Flags appear as documents age or go unreviewed." /> }.into_view()
                     } else {
                         o.documents
                             .iter()
                             .map(|d| {
-                                let badge = if d.freshness_status == "stale" {
-                                    "spp-badge spp-badge--warn"
-                                } else {
-                                    "spp-badge spp-badge--ok"
-                                };
                                 view! {
-                                    <div class="spp-flex spp-flex--between" title=format!("last reviewed {}", d.last_reviewed_at.clone().unwrap_or_else(|| "never".into()))>
-                                        <span class="spp-text-sm">{d.title.clone()}</span>
-                                        <span class=badge>{d.freshness_status.clone()}</span>
-                                    </div>
+                                    <FreshnessRow
+                                        row=d.clone()
+                                        reload=reload
+                                    />
                                 }
                             })
                             .collect::<Vec<_>>()
                             .into_view()
                     }}
+                    <p class="spp-muted spp-text-xs spp-mt-8">
+                        "Review and verify are human-only timestamps — SupportOS never edits or publishes knowledge automatically."
+                    </p>
                 }.into_view()
             }}
+        </div>
+    }
+}
+
+/// One freshness row: the age/flags + the Review/Verify stamps.
+#[component]
+fn FreshnessRow(row: FreshnessDocument, reload: RwSignal<u32>) -> impl IntoView {
+    let id = row.id;
+    let title = row.title.clone();
+    let reviewed = row
+        .last_reviewed_at
+        .clone()
+        .unwrap_or_else(|| "never".to_string());
+    let verified = row
+        .last_verified_at
+        .clone()
+        .unwrap_or_else(|| "never".to_string());
+    let updated = match row.days_since_update {
+        Some(d) => format!("{d}d ago"),
+        None => "—".to_string(),
+    };
+    let badge = if row.stale {
+        "spp-badge spp-badge--warn"
+    } else {
+        "spp-badge spp-badge--ok"
+    };
+
+    let mark = move |action: &'static str| {
+        move |_| {
+            wasm_bindgen_futures::spawn_local(async move {
+                let path = format!("/api/knowledge/documents/{id}/{action}");
+                match crate::api::post_json::<serde_json::Value>(&path, None).await {
+                    Ok(r) if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) => {
+                        let message = r.get("message").and_then(|v| v.as_str()).unwrap_or("Done.");
+                        crate::toasts::success(message);
+                        reload.update(|t| *t += 1);
+                    }
+                    Ok(r) => {
+                        crate::toasts::error(
+                            r.get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Failed."),
+                        );
+                    }
+                    Err(e) => crate::toasts::error(e),
+                }
+            });
+        }
+    };
+    let do_review = mark("review");
+    let do_verify = mark("verify");
+
+    view! {
+        <div class="spp-flex spp-flex--between spp-knowledge__fresh-row">
+            <div>
+                <span class="spp-text-sm">{title}</span>
+                <div class="spp-muted spp-text-xs">
+                    {format!(
+                        "{} · v{} · updated {} · reviewed {} · verified {}",
+                        row.source_name.clone().unwrap_or_else(|| "—".to_string()),
+                        row.version,
+                        updated,
+                        reviewed.get(..10).unwrap_or(&reviewed),
+                        verified.get(..10).unwrap_or(&verified),
+                    )}
+                </div>
+            </div>
+            <div class="spp-flex">
+                {if row.stale {
+                    view! { <span class=badge>"stale"</span> }.into_view()
+                } else {
+                    view! { <span class=badge>"fresh"</span> }.into_view()
+                }}
+                {if row.unreviewed_long {
+                    view! { <span class="spp-badge spp-badge--warn">"needs review"</span> }
+                        .into_view()
+                } else {
+                    ().into_view()
+                }}
+                <button
+                    class="spp-button spp-button--small"
+                    title="Mark reviewed (human action; nothing is published)"
+                    on:click=do_review
+                >
+                    "Review"
+                </button>
+                <button
+                    class="spp-button spp-button--small"
+                    title="Mark verified (human action; nothing is published)"
+                    on:click=do_verify
+                >
+                    "Verify"
+                </button>
+            </div>
         </div>
     }
 }

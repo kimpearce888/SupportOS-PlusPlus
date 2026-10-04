@@ -70,6 +70,7 @@ pub mod intelligence_features;
 pub mod interaction_current;
 pub mod issue_impact;
 pub mod jobs;
+pub mod knowledge_store;
 pub mod logging;
 pub mod loopback;
 pub mod maintenance;

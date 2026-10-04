@@ -2582,3 +2582,30 @@ body {
   .spp-form-grid { grid-template-columns: 1fr; }
   .spp-form-grid__label { padding-top: 0; }
 }
+
+/* ─── Knowledge workspace (reference Knowledge.tsx) ───────────────────── */
+
+.spp-knowledge__card { padding: 0; overflow-x: auto; }
+.spp-knowledge__card .spp-table { margin: 0; }
+.spp-knowledge__title { font-size: var(--spp-text-sm); }
+
+.spp-knowledge__import-textarea { min-height: 180px; }
+.spp-knowledge__import-divider {
+  border: none;
+  border-top: 1px solid var(--spp-border);
+  margin: var(--spp-space-4) 0;
+}
+.spp-knowledge__import-file {
+  padding: 5px 0;
+  border-bottom: 1px dashed var(--spp-border);
+}
+.spp-knowledge__modal-close { text-align: right; margin-top: var(--spp-space-2); }
+
+.spp-knowledge__fresh-row {
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--spp-border);
+  flex-wrap: wrap;
+}
+.spp-knowledge__fresh-row:last-of-type { border-bottom: none; }
+
+.spp-modal--wide { max-width: 720px; }

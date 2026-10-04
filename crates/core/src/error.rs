@@ -50,6 +50,10 @@ pub enum Error {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// A request or input failed validation (surfaces as 4xx, never 500).
+    #[error("validation error: {0}")]
+    Validation(String),
+
     /// A typed wrapper for any other error.
     #[error(transparent)]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),
