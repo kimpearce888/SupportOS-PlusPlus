@@ -83,6 +83,15 @@ pub async fn patch_json<T: DeserializeOwned>(
     request_json::<T>("PATCH", path, Some(body)).await
 }
 
+/// PUT `path` with a JSON body and parse the JSON response
+/// (business-hours saves use the reference's `api.put`).
+pub async fn put_json<T: DeserializeOwned>(
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<T, String> {
+    request_json::<T>("PUT", path, Some(body)).await
+}
+
 /// DELETE `path` and parse the JSON response.
 pub async fn delete_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     request_json::<T>("DELETE", path, None).await

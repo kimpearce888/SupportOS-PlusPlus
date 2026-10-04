@@ -2341,3 +2341,154 @@ body {
 
 .spp-outreach__error { color: var(--spp-critical); margin: 2px 0; }
 .spp-outreach__warning { color: var(--spp-warning); margin: 2px 0; }
+
+/* ─── Settings page (P5 part 1: the full 8-tab write surface) ───────────── */
+
+.spp-settings__card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-3);
+  align-self: start;
+}
+
+.spp-settings__card-title {
+  margin: 0;
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+  color: var(--spp-fg);
+}
+
+.spp-settings__field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-1);
+}
+
+.spp-settings__label {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+  font-weight: 500;
+}
+
+.spp-settings__hint {
+  margin: var(--spp-space-1) 0 0;
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+  line-height: var(--spp-text-line-normal);
+}
+
+.spp-settings__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spp-space-3);
+  padding: var(--spp-space-2) 0;
+  border-bottom: 1px dashed var(--spp-border);
+}
+
+.spp-settings__toggle-label {
+  font-weight: 600;
+  font-size: var(--spp-text-sm);
+  color: var(--spp-fg);
+}
+
+.spp-settings__switch {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.spp-settings__kv {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--spp-space-4);
+  padding: var(--spp-space-1) 0;
+  border-bottom: 1px dashed var(--spp-border-subtle);
+  font-size: var(--spp-text-sm);
+}
+
+.spp-settings__locked {
+  margin-top: var(--spp-space-4);
+  align-items: flex-start;
+  text-align: left;
+  padding: var(--spp-space-3);
+  max-width: none;
+}
+
+.spp-settings__editor {
+  margin-top: var(--spp-space-4);
+  padding-top: var(--spp-space-4);
+  border-top: 1px solid var(--spp-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-3);
+}
+
+.spp-settings__model-chip {
+  cursor: pointer;
+  margin: 0 var(--spp-space-1) var(--spp-space-1) 0;
+  background: none;
+}
+
+.spp-settings__model-chip:hover {
+  border-color: var(--spp-accent);
+  color: var(--spp-accent);
+}
+
+.spp-settings__ledger-row {
+  gap: var(--spp-space-2);
+  padding: 2px 0;
+  align-items: center;
+}
+
+.spp-settings__matrix {
+  padding: 0;
+  align-self: stretch;
+}
+
+.spp-settings__matrix-head {
+  padding: var(--spp-space-3) var(--spp-space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-1);
+  border-bottom: 1px solid var(--spp-border-subtle);
+}
+
+.spp-settings__matrix-scroll {
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+/* Inline alert variants (demo-mode banner, Qdrant probe result) — unlike
+   the centered empty/error states these read as block alerts. */
+.spp-state--warn {
+  align-items: flex-start;
+  text-align: left;
+  padding: var(--spp-space-3);
+  max-width: none;
+  background: rgba(210, 153, 34, 0.12);
+  border: 1px solid rgba(210, 153, 34, 0.4);
+  border-radius: var(--spp-radius-md);
+  color: var(--spp-warning);
+  font-size: var(--spp-text-sm);
+}
+
+.spp-state--info {
+  align-items: flex-start;
+  text-align: left;
+  padding: var(--spp-space-3);
+  max-width: none;
+  background: rgba(79, 156, 249, 0.1);
+  border: 1px solid rgba(79, 156, 249, 0.4);
+  border-radius: var(--spp-radius-md);
+  color: var(--spp-fg);
+  font-size: var(--spp-text-sm);
+}
+
+/* Active state for the small toggle buttons (business-hours weekdays). */
+.spp-button.is-active {
+  background: var(--spp-accent-soft);
+  border-color: var(--spp-accent);
+  color: var(--spp-accent);
+}
