@@ -185,6 +185,143 @@ impl OpenAiCompatibleClient {
         Ok(parse_chat_response(body))
     }
 
+    /// Chat completion via `POST /chat/completions` — full reference options
+    /// (`lmStudioClient.chat`): temperature, max_tokens, JSON mode. `model`
+    /// is optional exactly like the reference (`opts.model ?? settings
+    /// .chat_model ?? undefined` — when absent the field is omitted and the
+    /// server picks its default).
+    pub async fn chat_with_opts(
+        &self,
+        model: Option<&str>,
+        messages: &[ChatMessage],
+        opts: ChatOpts,
+    ) -> Result<ChatOptsResult> {
+        let mut request = ChatCompletionRequest {
+            model: model.unwrap_or_default().to_string(),
+            messages: messages
+                .iter()
+                .map(|m| ChatCompletionMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect(),
+            temperature: opts.temperature,
+            max_tokens: opts.max_tokens,
+            response_format: if opts.json_mode {
+                Some(serde_json::json!({ "type": "json_object" }))
+            } else {
+                None
+            },
+            stream: false,
+        };
+        if model.is_none() {
+            // Omit the model field entirely (serde can't skip a non-Option
+            // field, so serialize through a shim).
+            request.model = String::new();
+            let shim = serde_json::to_value(&request)?;
+            let mut map = shim.as_object().cloned().unwrap_or_default();
+            map.remove("model");
+            return self.post_chat_body(serde_json::Value::Object(map)).await;
+        }
+        self.post_chat_body(serde_json::to_value(&request)?).await
+    }
+
+    /// Shared POST + parse for the chat endpoints.
+    async fn post_chat_body(&self, body: serde_json::Value) -> Result<ChatOptsResult> {
+        let started = std::time::Instant::now();
+        let mut req_builder = self
+            .http
+            .post(format!("{}/chat/completions", self.base_url))
+            .json(&body);
+        if let Some(ref key) = self.api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+        let resp = req_builder
+            .send()
+            .await
+            .map_err(|e| Error::Config(format!("LM Studio chat failed: {e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| Error::Config(format!("LM Studio chat read failed: {e}")))?;
+        if !status.is_success() {
+            let snippet: String = text.chars().take(300).collect();
+            return Err(Error::Config(format!(
+                "LM Studio chat request failed (HTTP {status}): {snippet}"
+            )));
+        }
+        let body: ChatCompletionResponse = serde_json::from_str(&text)
+            .map_err(|e| Error::Config(format!("LM Studio chat parse failed: {e}")))?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let content = body
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone());
+        let tool_calls = body
+            .choices
+            .first()
+            .map(|c| {
+                c.message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|tc| ToolCall {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        arguments: tc.function.arguments.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ChatOptsResult {
+            content,
+            model: body.model,
+            latency_ms,
+            tool_calls,
+        })
+    }
+
+    /// The Copilot tool loop call (reference `lmStudioClient.chat` with
+    /// `tools`): sends the tool definitions, returns the model's tool calls
+    /// (if any) alongside the content.
+    pub async fn chat_with_tools(
+        &self,
+        model: Option<&str>,
+        messages: &[CopilotWireMessage],
+        tools: &[ChatTool],
+        temperature: f64,
+        max_tokens: u32,
+    ) -> Result<ChatOptsResult> {
+        let mut body = serde_json::json!({
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": false,
+        });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::to_value(
+                tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters,
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+        if let Some(model) = model {
+            body["model"] = serde_json::Value::String(model.to_string());
+        }
+        self.post_chat_body(body).await
+    }
+
     /// Embedding via `POST /embeddings`.
     pub async fn embed(&self, model: &str, text: &str) -> Result<EmbedResponse> {
         let request = build_embed_request_body(model, text);
@@ -236,11 +373,30 @@ pub fn infer_model_role(model: OpenAiModel) -> ModelInfo {
     ModelInfo { id: model.id, role }
 }
 
+/// Serde skip predicate for the always-false `stream` flag.
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// The request body for `POST /chat/completions`.
+///
+/// `temperature` / `max_tokens` / `response_format` mirror the reference
+/// `lmStudioClient.chat` options (temperature 0.2, max_tokens 2048,
+/// `response_format: {type: 'json_object'}` in JSON mode); they are omitted
+/// from the JSON when unset so legacy callers keep the exact same wire
+/// shape as before.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatCompletionMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub stream: bool,
 }
 
 /// A message in the chat completion request (mirrors `ChatMessage` but with
@@ -252,7 +408,7 @@ pub struct ChatCompletionMessage {
 }
 
 /// Build the request body for a chat completion. Pure function — testable
-/// without HTTP.
+/// without HTTP. Legacy shape: no temperature/max_tokens/json-mode.
 #[must_use]
 pub fn build_chat_request_body(model: &str, messages: &[ChatMessage]) -> ChatCompletionRequest {
     ChatCompletionRequest {
@@ -264,7 +420,87 @@ pub fn build_chat_request_body(model: &str, messages: &[ChatMessage]) -> ChatCom
                 content: m.content.clone(),
             })
             .collect(),
+        temperature: None,
+        max_tokens: None,
+        response_format: None,
+        stream: false,
     }
+}
+
+/// The full-options chat result (reference `lmStudioClient.chat` ChatResult:
+/// content may be null — e.g. when the model called a tool instead).
+#[derive(Debug, Clone)]
+pub struct ChatOptsResult {
+    /// The generated text (None when the model returned no content).
+    pub content: Option<String>,
+    /// The model that actually served the request.
+    pub model: String,
+    /// Round-trip latency in milliseconds.
+    pub latency_ms: u64,
+    /// Tool calls the model requested (empty when it answered directly —
+    /// reference `ChatResult.toolCalls`).
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// A tool definition for the chat API (reference `ChatTool`):
+/// `{type:'function', function:{name, description, parameters}}`.
+#[derive(Debug, Clone)]
+pub struct ChatTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+/// A tool call requested by the model (reference `ChatResult.toolCalls`
+/// entry): the raw argument string is passed through verbatim and parsed
+/// server-side by the registry.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// A message in the Copilot tool loop (reference `ChatMessage` with
+/// `tool_calls` / `tool_call_id` / `name`). Serialized with the exact
+/// OpenAI field names; `null`-content assistant turns serialize as
+/// `""` exactly like the reference (`content: res.content ?? ''`).
+#[derive(Debug, Clone, Serialize)]
+pub struct CopilotWireMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<CopilotWireToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// The `tool_calls` entry on an assistant message.
+#[derive(Debug, Clone, Serialize)]
+pub struct CopilotWireToolCall {
+    pub id: String,
+    pub r#type: &'static str,
+    pub function: CopilotWireToolFunction,
+}
+
+/// The `function` block of a tool call.
+#[derive(Debug, Clone, Serialize)]
+pub struct CopilotWireToolFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Options for the full chat call (reference `lmStudioClient.chat(opts)`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChatOpts {
+    /// Sampling temperature (reference default 0.2).
+    pub temperature: Option<f64>,
+    /// Completion token cap (reference default 2048).
+    pub max_tokens: Option<u32>,
+    /// `response_format: {"type":"json_object"}` when true.
+    pub json_mode: bool,
 }
 
 /// The response from `POST /chat/completions`.
@@ -285,7 +521,31 @@ pub struct ChatChoice {
 /// The message in a chat choice.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatChoiceMessage {
-    pub content: String,
+    /// The message content — null when the model returned only tool calls
+    /// (reference `choice?.message?.content ?? null`).
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Tool calls the model requested (reference
+    /// `choice?.message?.tool_calls`).
+    #[serde(default)]
+    pub tool_calls: Option<Vec<RawToolCall>>,
+}
+
+/// A raw tool call in the response (OpenAI shape).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawToolCall {
+    pub id: String,
+    #[serde(default)]
+    pub r#type: Option<String>,
+    pub function: RawToolCallFunction,
+}
+
+/// The `function` block of a raw tool call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawToolCallFunction {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
 }
 
 /// The usage object in an OpenAI response.
@@ -302,7 +562,7 @@ pub fn parse_chat_response(resp: ChatCompletionResponse) -> ChatResponse {
     let content = resp
         .choices
         .first()
-        .map(|c| c.message.content.clone())
+        .and_then(|c| c.message.content.clone())
         .unwrap_or_else(|| "Unknown".into());
     let finish_reason = resp.choices.first().and_then(|c| c.finish_reason.clone());
     let usage = resp.usage.map(|u| TokenUsage {
@@ -448,7 +708,8 @@ mod tests {
             model: "llama-3".into(),
             choices: vec![ChatChoice {
                 message: ChatChoiceMessage {
-                    content: "Hello!".into(),
+                    content: Some("Hello!".into()),
+                    tool_calls: None,
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -487,7 +748,8 @@ mod tests {
             model: "m".into(),
             choices: vec![ChatChoice {
                 message: ChatChoiceMessage {
-                    content: "hi".into(),
+                    content: Some("hi".into()),
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -617,7 +879,7 @@ mod tests {
         let resp: ChatCompletionResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.model, "llama-3");
         assert_eq!(resp.choices.len(), 1);
-        assert_eq!(resp.choices[0].message.content, "Hello!");
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello!"));
         let usage = resp.usage.unwrap();
         assert_eq!(usage.total_tokens, 8);
     }

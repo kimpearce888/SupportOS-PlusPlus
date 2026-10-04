@@ -71,6 +71,14 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     crate::oauth_state::ensure_oauth_states_table(conn)?;
     crate::jobs::ensure_jobs_table(conn)?;
     crate::interaction_current::ensure_client_current_signals_table(conn)?;
+    // AI pipeline stores (ai_drafts/ai_sources/customer_memory reference
+    // shape) + the Copilot session/message tables + the tool-read tables.
+    // The reference creates these in migrations 003/013; the port creates
+    // them lazily on first AI call — ensuring them at boot keeps runtime
+    // reads (AI center, jobs, copilot session lists) from depending on
+    // call order.
+    crate::ai_pipeline::ensure_pipeline_schema(conn)?;
+    crate::copilot::ensure_copilot_schema(conn)?;
 
     // Record the reference-equivalent migration set so `migrations_applied`
     // and the .sosync schema guard compare like with like (the reference's

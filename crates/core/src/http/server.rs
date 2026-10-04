@@ -101,6 +101,42 @@ impl AppState {
     pub fn conn_lock(&self) -> MutexGuard<'_, rusqlite::Connection> {
         lock_or_recover(&self.conn)
     }
+
+    /// Run an async pipeline call that needs `&Connection` across its
+    /// await points (LM Studio HTTP round-trips).
+    ///
+    /// A `std::sync::MutexGuard` is not `Send`, so an axum handler cannot
+    /// hold the shared connection across an `.await`. This helper moves the
+    /// whole call onto a blocking thread: the guard lives on the blocking
+    /// thread's stack (no `Send` requirement) while the future is driven by
+    /// `Handle::block_on` — the outer runtime's reactor still serves the
+    /// HTTP I/O. The port's other phase-based AI routes (attributes.rs)
+    /// avoid this by design; the multi-stage pipeline + Copilot tool loop
+    /// interleave DB and HTTP too tightly for that, so they run through
+    /// here instead.
+    ///
+    /// The connection stays locked for the duration of the AI call — the
+    /// same characteristic a single-connection synchronous SQLite server
+    /// (the reference) has while a pipeline stage is in flight.
+    pub async fn run_ai<T>(
+        &self,
+        f: impl for<'a> FnOnce(
+                &'a rusqlite::Connection,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
+            + Send
+            + 'static,
+    ) -> std::result::Result<T, String>
+    where
+        T: Send + 'static,
+    {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = lock_or_recover(&conn);
+            tokio::runtime::Handle::current().block_on(f(&conn))
+        })
+        .await
+        .map_err(|e| e.to_string())
+    }
 }
 
 /// The HTTP server. Owns the bound socket address.

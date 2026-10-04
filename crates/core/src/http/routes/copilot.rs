@@ -1,208 +1,209 @@
-//! Copilot routes — mirrors src/server/routes/copilot.ts
+//! Copilot routes — faithful port of `src/server/routes/copilot.ts`.
+//!
+//! All handlers validate their bodies (4xx on hostile input, never a 500)
+//! and the chat endpoint reports honest 503s when AI is disabled or LM
+//! Studio is down — the Copilot never pretends to work.
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::super::server::AppState;
+use crate::ai_pipeline;
 
-/// GET /api/copilot/sessions
-pub async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let sessions: Vec<Value> = conn
-        .prepare("SELECT id, conversation_id, created_at FROM ai_runs WHERE type = 'copilot' ORDER BY created_at DESC LIMIT 50")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "conversation_id": r.get::<_, Option<i64>>(1)?,
-                    "created_at": r.get::<_, String>(2)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    Json(json!({"sessions": sessions}))
+fn validation_422(message: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "statusCode": 422,
+            "error": "ValidationError",
+            "message": message,
+        })),
+    )
+        .into_response()
 }
 
-/// GET /api/copilot/sessions/:id
-pub async fn get_session(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let row = conn.query_row(
-        "SELECT id, conversation_id, created_at, result_json FROM ai_runs WHERE id = ?1",
-        rusqlite::params![id],
-        |r| {
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?,
-                "conversation_id": r.get::<_, Option<i64>>(1)?,
-                "created_at": r.get::<_, String>(2)?,
-                "messages": r.get::<_, Option<String>>(3)?,
-            }))
-        },
-    );
-    match row {
-        Ok(v) => Json(v),
-        Err(_) => Json(json!({"error": "Session not found"})),
+fn not_found_404(message: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "statusCode": 404,
+            "error": "NotFound",
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
+fn service_503(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "statusCode": 503,
+            "error": "ServiceUnavailable",
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /api/copilot/sessions — most recent sessions (`?limit=` 1..=200,
+/// default 50).
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Json<Value> {
+    let limit = query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("limit=")))
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let conn = state.conn_lock();
+    crate::copilot::ensure_copilot_schema(&conn).ok();
+    Json(json!({ "sessions": crate::copilot::list_sessions(&conn, limit) }))
+}
+
+/// GET /api/copilot/sessions/:id — one session + its messages.
+pub async fn get_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return validation_422("Session id must be a positive integer.");
+    };
+    if id <= 0 {
+        return validation_422("Session id must be a positive integer.");
+    }
+    let conn = state.conn_lock();
+    crate::copilot::ensure_copilot_schema(&conn).ok();
+    let Some(session) = crate::copilot::list_sessions(&conn, 200)
+        .into_iter()
+        .find(|s| s["id"] == json!(id))
+    else {
+        return not_found_404("Copilot session not found.");
+    };
+    Json(json!({
+        "session": session,
+        "messages": crate::copilot::list_messages(&conn, id),
+    }))
+    .into_response()
+}
+
+/// POST /api/copilot/chat — one Copilot turn (bounded tool loop).
+pub async fn chat(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    // copilotChatSchema: question 1..=4000 chars, optional ids.
+    let question = match body.get("question").and_then(Value::as_str) {
+        Some(q) if !q.is_empty() && q.chars().count() <= 4000 => q.to_string(),
+        _ => return validation_422("question must be a non-empty string of at most 4000 characters."),
+    };
+    let conversation_id = body.get("conversationId").and_then(Value::as_i64);
+    let session_id = body.get("sessionId").and_then(Value::as_i64);
+    {
+        let conn = state.conn_lock();
+        crate::copilot::ensure_copilot_schema(&conn).ok();
+        if !crate::settings::get_bool(&conn, "ai_enabled", true).unwrap_or(true) {
+            return service_503(
+                "AI is disabled in Settings. Enable LM Studio to use the Local Copilot.",
+            );
+        }
+        // Unknown conversation / session are CLIENT errors (v1.9.0 audit fix)
+        // — pre-validated instead of surfacing as service-shaped 503s.
+        if let Some(cid) = conversation_id {
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+                    rusqlite::params![cid],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            if !exists {
+                return not_found_404("Conversation not found.");
+            }
+        }
+        if let Some(sid) = session_id {
+            let known = crate::copilot::list_sessions(&conn, 200)
+                .into_iter()
+                .any(|s| s["id"] == json!(sid));
+            if !known {
+                return not_found_404("Copilot session not found.");
+            }
+        }
+    }
+    let result = state
+        .run_ai(move |conn| {
+            Box::pin(async move {
+                let backend = ai_pipeline::backend_from_settings(conn);
+                crate::copilot::chat(conn, &backend, &question, conversation_id, session_id).await
+            })
+        })
+        .await;
+    match result {
+        Ok(Ok(mut payload)) => {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("ok".into(), json!(true));
+            }
+            (StatusCode::OK, Json(payload)).into_response()
+        }
+        Ok(Err(e)) => service_503(&e.message),
+        Err(join) => service_503(&join),
     }
 }
 
-/// POST /api/copilot/chat
-pub async fn chat(State(state): State<AppState>, Json(body): Json<Value>) -> Json<Value> {
-    let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("");
-    let conversation_id = body.get("conversationId").and_then(|v| v.as_i64());
-    Json(json!({
-        "response": "Copilot is not available without a configured AI provider.",
-        "message": message,
-        "conversationId": conversation_id,
-        "tools_used": [],
-    }))
+/// DELETE /api/copilot/sessions/:id.
+pub async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return validation_422("Session id must be a positive integer.");
+    };
+    if id <= 0 {
+        return validation_422("Session id must be a positive integer.");
+    }
+    let conn = state.conn_lock();
+    crate::copilot::ensure_copilot_schema(&conn).ok();
+    if crate::copilot::delete_session(&conn, id) {
+        Json(json!({ "ok": true, "message": "Copilot session deleted." })).into_response()
+    } else {
+        not_found_404("Copilot session not found.")
+    }
 }
 
-/// DELETE /api/copilot/sessions/:id
-pub async fn delete_session(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute("DELETE FROM ai_runs WHERE id = ?1", rusqlite::params![id]);
-    Json(json!({"ok": true}))
-}
-
-/// GET /api/copilot/tools
-pub async fn tools(State(_state): State<AppState>) -> Json<Value> {
-    use crate::catalog::CopilotTool;
-    let tools: Vec<Value> = CopilotTool::ALL
-        .iter()
-        .map(|t| {
-            json!({
-                "id": t.as_str(),
-                "description": t.description(),
-            })
-        })
-        .collect();
-    Json(json!({
-        "tools": tools,
-        "note": "Copilot tools available — actual AI responses require a configured AI provider.",
-    }))
-}
-
-/// GET /api/copilot/starter-questions/:conversationId — deterministic starter
-/// questions (reference copilot.ts:79 → ai/copilot.ts starterQuestions()).
-///
-/// The question set is derived from conversation facts (prior tickets, known
-/// issue links, analyses, attributes); 0 questions = 404 (not found).
+/// GET /api/copilot/starter-questions/:conversationId — deterministic
+/// starter questions (0 questions = 404, not found).
 pub async fn starter_questions(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Json<Value> {
-    let Some(conv_id) =
-        crate::conversation_ops::js_number(&id).filter(|v| v.fract() == 0.0 && *v > 0.0)
-    else {
-        return Json(json!({
-            "statusCode": 422,
-            "error": "ValidationError",
-            "message": "Conversation id must be a positive integer."
-        }));
+) -> Response {
+    let Ok(id) = id.parse::<i64>() else {
+        return validation_422("Conversation id must be a positive integer.");
     };
-    let conv_id = conv_id as i64;
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let facts: Option<(i64, Option<i64>, i64, i64, i64)> = conn
-        .query_row(
-            "SELECT c.id, c.customer_local_id,
-                (SELECT COUNT(*) FROM conversations c2
-                  WHERE c2.customer_local_id = c.customer_local_id
-                    AND c2.deleted_at IS NULL AND c2.id != c.id),
-                (SELECT COUNT(*) FROM known_issue_conversations kic WHERE kic.conversation_id = c.id),
-                (SELECT COUNT(*) FROM ai_runs ar
-                  WHERE ar.conversation_id = c.id AND ar.type = 'ticket_analysis' AND ar.status = 'completed')
-             FROM conversations c WHERE c.id = ?1 AND c.deleted_at IS NULL",
-            rusqlite::params![conv_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    // attributes count: current rows only (superseded_at IS NULL)
-                    0,
-                ))
-            },
-        )
-        .ok();
-    let Some((_, _, prior_tickets, known_issue_links, analyses)) = facts else {
-        return Json(json!({
-            "statusCode": 404,
-            "error": "NotFound",
-            "message": "Conversation not found."
-        }));
-    };
-    let attributes: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM ai_attributes WHERE conversation_id = ?1 AND superseded_at IS NULL",
-            rusqlite::params![conv_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let mut questions: Vec<(String, String)> = vec![
-        (
-            "What is this customer asking?".into(),
-            "Summarizes the current conversation".into(),
-        ),
-        (
-            "What should I check before replying?".into(),
-            "Pre-reply checklist from local evidence".into(),
-        ),
-        (
-            "What information has already been provided?".into(),
-            "Avoids asking the customer twice".into(),
-        ),
-        (
-            "Why is this ticket currently considered urgent?".into(),
-            "Explains urgency from AI attributes + analysis".into(),
-        ),
-    ];
-    if prior_tickets > 0 {
-        questions.push((
-            "What happened in their previous tickets?".into(),
-            format!("{prior_tickets} previous ticket(s) in the local archive"),
-        ));
-        questions.push((
-            "What changed since the last interaction?".into(),
-            "Compares with the last conversation".into(),
-        ));
-        questions.push((
-            "Summarize the last three conversations.".into(),
-            "Recent history digest".into(),
-        ));
+    if id <= 0 {
+        return validation_422("Conversation id must be a positive integer.");
     }
-    questions.push((
-        "Have we seen this issue before?".into(),
-        "Searches similar conversations".into(),
-    ));
-    questions.push((
-        "What solved the previous cases?".into(),
-        "Resolutions from similar tickets".into(),
-    ));
-    questions.push((
-        "Has another customer had the same problem?".into(),
-        "Cross-customer search".into(),
-    ));
-    if known_issue_links > 0 {
-        questions.push((
-            "Which known issue is this linked to?".into(),
-            "Known-issue linkage and status".into(),
-        ));
-    }
-    if analyses > 0 || attributes > 0 {
-        questions.push((
-            "What does the AI analysis say?".into(),
-            "Summarizes the stored AI analysis and attributes".into(),
-        ));
+    let conn = state.conn_lock();
+    let questions = crate::copilot::starter_questions(&conn, id);
+    if questions.is_empty() {
+        return not_found_404("Conversation not found.");
     }
     Json(json!({
         "questions": questions
             .iter()
             .map(|(q, why)| json!({ "question": q, "why": why }))
             .collect::<Vec<_>>()
+    }))
+    .into_response()
+}
+
+/// GET /api/copilot/tools — the allowlisted read-only tool definitions,
+/// surfaced for transparency/debugging.
+pub async fn tools(State(_state): State<AppState>) -> Json<Value> {
+    let tools: Vec<Value> = crate::ai_tools::definitions()
+        .iter()
+        .map(|t| json!({ "name": t.name, "description": t.description }))
+        .collect();
+    Json(json!({
+        "tools": tools,
+        "note": "The Copilot can only call these allowlisted read-only tools. No SQL is ever exposed to the model."
     }))
 }

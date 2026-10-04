@@ -196,7 +196,7 @@ fn has_case_word(text: &str, word: &str) -> bool {
 /// Reference shared/memory.ts isQuarantined: every red-line pattern is
 /// tested against BOTH the key and `"{key} {value}"` (the key alone when
 /// the value is null).
-fn is_quarantined(key: &str, value: Option<&str>) -> bool {
+pub fn is_quarantined(key: &str, value: Option<&str>) -> bool {
     let text = value.map_or(key.to_string(), |v| format!("{key} {v}"));
     let key_lower = key.to_lowercase();
     let text_lower = text.to_lowercase();
