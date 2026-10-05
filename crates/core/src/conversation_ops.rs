@@ -1044,6 +1044,30 @@ pub fn op_download_attachment(
     if !conv_ok {
         return rejected("Parent conversation not found.");
     }
+    match download_attachment_to(conn, attachments_dir, attachment_id) {
+        Ok(path) => ok_result("Attachment downloaded.", Some(json!({ "path": path }))),
+        Err(msg) => rejected(&msg),
+    }
+}
+
+/// The attachment download itself (WK-03): writes the bytes to the
+/// attachments dir with the reference's `{conversationId}-{attachmentId}-
+/// {safeName}` layout, records the sha256 and flips the state to
+/// `downloaded`. Shared by the route (`POST /api/attachments/:id/download`)
+/// and the worker's `download_recent_attachments` job.
+///
+/// Returns the local path on success; a friendly error message on failure.
+pub fn download_attachment_to(
+    conn: &Connection,
+    attachments_dir: &std::path::Path,
+    attachment_id: i64,
+) -> std::result::Result<String, String> {
+    let Some(att) = attachment_by_id(conn, attachment_id) else {
+        return Err("Attachment not found.".into());
+    };
+    if conv_by_local_id(conn, att.conversation_id).is_none() {
+        return Err("Parent conversation not found.".into());
+    }
     // Demo data: deterministic placeholder bytes (the reference fake
     // generates real random data; content itself is not part of the API
     // contract — the path/hash/state transitions are).
@@ -1064,7 +1088,7 @@ pub fn op_download_attachment(
     ));
     if let Err(e) = std::fs::write(&target, &data) {
         set_attachment_state(conn, attachment_id, "failed", None, None);
-        return rejected(&format!("Attachment download failed. {e}"));
+        return Err(format!("Attachment download failed. {e}"));
     }
     use sha2::{Digest, Sha256};
     let hash = hex(&Sha256::digest(&data));
@@ -1076,7 +1100,7 @@ pub fn op_download_attachment(
         Some(&path_str),
         Some(&hash),
     );
-    ok_result("Attachment downloaded.", Some(json!({ "path": path_str })))
+    Ok(path_str)
 }
 
 fn set_attachment_state(

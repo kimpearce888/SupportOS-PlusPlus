@@ -2021,9 +2021,8 @@ mod tests {
                 }),
             ])
             .await;
-            let base = base; // keep alive
-                             // Patch the canned href with the real mock host (the provider
-                             // requests the path verbatim, so it must be absolute-shaped).
+            // Patch the canned href with the real mock host (the provider
+            // requests the path verbatim, so it must be absolute-shaped).
             {
                 let mut resps = api.responses.lock().unwrap();
                 resps[0]["_links"]["next"]["href"] = json!(format!(

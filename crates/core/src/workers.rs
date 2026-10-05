@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::helpscout::HelpScoutProvider;
 use crate::http::EventBus;
 use crate::jobs;
@@ -781,6 +781,69 @@ impl WorkerManager {
                         return Ok(());
                     }
                 }
+                // ---------- ai queue (WK-03 / C6: the automation engine
+                // enqueues these; they used to fall to `Unknown job type`
+                // and fail permanently). Handlers run the real pipeline;
+                // with AI disabled the job completes with a trace note (the
+                // automation engine gates its own enqueue sites). ----------
+                "analyze_ticket" => {
+                    let Some(conv_id) = num("conversationId") else {
+                        let conn = self.lock();
+                        jobs::fail(&conn, job_id, "analyze_ticket missing conversationId")?;
+                        return Ok(());
+                    };
+                    self.run_ai_job(kind, conv_id, AiJob::Analyze).await?;
+                }
+                "generate_draft" => {
+                    let Some(conv_id) = num("conversationId") else {
+                        let conn = self.lock();
+                        jobs::fail(&conn, job_id, "generate_draft missing conversationId")?;
+                        return Ok(());
+                    };
+                    self.run_ai_job(kind, conv_id, AiJob::Draft).await?;
+                }
+                "create_ai_note" => {
+                    let Some(conv_id) = num("conversationId") else {
+                        let conn = self.lock();
+                        jobs::fail(&conn, job_id, "create_ai_note missing conversationId")?;
+                        return Ok(());
+                    };
+                    self.run_ai_job(kind, conv_id, AiJob::Note).await?;
+                }
+                // ---------- attachments queue (WK-03 / C6) ----------
+                "download_recent_attachments" => {
+                    self.run_attachment_downloads().await;
+                }
+                // ---------- api queue: bulk actions (WK-03 / C6 — one job
+                // per conversation, `bulk_{action}` kinds, priority 1) ----------
+                k if k.starts_with("bulk_") => {
+                    let action = k.trim_start_matches("bulk_");
+                    if let Err(e) = self.execute_bulk_action(action, &payload).await {
+                        let msg = e.to_string();
+                        let conn = self.lock();
+                        let _ = jobs::fail(&conn, job_id, &msg);
+                        let _ = jobs::log_error(
+                            &conn,
+                            "workers",
+                            &format!("Job {kind} failed: {msg}"),
+                        );
+                        return Ok(());
+                    }
+                }
+                // ---------- demo simulate jobs (demo.rs enqueue kinds) ----------
+                // The simulated CSAT rating is PERSISTED (no fabrication: the
+                // payload is clearly marked simulated; the ratings row keeps
+                // the raw payload in raw_json).
+                "rating.process" => {
+                    self.persist_simulated_rating(&payload)?;
+                }
+                // The simulated incoming message cannot be fabricated into
+                // the mirror (it exists nowhere on the provider); the real
+                // work this job can do is a conversations sync pass.
+                "sync.conversations" => {
+                    self.run_engine(|e| async move { e.incremental_sync().await.map(|_| ()) })
+                        .await?;
+                }
                 _ => {
                     let conn = self.lock();
                     jobs::fail(&conn, job_id, &format!("Unknown job type: {kind}"))?;
@@ -857,6 +920,436 @@ impl WorkerManager {
         };
         f(engine).await
     }
+
+    // ------------------------------------------------------------------
+    // WK-03 (C6): the job-kind handlers that used to fall to `Unknown job
+    // type` and fail permanently.
+    // ------------------------------------------------------------------
+
+    /// The AI-queue job family (ai queue: analyze_ticket / generate_draft /
+    /// create_ai_note). Runs the pipeline with the DB guard confined to a
+    /// blocking thread (the AppState::run_ai pattern) so the global mutex is
+    /// never held across the LM Studio call from the worker side either.
+    async fn run_ai_job(&self, kind: &str, conv_id: i64, job: AiJob) -> Result<()> {
+        let backend = {
+            let conn = self.lock();
+            crate::ai_pipeline::backend_from_settings(&conn)
+        };
+        if matches!(backend, crate::ai_pipeline::AiBackend::Disabled) {
+            // AI off: return without AI output (the outer flow completes the
+            // job). Nothing is fabricated; the automation engine gates its
+            // own enqueue sites, so this only fires for jobs enqueued
+            // elsewhere (manual/demo).
+            tracing::info!(
+                operation = kind,
+                conversation_id = conv_id,
+                "AI backend disabled - job completed without AI output"
+            );
+            return Ok(());
+        }
+        let conn_arc = self.conn.clone();
+        let (result, note_text, remote_id) = tokio::task::spawn_blocking(move || {
+            let conn = conn_arc.lock().unwrap_or_else(|p| p.into_inner());
+            tokio::runtime::Handle::current().block_on(async {
+                // Every AI call site must be able to find the conversation.
+                let remote: Option<i64> = conn
+                    .query_row(
+                        "SELECT remote_id FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+                        rusqlite::params![conv_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let remote_id = match remote {
+                    Some(r) => r,
+                    None => {
+                        return (
+                            Err(Error::Other("Conversation not found locally.".into())),
+                            None,
+                            None,
+                        );
+                    }
+                };
+                match job {
+                    AiJob::Analyze => {
+                        let r = crate::ai_pipeline::analyze_ticket(&conn, &backend, conv_id, false)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| Error::Other(e.to_string().into()));
+                        (r, None, Some(remote_id))
+                    }
+                    AiJob::Draft => {
+                        let mode = "standard".to_string();
+                        let r = crate::ai_pipeline::generate_draft(
+                            &conn, &backend, conv_id, &mode, false, None,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| Error::Other(e.to_string().into()));
+                        (r, None, Some(remote_id))
+                    }
+                    AiJob::Note => {
+                        // The note body comes from the ticket analysis (the
+                        // AI-derived facts); nothing is fabricated.
+                        let analysis = match crate::ai_pipeline::analyze_ticket(
+                            &conn, &backend, conv_id, false,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => outcome.analysis,
+                            Err(e) => {
+                                return (
+                                    Err(Error::Other(e.to_string().into())),
+                                    None,
+                                    Some(remote_id),
+                                );
+                            }
+                        };
+                        let mut body = String::new();
+                        if let Some(summary) = &analysis.summary {
+                            body.push_str(&format!("Summary: {summary}\n"));
+                        }
+                        if let Some(intent) = &analysis.intent {
+                            body.push_str(&format!("Intent: {intent}\n"));
+                        }
+                        if let Some(goal) = &analysis.customer_goal {
+                            body.push_str(&format!("Customer goal: {goal}\n"));
+                        }
+                        if let Some(sentiment) = &analysis.sentiment {
+                            body.push_str(&format!("Sentiment: {sentiment}"));
+                            if let Some(urgency) = &analysis.urgency {
+                                body.push_str(&format!(" (urgency: {urgency})"));
+                            }
+                            body.push('\n');
+                        }
+                        if !analysis.missing_information.is_empty() {
+                            body.push_str(&format!(
+                                "Missing information: {}\n",
+                                analysis.missing_information.join(", ")
+                            ));
+                        }
+                        if body.trim().is_empty() {
+                            return (
+                                Err(Error::Other(
+                                    "Ticket analysis carried no note content.".into(),
+                                )),
+                                None,
+                                Some(remote_id),
+                            );
+                        }
+                        body.push_str("\n(This note was drafted by SupportOS AI.)");
+                        (Ok(()), Some(body), Some(remote_id))
+                    }
+                }
+            })
+        })
+        .await
+        .map_err(|e| Error::Other(e.to_string().into()))?;
+
+        result?;
+        // create_ai_note: write the note through the provider boundary, then
+        // re-sync the conversation so the local mirror carries the new note.
+        if let (Some(text), Some(remote_id)) = (note_text, remote_id) {
+            self.provider
+                .create_note_thread(crate::helpscout::CreateThreadInput {
+                    conversation_id: remote_id,
+                    text,
+                    draft: false,
+                    cc: vec![],
+                    bcc: vec![],
+                    status_after: None,
+                    assign_to: None,
+                })
+                .await?;
+            let engine = self.engine.clone();
+            if let Some(engine) = engine {
+                engine.sync_single_conversation(remote_id).await?;
+            }
+            let conn = self.lock();
+            let _ = crate::jobs::audit(
+                &conn,
+                "ai",
+                "note_added",
+                crate::sync_engine::conversation_local_id(&conn, remote_id),
+                None,
+                None,
+                None,
+                None,
+                true,
+            );
+            self.emit_conversation_updated_for_remote(remote_id);
+        }
+        tracing::info!(
+            operation = kind,
+            conversation_id = conv_id,
+            "AI job completed"
+        );
+        Ok(())
+    }
+
+    /// `download_recent_attachments` (attachments queue): download up to 100
+    /// pending attachment rows. The fake provider's downloads land with
+    /// deterministic bytes; the real provider has no attachment-fetch support
+    /// yet (the SY-10 provider gap) — those rows stay pending and the job
+    /// completes with a trace note instead of fabricating content.
+    async fn run_attachment_downloads(&self) {
+        let ids: Vec<i64> = {
+            let conn = self.lock();
+            let Ok(mut stmt) = conn.prepare(
+                "SELECT id FROM attachments
+                  WHERE state IS NULL OR state NOT IN ('downloaded')
+                  ORDER BY id DESC LIMIT 100",
+            ) else {
+                return;
+            };
+            stmt.query_map([], |r| r.get(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        if self.provider.kind() != "fake" {
+            tracing::info!(
+                count = ids.len(),
+                "Attachment download skipped: the real provider does not support attachment fetch yet"
+            );
+            return;
+        }
+        let attachments_dir = self.data_dir.join("attachments");
+        let mut downloaded = 0usize;
+        for id in ids {
+            let conn = self.lock();
+            match crate::conversation_ops::download_attachment_to(&conn, &attachments_dir, id) {
+                Ok(_) => downloaded += 1,
+                Err(msg) => {
+                    tracing::warn!(attachment_id = id, error = %msg, "Attachment download failed");
+                }
+            }
+        }
+        tracing::info!(count = downloaded, "Recent attachments downloaded");
+    }
+
+    /// `bulk_{action}` jobs (api queue, one per conversation): execute the
+    /// action against the provider + local mirror. `tag`/`untag` are local
+    /// mirror writes (the provider trait has no tag-write method — the SY-10
+    /// gap, same as the automation add_tag path).
+    async fn execute_bulk_action(&self, action: &str, payload: &serde_json::Value) -> Result<()> {
+        use crate::helpscout::ConversationPatch;
+        let Some(conv_id) = payload.get("conversationId").and_then(|v| v.as_i64()) else {
+            return Err(Error::Other("bulk job missing conversationId".into()));
+        };
+        let row: Option<(i64, String)> = {
+            let conn = self.lock();
+            conn.query_row(
+                "SELECT remote_id, status FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+                rusqlite::params![conv_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
+        };
+        let Some((remote_id, _current_status)) = row else {
+            return Err(Error::Other("Conversation not found locally.".into()));
+        };
+        match action {
+            "tag" | "untag" => {
+                let Some(tag) = payload.get("tag").and_then(|v| v.as_str()) else {
+                    return Err(Error::Other(format!("bulk_{action} missing tag").into()));
+                };
+                {
+                    let conn = self.lock();
+                    let mut tags = crate::conversation_ops::read_conversation_tags(&conn, conv_id);
+                    if action == "tag" {
+                        if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                            tags.push(tag.to_string());
+                        }
+                    } else {
+                        tags.retain(|t| !t.eq_ignore_ascii_case(tag));
+                    }
+                    crate::conversation_ops::write_conversation_tags(&conn, conv_id, &tags);
+                }
+            }
+            "assign" | "unassign" | "status" | "close" => {
+                let patch = match action {
+                    "close" => ConversationPatch {
+                        status: Some("closed".into()),
+                        ..Default::default()
+                    },
+                    "status" => {
+                        let Some(status) = payload.get("status").and_then(|v| v.as_str()) else {
+                            return Err(Error::Other("bulk_status missing status".into()));
+                        };
+                        const STATUSES: [&str; 4] = ["active", "closed", "pending", "spam"];
+                        if !STATUSES.contains(&status) {
+                            return Err(Error::Other(
+                                format!("bulk_status invalid status {status}").into(),
+                            ));
+                        }
+                        ConversationPatch {
+                            status: Some(status.to_string()),
+                            ..Default::default()
+                        }
+                    }
+                    "assign" => {
+                        // assignRequestSchema: userId is a REMOTE user id.
+                        let Some(user_remote) = payload.get("userId").and_then(|v| v.as_i64())
+                        else {
+                            return Err(Error::Other("bulk_assign missing userId".into()));
+                        };
+                        ConversationPatch {
+                            assign_to: Some(Some(user_remote)),
+                            ..Default::default()
+                        }
+                    }
+                    _ => ConversationPatch {
+                        // unassign: Some(None) = clear assignee.
+                        assign_to: Some(None),
+                        ..Default::default()
+                    },
+                };
+                self.provider.update_conversation(remote_id, patch).await?;
+                // Local mirror write (checked transaction — the C2 pattern).
+                {
+                    let mut conn = self.lock();
+                    let assignee_local = if action == "assign" {
+                        payload
+                            .get("userId")
+                            .and_then(|v| v.as_i64())
+                            .and_then(|user_remote| {
+                                // The users mirror may not have seen this
+                                // user yet; the remote write succeeded and
+                                // the next full sync reconciles the local
+                                // row (logged when unresolvable).
+                                let local =
+                                    crate::sync_engine::local_id(&conn, "users", user_remote);
+                                if local.is_none() {
+                                    tracing::warn!(
+                                        conversation_id = conv_id,
+                                        user_remote,
+                                        "bulk_assign: user not in local mirror; local assignee left unchanged"
+                                    );
+                                }
+                                local
+                            })
+                    } else {
+                        None
+                    };
+                    let tx = conn.transaction()?;
+                    if let Some(status) = payload
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| (action == "close").then(|| "closed".to_string()))
+                        .filter(|s| !s.is_empty())
+                    {
+                        tx.execute(
+                            "UPDATE conversations SET status = ?1,
+                                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                               WHERE id = ?2",
+                            rusqlite::params![status, conv_id],
+                        )?;
+                        if status == "closed" {
+                            tx.execute(
+                                "UPDATE conversations SET closed_at = COALESCE(closed_at, datetime('now'))
+                                   WHERE id = ?1",
+                                rusqlite::params![conv_id],
+                            )?;
+                        }
+                    }
+                    if action == "assign" {
+                        if let Some(local) = assignee_local {
+                            tx.execute(
+                                "UPDATE conversations SET assignee_id = ?1 WHERE id = ?2",
+                                rusqlite::params![local, conv_id],
+                            )?;
+                        }
+                    }
+                    if action == "unassign" {
+                        tx.execute(
+                            "UPDATE conversations SET assignee_id = NULL WHERE id = ?1",
+                            rusqlite::params![conv_id],
+                        )?;
+                    }
+                    tx.commit()?;
+                }
+            }
+            _ => {
+                return Err(Error::Other(
+                    format!("Unknown bulk action: {action}").into(),
+                ));
+            }
+        }
+        {
+            let conn = self.lock();
+            let _ = crate::jobs::audit(
+                &conn,
+                "user",
+                &format!("bulk_{action}"),
+                Some(conv_id),
+                None,
+                None,
+                None,
+                None,
+                false,
+            );
+        }
+        self.emit_conversation_updated_for_remote(remote_id);
+        Ok(())
+    }
+
+    /// `rating.process` (the demo simulate-CSAT job): persist the simulated
+    /// rating. The payload is marked simulated; the raw payload is kept in
+    /// `raw_json` so nothing masquerades as provider data.
+    fn persist_simulated_rating(&self, payload: &serde_json::Value) -> Result<()> {
+        let rating_num = payload.get("rating").and_then(|v| v.as_i64()).unwrap_or(5);
+        let label = match rating_num {
+            4 | 5 => "great",
+            3 => "okay",
+            _ => "not-good",
+        };
+        let conv_remote = payload
+            .get("conversation_id")
+            .and_then(|v| v.as_i64())
+            .or_else(|| payload.get("conversationId").and_then(|v| v.as_i64()));
+        let comment = payload.get("comment").and_then(|v| v.as_str());
+        let conn = self.lock();
+        let conv_local =
+            conv_remote.and_then(|r| crate::sync_engine::conversation_local_id(&conn, r));
+        // Insert (not upsert): every simulated rating is a distinct event.
+        conn.execute(
+            "INSERT INTO ratings (conversation_id, rating, comments, raw_json, remote_created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                conv_local,
+                label,
+                comment,
+                payload.to_string(),
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ],
+        )?;
+        if let Some(conv_local) = conv_local {
+            let _ = crate::jobs::audit(
+                &conn,
+                "user",
+                "rating_simulated",
+                Some(conv_local),
+                None,
+                Some(&format!("{{\"rating\":\"{label}\"}}")),
+                None,
+                None,
+                false,
+            );
+        }
+        tracing::info!(rating = label, "Simulated CSAT rating persisted");
+        Ok(())
+    }
+}
+
+/// The AI-queue job kinds (WK-03).
+#[derive(Clone, Copy)]
+enum AiJob {
+    Analyze,
+    Draft,
+    Note,
 }
 
 #[cfg(test)]
@@ -995,5 +1488,392 @@ mod tests {
         assert_eq!(rating_word("great"), "great");
         assert_eq!(rating_word("okay"), "okay");
         assert_eq!(rating_word("not-good"), "not-good");
+    }
+
+    // ---- WK-03 (C6): every enqueued job kind is now runnable -------------
+
+    /// A worker wired like production: the shared conn, the sync engine and
+    /// the fake provider (one world), a throwaway data dir.
+    async fn demo_worker(
+        db: &std::path::Path,
+        data_dir: &std::path::Path,
+    ) -> (Arc<Mutex<Connection>>, WorkerManager) {
+        let mut conn = crate::db::open(db).expect("open DB");
+        crate::bootstrap::apply_all(&mut conn).expect("apply all migrations");
+        let shared = Arc::new(Mutex::new(conn));
+        let provider = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+            as Arc<dyn crate::helpscout::HelpScoutProvider>;
+        let engine = Arc::new(SyncEngine::new(shared.clone(), provider.clone()));
+        engine.initial_sync().await.expect("demo initial sync");
+        let manager = WorkerManager::new(
+            shared.clone(),
+            Some(engine),
+            provider,
+            EventBus::new(64),
+            data_dir.to_path_buf(),
+            None,
+        );
+        (shared, manager)
+    }
+
+    /// Enqueue + claim (the tick's transition) + execute one job; returns the
+    /// job id so the caller can assert its final state. NEVER holds the DB
+    /// guard across the execute (the handlers lock it themselves).
+    async fn run_job(
+        shared: &Arc<Mutex<Connection>>,
+        manager: &WorkerManager,
+        queue: &str,
+        kind: &str,
+        payload: &str,
+    ) -> i64 {
+        let id = {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            let id = jobs::enqueue_on(&conn, queue, kind, payload, 2).expect("enqueue");
+            conn.execute(
+                "UPDATE jobs SET status = 'running', attempt = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .expect("claim");
+            id
+        };
+        manager.execute_job(id, kind, payload).await;
+        id
+    }
+
+    fn job_status(shared: &Arc<Mutex<Connection>>, id: i64) -> String {
+        let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT status FROM jobs WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .expect("job row")
+    }
+
+    fn col(shared: &Arc<Mutex<Connection>>, sql: &str, conv: i64) -> Option<String> {
+        let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(sql, rusqlite::params![conv], |r| r.get(0))
+            .ok()
+            .flatten()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bulk_actions_execute_against_provider_and_mirror() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (shared, manager) = demo_worker(&tmp.path().join("wk03.db"), tmp.path()).await;
+
+        let (conv, remote): (i64, i64) = {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT id, remote_id FROM conversations WHERE deleted_at IS NULL
+                  ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        // bulk_close: provider write + local mirror (status + closed_at).
+        let id = run_job(
+            &shared,
+            &manager,
+            "api",
+            "bulk_close",
+            &format!("{{\"conversationId\":{conv}}}"),
+        )
+        .await;
+        assert_eq!(job_status(&shared, id), "completed", "bulk_close completed");
+        assert_eq!(
+            col(
+                &shared,
+                "SELECT status FROM conversations WHERE id = ?1",
+                conv
+            )
+            .as_deref(),
+            Some("closed"),
+            "local status closed"
+        );
+        assert!(
+            col(
+                &shared,
+                "SELECT closed_at FROM conversations WHERE id = ?1",
+                conv
+            )
+            .is_some(),
+            "closed_at stamped"
+        );
+
+        // bulk_status with an invalid status fails the job (never ok:true).
+        let id = run_job(
+            &shared,
+            &manager,
+            "api",
+            "bulk_status",
+            &format!("{{\"conversationId\":{conv},\"status\":\"bogus\"}}"),
+        )
+        .await;
+        assert_ne!(
+            job_status(&shared, id),
+            "completed",
+            "invalid status rejected"
+        );
+
+        // bulk_status pending.
+        let id = run_job(
+            &shared,
+            &manager,
+            "api",
+            "bulk_status",
+            &format!("{{\"conversationId\":{conv},\"status\":\"pending\"}}"),
+        )
+        .await;
+        assert_eq!(job_status(&shared, id), "completed");
+        assert_eq!(
+            col(
+                &shared,
+                "SELECT status FROM conversations WHERE id = ?1",
+                conv
+            )
+            .as_deref(),
+            Some("pending")
+        );
+
+        // bulk_tag / bulk_untag (local mirror writes, the add_tag path).
+        let id = run_job(
+            &shared,
+            &manager,
+            "api",
+            "bulk_tag",
+            &format!("{{\"conversationId\":{conv},\"tag\":\"vip\"}}"),
+        )
+        .await;
+        assert_eq!(job_status(&shared, id), "completed");
+        {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            let tags = crate::conversation_ops::read_conversation_tags(&conn, conv);
+            assert!(
+                tags.iter().any(|t| t.eq_ignore_ascii_case("vip")),
+                "{tags:?}"
+            );
+        }
+        let id = run_job(
+            &shared,
+            &manager,
+            "api",
+            "bulk_untag",
+            &format!("{{\"conversationId\":{conv},\"tag\":\"vip\"}}"),
+        )
+        .await;
+        assert_eq!(job_status(&shared, id), "completed");
+        {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            let tags = crate::conversation_ops::read_conversation_tags(&conn, conv);
+            assert!(
+                !tags.iter().any(|t| t.eq_ignore_ascii_case("vip")),
+                "{tags:?}"
+            );
+        }
+
+        // bulk_assign: remote user 1001 (demo world) -> local assignee.
+        let user_local: i64 = {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row("SELECT id FROM users WHERE remote_id = 1001", [], |r| {
+                r.get(0)
+            })
+            .expect("demo user mirrored")
+        };
+        let id = run_job(
+            &shared,
+            &manager,
+            "api",
+            "bulk_assign",
+            &format!("{{\"conversationId\":{conv},\"userId\":1001}}"),
+        )
+        .await;
+        assert_eq!(job_status(&shared, id), "completed");
+        assert_eq!(
+            col(
+                &shared,
+                "SELECT CAST(assignee_id AS TEXT) FROM conversations WHERE id = ?1",
+                conv
+            )
+            .as_deref(),
+            Some(user_local.to_string().as_str()),
+            "local assignee resolved to the demo user"
+        );
+
+        // bulk_unassign clears it.
+        let id = run_job(
+            &shared,
+            &manager,
+            "api",
+            "bulk_unassign",
+            &format!("{{\"conversationId\":{conv}}}"),
+        )
+        .await;
+        assert_eq!(job_status(&shared, id), "completed");
+        assert!(
+            col(
+                &shared,
+                "SELECT CAST(assignee_id AS TEXT) FROM conversations WHERE id = ?1",
+                conv
+            )
+            .is_none(),
+            "assignee cleared"
+        );
+
+        // Every bulk job also wrote an audit row.
+        let audits: i64 = {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'bulk_%' AND conversation_id = ?1",
+                rusqlite::params![conv],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+        };
+        assert!(audits >= 6, "bulk actions audited: {audits}");
+        let _ = remote;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attachment_download_job_downloads_pending_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (shared, manager) = demo_worker(&tmp.path().join("wk03-att.db"), tmp.path()).await;
+        {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            let conv: i64 = conn
+                .query_row(
+                    "SELECT id FROM conversations WHERE deleted_at IS NULL ORDER BY id LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO attachments (remote_id, conversation_id, filename, mime_type, size, state)
+                 VALUES (5001, ?1, 'invoice.pdf', 'application/pdf', 1234, 'metadata')",
+                rusqlite::params![conv],
+            )
+            .unwrap();
+        }
+
+        let id = run_job(
+            &shared,
+            &manager,
+            "attachments",
+            "download_recent_attachments",
+            "{}",
+        )
+        .await;
+        assert_eq!(job_status(&shared, id), "completed", "the job is runnable");
+        let (state, path, hash): (String, Option<String>, Option<String>) = {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT state, local_path, hash FROM attachments WHERE remote_id = 5001",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(state, "downloaded");
+        let path = path.expect("local path recorded");
+        assert!(std::path::Path::new(&path).exists(), "file on disk: {path}");
+        assert!(
+            hash.as_deref().is_some_and(|h| h.len() == 64),
+            "sha256 recorded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rating_process_persists_the_simulated_rating() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (shared, manager) = demo_worker(&tmp.path().join("wk03-rating.db"), tmp.path()).await;
+        let (conv_local, conv_remote): (i64, i64) = {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT id, remote_id FROM conversations WHERE deleted_at IS NULL ORDER BY id LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let payload = serde_json::json!({
+            "id": "demo_rating_xyz", "conversation_id": conv_remote,
+            "rating": 5, "comment": "Great support!", "simulated": true
+        })
+        .to_string();
+
+        let id = run_job(&shared, &manager, "sync", "rating.process", &payload).await;
+        assert_eq!(job_status(&shared, id), "completed", "the job is runnable");
+        let (rating, comments, raw, conv): (String, Option<String>, String, i64) = {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT rating, comments, raw_json, conversation_id FROM ratings
+                  WHERE raw_json LIKE '%demo_rating_xyz%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("simulated rating persisted")
+        };
+        assert_eq!(rating, "great", "5 maps to the reference vocabulary");
+        assert_eq!(comments.as_deref(), Some("Great support!"));
+        assert!(
+            raw.contains("\"simulated\":true"),
+            "raw payload kept: {raw}"
+        );
+        assert_eq!(conv, conv_local, "resolved to the local conversation");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ai_jobs_complete_without_output_when_backend_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (shared, manager) = demo_worker(&tmp.path().join("wk03-ai.db"), tmp.path()).await;
+        let (conv, threads_before): (i64, i64) = {
+            let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+            crate::settings::set_bool(&conn, "ai_enabled", false).unwrap();
+            let conv = conn
+                .query_row(
+                    "SELECT id FROM conversations WHERE deleted_at IS NULL ORDER BY id LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let threads = conn
+                .query_row("SELECT COUNT(*) FROM conversation_threads", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            (conv, threads)
+        };
+
+        // The three ai-queue kinds the automation engine enqueues: with the
+        // backend disabled they COMPLETE (no permanent failures, no
+        // fabricated AI output).
+        for kind in ["analyze_ticket", "generate_draft", "create_ai_note"] {
+            let id = run_job(
+                &shared,
+                &manager,
+                "ai",
+                kind,
+                &format!("{{\"conversationId\":{conv}}}"),
+            )
+            .await;
+            assert_eq!(
+                job_status(&shared, id),
+                "completed",
+                "{kind} completes with AI disabled"
+            );
+        }
+        let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs, 0, "no fabricated AI runs");
+        let threads_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversation_threads", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(threads_before, threads_after, "no fabricated notes");
     }
 }

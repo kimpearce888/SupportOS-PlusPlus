@@ -1692,6 +1692,13 @@ pub fn fire_trigger_for_conversation(
     }
     ensure_main_rule_columns(conn)?;
     let write_enabled = crate::settings::get_bool(conn, "automation_write_actions_enabled", false)?;
+    // WK-03 (C6): AI actions only enqueue when the AI backend can run
+    // them (the reference gates on aiEnabled) — a queued job with no
+    // runnable backend failed permanently before.
+    let ai_enabled = !matches!(
+        crate::ai_pipeline::backend_from_settings(conn),
+        crate::ai_pipeline::AiBackend::Disabled
+    );
     let mut runs = Vec::new();
     for rule in list_rule_records(conn)? {
         if !rule.enabled || rule.trigger != fired {
@@ -1711,23 +1718,41 @@ pub fn fire_trigger_for_conversation(
                 match tier {
                     "read" => {
                         if kind == "analyze_ticket" {
-                            // Reference executeReadAction: enqueued as a job so
-                            // the AI worker handles it with normal retries.
-                            let _ = crate::jobs::enqueue_on(
+                            if ai_enabled {
+                                // Reference executeReadAction: enqueued as a job so
+                                // the AI worker handles it with normal retries.
+                                let _ = crate::jobs::enqueue_on(
+                                    conn,
+                                    "ai",
+                                    "analyze_ticket",
+                                    &format!("{{\"conversationId\":{conversation_id}}}"),
+                                    3,
+                                );
+                                record_run(
+                                    conn,
+                                    rule.id,
+                                    Some(conversation_id),
+                                    "completed",
+                                    &format!("Executed read action {kind}"),
+                                )?;
+                            } else {
+                                record_run(
+                                    conn,
+                                    rule.id,
+                                    Some(conversation_id),
+                                    "skipped",
+                                    "AI action analyze_ticket skipped: AI is disabled",
+                                )?;
+                            }
+                        } else {
+                            record_run(
                                 conn,
-                                "ai",
-                                "analyze_ticket",
-                                &format!("{{\"conversationId\":{conversation_id}}}"),
-                                3,
-                            );
+                                rule.id,
+                                Some(conversation_id),
+                                "completed",
+                                &format!("Executed read action {kind}"),
+                            )?;
                         }
-                        record_run(
-                            conn,
-                            rule.id,
-                            Some(conversation_id),
-                            "completed",
-                            &format!("Executed read action {kind}"),
-                        )?;
                     }
                     "non_destructive" => {
                         if rule.requires_approval && !write_enabled {
@@ -1742,22 +1767,42 @@ pub fn fire_trigger_for_conversation(
                         } else {
                             match kind {
                                 "create_ai_note" => {
-                                    let _ = crate::jobs::enqueue_on(
-                                        conn,
-                                        "ai",
-                                        "create_ai_note",
-                                        &format!("{{\"conversationId\":{conversation_id}}}"),
-                                        2,
-                                    );
+                                    if ai_enabled {
+                                        let _ = crate::jobs::enqueue_on(
+                                            conn,
+                                            "ai",
+                                            "create_ai_note",
+                                            &format!("{{\"conversationId\":{conversation_id}}}"),
+                                            2,
+                                        );
+                                    } else {
+                                        record_run(
+                                            conn,
+                                            rule.id,
+                                            Some(conversation_id),
+                                            "skipped",
+                                            "AI action create_ai_note skipped: AI is disabled",
+                                        )?;
+                                    }
                                 }
                                 "create_ai_draft" => {
-                                    let _ = crate::jobs::enqueue_on(
-                                        conn,
-                                        "ai",
-                                        "generate_draft",
-                                        &format!("{{\"conversationId\":{conversation_id}}}"),
-                                        2,
-                                    );
+                                    if ai_enabled {
+                                        let _ = crate::jobs::enqueue_on(
+                                            conn,
+                                            "ai",
+                                            "generate_draft",
+                                            &format!("{{\"conversationId\":{conversation_id}}}"),
+                                            2,
+                                        );
+                                    } else {
+                                        record_run(
+                                            conn,
+                                            rule.id,
+                                            Some(conversation_id),
+                                            "skipped",
+                                            "AI action create_ai_draft skipped: AI is disabled",
+                                        )?;
+                                    }
                                 }
                                 "add_tag" => {
                                     // The reference routes add_tag through the
