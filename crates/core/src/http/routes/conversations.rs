@@ -18,6 +18,20 @@ fn eval_rejected(msg: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// C2 (T16 audit): the 500 envelope for a failed local DB write — a mutation
+/// error must surface as this, never as `ok:true` + SSE (fake success).
+fn db_error_500(e: &rusqlite::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "statusCode": 500,
+            "error": "InternalError",
+            "message": e.to_string()
+        })),
+    )
+        .into_response()
+}
+
 /// GET /api/conversations — list conversations with filters.
 ///
 /// v1.8.0 Operations Center drill-down: `?ops=<tileKey>` compiles to the
@@ -287,24 +301,36 @@ pub async fn priority(
         .flatten();
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // Local write + transition record (one transaction, like the reference).
-    if let Ok(tx) = conn.transaction() {
-        let _ = tx.execute(
-            "UPDATE conversations SET supportos_priority = ?1 WHERE id = ?2",
-            rusqlite::params![priority_str, conv.id],
-        );
-        let _ = tx.execute(
-            "INSERT OR IGNORE INTO activity_events (conversation_id, event_type,
-                 actor_type, actor_id, occurred_at, source, metadata, dedup_key)
-             VALUES (?1, 'priority_changed', 'user', NULL, ?2, 'local', ?3,
-                 'priority_changed:' || ?1 || ':' || ?2)",
-            rusqlite::params![
-                conv.id,
-                at,
-                json!({ "previous": previous, "next": priority_str, "hs_field_synced": false })
-                    .to_string()
-            ],
-        );
-        let _ = tx.commit();
+    // C2 (T16 audit): every statement is CHECKED — a DB error must surface
+    // as the 500 envelope, never as ok:true + SSE. A failed statement
+    // returns early, dropping the uncommitted transaction (automatic
+    // rollback), so the priority write + activity pair stay atomic.
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return db_error_500(&e),
+    };
+    if let Err(e) = tx.execute(
+        "UPDATE conversations SET supportos_priority = ?1 WHERE id = ?2",
+        rusqlite::params![priority_str, conv.id],
+    ) {
+        return db_error_500(&e);
+    }
+    if let Err(e) = tx.execute(
+        "INSERT OR IGNORE INTO activity_events (conversation_id, event_type,
+             actor_type, actor_id, occurred_at, source, metadata, dedup_key)
+         VALUES (?1, 'priority_changed', 'user', NULL, ?2, 'local', ?3,
+             'priority_changed:' || ?1 || ':' || ?2)",
+        rusqlite::params![
+            conv.id,
+            at,
+            json!({ "previous": previous, "next": priority_str, "hs_field_synced": false })
+                .to_string()
+        ],
+    ) {
+        return db_error_500(&e);
+    }
+    if let Err(e) = tx.commit() {
+        return db_error_500(&e);
     }
     let _ = crate::jobs::audit(
         &conn,
@@ -450,41 +476,53 @@ pub async fn set_state(
             .into_response();
     }
     let occurred_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    if let Ok(tx) = conn.transaction() {
-        tx.execute(
-            "INSERT INTO state_transitions (conversation_id, previous_state_id,
-                 new_state_id, actor_type, actor_local_id, reason, occurred_at, source)
-             VALUES (?1, ?2, ?3, 'user', NULL, ?4, ?5, 'local')",
-            rusqlite::params![conv.id, current, state_id, reason, occurred_at],
-        )
-        .ok();
-        let transition_rowid = tx.last_insert_rowid();
-        tx.execute(
-            "UPDATE conversations SET supportos_state_id = ?1 WHERE id = ?2",
-            rusqlite::params![state_id, conv.id],
-        )
-        .ok();
-        // Activity entry: dedup key carries the TRANSITION rowid so two
-        // changes in the same millisecond stay distinct.
-        tx.execute(
-            "INSERT OR IGNORE INTO activity_events (conversation_id, event_type,
-                 actor_type, actor_id, occurred_at, source, metadata, dedup_key)
-             VALUES (?1, 'ticket_state_changed', 'user', NULL, ?2, 'local', ?3,
-                 'ticket_state_changed:' || ?1 || ':' || ?4)",
-            rusqlite::params![
-                conv.id,
-                occurred_at,
-                json!({
-                    "previous_state_id": current,
-                    "new_state_id": state_id,
-                    "reason": reason,
-                })
-                .to_string(),
-                transition_rowid
-            ],
-        )
-        .ok();
-        tx.commit().ok();
+    // C2 (T16 audit): every statement is CHECKED — a DB error must surface
+    // as the 500 envelope, never as ok:true + SSE. A failed statement
+    // returns early, dropping the uncommitted transaction (automatic
+    // rollback), so the transition + conversation update + activity entry
+    // stay atomic: either all three land or none does.
+    let tx = match conn.transaction() {
+        Ok(tx) => tx,
+        Err(e) => return db_error_500(&e),
+    };
+    if let Err(e) = tx.execute(
+        "INSERT INTO state_transitions (conversation_id, previous_state_id,
+             new_state_id, actor_type, actor_local_id, reason, occurred_at, source)
+         VALUES (?1, ?2, ?3, 'user', NULL, ?4, ?5, 'local')",
+        rusqlite::params![conv.id, current, state_id, reason, occurred_at],
+    ) {
+        return db_error_500(&e);
+    }
+    let transition_rowid = tx.last_insert_rowid();
+    if let Err(e) = tx.execute(
+        "UPDATE conversations SET supportos_state_id = ?1 WHERE id = ?2",
+        rusqlite::params![state_id, conv.id],
+    ) {
+        return db_error_500(&e);
+    }
+    // Activity entry: dedup key carries the TRANSITION rowid so two
+    // changes in the same millisecond stay distinct.
+    if let Err(e) = tx.execute(
+        "INSERT OR IGNORE INTO activity_events (conversation_id, event_type,
+             actor_type, actor_id, occurred_at, source, metadata, dedup_key)
+         VALUES (?1, 'ticket_state_changed', 'user', NULL, ?2, 'local', ?3,
+             'ticket_state_changed:' || ?1 || ':' || ?4)",
+        rusqlite::params![
+            conv.id,
+            occurred_at,
+            json!({
+                "previous_state_id": current,
+                "new_state_id": state_id,
+                "reason": reason,
+            })
+            .to_string(),
+            transition_rowid
+        ],
+    ) {
+        return db_error_500(&e);
+    }
+    if let Err(e) = tx.commit() {
+        return db_error_500(&e);
     }
     let _ = crate::jobs::audit(
         &conn,

@@ -1636,21 +1636,33 @@ pub async fn op_change_status(
         Ok(_) => {
             let mut conn = state.conn_lock();
             set_outbound_status(&conn, job_id, "confirmed", None);
-            // Atomic: status write + closed_at stamp together.
-            if let Ok(tx) = conn.transaction() {
-                let _ = tx.execute(
-                    "UPDATE conversations SET status = ?1,
-                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                       WHERE id = ?2",
-                    params![status, conv.id],
-                );
-                if status == "closed" && conv.closed_at.is_none() {
-                    let _ = tx.execute(
-                        "UPDATE conversations SET closed_at = datetime('now') WHERE id = ?1",
-                        params![conv.id],
-                    );
+            // Atomic: status write + closed_at stamp together. C2 (T16
+            // audit): every statement is CHECKED — a DB error must surface
+            // as the 500 envelope, never as ok:true + SSE (fake success).
+            // A failed statement returns early, dropping the uncommitted
+            // transaction (automatic rollback).
+            let tx = match conn.transaction() {
+                Ok(tx) => tx,
+                Err(e) => return internal_error(&e.to_string()),
+            };
+            if let Err(e) = tx.execute(
+                "UPDATE conversations SET status = ?1,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                   WHERE id = ?2",
+                params![status, conv.id],
+            ) {
+                return internal_error(&e.to_string());
+            }
+            if status == "closed" && conv.closed_at.is_none() {
+                if let Err(e) = tx.execute(
+                    "UPDATE conversations SET closed_at = datetime('now') WHERE id = ?1",
+                    params![conv.id],
+                ) {
+                    return internal_error(&e.to_string());
                 }
-                let _ = tx.commit();
+            }
+            if let Err(e) = tx.commit() {
+                return internal_error(&e.to_string());
             }
             let _ = crate::jobs::audit_entry(
                 &conn,
