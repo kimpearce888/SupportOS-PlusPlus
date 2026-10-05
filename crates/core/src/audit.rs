@@ -77,6 +77,12 @@ impl AuditEntry {
         self.after_state = Some(state);
         self
     }
+
+    /// Attach a before-state snapshot (delete-style audit entries).
+    pub fn with_before_state(mut self, state: Value) -> Self {
+        self.before_state = Some(state);
+        self
+    }
 }
 
 /// Record an audit entry — mirrors `jobRepo.audit()` exactly: states are

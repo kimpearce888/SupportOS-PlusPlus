@@ -49,6 +49,7 @@ pub mod config;
 pub mod connectors;
 pub mod conversation_ops;
 pub mod copilot;
+pub mod custom_objects;
 pub mod customer_events;
 pub mod customers;
 pub mod data_tools;

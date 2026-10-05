@@ -47,8 +47,11 @@ pub fn CustomObjectsPage() -> impl IntoView {
                 let path = format!("/api/custom-objects/types/{tid}");
                 match crate::api::get_json::<serde_json::Value>(&path).await {
                     Ok(data) => {
+                        // Reference shape: { type: { fields: [...] } } — the
+                        // field rows carry key/label/fieldType/required.
                         let items = data
-                            .get("fields")
+                            .get("type")
+                            .and_then(|t| t.get("fields"))
                             .and_then(|v| v.as_array())
                             .cloned()
                             .unwrap_or_default();
@@ -143,7 +146,7 @@ pub fn CustomObjectsPage() -> impl IntoView {
                                 <table class="spp-custom-objects__fields-table">
                                     <thead>
                                         <tr>
-                                            <th>"Name"</th>
+                                            <th>"Key"</th>
                                             <th>"Type"</th>
                                             <th>"Required"</th>
                                         </tr>
@@ -151,12 +154,16 @@ pub fn CustomObjectsPage() -> impl IntoView {
                                     <tbody>
                                         {move || fields.with(|items| {
                                             items.iter().map(|f| {
-                                                let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                let field_type = f.get("field_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let key = f.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let label = f.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let field_type = f.get("fieldType").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                                 let required = f.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
                                                 view! {
                                                     <tr>
-                                                        <td>{name}</td>
+                                                        <td>
+                                                            <span class="spp-custom-objects__field-key">{key}</span>
+                                                            <span class="spp-custom-objects__field-label">{label}</span>
+                                                        </td>
                                                         <td><span class="spp-badge">{field_type}</span></td>
                                                         <td>{if required { "✅" } else { "—" }}</td>
                                                     </tr>

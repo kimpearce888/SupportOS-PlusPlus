@@ -920,7 +920,7 @@ mod tests {
         .unwrap();
         let (events, links) = timeline_rebuild(&conn).unwrap();
         assert!(events > 0, "the sweep should derive at least one event");
-        assert!(links >= 0);
+        assert!(links <= events, "links are a subset of events");
         // The org timeline now has member events.
         let (org_events, total) =
             crate::customer_events::list_for_organization(&conn, org_id, None, 50, 0).unwrap();
