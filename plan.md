@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **115 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **114 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,7 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
 |---|---|---|---|---|---|---|---|
-| 2 | SG-02 | Contact LIKE operators (contains/starts/ends) | Partial | Critical | S | C4 | Use single-backslash ESCAPE like segment.rs:1406; make ids() surface prepare errors |
 | 3 | C2 | Swallowed transaction errors in conversation routes report fake success | Defect | Critical | M | T16 C2 | Route conversation mutations through checked transactions and propagate DB errors (crates/core/src/http/routes/conversations.rs:290-308,453-487: `let _ = tx.execute(...)`, `tx.commit().ok()` then ok:true + SSE). |
 | 4 | AI-19 | Interaction routes (GET card/evidence/profile, refresh) | Divergent | Critical | M | C7 | Fix GET queries to real schema; create evidence table; implement refresh; serve profile from signals |
 | 5 | SEC-02 | HTML sanitizing (40 tags, attr map, schemes, css clip, a-hardening) | Partial | Critical | S | T11 inv.8 | Strip protocol-relative URLs (UrlRelative::Custom deny) ; remove whole img on data:text/html |
