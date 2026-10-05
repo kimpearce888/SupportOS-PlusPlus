@@ -2824,3 +2824,53 @@ body {
   border-radius: 6px;
   padding: var(--spp-space-2) var(--spp-space-3);
 }
+
+/* ── Custom Objects page (P5 tail: the write surface) ── */
+
+.spp-custom-objects__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spp-space-2);
+  margin-bottom: var(--spp-space-4);
+}
+
+.spp-custom-objects__row-actions {
+  display: flex;
+  gap: var(--spp-space-1);
+  align-items: center;
+}
+
+.spp-custom-objects__report-row {
+  padding: var(--spp-space-2) 0;
+  border-bottom: 1px dashed var(--spp-border);
+}
+
+.spp-custom-objects__report-row:last-of-type { border-bottom: none; }
+
+.spp-custom-objects__field-row,
+.spp-custom-objects__link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spp-space-2);
+  align-items: center;
+  margin-bottom: var(--spp-space-2);
+}
+
+.spp-custom-objects__field-row .spp-input,
+.spp-custom-objects__link-row .spp-input {
+  width: 150px;
+}
+
+.spp-custom-objects__field-row .spp-input:nth-child(2) { width: 170px; }
+.spp-custom-objects__field-row select.spp-input { width: 130px; }
+.spp-custom-objects__field-row .spp-custom-objects__options-input { width: 220px; }
+.spp-custom-objects__link-row select.spp-input { width: 160px; }
+.spp-custom-objects__link-row .spp-input { width: 140px; }
+
+.spp-custom-objects__checkbox {
+  display: flex;
+  gap: var(--spp-space-1);
+  align-items: center;
+  font-size: var(--spp-text-xs);
+  white-space: nowrap;
+}
