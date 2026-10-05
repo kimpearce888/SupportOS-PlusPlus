@@ -2609,3 +2609,91 @@ body {
 .spp-knowledge__fresh-row:last-of-type { border-bottom: none; }
 
 .spp-modal--wide { max-width: 720px; }
+
+/* ─── People pages (P5 part 4) ───────────────────────────────────────────── */
+
+/* Page-header action row: the search input + primary action side by side
+   (Organizations list, org detail, customer profile). */
+.spp-page__header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+  flex-wrap: wrap;
+}
+
+/* Customer profile header: name + job title + the edit action. */
+.spp-customer-profile__header {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--spp-space-4);
+}
+
+.spp-customer-profile__edit {
+  margin-left: auto;
+}
+
+/* Organization detail: the summary card (identity + stat strip) over the
+   members table and the member-event timeline. */
+.spp-org-detail__summary {
+  display: flex;
+  gap: var(--spp-space-6);
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.spp-org-detail__identity { flex: 1 1 240px; }
+
+.spp-org-detail__stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--spp-space-4);
+  margin: 0;
+  flex: 2 1 380px;
+}
+
+.spp-org-detail__stats dt {
+  color: var(--spp-fg-muted);
+  font-size: var(--spp-text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.spp-org-detail__stats dd {
+  margin: var(--spp-space-1) 0 0;
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+}
+
+.spp-org-detail__section { margin-top: var(--spp-space-6); }
+.spp-org-detail__section h3 { margin: 0 0 var(--spp-space-3); }
+
+/* Timeline entries (shared by the customer profile and org detail). */
+.spp-timeline-entry {
+  padding: var(--spp-space-2) 0;
+  border-bottom: 1px dashed var(--spp-border);
+}
+
+.spp-timeline-entry:last-of-type { border-bottom: none; }
+
+.spp-timeline-entry__header {
+  display: flex;
+  gap: var(--spp-space-3);
+  flex-wrap: wrap;
+  align-items: baseline;
+  color: var(--spp-fg-muted);
+  font-size: var(--spp-text-xs);
+}
+
+.spp-timeline-entry__type {
+  color: var(--spp-accent);
+  font-weight: 600;
+  font-size: var(--spp-text-xs);
+}
+
+.spp-timeline-entry__body {
+  margin-top: var(--spp-space-1);
+  color: var(--spp-fg);
+  font-size: var(--spp-text-sm);
+}

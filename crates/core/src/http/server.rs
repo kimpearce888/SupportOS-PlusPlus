@@ -404,8 +404,14 @@ impl HttpServer {
                 get(routes::conversations::webhook_configs),
             )
             // People (customers + organizations)
-            .route("/api/customers", get(routes::people::list_customers))
-            .route("/api/customers/:id", get(routes::people::get_customer))
+            .route(
+                "/api/customers",
+                get(routes::people::list_customers).post(routes::people::create_customer),
+            )
+            .route(
+                "/api/customers/:id",
+                get(routes::people::get_customer).patch(routes::people::update_customer),
+            )
             .route(
                 "/api/customers/:id/timeline",
                 get(routes::people::customer_timeline),
@@ -416,11 +422,11 @@ impl HttpServer {
             )
             .route(
                 "/api/organizations",
-                get(routes::people::list_organizations),
+                get(routes::people::list_organizations).post(routes::people::create_organization),
             )
             .route(
                 "/api/organizations/:id",
-                get(routes::people::get_organization),
+                get(routes::people::get_organization).patch(routes::people::update_organization),
             )
             .route(
                 "/api/organizations/:id/timeline",

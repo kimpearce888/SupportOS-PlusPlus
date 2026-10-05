@@ -34,8 +34,12 @@ pub fn CustomerProfilePage(customer_id: i64) -> impl IntoView {
     let timeline = create_rw_signal(Vec::<serde_json::Value>::new());
     let loading = create_rw_signal(true);
     let error_msg = create_rw_signal(None::<String>);
+    // Bumped after a successful edit so the effect refetches both payloads.
+    let reload = create_rw_signal(0u32);
+    let editing = create_rw_signal(false);
 
     create_effect(move |_| {
+        let _ = reload.get();
         let customer = customer;
         let conversations = conversations;
         let timeline = timeline;
@@ -125,6 +129,12 @@ pub fn CustomerProfilePage(customer_id: i64) -> impl IntoView {
                                     } else {
                                         ().into_view()
                                     }}
+                                    <button
+                                        class="spp-button spp-button--ghost spp-button--small spp-customer-profile__edit"
+                                        on:click=move |_| editing.set(true)
+                                    >
+                                        "Edit profile"
+                                    </button>
                                 </header>
 
                                 <dl class="spp-customer-profile__details">
@@ -228,6 +238,155 @@ pub fn CustomerProfilePage(customer_id: i64) -> impl IntoView {
                     </section>
                 </Show>
             </Show>
+
+            <Show when=move || editing.get() fallback=|| ()>
+                <EditCustomerModal
+                    customer_id=customer_id
+                    customer=customer.get_untracked()
+                    on_close=std::rc::Rc::new(move || editing.set(false))
+                    on_saved=std::rc::Rc::new(move || {
+                        editing.set(false);
+                        reload.set(reload.get_untracked() + 1);
+                    })
+                />
+            </Show>
+        </div>
+    }
+}
+
+/// The customer edit modal — PATCH /api/customers/:id over the six
+/// profile fields. An emptied input clears the field (empty string and
+/// explicit null are the same thing on the wire); a field left exactly as
+/// loaded is still sent (the backend PATCH is idempotent).
+#[component]
+fn EditCustomerModal(
+    customer_id: i64,
+    customer: Option<serde_json::Value>,
+    on_close: std::rc::Rc<dyn Fn()>,
+    on_saved: std::rc::Rc<dyn Fn()>,
+) -> impl IntoView {
+    let c = customer.unwrap_or_default();
+    let field = |key: &str| -> String {
+        c.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let first_name = create_rw_signal(field("first_name"));
+    let last_name = create_rw_signal(field("last_name"));
+    let email = create_rw_signal(field("email"));
+    let organization = create_rw_signal(field("organization"));
+    let job_title = create_rw_signal(field("job_title"));
+    let phone = create_rw_signal(field("phone"));
+    let submitting = create_rw_signal(false);
+
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        if submitting.get() {
+            return;
+        }
+        submitting.set(true);
+        // Empty string = clear (the route treats "" and null alike for
+        // these optional text fields).
+        let body = serde_json::json!({
+            "firstName": first_name.get(),
+            "lastName": last_name.get(),
+            "email": email.get(),
+            "organization": organization.get(),
+            "jobTitle": job_title.get(),
+            "phone": phone.get(),
+        });
+        let on_saved = std::rc::Rc::clone(&on_saved);
+        wasm_bindgen_futures::spawn_local(async move {
+            let path = format!("/api/customers/{customer_id}");
+            match crate::api::patch_json::<serde_json::Value>(&path, &body).await {
+                Ok(r) if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) => {
+                    crate::toasts::success("Customer profile saved.");
+                    on_saved();
+                }
+                Ok(r) => {
+                    crate::toasts::error(
+                        r.get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Save failed"),
+                    );
+                    submitting.set(false);
+                }
+                Err(e) => {
+                    crate::toasts::error(e);
+                    submitting.set(false);
+                }
+            }
+        });
+    };
+
+    view! {
+        <div class="spp-overlay" role="dialog" aria-modal="true">
+            <div class="spp-modal spp-modal--form">
+                <h3 class="spp-modal__title">"Edit customer profile"</h3>
+                <p class="spp-modal__message">
+                    "Changes are local-only (they never sync back to Help Scout). Empty a field to clear it."
+                </p>
+                <form on:submit=submit>
+                    <div class="spp-form-grid">
+                        <label class="spp-form-grid__label">"First name"</label>
+                        <input
+                            class="spp-input"
+                            maxlength=80
+                            prop:value=first_name
+                            on:input=move |ev| first_name.set(event_target_value(&ev))
+                        />
+                        <label class="spp-form-grid__label">"Last name"</label>
+                        <input
+                            class="spp-input"
+                            maxlength=80
+                            prop:value=last_name
+                            on:input=move |ev| last_name.set(event_target_value(&ev))
+                        />
+                        <label class="spp-form-grid__label">"Email"</label>
+                        <input
+                            class="spp-input"
+                            type="email"
+                            maxlength=200
+                            prop:value=email
+                            on:input=move |ev| email.set(event_target_value(&ev))
+                        />
+                        <label class="spp-form-grid__label">"Organization"</label>
+                        <input
+                            class="spp-input"
+                            maxlength=200
+                            prop:value=organization
+                            on:input=move |ev| organization.set(event_target_value(&ev))
+                        />
+                        <label class="spp-form-grid__label">"Job title"</label>
+                        <input
+                            class="spp-input"
+                            maxlength=200
+                            prop:value=job_title
+                            on:input=move |ev| job_title.set(event_target_value(&ev))
+                        />
+                        <label class="spp-form-grid__label">"Phone"</label>
+                        <input
+                            class="spp-input"
+                            maxlength=60
+                            prop:value=phone
+                            on:input=move |ev| phone.set(event_target_value(&ev))
+                        />
+                    </div>
+                    <div class="spp-modal__actions spp-mt-8">
+                        <button class="spp-button spp-button--ghost" type="button" on:click=move |_| on_close()>
+                            "Cancel"
+                        </button>
+                        <button
+                            class="spp-button spp-button--primary"
+                            type="submit"
+                            disabled=move || submitting.get()
+                        >
+                            {move || if submitting.get() { "Saving…" } else { "Save changes" }}
+                        </button>
+                    </div>
+                </form>
+            </div>
         </div>
     }
 }

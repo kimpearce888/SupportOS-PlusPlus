@@ -85,6 +85,7 @@ pub mod oauth;
 pub mod oauth_state;
 pub mod operations;
 pub mod outreach;
+pub mod people_store;
 pub mod perf_guards;
 pub mod quality;
 pub mod reports;
