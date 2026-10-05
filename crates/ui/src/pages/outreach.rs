@@ -27,6 +27,12 @@
 use leptos::*;
 use std::rc::Rc;
 
+// IntervalGuard's wasm32 branch hands the Closure to web_sys, which needs
+// the JsCast surface (unchecked_ref) — the trait import only resolves on
+// the wasm target where that branch compiles.
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+
 use crate::components::condition_editor::{
     default_node, describe_condition, inject_uid, strip_uid, ConditionEditor,
 };
