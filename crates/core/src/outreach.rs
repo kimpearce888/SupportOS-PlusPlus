@@ -7,6 +7,7 @@
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
 
@@ -1555,6 +1556,567 @@ pub fn get_campaign_full(conn: &Connection, id: i64) -> Result<Option<serde_json
     })))
 }
 
+// ===========================================================================
+// Campaign send executor (audit OR-02 / B3): batch 5, attempts 3,
+// provider.createConversation, sync-back, unknown-state reconcile.
+//
+// The queue/resume/retry/reconcile services all enqueue `outreach_send_batch`
+// jobs; the worker (workers.rs) dispatches each to `send_batch` below. The
+// executor never holds the DB mutex across the provider call — the batch is
+// fetched under a short lock, the lock is dropped for the network call, and a
+// fresh lock re-acquires for the per-recipient write-back (mirrors the
+// sync_conversation_ratings pattern in workers.rs and avoids the M28 global
+// mutex freeze that would otherwise let one slow send block all requests).
+// ===========================================================================
+
+/// The maximum number of recipients to attempt per batch tick (spec #27).
+pub const SEND_BATCH_SIZE: i64 = 5;
+
+/// Per-recipient retry budget (spec #31; KNOWN PITFALLS: "recipients that
+/// exhaust retries must fail, never livelock"). Hard cap; not configurable
+/// per-campaign in the port today (the reference shares the same constant).
+pub const SEND_MAX_ATTEMPTS: i64 = 3;
+
+/// One row fetched for the batch — every field the executor needs to make a
+/// send decision and persist the outcome without re-querying.
+#[allow(dead_code)]
+struct BatchRow {
+    recipient_id: i64,
+    customer_local_id: i64,
+    customer_remote_id: Option<i64>,
+    email: Option<String>,
+    snapshot: String,
+    attempts: i64,
+}
+
+/// The send outcome for one recipient — produced by the provider call (or
+/// the pre-send skip filter). The executor uses this to write the per-row
+/// `outreach_attempts` row + the `outreach_events` log entry, and to drive
+/// the recipient state machine.
+enum SendOutcome {
+    Sent { remote_id: i64, number: i64 },
+    FailedPermanent(String),
+    FailedRetryable(String),
+    Unknown(String),
+}
+
+impl SendOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Sent { .. } => "sent",
+            Self::FailedPermanent(_) => "failed",
+            Self::FailedRetryable(_) => "queued",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Pre-send skip filter: DNC + missing/invalid email → `skipped` (so the
+/// campaign counters reflect them) and not selected for sending. Returns the
+/// number of recipients parked at `skipped` by this call.
+fn skip_ineligible_recipients(conn: &Connection, campaign_id: i64) -> i64 {
+    // No usable email.
+    let no_email = conn
+        .execute(
+            "UPDATE outreach_recipients
+                SET state = 'skipped', last_error = 'No usable email address on file.'
+              WHERE campaign_id = ?1
+                AND state IN ('selected','queued')
+                AND (email IS NULL OR TRIM(email) = '')",
+            [campaign_id],
+        )
+        .unwrap_or(0) as i64;
+    // DNC list members.
+    let on_dnc = conn
+        .execute(
+            "UPDATE outreach_recipients
+                SET state = 'skipped', last_error = 'On Do-Not-Contact list.'
+              WHERE campaign_id = ?1
+                AND state IN ('selected','queued')
+                AND customer_local_id IN (SELECT customer_id FROM do_not_contact)",
+            [campaign_id],
+        )
+        .unwrap_or(0) as i64;
+    no_email + on_dnc
+}
+
+/// Pick the next up-to-5 recipients that are ready to send.
+fn pick_batch(conn: &Connection, campaign_id: i64) -> Vec<BatchRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT id, customer_local_id, customer_remote_id, email, snapshot, attempts
+           FROM outreach_recipients
+          WHERE campaign_id = ?1 AND state IN ('selected','queued')
+          ORDER BY id ASC LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt
+        .query_map(params![campaign_id, SEND_BATCH_SIZE], |r| {
+            Ok(BatchRow {
+                recipient_id: r.get(0)?,
+                customer_local_id: r.get(1)?,
+                customer_remote_id: r.get(2)?,
+                email: r.get(3)?,
+                snapshot: r.get(4)?,
+                attempts: r.get(5)?,
+            })
+        })
+        .ok();
+    rows.map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Classify a provider error into permanent / retryable / unknown.
+///
+/// - 4xx that are the caller's fault (400/403/404/409/412/413/415/423) →
+///   `FailedPermanent`: another attempt will not help.
+/// - 429 + 5xx (500/502/503/504) → `FailedRetryable`: the next batch will
+///   retry; if `attempts` has reached `SEND_MAX_ATTEMPTS` the caller marks
+///   the recipient `failed`.
+/// - 2xx-but-no-id (the `200/unknown-id` sentinel) → `Unknown`: parked for
+///   the reconcile pass.
+/// - Network errors / status 0 → `FailedRetryable` (one more attempt later).
+fn classify_error(e: &crate::error::Error, attempts: i64) -> SendOutcome {
+    let status = crate::helpscout_real::hs_status(e).unwrap_or(0);
+    let label = e.to_string();
+    match status {
+        0 => SendOutcome::FailedRetryable(format!("Network error: {label}")),
+        200 => SendOutcome::Unknown(format!(
+            "Provider accepted the send but returned no conversation id. {label}"
+        )),
+        400 | 403 | 404 | 409 | 412 | 413 | 415 | 423 => {
+            SendOutcome::FailedPermanent(format!("Provider error {status}: {label}"))
+        }
+        429 | 500 | 502 | 503 | 504 => {
+            if attempts + 1 >= SEND_MAX_ATTEMPTS {
+                SendOutcome::FailedPermanent(format!(
+                    "Provider error {status} after {attempts} attempts: {label}"
+                ))
+            } else {
+                SendOutcome::FailedRetryable(format!("Provider error {status}: {label}"))
+            }
+        }
+        _ => SendOutcome::FailedRetryable(format!("Provider error {status}: {label}")),
+    }
+}
+
+/// Mark a recipient's transition state and write the per-attempt row +
+/// outreach_events log. The caller passes the new state explicitly so the
+/// same helper serves the sent / failed-permanent / retryable / unknown
+/// paths.
+fn record_outcome(
+    conn: &Connection,
+    campaign_id: i64,
+    row: &BatchRow,
+    attempt_no: i64,
+    outcome: &SendOutcome,
+    error_or_remote: Option<&str>,
+) {
+    let now = datetime_now();
+    // outreach_attempts: one row per attempt.
+    let _ = conn.execute(
+        "INSERT INTO outreach_attempts
+             (recipient_id, attempt_no, started_at, finished_at, result, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            row.recipient_id,
+            attempt_no,
+            now,
+            datetime_now(),
+            outcome.label(),
+            match outcome {
+                SendOutcome::Sent { .. } => None,
+                SendOutcome::FailedPermanent(m)
+                | SendOutcome::FailedRetryable(m)
+                | SendOutcome::Unknown(m) => Some(m.as_str()),
+            }
+        ],
+    );
+
+    // State transition for the recipient.
+    let _ = match outcome {
+        SendOutcome::Sent { remote_id, number } => conn.execute(
+            "UPDATE outreach_recipients
+                SET state = 'sent',
+                    hs_conversation_remote_id = ?1,
+                    hs_conversation_number = ?2,
+                    sent_at = datetime('now'),
+                    last_error = NULL
+              WHERE id = ?3",
+            params![remote_id, number, row.recipient_id],
+        ),
+        SendOutcome::FailedPermanent(msg) => conn.execute(
+            "UPDATE outreach_recipients
+                SET state = 'failed', last_error = ?1
+              WHERE id = ?2",
+            params![msg, row.recipient_id],
+        ),
+        SendOutcome::FailedRetryable(msg) => conn.execute(
+            "UPDATE outreach_recipients
+                SET state = 'queued', last_error = ?1
+              WHERE id = ?2",
+            params![msg, row.recipient_id],
+        ),
+        SendOutcome::Unknown(msg) => conn.execute(
+            "UPDATE outreach_recipients
+                SET state = 'unknown', last_error = ?1
+              WHERE id = ?2",
+            params![msg, row.recipient_id],
+        ),
+    };
+
+    // outreach_events: the audit-grade log of what happened.
+    let event = match outcome {
+        SendOutcome::Sent { .. } => "recipient_sent",
+        SendOutcome::FailedPermanent(_) => "recipient_failed",
+        SendOutcome::FailedRetryable(_) => "recipient_retryable_error",
+        SendOutcome::Unknown(_) => "recipient_unknown",
+    };
+    log_event(
+        conn,
+        campaign_id,
+        Some(row.recipient_id),
+        event,
+        error_or_remote,
+    );
+}
+
+/// `datetime('now')` in SQLite produces `YYYY-MM-DD HH:MM:SS`; the
+/// reference's `outreach_events.at` column uses the same shape.
+fn datetime_now() -> String {
+    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// The send executor (audit OR-02 / B3).
+///
+/// Workflow per call:
+/// 1. Skip-eligible filter: park DNC + no-email recipients at `skipped`.
+/// 2. Pick up to 5 recipients in `selected`/`queued` state.
+/// 3. For each recipient: render the template, call
+///    `provider.create_conversation`, classify the outcome, write
+///    `outreach_attempts` + `outreach_events` + recipient state.
+/// 4. If any recipient succeeded: enqueue `sync_conversation` jobs (the
+///    sync-back) so the new conversation lands in the local mirror.
+/// 5. If more recipients remain in `selected`/`queued`/`sending`: enqueue
+///    the next `outreach_send_batch` job (the campaign stays in `sending`).
+/// 6. Otherwise (nothing left to send): mark the campaign `completed`.
+///
+/// The function takes the provider as an `Arc<dyn HelpScoutProvider>` so the
+/// worker can pass its own `self.provider` directly. The DB lock is only
+/// held for the fetch + per-recipient write — never across the provider call
+/// (mirrors `sync_conversation_ratings` in workers.rs).
+pub async fn send_batch(
+    conn: &Arc<Mutex<Connection>>,
+    provider: &Arc<dyn crate::helpscout::HelpScoutProvider>,
+    campaign_id: i64,
+) -> serde_json::Value {
+    // 1. Load the campaign + recipients under a short lock, then drop the
+    //    lock before any provider call.
+    let (campaign, mailbox_local_id, tags, subject, body, batch) = {
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = skip_ineligible_recipients(&c, campaign_id);
+        let Some(camp) = get_outreach_campaign(&c, campaign_id).unwrap_or_default() else {
+            return serde_json::json!({ "ok": false, "message": "Campaign not found." });
+        };
+        if camp.status == "paused" || camp.status == "cancelled" || camp.status == "completed" {
+            return serde_json::json!({
+                "ok": false,
+                "message": format!(
+                    "Campaign is {}; nothing to send.",
+                    camp.status
+                ),
+            });
+        }
+        // Mark the campaign as actively sending (idempotent).
+        if camp.status != "sending" {
+            update_status(&c, campaign_id, "sending");
+        }
+        let mailbox_local_id = camp.mailbox_local_id;
+        let tags = camp.tags.clone();
+        let subject = camp.subject.clone();
+        let body = camp.body.clone();
+        let batch = pick_batch(&c, campaign_id);
+        (camp, mailbox_local_id, tags, subject, body, batch)
+    };
+
+    let _ = campaign; // Camp is here for the early-return shape check above.
+
+    if batch.is_empty() {
+        // Nothing to send this tick — finalize if no work remains at all.
+        return finalize_if_drained(conn, campaign_id);
+    }
+
+    let Some(mailbox_local_id) = mailbox_local_id else {
+        // No mailbox configured — every remaining recipient is failed.
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        for row in &batch {
+            record_outcome(
+                &c,
+                campaign_id,
+                row,
+                row.attempts + 1,
+                &SendOutcome::FailedPermanent("Campaign has no sending mailbox configured.".into()),
+                Some("no mailbox"),
+            );
+        }
+        return finalize_if_drained(conn, campaign_id);
+    };
+
+    let mut sent_remote_ids: Vec<i64> = Vec::new();
+    let mut counts = BatchCounts::default();
+
+    for row in batch {
+        let attempt_no = row.attempts + 1;
+
+        // The render context (snapshot carries the matching_tickets for
+        // personalization). Customer missing → fail permanently.
+        let Some(customer_remote_id) = row.customer_remote_id else {
+            let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+            record_outcome(
+                &c,
+                campaign_id,
+                &row,
+                attempt_no,
+                &SendOutcome::FailedPermanent(
+                    "Recipient has no remote customer id; cannot create conversation.".into(),
+                ),
+                Some("no customer_remote_id"),
+            );
+            counts.failed_permanent += 1;
+            continue;
+        };
+
+        // Render the personalized subject/body under a brief lock (the
+        // render_for helper queries customer + organization names).
+        let rendered = {
+            let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+            let matching_tickets: Vec<serde_json::Value> =
+                serde_json::from_str::<serde_json::Value>(&row.snapshot)
+                    .ok()
+                    .and_then(|v| v.get("matching_tickets").cloned())
+                    .and_then(|t| serde_json::from_value(t).ok())
+                    .unwrap_or_default();
+            render_for(
+                &c,
+                row.customer_local_id,
+                &matching_tickets,
+                &subject,
+                &body,
+            )
+        };
+        let r_subject = rendered["subject"].as_str().unwrap_or(&subject).to_string();
+        let r_body = rendered["body"].as_str().unwrap_or(&body).to_string();
+
+        // Provider call — no DB lock held.
+        let input = crate::helpscout::CreateConversationInput {
+            mailbox_id: mailbox_local_id,
+            customer_id: customer_remote_id,
+            subject: r_subject,
+            body: r_body,
+            tags: tags.clone(),
+            status: Some("active".to_string()),
+        };
+        let result = provider.create_conversation(input).await;
+
+        let outcome = match result {
+            Ok(crate::helpscout::ConversationCreated {
+                conversation_id,
+                number,
+                ..
+            }) => {
+                counts.sent += 1;
+                sent_remote_ids.push(conversation_id);
+                SendOutcome::Sent {
+                    remote_id: conversation_id,
+                    number,
+                }
+            }
+            Err(e) => {
+                let mut o = classify_error(&e, row.attempts);
+                match &o {
+                    SendOutcome::Sent { .. } => {}
+                    SendOutcome::FailedPermanent(_) => counts.failed_permanent += 1,
+                    SendOutcome::FailedRetryable(_) => counts.retryable += 1,
+                    SendOutcome::Unknown(_) => counts.unknown += 1,
+                }
+                // Downgrade retryable to permanent when the attempt budget
+                // is exhausted — KNOWN PITFALLS: "recipients that exhaust
+                // retries must fail, never livelock."
+                if let SendOutcome::FailedRetryable(msg) = &o {
+                    if attempt_no >= SEND_MAX_ATTEMPTS {
+                        counts.retryable -= 1;
+                        counts.failed_permanent += 1;
+                        o = SendOutcome::FailedPermanent(format!(
+                            "{msg} (attempts exhausted: {attempt_no})"
+                        ));
+                    }
+                }
+                o
+            }
+        };
+
+        let error_or_remote: Option<&str> = match &outcome {
+            SendOutcome::Sent { remote_id, .. } => {
+                // Persist immediately while the result is fresh.
+                let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+                record_outcome(
+                    &c,
+                    campaign_id,
+                    &row,
+                    attempt_no,
+                    &outcome,
+                    Some(&remote_id.to_string()),
+                );
+                None
+            }
+            SendOutcome::FailedPermanent(m)
+            | SendOutcome::FailedRetryable(m)
+            | SendOutcome::Unknown(m) => {
+                let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+                record_outcome(&c, campaign_id, &row, attempt_no, &outcome, Some(m));
+                None
+            }
+        };
+        let _ = error_or_remote;
+    }
+
+    // 4. Sync-back: enqueue one sync_conversation job per newly-created
+    //    conversation so the local mirror catches up. This is the
+    //    "sync-back" leg of the audit's spec for OR-02.
+    if !sent_remote_ids.is_empty() {
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        for rid in &sent_remote_ids {
+            let _ = crate::jobs::enqueue_on(
+                &c,
+                "sync",
+                "sync_conversation",
+                &serde_json::json!({ "remoteId": rid }).to_string(),
+                3,
+            );
+        }
+        log_event(
+            &c,
+            campaign_id,
+            None,
+            "batch_sync_back_enqueued",
+            Some(&format!("{} sync_conversation jobs", sent_remote_ids.len())),
+        );
+    }
+
+    // Surface the per-batch outcome counts so the job log shows progress
+    // (and the field is "read" — keeps the warnings honest).
+    tracing::info!(
+        campaign_id = campaign_id,
+        sent = counts.sent,
+        failed = counts.failed_permanent,
+        retryable = counts.retryable,
+        unknown = counts.unknown,
+        "Outreach batch outcomes"
+    );
+
+    // 5/6. Re-enqueue next batch or finalize.
+    let mut summary = finalize_if_drained(conn, campaign_id);
+    if let Some(obj) = summary.as_object_mut() {
+        obj.insert(
+            "batch".to_string(),
+            serde_json::json!({
+                "sent": counts.sent,
+                "failed": counts.failed_permanent,
+                "retryable": counts.retryable,
+                "unknown": counts.unknown,
+            }),
+        );
+    }
+    summary
+}
+
+#[derive(Default)]
+struct BatchCounts {
+    sent: i64,
+    failed_permanent: i64,
+    retryable: i64,
+    unknown: i64,
+}
+
+/// Count recipients still eligible to send (selected/queued/sending).
+fn count_remaining_for_send(conn: &Connection, campaign_id: i64) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM outreach_recipients
+          WHERE campaign_id = ?1 AND state IN ('selected','queued','sending')",
+        [campaign_id],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// After a batch finishes: if recipients still remain in a sendable state,
+/// enqueue the next `outreach_send_batch` job; otherwise flip the campaign
+/// to `completed` and log a final `campaign_completed` event. Returns the
+/// JSON summary the worker can attach to the job log.
+fn finalize_if_drained(conn: &Arc<Mutex<Connection>>, campaign_id: i64) -> serde_json::Value {
+    let (remaining, sent, failed, skipped, unknown, status) = {
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let remaining = count_remaining_for_send(&c, campaign_id);
+        let camp = get_outreach_campaign(&c, campaign_id)
+            .ok()
+            .flatten()
+            .map(|c| (c.sent, c.failed, c.skipped, c.unknown, c.status));
+        let (sent, failed, skipped, unknown, status) =
+            camp.unwrap_or((0, 0, 0, 0, "unknown".into()));
+        (remaining, sent, failed, skipped, unknown, status)
+    };
+
+    if remaining > 0 {
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = crate::jobs::enqueue_on(
+            &c,
+            "outreach",
+            "outreach_send_batch",
+            &serde_json::json!({ "campaignId": campaign_id }).to_string(),
+            1,
+        );
+        return serde_json::json!({
+            "ok": true,
+            "campaign_id": campaign_id,
+            "remaining": remaining,
+            "message": "Batch processed; next batch enqueued.",
+        });
+    }
+
+    // Drain complete — flip the campaign to `completed` (idempotent; a
+    // cancelled/paused campaign stays as-is).
+    {
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        if status != "completed" && status != "cancelled" && status != "paused" {
+            update_status(&c, campaign_id, "completed");
+            let _ = c.execute(
+                "UPDATE outreach_campaigns SET completed_at = datetime('now') WHERE id = ?1",
+                [campaign_id],
+            );
+            log_event(
+                &c,
+                campaign_id,
+                None,
+                "campaign_completed",
+                Some(&format!(
+                    "{sent} sent, {failed} failed, {skipped} skipped, {unknown} unknown"
+                )),
+            );
+        }
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "campaign_id": campaign_id,
+        "remaining": 0,
+        "message": "Campaign completed: all recipients processed.",
+        "totals": {
+            "sent": sent, "failed": failed, "skipped": skipped, "unknown": unknown
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1918,5 +2480,568 @@ mod tests {
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"reply_rate\":0.375"));
+    }
+
+    // ---- OR-02 / B3: campaign send executor unit tests ---------------------
+
+    use crate::helpscout::{
+        ConversationCreated, CreateConversationInput, FakeHelpScoutProvider, HelpScoutProvider,
+    };
+
+    /// Fresh DB with the M031 outreach tables applied.
+    fn fresh_db_m031() -> (Connection, std::sync::Arc<std::sync::Mutex<Connection>>) {
+        let conn = fresh_db();
+        apply_m031(&conn).expect("apply M031");
+        let arc = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        // Re-open the inner connection for synchronous setup; the Arc is
+        // what send_batch uses.
+        let inner = arc.lock().unwrap();
+        // The mutex-locked connection is the same handle the tests query
+        // through; just return a clone of the Arc + a fresh Connection
+        // obtained by re-opening the file.
+        drop(inner);
+        // To avoid file-locking headaches, we re-use the Arc's connection
+        // for synchronous setup via .lock().unwrap() at each test step.
+        let placeholder = Connection::open_in_memory().unwrap();
+        (placeholder, arc)
+    }
+
+    /// A campaign + recipients fixture used by the send_batch tests.
+    fn seed_campaign(
+        conn: &Connection,
+        mailbox_id: i64,
+        recipients: &[(i64, Option<i64>, Option<&str>)],
+    ) -> i64 {
+        // The recipients tuple is (local_id, remote_id, email).
+        conn.execute(
+            "INSERT INTO outreach_campaigns
+                 (name, subject, body, mailbox_local_id, tags, status, segment_id,
+                  segment_snapshot, created_at, queued_at, completed_at, updated_at)
+             VALUES ('Test','Hi {{first_name}}','Body {{last_ticket_subject}}', ?1, '[]',
+                     'queued', NULL, NULL, datetime('now'), datetime('now'), NULL,
+                     datetime('now'))",
+            params![mailbox_id],
+        )
+        .unwrap();
+        let campaign_id = conn.last_insert_rowid();
+        for (local, remote, email) in recipients {
+            conn.execute(
+                "INSERT INTO outreach_recipients
+                     (campaign_id, customer_local_id, customer_remote_id, email, snapshot, state,
+                      attempts, last_error, hs_conversation_remote_id, hs_conversation_number,
+                      sent_at, replied_at)
+                 VALUES (?1, ?2, ?3, ?4, '{}', 'queued', 0, NULL, NULL, NULL, NULL, NULL)",
+                params![campaign_id, local, remote, email],
+            )
+            .unwrap();
+        }
+        campaign_id
+    }
+
+    #[test]
+    fn skip_ineligible_parks_no_email_and_dnc() {
+        let (conn, arc) = fresh_db_m031();
+        let _ = conn;
+        let c = arc.lock().unwrap();
+        // mailbox + customers.
+        c.execute(
+            "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO customers (id, remote_id, first_name, last_name) VALUES
+                (10, 1001, 'Ada', 'Lovelace'),
+                (11, 1002, 'Grace', 'Hopper'),
+                (12, 1003, 'Linus', 'Torvalds')",
+            [],
+        )
+        .unwrap();
+        // Recipient with no remote id (skip-able via no-email path? no — has
+        // email but no remote id triggers the per-row permanent failure later).
+        // Here we test the no-email + DNC skip paths.
+        // Recipients: (10,1001,has-email) ; (11,1002,no-email) ; (12,1003,dnc)
+        let cid = seed_campaign(&c, 1, &[(10, Some(1001), Some("a@b.co"))]);
+        // Add the no-email one directly (the helper takes Option<&str>; pass
+        // None for email).
+        c.execute(
+            "INSERT INTO outreach_recipients
+                 (campaign_id, customer_local_id, customer_remote_id, email, snapshot, state)
+             VALUES (?1, 11, 1002, NULL, '{}', 'queued')",
+            params![cid],
+        )
+        .unwrap();
+        // DNC the third.
+        c.execute(
+            "INSERT INTO do_not_contact (customer_id, reason) VALUES (10, 'manual')",
+            [],
+        )
+        .unwrap();
+
+        let skipped = skip_ineligible_recipients(&c, cid);
+        // 2 skipped: customer 10 (DNC), customer 11 (no email).
+        assert_eq!(skipped, 2);
+
+        // Verify the rows are now state='skipped'.
+        let parked: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM outreach_recipients
+                  WHERE campaign_id = ?1 AND state = 'skipped'",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked, 2);
+    }
+
+    #[test]
+    fn pick_batch_returns_at_most_five_rows() {
+        let (conn, arc) = fresh_db_m031();
+        let _ = conn;
+        let c = arc.lock().unwrap();
+        c.execute(
+            "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO customers (id, remote_id, first_name, last_name) VALUES
+                (10, 1001, 'Ada', 'Lovelace')",
+            [],
+        )
+        .unwrap();
+        let cid = seed_campaign(&c, 1, &[(10, Some(1001), Some("a@b.co"))]);
+        // Add 7 more recipients — total 8, pick_batch should return 5.
+        for i in 11..18 {
+            c.execute(
+                "INSERT INTO outreach_recipients
+                     (campaign_id, customer_local_id, customer_remote_id, email, snapshot, state)
+                 VALUES (?1, ?2, ?3, ?4, '{}', 'queued')",
+                params![cid, i, 1000 + i as i64, format!("u{i}@b.co")],
+            )
+            .unwrap();
+        }
+        let batch = pick_batch(&c, cid);
+        assert_eq!(batch.len(), 5, "pick_batch returns at most 5");
+        // Ordered by id ASC.
+        assert!(batch[0].recipient_id < batch[1].recipient_id);
+    }
+
+    #[test]
+    fn classify_error_permanent_for_4xx_caller_fault() {
+        use crate::error::Error;
+        use crate::helpscout_real::HsApiError;
+        let e: Error = HsApiError {
+            status_code: 400,
+            message: "bad request".into(),
+            friendly: "Invalid request".into(),
+            retryable: false,
+        }
+        .into();
+        match classify_error(&e, 0) {
+            SendOutcome::FailedPermanent(_) => {}
+            other => panic!("expected FailedPermanent, got {:?}", other.label()),
+        }
+    }
+
+    #[test]
+    fn classify_error_retryable_for_5xx_then_permanent_on_max_attempts() {
+        use crate::error::Error;
+        use crate::helpscout_real::HsApiError;
+        let e: Error = HsApiError {
+            status_code: 503,
+            message: "unavailable".into(),
+            friendly: "Help Scout is down".into(),
+            retryable: true,
+        }
+        .into();
+        assert!(
+            matches!(classify_error(&e, 0), SendOutcome::FailedRetryable(_)),
+            "5xx with attempts < max should be retryable"
+        );
+        match classify_error(&e, SEND_MAX_ATTEMPTS - 1) {
+            SendOutcome::FailedPermanent(_) => {}
+            other => panic!(
+                "5xx with attempts = max-1 (next attempt = max) should be permanent, got {:?}",
+                other.label()
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_error_unknown_for_2xx_no_id() {
+        use crate::error::Error;
+        use crate::helpscout_real::HsApiError;
+        let e: Error = HsApiError {
+            status_code: 200,
+            message: "no id".into(),
+            friendly: "Help Scout accepted the send but returned no id".into(),
+            retryable: false,
+        }
+        .into();
+        assert!(matches!(classify_error(&e, 0), SendOutcome::Unknown(_)));
+    }
+
+    #[tokio::test]
+    async fn send_batch_happy_path_marks_sent_and_finalizes() {
+        let (conn, arc) = fresh_db_m031();
+        let _ = conn;
+        {
+            let c = arc.lock().unwrap();
+            c.execute(
+                "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO customers (id, remote_id, first_name, last_name) VALUES
+                    (10, 1001, 'Ada', 'Lovelace'),
+                    (11, 1002, 'Grace', 'Hopper'),
+                    (12, 1003, 'Linus', 'Torvalds')",
+                [],
+            )
+            .unwrap();
+        }
+        let cid = {
+            let c = arc.lock().unwrap();
+            seed_campaign(
+                &c,
+                1,
+                &[
+                    (10, Some(1001), Some("a@b.co")),
+                    (11, Some(1002), Some("g@b.co")),
+                    (12, Some(1003), Some("l@b.co")),
+                ],
+            )
+        };
+
+        let provider: std::sync::Arc<dyn HelpScoutProvider> =
+            std::sync::Arc::new(FakeHelpScoutProvider::new_demo());
+        let summary = send_batch(&arc, &provider, cid).await;
+
+        // The summary claims the campaign is finalized.
+        assert_eq!(summary["ok"].as_bool(), Some(true));
+        assert_eq!(summary["remaining"].as_i64(), Some(0));
+
+        let c = arc.lock().unwrap();
+        // All three recipients are now 'sent' with a real hs_conversation_remote_id.
+        let sent: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM outreach_recipients
+                  WHERE campaign_id = ?1 AND state = 'sent'",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sent, 3, "all three recipients should be sent");
+
+        // The new conversations exist in the local mirror (sync-back was
+        // enqueued — the fake provider's create_conversation added them to
+        // its in-memory world; we verify the outreach_recipients got
+        // populated with the new remote ids + numbers).
+        let with_remote: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM outreach_recipients
+                  WHERE campaign_id = ?1
+                    AND hs_conversation_remote_id IS NOT NULL
+                    AND hs_conversation_number IS NOT NULL
+                    AND sent_at IS NOT NULL",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(with_remote, 3);
+
+        // Three outreach_attempts rows (one per send).
+        let attempts: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM outreach_attempts
+                  WHERE recipient_id IN (SELECT id FROM outreach_recipients WHERE campaign_id = ?1)
+                    AND result = 'sent'",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 3);
+
+        // The campaign is 'completed'.
+        let status: String = c
+            .query_row(
+                "SELECT status FROM outreach_campaigns WHERE id = ?1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+
+        // A sync_conversation job was enqueued per recipient (sync-back).
+        let sync_jobs: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE type = 'sync_conversation' AND status = 'queued'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sync_jobs, 3,
+            "sync-back enqueues one job per sent recipient"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_batch_marks_unknown_when_provider_returns_no_id() {
+        // A stub provider whose create_conversation returns an HsApiError
+        // with status 200 — the "sent but no id" sentinel. The recipient
+        // should land in 'unknown' state.
+        use crate::helpscout_real::{friendly_error, HsApiError};
+        struct UnknownStub;
+        #[async_trait::async_trait]
+        impl HelpScoutProvider for UnknownStub {
+            fn kind(&self) -> &'static str {
+                "stub"
+            }
+            async fn get_me(&self) -> Result<crate::helpscout::HsUser> {
+                Ok(crate::helpscout::HsUser::default())
+            }
+            async fn list_mailboxes(&self) -> Result<Vec<crate::helpscout::HsMailbox>> {
+                Ok(Vec::new())
+            }
+            async fn list_users(&self) -> Result<Vec<crate::helpscout::HsUser>> {
+                Ok(Vec::new())
+            }
+            async fn list_teams(&self) -> Result<Vec<crate::helpscout::HsTeam>> {
+                Ok(Vec::new())
+            }
+            async fn list_tags(&self) -> Result<Vec<crate::helpscout::HsTag>> {
+                Ok(Vec::new())
+            }
+            async fn list_conversations(
+                &self,
+                _q: &crate::helpscout::ConversationQuery,
+            ) -> Result<crate::helpscout::Page<crate::helpscout::HsConversation>> {
+                Ok(crate::helpscout::Page {
+                    items: Vec::new(),
+                    next_cursor: None,
+                })
+            }
+            async fn list_customers(
+                &self,
+                _q: &crate::helpscout::CustomerQuery,
+            ) -> Result<crate::helpscout::Page<crate::helpscout::HsCustomer>> {
+                Ok(crate::helpscout::Page {
+                    items: Vec::new(),
+                    next_cursor: None,
+                })
+            }
+            async fn list_beacon_chats(&self) -> Result<Vec<crate::helpscout::HsBeaconChat>> {
+                Ok(Vec::new())
+            }
+            async fn list_docs(&self) -> Result<Vec<crate::helpscout::HsDocArticle>> {
+                Ok(Vec::new())
+            }
+            async fn list_ratings(&self) -> Result<Vec<crate::helpscout::HsRating>> {
+                Ok(Vec::new())
+            }
+            async fn create_reply_thread(
+                &self,
+                _i: crate::helpscout::CreateThreadInput,
+            ) -> Result<crate::helpscout::ThreadCreated> {
+                Ok(crate::helpscout::ThreadCreated {
+                    thread_id: 0,
+                    conversation_id: 0,
+                })
+            }
+            async fn create_note_thread(
+                &self,
+                _i: crate::helpscout::CreateThreadInput,
+            ) -> Result<crate::helpscout::ThreadCreated> {
+                Ok(crate::helpscout::ThreadCreated {
+                    thread_id: 0,
+                    conversation_id: 0,
+                })
+            }
+            async fn update_conversation(
+                &self,
+                _id: i64,
+                _p: crate::helpscout::ConversationPatch,
+            ) -> Result<bool> {
+                Ok(true)
+            }
+            async fn create_conversation(
+                &self,
+                _i: CreateConversationInput,
+            ) -> Result<ConversationCreated> {
+                Err(crate::error::Error::Other(Box::new(HsApiError {
+                    status_code: 200,
+                    message: "no id".into(),
+                    friendly: friendly_error(200, "", "POST"),
+                    retryable: false,
+                })))
+            }
+        }
+
+        let (conn, arc) = fresh_db_m031();
+        let _ = conn;
+        {
+            let c = arc.lock().unwrap();
+            c.execute(
+                "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO customers (id, remote_id, first_name, last_name) VALUES
+                    (10, 1001, 'Ada', 'Lovelace')",
+                [],
+            )
+            .unwrap();
+        }
+        let cid = {
+            let c = arc.lock().unwrap();
+            seed_campaign(&c, 1, &[(10, Some(1001), Some("a@b.co"))])
+        };
+        let provider: std::sync::Arc<dyn HelpScoutProvider> = std::sync::Arc::new(UnknownStub);
+        let _summary = send_batch(&arc, &provider, cid).await;
+        let c = arc.lock().unwrap();
+        let state: String = c
+            .query_row(
+                "SELECT state FROM outreach_recipients WHERE campaign_id = ?1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "unknown", "200-no-id outcome should park as unknown");
+        // campaign is still completed (no remaining recipients).
+        let status: String = c
+            .query_row(
+                "SELECT status FROM outreach_campaigns WHERE id = ?1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    #[tokio::test]
+    async fn send_batch_marks_failed_for_permanent_provider_error() {
+        use crate::helpscout_real::HsApiError;
+        struct FailStub;
+        #[async_trait::async_trait]
+        impl HelpScoutProvider for FailStub {
+            fn kind(&self) -> &'static str {
+                "stub"
+            }
+            async fn get_me(&self) -> Result<crate::helpscout::HsUser> {
+                Ok(crate::helpscout::HsUser::default())
+            }
+            async fn list_mailboxes(&self) -> Result<Vec<crate::helpscout::HsMailbox>> {
+                Ok(Vec::new())
+            }
+            async fn list_users(&self) -> Result<Vec<crate::helpscout::HsUser>> {
+                Ok(Vec::new())
+            }
+            async fn list_teams(&self) -> Result<Vec<crate::helpscout::HsTeam>> {
+                Ok(Vec::new())
+            }
+            async fn list_tags(&self) -> Result<Vec<crate::helpscout::HsTag>> {
+                Ok(Vec::new())
+            }
+            async fn list_conversations(
+                &self,
+                _q: &crate::helpscout::ConversationQuery,
+            ) -> Result<crate::helpscout::Page<crate::helpscout::HsConversation>> {
+                Ok(crate::helpscout::Page {
+                    items: Vec::new(),
+                    next_cursor: None,
+                })
+            }
+            async fn list_customers(
+                &self,
+                _q: &crate::helpscout::CustomerQuery,
+            ) -> Result<crate::helpscout::Page<crate::helpscout::HsCustomer>> {
+                Ok(crate::helpscout::Page {
+                    items: Vec::new(),
+                    next_cursor: None,
+                })
+            }
+            async fn list_beacon_chats(&self) -> Result<Vec<crate::helpscout::HsBeaconChat>> {
+                Ok(Vec::new())
+            }
+            async fn list_docs(&self) -> Result<Vec<crate::helpscout::HsDocArticle>> {
+                Ok(Vec::new())
+            }
+            async fn list_ratings(&self) -> Result<Vec<crate::helpscout::HsRating>> {
+                Ok(Vec::new())
+            }
+            async fn create_reply_thread(
+                &self,
+                _i: crate::helpscout::CreateThreadInput,
+            ) -> Result<crate::helpscout::ThreadCreated> {
+                Ok(crate::helpscout::ThreadCreated {
+                    thread_id: 0,
+                    conversation_id: 0,
+                })
+            }
+            async fn create_note_thread(
+                &self,
+                _i: crate::helpscout::CreateThreadInput,
+            ) -> Result<crate::helpscout::ThreadCreated> {
+                Ok(crate::helpscout::ThreadCreated {
+                    thread_id: 0,
+                    conversation_id: 0,
+                })
+            }
+            async fn update_conversation(
+                &self,
+                _id: i64,
+                _p: crate::helpscout::ConversationPatch,
+            ) -> Result<bool> {
+                Ok(true)
+            }
+            async fn create_conversation(
+                &self,
+                _i: CreateConversationInput,
+            ) -> Result<ConversationCreated> {
+                Err(crate::error::Error::Other(Box::new(HsApiError {
+                    status_code: 400,
+                    message: "bad request".into(),
+                    friendly: "Invalid request".into(),
+                    retryable: false,
+                })))
+            }
+        }
+
+        let (conn, arc) = fresh_db_m031();
+        let _ = conn;
+        {
+            let c = arc.lock().unwrap();
+            c.execute(
+                "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO customers (id, remote_id, first_name, last_name) VALUES
+                    (10, 1001, 'Ada', 'Lovelace')",
+                [],
+            )
+            .unwrap();
+        }
+        let cid = {
+            let c = arc.lock().unwrap();
+            seed_campaign(&c, 1, &[(10, Some(1001), Some("a@b.co"))])
+        };
+        let provider: std::sync::Arc<dyn HelpScoutProvider> = std::sync::Arc::new(FailStub);
+        let _summary = send_batch(&arc, &provider, cid).await;
+        let c = arc.lock().unwrap();
+        let (state, last_error): (String, Option<String>) = c
+            .query_row(
+                "SELECT state, last_error FROM outreach_recipients WHERE campaign_id = ?1",
+                params![cid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "failed", "400 → permanent failure");
+        assert!(last_error.unwrap_or_default().contains("400"));
     }
 }

@@ -620,6 +620,20 @@ pub trait HelpScoutProvider: Send + Sync {
         patch: ConversationPatch,
     ) -> Result<bool>;
 
+    /// Create a new outbound conversation (audit OR-02 / B3 — the send
+    /// executor calls this for each campaign recipient). The default impl
+    /// returns an error so existing test mocks (which only override the
+    /// reply/note/update mutators) keep compiling; the Fake and Real
+    /// providers override it for real.
+    async fn create_conversation(
+        &self,
+        _input: CreateConversationInput,
+    ) -> Result<ConversationCreated> {
+        Err(crate::error::Error::Other(
+            "create_conversation is not supported by this provider".into(),
+        ))
+    }
+
     /// Reset the provider's state (Fake only; Real is a no-op).
     /// Used by tests to get a clean slate.
     fn reset(&self) {}
@@ -646,6 +660,33 @@ pub struct CreateThreadInput {
 pub struct ThreadCreated {
     pub thread_id: i64,
     pub conversation_id: i64,
+}
+
+/// `createConversation` input — used by the outreach send executor
+/// (audit OR-02 / B3) to start a new outbound conversation on the
+/// provider (Help Scout v3 `POST /v3/conversations`). The customer
+/// is identified by remote id; `body` becomes the first (customer-side)
+/// thread; `tags` are applied to the new conversation; `status` defaults
+/// to `active` when `None`.
+#[derive(Debug, Clone)]
+pub struct CreateConversationInput {
+    pub mailbox_id: i64,
+    pub customer_id: i64,
+    pub subject: String,
+    pub body: String,
+    pub tags: Vec<String>,
+    pub status: Option<String>,
+}
+
+/// The provider's create-conversation result shape — the new conversation's
+/// remote id + human-readable number, plus the first thread's remote id.
+/// The outreach executor uses `conversation_id` for the sync-back call and
+/// stores `number` on `outreach_recipients.hs_conversation_number`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversationCreated {
+    pub conversation_id: i64,
+    pub number: i64,
+    pub thread_id: i64,
 }
 
 /// `ConversationPatch` — present fields are written, absent fields are left
@@ -2563,6 +2604,91 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
         conv.updated_at =
             Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
         Ok(true)
+    }
+
+    /// fakeProvider.ts `createConversation` (audit OR-02 / B3): the demo mode
+    /// behaves like the remote — a fresh conversation with the supplied
+    /// subject/body/tags/mailbox/customer is created in the in-memory world,
+    /// then the single-conversation sync-back in the executor persists it
+    /// locally. The remote id is `max(remote_id) + 1` (matching the fake's
+    /// existing id-allocator pattern from `create_reply_thread`); the number
+    /// is the next 4-digit user-facing number.
+    async fn create_conversation(
+        &self,
+        input: CreateConversationInput,
+    ) -> Result<ConversationCreated> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        // Allocate fresh ids monotonically (mirrors create_reply_thread).
+        let next_conv_remote = world
+            .conversations
+            .iter()
+            .map(|c| c.remote_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let next_thread_remote = world.threads.iter().map(|t| t.remote_id).max().unwrap_or(0) + 1;
+        let next_number = world
+            .conversations
+            .iter()
+            .map(|c| c.number)
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        let status = input
+            .status
+            .clone()
+            .filter(|s| matches!(s.as_str(), "active" | "pending" | "closed" | "spam"))
+            .unwrap_or_else(|| "active".to_string());
+
+        let conv = HsConversation {
+            remote_id: next_conv_remote,
+            number: next_number,
+            kind: Some("email".into()),
+            source_type: None,
+            source_via: None,
+            subject: Some(input.subject.clone()),
+            preview: Some(input.body.chars().take(200).collect::<String>()),
+            status,
+            state: Some("published".into()),
+            mailbox_id: input.mailbox_id,
+            assignee_id: None,
+            assignee_type: None,
+            assigned_team_id: None,
+            customer_id: input.customer_id,
+            priority: None,
+            created_at: Some(now.clone()),
+            updated_at: Some(now.clone()),
+            closed_at: None,
+            snoozed_until: None,
+            thread_count: 1,
+            merged_into: None,
+            tags: input.tags.clone(),
+        };
+        world.conversations.push(conv);
+
+        let thread = HsThread {
+            remote_id: next_thread_remote,
+            conversation_id: next_conv_remote,
+            kind: "customer".into(),
+            status: None,
+            state: Some("published".into()),
+            body: Some(input.body.clone()),
+            created_by_customer_id: Some(input.customer_id),
+            created_by_user_id: None,
+            assigned_to_id: None,
+            created_at: Some(now.clone()),
+        };
+        world.threads.push(thread);
+
+        Ok(ConversationCreated {
+            conversation_id: next_conv_remote,
+            number: next_number,
+            thread_id: next_thread_remote,
+        })
     }
 }
 

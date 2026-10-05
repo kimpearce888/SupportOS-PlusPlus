@@ -756,6 +756,31 @@ impl WorkerManager {
                         jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 2)?;
                     }
                 }
+                // ---------- outreach queue ----------
+                // audit OR-02 / B3: campaign send executor. Picked off the
+                // outreach queue and dispatched to outreach::send_batch
+                // (batch 5, attempts 3, provider.createConversation,
+                // sync-back, unknown-state reconcile).
+                "outreach_send_batch" => {
+                    if let Some(campaign_id) = num("campaignId") {
+                        let summary = crate::outreach::send_batch(
+                            &self.conn,
+                            &self.provider,
+                            campaign_id,
+                        )
+                        .await;
+                        tracing::info!(
+                            operation = kind,
+                            campaign_id = campaign_id,
+                            remaining = summary["remaining"].as_i64().unwrap_or(-1),
+                            "Outreach send batch processed"
+                        );
+                    } else {
+                        let conn = self.lock();
+                        jobs::fail(&conn, job_id, "outreach_send_batch missing campaignId")?;
+                        return Ok(());
+                    }
+                }
                 _ => {
                     let conn = self.lock();
                     jobs::fail(&conn, job_id, &format!("Unknown job type: {kind}"))?;

@@ -22,11 +22,11 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 
 use crate::helpscout::{
-    ConversationPatch, ConversationQuery, CreateThreadInput, CustomerQuery, HelpScoutProvider,
-    HsBeaconChat, HsConversation, HsCustomer, HsDocArticle, HsDocCategory, HsDocCollection,
-    HsField, HsFieldOption, HsFolder, HsMailbox, HsOrganization, HsPropertyDef, HsRating,
-    HsSavedReply, HsTag, HsTeam, HsThread, HsUser, HsUserStatus, HsWebhookConfig, HsWorkflow, Page,
-    ThreadCreated,
+    ConversationCreated, ConversationPatch, ConversationQuery, CreateConversationInput,
+    CreateThreadInput, CustomerQuery, HelpScoutProvider, HsBeaconChat, HsConversation, HsCustomer,
+    HsDocArticle, HsDocCategory, HsDocCollection, HsField, HsFieldOption, HsFolder, HsMailbox,
+    HsOrganization, HsPropertyDef, HsRating, HsSavedReply, HsTag, HsTeam, HsThread, HsUser,
+    HsUserStatus, HsWebhookConfig, HsWorkflow, Page, ThreadCreated,
 };
 
 /// Default Help Scout API base.
@@ -1637,6 +1637,67 @@ impl HelpScoutProvider for RealHelpScoutProvider {
             None => {}
         }
         Ok(true)
+    }
+
+    /// realProvider.ts `createConversation` (audit OR-02 / B3): POST a new
+    /// conversation to `/v3/conversations` with the customer's first message
+    /// as the first thread. The send executor uses the returned id + number
+    /// to record `hs_conversation_remote_id` + `hs_conversation_number` on
+    /// `outreach_recipients` and enqueue a `sync_conversation` job.
+    async fn create_conversation(
+        &self,
+        input: CreateConversationInput,
+    ) -> Result<ConversationCreated> {
+        let mut threads = json!([{
+            "type": "customer",
+            "customer": { "id": input.customer_id },
+            "text": input.body,
+        }]);
+        if !input.tags.is_empty() {
+            threads[0]["tags"] = json!(input.tags);
+        }
+        let mut body = json!({
+            "subject": input.subject,
+            "mailboxId": input.mailbox_id,
+            "customer": { "id": input.customer_id },
+            "threads": threads,
+        });
+        if let Some(status) = &input.status {
+            body["status"] = json!(status);
+        }
+        if !input.tags.is_empty() {
+            body["tags"] = json!(input.tags);
+        }
+        let res = self
+            .request("/v3/conversations", "POST", Some(body))
+            .await?;
+        let conversation_id = res["id"].as_i64().unwrap_or(0);
+        let number = res["number"].as_i64().unwrap_or(0);
+        let thread_id = res["threads"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|t| t["id"].as_i64())
+            .unwrap_or(0);
+        if conversation_id == 0 {
+            // Help Scout returned 2xx but no id — the executor treats this as
+            // an UNKNOWN outcome (the recipient is parked in 'unknown' state
+            // for the reconcile pass to resolve against the local mirror).
+            return Err(HsApiError {
+                status_code: 200,
+                message: "Help Scout created the conversation but returned no id".into(),
+                friendly:
+                    "Help Scout accepted the new conversation but did not return a conversation id. \
+                     The recipient will be reconciled against the local mirror."
+                        .into(),
+                retryable: false,
+            }
+            .into());
+        }
+        Ok(ConversationCreated {
+            conversation_id,
+            number,
+            thread_id,
+        })
     }
 }
 
