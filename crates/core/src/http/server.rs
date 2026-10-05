@@ -217,6 +217,16 @@ impl HttpServer {
         // CORS: localhost-only (matching the reference's allowedOrigins
         // exactly: configured port for localhost/127.0.0.1/[::1], plus the
         // Vite dev ports 5173-5175 for both loopback names).
+        //
+        // Stack adaptation (audit B1/UI-23): the reference serves its SPA
+        // same-origin from the API server (@fastify/static), so its packaged
+        // webview never crosses an origin. This port's Leptos UI runs in the
+        // Tauri webview instead, so the loopback API must additionally allow
+        // the webview origins: `http://tauri.localhost` (Linux/Windows
+        // packaged), `https://tauri.localhost` (Windows HTTPS variant),
+        // `tauri://localhost` (macOS packaged) and the Trunk dev server on
+        // :1420 (tauri.conf.json devUrl). Without these the packaged app
+        // cannot read any API response.
         let cors = CorsLayer::new()
             .allow_origin([
                 format!("http://localhost:{}", self.state.port)
@@ -232,6 +242,13 @@ impl HttpServer {
                 "http://127.0.0.1:5173".parse().unwrap(),
                 "http://127.0.0.1:5174".parse().unwrap(),
                 "http://127.0.0.1:5175".parse().unwrap(),
+                // Tauri webview origins (packaged app) — see comment above.
+                "http://tauri.localhost".parse().unwrap(),
+                "https://tauri.localhost".parse().unwrap(),
+                "tauri://localhost".parse().unwrap(),
+                // Trunk dev server (tauri.conf.json devUrl) for `tauri dev`.
+                "http://127.0.0.1:1420".parse().unwrap(),
+                "http://localhost:1420".parse().unwrap(),
             ])
             .allow_methods([
                 axum::http::Method::GET,
