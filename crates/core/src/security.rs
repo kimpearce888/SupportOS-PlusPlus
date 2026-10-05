@@ -111,12 +111,13 @@ fn tag_attributes() -> HashMap<&'static str, HashSet<&'static str>> {
     m
 }
 
-/// Per-attribute filter (ammonia): CSS scrubbing + link hardening +
-/// data:text/html image removal. Runs for every attribute on every allowed
-/// element.
 /// Sanitize untrusted thread/ticket HTML (spec #86, #87).
 pub fn sanitize_thread_html(dirty: &str) -> String {
     let dangerous_css = Regex::new(DANGEROUS_CSS).expect("static regex");
+    // SEC-02 (T11 inv.8): the reference's exclusiveFilter drops the WHOLE
+    // <img> element when its src is data:text/html. Ammonia has no
+    // element-level filter, so the element is removed BEFORE ammonia runs.
+    let pre = strip_data_text_html_images(dirty);
     let mut builder = ammonia::Builder::new();
     builder.tags(allowed_tags());
     builder.tag_attributes(tag_attributes());
@@ -128,8 +129,15 @@ pub fn sanitize_thread_html(dirty: &str) -> String {
             .into_iter()
             .collect(),
     );
-    // No protocol-relative URLs (allowProtocolRelative: false).
-    builder.url_relative(ammonia::UrlRelative::PassThrough);
+    // No protocol-relative URLs (allowProtocolRelative: false). The Custom
+    // evaluator receives only RELATIVE URLs: scheme-relative //host/path is
+    // denied (the attribute is removed, like UrlRelative::Deny would), while
+    // plain relative paths pass through unchanged — matching the reference
+    // sanitize-html behavior where only the protocol-relative form is
+    // rejected. (PassThrough let //evil.com/x through — T11 inv.8.)
+    builder.url_relative(ammonia::UrlRelative::Custom(Box::new(
+        deny_protocol_relative,
+    )));
     // <a> hardening (simpleTransform parity): ammonia manages rel/target.
     builder.link_rel(Some("noopener noreferrer nofollow"));
     builder.set_tag_attribute_value("a", "target", "_blank");
@@ -145,7 +153,9 @@ pub fn sanitize_thread_html(dirty: &str) -> String {
             return Some(std::borrow::Cow::Owned(clipped));
         }
         // img src that is data:text/html is dropped (exclusiveFilter
-        // parity — the attribute goes; ammonia leaves an inert <img>).
+        // parity — the whole element was already removed by the pre-filter;
+        // this stays as defense-in-depth for anything the pre-filter
+        // cannot see, e.g. markup nested inside another tag's attribute).
         if element == "img" && attribute == "src" && value.trim().starts_with("data:text/html") {
             return None;
         }
@@ -158,7 +168,66 @@ pub fn sanitize_thread_html(dirty: &str) -> String {
         }
         Some(std::borrow::Cow::Borrowed(value))
     });
-    builder.clean(dirty).to_string()
+    builder.clean(&pre).to_string()
+}
+
+/// A full `<img ...>` start tag. `<img>` is a VOID element — no children, no
+/// end tag — so removing the start tag removes the whole element. The pattern
+/// is quote-aware: a `>` inside a quoted attribute value does not end the
+/// tag (`<img alt="a>b" src=...>`).
+const IMG_START_TAG_RE: &str = r#"(?is)<img\b(?:[^>"']|"[^"]*"|'[^']*')*>"#;
+
+/// The `src` attribute inside an already-isolated tag (quoted single,
+/// quoted double, or unquoted-until-whitespace value form).
+const SRC_ATTR_RE: &str = r#"(?is)\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#;
+
+/// SEC-02 (T11 inv.8): the UrlRelative::Custom evaluator — a scheme-relative
+/// `//host/path` URL is DENIED (the attribute is removed); every other
+/// relative URL passes through unchanged. Only called for relative URLs;
+/// absolute URLs are handled by the scheme allowlist.
+fn deny_protocol_relative(url: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if url.starts_with("//") {
+        None
+    } else {
+        Some(std::borrow::Cow::Borrowed(url))
+    }
+}
+
+/// SEC-02 (T11 inv.8): remove the whole `<img>` element when its `src` is a
+/// `data:text/html` URL (the reference exclusiveFilter behavior). Runs
+/// BEFORE ammonia, which has no element-level filter. Only removal — the
+/// pre-filter cannot introduce markup, and ammonia still sanitizes whatever
+/// remains.
+fn strip_data_text_html_images(dirty: &str) -> std::borrow::Cow<'_, str> {
+    // Fast path: no img tag at all.
+    if !dirty.to_ascii_lowercase().contains("<img") {
+        return std::borrow::Cow::Borrowed(dirty);
+    }
+    let img_tag = Regex::new(IMG_START_TAG_RE).expect("static img tag regex");
+    let src_attr = Regex::new(SRC_ATTR_RE).expect("static src attr regex");
+    img_tag.replace_all(dirty, |caps: &regex::Captures<'_>| -> String {
+        let tag = caps
+            .get(0)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let is_data_text_html = src_attr.captures(&tag).is_some_and(|m| {
+            let value = m
+                .get(1)
+                .or_else(|| m.get(2))
+                .or_else(|| m.get(3))
+                .map(|v| v.as_str())
+                .unwrap_or_default();
+            value
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("data:text/html")
+        });
+        if is_data_text_html {
+            String::new()
+        } else {
+            tag
+        }
+    })
 }
 
 /// Escape text for safe HTML contexts.
@@ -674,6 +743,67 @@ mod tests {
             "<img src=\"data:text/html,<script>alert(1)</script>\" alt=\"x\">",
         );
         assert!(!out.contains("data:text/html"), "{out}");
+    }
+
+    #[test]
+    fn sanitizer_removes_whole_img_on_data_text_html() {
+        // SEC-02: the reference exclusiveFilter drops the whole element,
+        // not just the src attribute (no inert <img alt="x"> left behind).
+        let out = sanitize_thread_html(
+            "<p>before</p><img src=\"data:text/html,<b>hi</b>\" alt=\"evil\">between<img src=\"https://cdn.example/ok.png\" alt=\"ok\"><p>after</p>",
+        );
+        assert!(
+            !out.contains("data:text/html"),
+            "whole data:text/html img removed: {out}"
+        );
+        assert!(
+            !out.contains("evil"),
+            "alt of the dropped img is gone: {out}"
+        );
+        assert!(
+            out.contains("between"),
+            "text between the two imgs preserved: {out}"
+        );
+        assert!(
+            out.contains("<img src=\"https://cdn.example/ok.png\""),
+            "the benign img survives: {out}"
+        );
+        assert!(out.contains("before") && out.contains("after"), "{out}");
+    }
+
+    #[test]
+    fn sanitizer_removes_unquoted_and_single_quoted_data_text_html_images() {
+        // Attribute quoting variants of the same attack.
+        let out = sanitize_thread_html("<img src=data:text/html,x alt=u>");
+        assert!(!out.contains("<img"), "unquoted src: {out}");
+        let out = sanitize_thread_html("<img SRC='data:text/html,y' alt='s'>");
+        assert!(!out.contains("<img"), "single-quoted uppercase SRC: {out}");
+        // A quoted '>' inside another attribute must not hide the src.
+        let out = sanitize_thread_html("<img alt=\"a>b\" src=\"data:text/html,z\">");
+        assert!(!out.contains("<img"), "quoted > before src: {out}");
+        // data:image/* is NOT data:text/html and must stay.
+        let out = sanitize_thread_html("<img src=\"data:image/png;base64,iVBOR\">");
+        assert!(out.contains("data:image/png"), "{out}");
+    }
+
+    #[test]
+    fn sanitizer_strips_protocol_relative_urls() {
+        // SEC-02 (T11 inv.8): allowProtocolRelative:false — //host/path is
+        // removed from every URL attribute (the old PassThrough kept it).
+        let out = sanitize_thread_html("<a href=\"//evil.example/x\">click</a>");
+        assert!(!out.contains("//evil.example"), "{out}");
+        assert!(out.contains("click"), "{out}");
+        let out = sanitize_thread_html("<img src=\"//evil.example/x.gif\" alt=\"x\">");
+        assert!(!out.contains("//evil.example"), "{out}");
+        // Plain relative URLs are NOT protocol-relative — they pass through
+        // like the reference (only the // form is rejected).
+        let out = sanitize_thread_html("<a href=\"/docs/guide\">rel</a>");
+        assert!(out.contains("href=\"/docs/guide\""), "{out}");
+        let out = sanitize_thread_html("<a href=\"page.html\">file-rel</a>");
+        assert!(out.contains("href=\"page.html\""), "{out}");
+        // Absolute URLs are untouched by the relative evaluator.
+        let out = sanitize_thread_html("<a href=\"https://good.example/a\">abs</a>");
+        assert!(out.contains("https://good.example/a"), "{out}");
     }
 
     #[test]
