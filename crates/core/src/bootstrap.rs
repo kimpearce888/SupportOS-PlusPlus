@@ -79,6 +79,9 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     crate::oauth_state::ensure_oauth_states_table(conn)?;
     crate::jobs::ensure_jobs_table(conn)?;
     crate::interaction_current::ensure_client_current_signals_table(conn)?;
+    // AI-19 (C7): the interaction evidence table the interactions routes
+    // read — ensured at boot so the routes never depend on a prior refresh.
+    crate::interaction_current::ensure_interaction_evidence_table(conn)?;
     // The SLA schema owns `conversations.deleted_at` (reference migration
     // 003). It used to be ensured lazily by the first SLA report — every
     // `deleted_at IS NULL` mirror query that ran before that (incident
@@ -139,6 +142,7 @@ mod tests {
             "webhook_events",
             "inbox_views",
             "client_current_signals",
+            "interaction_evidence",
             "oauth_states",
             "jobs",
         ] {

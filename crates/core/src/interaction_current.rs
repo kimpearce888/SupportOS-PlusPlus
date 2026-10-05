@@ -54,6 +54,67 @@ pub fn ensure_client_current_signals_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The `interaction_evidence` table (AI-19 / audit C7): one row per signal
+/// observation carrying evidence, keyed by the LOCAL conversation id. Written
+/// by [`record_current_interaction`] (replace-per-conversation, so the table
+/// always mirrors the live snapshot) and served by
+/// `GET /api/interaction/:conversationId/evidence`.
+const INTERACTION_EVIDENCE_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS interaction_evidence (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        evidence_type TEXT NOT NULL,
+        evidence_data TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_interaction_evidence_conversation
+            ON interaction_evidence(conversation_id);
+";
+
+/// Ensure the `interaction_evidence` table exists (idempotent).
+///
+/// # Errors
+/// Returns [`crate::error::Error::Sqlite`] when the DDL fails.
+pub fn ensure_interaction_evidence_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(INTERACTION_EVIDENCE_SQL)?;
+    Ok(())
+}
+
+/// Replace the conversation's evidence rows from the freshly computed
+/// snapshot (one row per signal that carries evidence).
+fn replace_evidence_rows(
+    conn: &Connection,
+    conversation_id: i64,
+    signals: &[InteractionSignal],
+) -> Result<()> {
+    ensure_interaction_evidence_table(conn)?;
+    conn.execute(
+        "DELETE FROM interaction_evidence WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    for s in signals {
+        let Some(ev) = &s.evidence else { continue };
+        conn.execute(
+            "INSERT INTO interaction_evidence (conversation_id, evidence_type, evidence_data)
+             VALUES (?1, ?2, ?3)",
+            params![
+                conversation_id,
+                s.dimension,
+                serde_json::json!({
+                    "excerpt": ev.excerpt,
+                    "thread_local_id": ev.thread_local_id,
+                    "conversation_local_id": ev.conversation_local_id,
+                    "value": s.value,
+                    "confidence": s.confidence,
+                    "source": s.source,
+                })
+                .to_string()
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Vocabularies (reference shared/constants.ts — closed observable unions)
 // ---------------------------------------------------------------------------
@@ -396,7 +457,7 @@ fn excerpt(text: &str, max_len: usize) -> String {
 }
 
 /// The evidence pointer (reference `InteractionSignal['evidence']`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
     pub excerpt: String,
     pub thread_local_id: Option<i64>,
@@ -404,7 +465,7 @@ pub struct Evidence {
 }
 
 /// One interaction signal (reference `InteractionSignal`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InteractionSignal {
     pub dimension: String,
     pub value: String,
@@ -954,7 +1015,260 @@ pub fn record_current_interaction(
             current.customer_goal,
         ],
     )?;
+    // AI-19 (C7): keep the evidence rows mirroring the fresh snapshot so
+    // GET /api/interaction/:id/evidence serves real data. Failure to
+    // refresh the evidence rows must not fail the snapshot write (the
+    // reference engine treats evidence persistence as best-effort).
+    let _ = replace_evidence_rows(conn, conversation_id, &current.signals);
     Ok(Some(current))
+}
+
+/// The stored current-signals snapshot (reference `getCurrentInteraction` —
+/// the read side of interactionRepo; serves `GET /api/interaction/:id`).
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredCurrentSignals {
+    pub conversation_id: i64,
+    pub customer_id: Option<i64>,
+    pub signals: Vec<InteractionSignal>,
+    pub customer_goal: Option<String>,
+    pub message_stats: Option<MessageStats>,
+    pub generated_at: Option<String>,
+    pub provenance: Option<String>,
+    pub analysis_version: Option<String>,
+}
+
+/// Load the stored snapshot for a conversation (reference
+/// `getCurrentInteraction` — pure read, never computes).
+///
+/// # Errors
+/// Returns [`crate::error::Error::Sqlite`] when the mirror read fails.
+pub fn get_current_interaction(
+    conn: &Connection,
+    conversation_id: i64,
+) -> Result<Option<StoredCurrentSignals>> {
+    let row = conn
+        .query_row(
+            "SELECT customer_id, signals_json, customer_goal, message_stats_json,
+                    generated_at, provenance, analysis_version
+             FROM client_current_signals WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .ok();
+    let Some((
+        customer_id,
+        signals_json,
+        customer_goal,
+        stats_json,
+        generated_at,
+        provenance,
+        analysis_version,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    Ok(Some(StoredCurrentSignals {
+        conversation_id,
+        customer_id,
+        signals: serde_json::from_str(&signals_json).unwrap_or_default(),
+        customer_goal,
+        message_stats: stats_json.and_then(|s| serde_json::from_str(&s).ok()),
+        generated_at,
+        provenance,
+        analysis_version,
+    }))
+}
+
+/// One dimension's aggregated value counts in the customer profile.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileDimensionValue {
+    pub value: String,
+    pub count: u32,
+}
+
+/// One dimension's summary in the customer profile.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileDimension {
+    pub dimension: String,
+    /// The most frequent value for the dimension.
+    pub value: String,
+    /// Total observations for the dimension.
+    pub count: u32,
+    /// Per-value counts (reference `signalBreakdown` richness).
+    pub values: Vec<ProfileDimensionValue>,
+}
+
+/// The response-preference resolution in the customer profile.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileResponsePreference {
+    pub value: String,
+    /// "human" (explicit override) or "heuristic" (inferred majority).
+    pub source: String,
+    pub observations: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The customer's interaction profile (AI-19 / C7: "serve profile from
+/// signals" — aggregated from the client_current_signals layer).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractionProfile {
+    pub customer_id: i64,
+    pub total_signals: u32,
+    pub conversations_analyzed: u32,
+    pub signal_breakdown: Vec<ProfileDimension>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_preference: Option<ProfileResponsePreference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_goal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_signal_at: Option<String>,
+}
+
+/// The human override row for the customer (interaction_overrides, m035).
+#[derive(Debug, Clone, Serialize)]
+pub struct InteractionOverrideRow {
+    pub field: String,
+    pub value: String,
+    pub reason: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Load the customer's explicit response-preference override.
+pub fn get_interaction_override(
+    conn: &Connection,
+    customer_id: i64,
+) -> Result<Option<InteractionOverrideRow>> {
+    let row = conn
+        .query_row(
+            "SELECT field, value, reason, updated_at FROM interaction_overrides
+             WHERE customer_id = ?1 AND field = 'response_preference'",
+            params![customer_id],
+            |r| {
+                Ok(InteractionOverrideRow {
+                    field: r.get(0)?,
+                    value: r.get(1)?,
+                    reason: r.get(2)?,
+                    updated_at: r.get(3)?,
+                })
+            },
+        )
+        .ok();
+    Ok(row)
+}
+
+/// Aggregate the customer's interaction profile from the current-signals
+/// layer (`client_current_signals` rows of every conversation owned by the
+/// customer). The response preference resolves the way the engine ranks it:
+/// the explicit human override first, then the inferred majority once it has
+/// >= [`MIN_OBSERVATIONS_FOR_PREFERENCE`] observations.
+///
+/// # Errors
+/// Returns [`crate::error::Error::Sqlite`] when the mirror read fails.
+pub fn interaction_profile(conn: &Connection, customer_id: i64) -> Result<InteractionProfile> {
+    use std::collections::BTreeMap;
+    let mut stmt = conn.prepare(
+        "SELECT signals_json, customer_goal, generated_at
+           FROM client_current_signals
+          WHERE customer_id = ?1
+          ORDER BY generated_at ASC",
+    )?;
+    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+        .query_map(params![customer_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut per_dimension: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+    let mut total_signals: u32 = 0;
+    let mut last_goal: Option<String> = None;
+    let mut last_signal_at: Option<String> = None;
+    let conversations_analyzed = rows.len();
+    for (signals_json, goal, generated_at) in &rows {
+        let signals: Vec<InteractionSignal> =
+            serde_json::from_str(signals_json).unwrap_or_default();
+        total_signals += u32::try_from(signals.len()).unwrap_or(0);
+        last_goal = goal.clone().or(last_goal);
+        if generated_at.as_deref().is_some_and(|g| !g.is_empty()) {
+            last_signal_at = generated_at.clone();
+        }
+        for s in signals {
+            *per_dimension
+                .entry(s.dimension)
+                .or_default()
+                .entry(s.value)
+                .or_insert(0) += 1;
+        }
+    }
+    let mut signal_breakdown: Vec<ProfileDimension> = per_dimension
+        .into_iter()
+        .map(|(dimension, values)| {
+            let mut values: Vec<ProfileDimensionValue> = values
+                .into_iter()
+                .map(|(value, count)| ProfileDimensionValue { value, count })
+                .collect();
+            values.sort_by(|a, b| b.count.cmp(&a.count).then(a.value.cmp(&b.value)));
+            let count: u32 = values.iter().map(|v| v.count).sum();
+            let value = values.first().map(|v| v.value.clone()).unwrap_or_default();
+            ProfileDimension {
+                dimension,
+                value,
+                count,
+                values,
+            }
+        })
+        .collect();
+    signal_breakdown.sort_by(|a, b| a.dimension.cmp(&b.dimension));
+
+    // Response preference: explicit override first (the human always
+    // wins), else the inferred majority once it is a confirmed pattern.
+    let response_preference = if let Some(o) = get_interaction_override(conn, customer_id)? {
+        Some(ProfileResponsePreference {
+            value: o.value,
+            source: "human".into(),
+            observations: 1,
+            reason: o.reason,
+        })
+    } else {
+        signal_breakdown
+            .iter()
+            .find(|d| d.dimension == "response_preference")
+            .and_then(|d| {
+                let top = d.values.first()?;
+                (top.count >= crate::intelligence::MIN_OBSERVATIONS_FOR_PREFERENCE).then_some(
+                    ProfileResponsePreference {
+                        value: top.value.clone(),
+                        source: "heuristic".into(),
+                        observations: top.count,
+                        reason: None,
+                    },
+                )
+            })
+    };
+
+    Ok(InteractionProfile {
+        customer_id,
+        total_signals,
+        conversations_analyzed: u32::try_from(conversations_analyzed).unwrap_or(0),
+        signal_breakdown,
+        response_preference,
+        customer_goal: last_goal,
+        last_signal_at,
+    })
 }
 
 /// Post-initial-sync backfill: refresh the snapshot for every non-deleted
@@ -1449,5 +1763,187 @@ mod tests {
             )
             .unwrap();
         assert_eq!(with_stats, rows);
+    }
+
+    // ---- AI-19 (C7): evidence rows + snapshot loader + profile ------------
+
+    /// Fixture: customer 2001 with one conversation whose customer thread
+    /// triggers deterministic signals with evidence.
+    fn evidence_db() -> (Connection, i64) {
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO customers (id, remote_id) VALUES (2001, 2001)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+             VALUES (1001, 1001, 'active', 1, 2001)",
+            [],
+        )
+        .unwrap();
+        let cid: i64 = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = 1001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+             VALUES (?1, 'customer', 'published',
+                'This is STILL not working. I already called twice and nobody fixed it. Every time the same thing. Please walk me through step by step how to fix the API endpoint.',
+                'customer', datetime('now'))",
+            params![cid],
+        )
+        .unwrap();
+        (conn, cid)
+    }
+
+    #[test]
+    fn record_writes_evidence_rows_replace_per_conversation() {
+        let (conn, cid) = evidence_db();
+        let current = record_current_interaction(&conn, cid).unwrap().unwrap();
+        let with_evidence = current
+            .signals
+            .iter()
+            .filter(|s| s.evidence.is_some())
+            .count();
+        assert!(with_evidence >= 1, "signals carry evidence");
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM interaction_evidence WHERE conversation_id = ?1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            i64::try_from(with_evidence).unwrap(),
+            "one evidence row per evidenced signal"
+        );
+
+        // The row shape: evidence_type = dimension, evidence_data parses as
+        // the JSON object with the excerpt + pointers + signal context.
+        let (etype, data): (String, String) = conn
+            .query_row(
+                "SELECT evidence_type, evidence_data FROM interaction_evidence
+                  WHERE conversation_id = ?1 ORDER BY id LIMIT 1",
+                params![cid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert!(v["excerpt"].as_str().is_some_and(|e| !e.is_empty()));
+        assert_eq!(v["conversation_local_id"], serde_json::json!(cid));
+        assert_eq!(
+            v["source"], "heuristic",
+            "evidence_data carries the signal context"
+        );
+        assert!(
+            INTERACTION_DIMENSIONS.contains(&etype.as_str()),
+            "evidence_type is a dimension: {etype}"
+        );
+
+        // Re-record after the message changes: rows are REPLACED, never
+        // accumulated (the table mirrors the live snapshot).
+        conn.execute(
+            "UPDATE conversation_threads SET body = 'Thanks! This is great support.'
+             WHERE conversation_id = ?1",
+            params![cid],
+        )
+        .unwrap();
+        let current2 = record_current_interaction(&conn, cid).unwrap().unwrap();
+        let with_evidence2 = current2
+            .signals
+            .iter()
+            .filter(|s| s.evidence.is_some())
+            .count();
+        let rows2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM interaction_evidence WHERE conversation_id = ?1",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows2, i64::try_from(with_evidence2).unwrap());
+    }
+
+    #[test]
+    fn get_current_interaction_round_trips_the_stored_snapshot() {
+        let (conn, cid) = evidence_db();
+        // No snapshot yet → None (pure read, never computes).
+        assert!(get_current_interaction(&conn, cid).unwrap().is_none());
+
+        let current = record_current_interaction(&conn, cid).unwrap().unwrap();
+        let stored = get_current_interaction(&conn, cid).unwrap().unwrap();
+        assert_eq!(stored.conversation_id, cid);
+        assert_eq!(stored.customer_id, Some(2001));
+        assert_eq!(stored.signals, current.signals);
+        assert_eq!(stored.customer_goal, current.customer_goal);
+        assert!(stored.message_stats.is_some());
+        assert!(stored
+            .generated_at
+            .as_deref()
+            .is_some_and(|g| !g.is_empty()));
+        assert_eq!(stored.provenance.as_deref(), Some("heuristic"));
+        assert_eq!(
+            stored.analysis_version.as_deref(),
+            Some("heuristic_v1"),
+            "the loader serves the full stored row"
+        );
+    }
+
+    #[test]
+    fn interaction_profile_aggregates_dimensions_and_resolves_preference() {
+        let (conn, cid) = evidence_db();
+        record_current_interaction(&conn, cid).unwrap();
+
+        let p = interaction_profile(&conn, 2001).unwrap();
+        assert_eq!(p.customer_id, 2001);
+        assert_eq!(p.conversations_analyzed, 1);
+        assert!(p.total_signals >= 1);
+        assert!(p.last_signal_at.is_some());
+        // The frustrated message + step-by-step request produced both a
+        // frustration observation and an explicit response_preference.
+        assert!(p
+            .signal_breakdown
+            .iter()
+            .any(|d| d.dimension == "frustration" && !d.values.is_empty()));
+        // A single observation is below the pattern threshold → no inferred
+        // preference yet.
+        assert!(
+            p.response_preference.is_none()
+                || p.response_preference.as_ref().is_some_and(
+                    |r| r.observations >= crate::intelligence::MIN_OBSERVATIONS_FOR_PREFERENCE
+                ),
+            "inferred preferences need the min observation count"
+        );
+
+        // With a human override the preference resolves to it, source human.
+        conn.execute(
+            "INSERT INTO interaction_overrides (customer_id, field, value, reason)
+             VALUES (2001, 'response_preference', 'concise', 'prefers short answers')",
+            [],
+        )
+        .unwrap();
+        let p = interaction_profile(&conn, 2001).unwrap();
+        let pref = p.response_preference.expect("override wins");
+        assert_eq!(pref.value, "concise");
+        assert_eq!(pref.source, "human");
+        assert_eq!(pref.reason.as_deref(), Some("prefers short answers"));
+
+        // A customer with no analyzed conversations: zeroed profile, no 500.
+        conn.execute(
+            "INSERT INTO customers (id, remote_id) VALUES (2002, 2002)",
+            [],
+        )
+        .unwrap();
+        let p = interaction_profile(&conn, 2002).unwrap();
+        assert_eq!(p.total_signals, 0);
+        assert_eq!(p.conversations_analyzed, 0);
+        assert!(p.signal_breakdown.is_empty());
+        assert!(p.response_preference.is_none());
     }
 }

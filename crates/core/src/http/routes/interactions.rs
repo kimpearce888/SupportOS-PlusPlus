@@ -12,7 +12,14 @@ use serde_json::{json, Value};
 
 use super::super::server::AppState;
 
-/// GET /api/interaction/:conversationId — list signals for a conversation.
+/// GET /api/interaction/:conversationId — the conversation's current
+/// interaction snapshot (reference `getCurrentInteraction`).
+///
+/// AI-19 (C7): the old handler queried `interaction_signals` with columns
+/// that do not exist in the real schema (conversation_id/signal_type/
+/// confidence/created_at) — the prepare failed and was swallowed into an
+/// empty list. The snapshot the engine actually writes lives in
+/// `client_current_signals` (LOCAL conversation id key) and is served here.
 ///
 /// Returns 404 when the conversation does not exist (matching the reference).
 pub async fn get(
@@ -22,7 +29,7 @@ pub async fn get(
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let exists: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE remote_id = ?1",
+            "SELECT COUNT(*) FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
             rusqlite::params![conversation_id],
             |r| r.get(0),
         )
@@ -37,18 +44,155 @@ pub async fn get(
             })),
         );
     }
-    let signals: Vec<Value> = conn
-        .prepare("SELECT id, conversation_id, signal_type, signal_value, confidence, created_at FROM interaction_signals WHERE conversation_id = ?1 ORDER BY created_at DESC")
+    // Pure read of the stored snapshot (never computes — refresh does that).
+    let snapshot = crate::interaction_current::get_current_interaction(&conn, conversation_id)
+        .ok()
+        .flatten();
+    match snapshot {
+        Some(s) => (
+            StatusCode::OK,
+            Json(json!({
+                "conversationId": conversation_id,
+                "signals": s.signals,
+                "customerGoal": s.customer_goal,
+                "messageStats": s.message_stats,
+                "generatedAt": s.generated_at,
+                "provenance": s.provenance,
+                "analysisVersion": s.analysis_version,
+            })),
+        ),
+        // The conversation exists but has not been analyzed yet — an empty
+        // snapshot, not an error (reference getCurrentInteraction null row).
+        None => (
+            StatusCode::OK,
+            Json(json!({
+                "conversationId": conversation_id,
+                "signals": [],
+                "customerGoal": null,
+                "messageStats": null,
+                "generatedAt": null,
+                "provenance": null,
+                "analysisVersion": null,
+            })),
+        ),
+    }
+}
+
+/// POST /api/interaction/:conversationId/refresh — recompute and persist the
+/// conversation's interaction snapshot (reference `recordCurrentInteraction`).
+///
+/// AI-19 (C7): this used to be a no-op that answered ok:true without touching
+/// any data. It now runs the deterministic engine over the customer's
+/// messages (heuristic signals + explicit preference + goal), upserts the
+/// `client_current_signals` row and refreshes the evidence rows, then serves
+/// the fresh snapshot.
+///
+/// Returns 404 when the conversation does not exist (matching the reference).
+pub async fn refresh(State(state): State<AppState>, Path(conversation_id): Path<i64>) -> Response {
+    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![conversation_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
+            })),
+        )
+            .into_response();
+    }
+    match crate::interaction_current::record_current_interaction(&conn, conversation_id) {
+        Ok(Some(current)) => {
+            let _ = crate::interaction_current::ensure_interaction_evidence_table(&conn);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "conversationId": conversation_id,
+                    "message": "Interaction signals refreshed.",
+                    "signals": current.signals,
+                    "customerGoal": current.customer_goal,
+                    "messageStats": current.message_stats,
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": "Conversation not found locally."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/interaction/:conversationId/evidence — the evidence rows backing
+/// the conversation's signals.
+///
+/// AI-19 (C7): the old handler queried an `interaction_evidence` table that
+/// was never created (prepare failed → silently empty). The table now exists
+/// (bootstrap guard) and is written by the engine's snapshot path
+/// (replace-per-conversation) — one row per signal that carries evidence.
+pub async fn evidence(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<i64>,
+) -> impl IntoResponse {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![conversation_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
+            })),
+        );
+    }
+    let evidence: Vec<Value> = conn
+        .prepare(
+            "SELECT id, conversation_id, evidence_type, evidence_data, created_at
+             FROM interaction_evidence WHERE conversation_id = ?1
+             ORDER BY created_at DESC, id DESC",
+        )
         .ok()
         .map(|mut stmt| {
             stmt.query_map(rusqlite::params![conversation_id], |r| {
+                // evidence_data stores a JSON object; serve it parsed when it
+                // parses, else the raw string.
+                let raw: String = r.get(3)?;
+                let data: Value = serde_json::from_str(&raw).unwrap_or(Value::String(raw));
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?,
                     "conversation_id": r.get::<_, i64>(1)?,
-                    "signal_type": r.get::<_, String>(2)?,
-                    "signal_value": r.get::<_, String>(3)?,
-                    "confidence": r.get::<_, f64>(4)?,
-                    "created_at": r.get::<_, String>(5)?,
+                    "evidence_type": r.get::<_, String>(2)?,
+                    "evidence_data": data,
+                    "created_at": r.get::<_, String>(4)?,
                 }))
             })
             .ok()
@@ -58,50 +202,19 @@ pub async fn get(
         .unwrap_or_default();
     (
         StatusCode::OK,
-        Json(json!({"conversationId": conversation_id, "signals": signals})),
+        Json(json!({"conversationId": conversation_id, "evidence": evidence})),
     )
 }
 
-/// POST /api/interaction/:conversationId/refresh — recompute interaction signals.
-pub async fn refresh(
-    State(state): State<AppState>,
-    Path(conversation_id): Path<i64>,
-) -> Json<Value> {
-    // Without an AI provider, this is a no-op + a real-time notification
-    // so the UI shows a "refreshed" state.
-    Json(
-        json!({"ok": true, "conversationId": conversation_id, "message": "Interaction signals refresh queued."}),
-    )
-}
-
-/// GET /api/interaction/:conversationId/evidence — evidence supporting the signals.
-pub async fn evidence(
-    State(state): State<AppState>,
-    Path(conversation_id): Path<i64>,
-) -> Json<Value> {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let evidence: Vec<Value> = conn
-        .prepare("SELECT id, conversation_id, evidence_type, evidence_data, created_at FROM interaction_evidence WHERE conversation_id = ?1 ORDER BY created_at DESC")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![conversation_id], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "conversation_id": r.get::<_, i64>(1)?,
-                    "evidence_type": r.get::<_, String>(2)?,
-                    "evidence_data": r.get::<_, String>(3)?,
-                    "created_at": r.get::<_, String>(4)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    Json(json!({"conversationId": conversation_id, "evidence": evidence}))
-}
-
-/// GET /api/interaction/profile/:customerId — interaction profile for a customer.
+/// GET /api/interaction/profile/:customerId — the customer's interaction
+/// profile, aggregated from their signals (AI-19 / C7: "serve profile from
+/// signals").
+///
+/// The old handler joined `interaction_signals` through fictional columns
+/// (prepare failed → zeros). The profile now aggregates the REAL
+/// `client_current_signals` layer: per-dimension majorities, the response
+/// preference (explicit human override first, then the inferred majority
+/// once it is a confirmed pattern), and the most recent goal/refresh stamp.
 ///
 /// Returns 404 when the customer does not exist (matching the reference).
 pub async fn profile(
@@ -111,7 +224,7 @@ pub async fn profile(
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let exists: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM customers WHERE remote_id = ?1",
+            "SELECT COUNT(*) FROM customers WHERE id = ?1",
             rusqlite::params![customer_id],
             |r| r.get(0),
         )
@@ -126,39 +239,33 @@ pub async fn profile(
             })),
         );
     }
-    // Aggregate the customer's signals across all their conversations.
-    let total_signals: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM interaction_signals s
-             JOIN conversations c ON c.remote_id = s.conversation_id
-             WHERE c.customer_id = ?1",
-            rusqlite::params![customer_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let signal_breakdown: Vec<Value> = conn
-        .prepare("SELECT s.signal_type, COUNT(*) FROM interaction_signals s JOIN conversations c ON c.remote_id = s.conversation_id WHERE c.customer_id = ?1 GROUP BY s.signal_type ORDER BY 2 DESC")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![customer_id], |r| {
-                Ok(json!({
-                    "signal_type": r.get::<_, String>(0)?,
-                    "count": r.get::<_, i64>(1)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "customerId": customer_id,
-            "total_signals": total_signals,
-            "signal_breakdown": signal_breakdown,
-        })),
-    )
+    match crate::interaction_current::interaction_profile(&conn, customer_id) {
+        Ok(p) => {
+            let override_row =
+                crate::interaction_current::get_interaction_override(&conn, customer_id)
+                    .ok()
+                    .flatten();
+            let mut body = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
+            body["customerId"] = json!(customer_id);
+            if let Some(o) = override_row {
+                body["override"] = json!({
+                    "field": o.field,
+                    "value": o.value,
+                    "reason": o.reason,
+                    "updatedAt": o.updated_at,
+                });
+            }
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        ),
+    }
 }
 
 // ─── Human response-preference overrides (reference interactions.ts:93-126) ─
