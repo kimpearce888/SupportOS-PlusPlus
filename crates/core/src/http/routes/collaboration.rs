@@ -10,21 +10,35 @@ use super::super::server::AppState;
 
 /// GET /api/conversations/:id/side-threads
 ///
-/// Returns 404 when the conversation does not exist (matching the reference).
+/// Reference routes/collaboration.ts:31-43: `:id` is the LOCAL conversation
+/// id (conversations.id, soft-delete filtered) — the audit B2 fix; the
+/// payload is the reference listThreads shape
+/// (title/status/message_count/team_name/conversation_number …) — N1.
 pub async fn list_side_threads(
     State(state): State<AppState>,
     Path(conversation_id): Path<i64>,
 ) -> impl IntoResponse {
+    if conversation_id <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "id must be a positive integer."
+            })),
+        );
+    }
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Check that the conversation exists first.
-    let exists: i64 = conn
+    // Check that the conversation exists (local id + not soft-deleted, like
+    // the reference's `WHERE id = ? AND deleted_at IS NULL`).
+    let exists = conn
         .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE remote_id = ?1",
+            "SELECT 1 FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
             rusqlite::params![conversation_id],
-            |r| r.get(0),
+            |_| Ok(()),
         )
-        .unwrap_or(0);
-    if exists == 0 {
+        .is_ok();
+    if !exists {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -34,13 +48,17 @@ pub async fn list_side_threads(
             })),
         );
     }
-    let threads = crate::side_threads::list_side_threads_for_conversation(&conn, conversation_id)
-        .unwrap_or_default();
-    let items: Vec<Value> = threads
-        .iter()
-        .filter_map(|t| serde_json::to_value(t).ok())
-        .collect();
-    (StatusCode::OK, Json(json!({"side_threads": items})))
+    match crate::side_threads::list_side_thread_summaries(&conn, conversation_id) {
+        Ok(items) => (StatusCode::OK, Json(json!({ "side_threads": items }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "Internal Server Error",
+                "message": e.to_string()
+            })),
+        ),
+    }
 }
 
 /// POST /api/conversations/:id/side-threads
@@ -58,14 +76,45 @@ pub async fn create_side_thread(
 }
 
 /// GET /api/side-threads/:id
-pub async fn get_side_thread(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+///
+/// Reference routes/collaboration.ts:75-87: serves `{ side_thread: … }` —
+/// the full detail payload (summary fields + participants + messages with
+/// resolved mentions) — 404 for unknown ids, 422 for invalid ones (audit N1:
+/// the old handler returned `{ messages: … }` and never 404'd).
+pub async fn get_side_thread(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if id <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "id must be a positive integer."
+            })),
+        );
+    }
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let messages = crate::side_threads::list_side_thread_messages(&conn, id).unwrap_or_default();
-    let items: Vec<Value> = messages
-        .iter()
-        .filter_map(|m| serde_json::to_value(m).ok())
-        .collect();
-    Json(json!({"messages": items}))
+    match crate::side_threads::get_side_thread_detail(&conn, id) {
+        Ok(Some(detail)) => (StatusCode::OK, Json(json!({ "side_thread": detail }))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Side thread not found."
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "Internal Server Error",
+                "message": e.to_string()
+            })),
+        ),
+    }
 }
 
 /// POST /api/side-threads/:id/messages

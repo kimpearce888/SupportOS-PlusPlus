@@ -449,6 +449,308 @@ pub fn count_side_thread_messages(conn: &Connection, thread_id: i64) -> Result<u
     Ok(u32::try_from(count).unwrap_or(0))
 }
 
+// ---------------------------------------------------------------------------
+// MAIN list/detail payloads (audit B2 + N1 / plan item CL-02).
+//
+// The reference serves `GET /api/conversations/:id/side-threads` and
+// `GET /api/side-threads/:id` from `SideThreadRepository.listThreads` /
+// `getThread` (src/server/database/repositories/sideThreadRepo.ts:51-104):
+// a summary row per thread (title/status/message_count/team_name/
+// conversation_number/last_message_at …) and a detail object that adds
+// participants + messages with their resolved mentions. The port's storage
+// keeps a few divergent column names (created_by_user_id, thread_id,
+// author_user_id — audit DB-04); they are mapped to the reference payload
+// field names at this query boundary.
+// ---------------------------------------------------------------------------
+
+/// One list row — the reference `mapThread` payload
+/// (sideThreadRepo.ts:249-265).
+#[derive(Debug, Clone, Serialize)]
+pub struct SideThreadSummary {
+    pub id: i64,
+    pub conversation_id: i64,
+    pub conversation_number: Option<i64>,
+    pub title: String,
+    pub team_local_id: Option<i64>,
+    pub team_name: Option<String>,
+    pub status: String,
+    /// Stored as `created_by_user_id` in the port schema; served under the
+    /// reference payload field name.
+    pub created_by_user_local_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub resolved_at: Option<String>,
+    pub message_count: i64,
+    pub last_message_at: Option<String>,
+}
+
+/// One participant row of a detail payload (sideThreadRepo.ts:86-101).
+#[derive(Debug, Clone, Serialize)]
+pub struct SideThreadParticipant {
+    pub user_local_id: i64,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub mention: Option<String>,
+    pub added_at: String,
+    pub added_by_user_local_id: Option<i64>,
+}
+
+/// One resolved @mention attached to a message (sideThreadRepo.ts:118-123).
+#[derive(Debug, Clone, Serialize)]
+pub struct SideThreadMentionRef {
+    pub user_local_id: Option<i64>,
+    pub team_local_id: Option<i64>,
+}
+
+/// One message row of a detail payload (sideThreadRepo.ts:124-133).
+#[derive(Debug, Clone, Serialize)]
+pub struct SideThreadMessageItem {
+    pub id: i64,
+    /// Stored as `thread_id` in the port schema; served under the reference
+    /// payload field name.
+    pub side_thread_id: i64,
+    /// Stored as `author_user_id` in the port schema.
+    pub author_user_local_id: Option<i64>,
+    pub author_first_name: Option<String>,
+    pub author_last_name: Option<String>,
+    pub body: String,
+    pub created_at: String,
+    pub mentions: Vec<SideThreadMentionRef>,
+}
+
+/// The detail payload — the reference `getThread` return
+/// (sideThreadRepo.ts:70-104): the summary fields plus participants and
+/// messages.
+#[derive(Debug, Clone, Serialize)]
+pub struct SideThreadDetail {
+    pub id: i64,
+    pub conversation_id: i64,
+    pub conversation_number: Option<i64>,
+    pub title: String,
+    pub team_local_id: Option<i64>,
+    pub team_name: Option<String>,
+    pub status: String,
+    pub created_by_user_local_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub resolved_at: Option<String>,
+    pub message_count: i64,
+    pub last_message_at: Option<String>,
+    pub participants: Vec<SideThreadParticipant>,
+    pub messages: Vec<SideThreadMessageItem>,
+}
+
+/// Row shape of the shared summary SELECT — the reference SQL
+/// (sideThreadRepo.ts:52-64 listThreads / 71-84 getThread) adapted to the
+/// port's column names.
+struct ThreadSummaryRow {
+    id: i64,
+    conversation_id: i64,
+    title: String,
+    team_local_id: Option<i64>,
+    team_name: Option<String>,
+    status: String,
+    created_by_user_local_id: Option<i64>,
+    created_at: String,
+    updated_at: String,
+    resolved_at: Option<String>,
+    conversation_number: Option<i64>,
+    message_count: i64,
+    last_message_at: Option<String>,
+}
+
+impl ThreadSummaryRow {
+    /// Indices follow THREAD_SUMMARY_SELECT's column order:
+    /// id, conversation_id, title, team_local_id, status, created_by_user_id,
+    /// created_at, updated_at, resolved_at, conversation_number, team_name,
+    /// message_count, last_message_at.
+    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            conversation_id: r.get(1)?,
+            title: r.get(2)?,
+            team_local_id: r.get(3)?,
+            status: r.get(4)?,
+            created_by_user_local_id: r.get(5)?,
+            created_at: r.get(6)?,
+            updated_at: r.get(7)?,
+            resolved_at: r.get(8)?,
+            conversation_number: r.get(9)?,
+            team_name: r.get(10)?,
+            message_count: r.get(11)?,
+            last_message_at: r.get(12)?,
+        })
+    }
+}
+
+/// The summary SELECT shared by list + detail (reference sideThreadRepo.ts
+/// 52-64: thread columns + conversation number + team name + message
+/// count/last-message subqueries). Open threads come first, newest update
+/// first — `ORDER BY st.status = 'resolved', st.updated_at DESC` in the
+/// reference; `julianday()` per this crate's KNOWN PITFALLS (mixed
+/// timestamp formats in the port columns).
+const THREAD_SUMMARY_SELECT: &str = "SELECT st.id, st.conversation_id, st.title, st.team_local_id,
+       st.status, st.created_by_user_id, st.created_at, st.updated_at, st.resolved_at,
+       c.number AS conversation_number, t.name AS team_name,
+       (SELECT COUNT(*) FROM side_thread_messages m WHERE m.thread_id = st.id) AS message_count,
+       (SELECT MAX(m.created_at) FROM side_thread_messages m WHERE m.thread_id = st.id) AS last_message_at
+FROM side_threads st
+JOIN conversations c ON c.id = st.conversation_id
+LEFT JOIN teams t ON t.id = st.team_local_id";
+
+/// List a conversation's side threads in the reference list payload shape
+/// (sideThreadRepo.ts:51-68). `conversation_id` is the LOCAL conversation id
+/// (conversations.id), like the reference.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the query fails.
+pub fn list_side_thread_summaries(
+    conn: &Connection,
+    conversation_id: i64,
+) -> Result<Vec<SideThreadSummary>> {
+    let mut stmt = conn.prepare(&format!(
+        "{THREAD_SUMMARY_SELECT}
+         WHERE st.conversation_id = ?1
+         ORDER BY (st.status = 'resolved') ASC, julianday(st.updated_at) DESC"
+    ))?;
+    let rows = stmt
+        .query_map(params![conversation_id], ThreadSummaryRow::read)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SideThreadSummary {
+            id: r.id,
+            conversation_id: r.conversation_id,
+            conversation_number: r.conversation_number,
+            title: r.title,
+            team_local_id: r.team_local_id,
+            team_name: r.team_name,
+            status: r.status,
+            created_by_user_local_id: r.created_by_user_local_id,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            resolved_at: r.resolved_at,
+            message_count: r.message_count,
+            last_message_at: r.last_message_at,
+        })
+        .collect())
+}
+
+/// Fetch one side thread in the reference detail payload shape
+/// (sideThreadRepo.ts:70-104): summary fields + participants + messages
+/// with resolved mentions. Returns `None` when the thread does not exist
+/// (the route answers 404, like the reference).
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if a query fails.
+pub fn get_side_thread_detail(
+    conn: &Connection,
+    thread_id: i64,
+) -> Result<Option<SideThreadDetail>> {
+    use rusqlite::OptionalExtension;
+
+    let mut stmt = conn.prepare(&format!("{THREAD_SUMMARY_SELECT} WHERE st.id = ?1"))?;
+    let row = stmt
+        .query_row(params![thread_id], ThreadSummaryRow::read)
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    // Participants (reference sideThreadRepo.ts:86-101).
+    let mut stmt = conn.prepare(
+        "SELECT p.user_local_id, u.first_name, u.last_name, u.mention,
+                p.added_at, p.added_by_user_local_id
+         FROM side_thread_participants p JOIN users u ON u.id = p.user_local_id
+         WHERE p.side_thread_id = ?1
+         ORDER BY julianday(p.added_at) ASC, p.user_local_id ASC",
+    )?;
+    let participants = stmt
+        .query_map(params![thread_id], |r| {
+            Ok(SideThreadParticipant {
+                user_local_id: r.get(0)?,
+                first_name: r.get(1)?,
+                last_name: r.get(2)?,
+                mention: r.get(3)?,
+                added_at: r.get(4)?,
+                added_by_user_local_id: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Messages + author names (reference sideThreadRepo.ts:106-134).
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.thread_id, m.author_user_id, m.body, m.created_at,
+                u.first_name AS author_first_name, u.last_name AS author_last_name
+         FROM side_thread_messages m LEFT JOIN users u ON u.id = m.author_user_id
+         WHERE m.thread_id = ?1
+         ORDER BY julianday(m.created_at) ASC, m.id ASC",
+    )?;
+    let messages = stmt
+        .query_map(params![thread_id], |r| {
+            Ok(SideThreadMessageItem {
+                id: r.get(0)?,
+                side_thread_id: r.get(1)?,
+                author_user_local_id: r.get(2)?,
+                author_first_name: r.get(5)?,
+                author_last_name: r.get(6)?,
+                body: r.get(3)?,
+                created_at: r.get(4)?,
+                mentions: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Resolved mentions, grouped per message (reference
+    // sideThreadRepo.ts:115-123).
+    let mut by_message: std::collections::HashMap<i64, Vec<SideThreadMentionRef>> =
+        std::collections::HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT message_id, user_local_id, team_local_id
+         FROM side_thread_mentions WHERE side_thread_id = ?1",
+    )?;
+    let mention_rows = stmt
+        .query_map(params![thread_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                SideThreadMentionRef {
+                    user_local_id: r.get(1)?,
+                    team_local_id: r.get(2)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (message_id, m) in mention_rows {
+        by_message.entry(message_id).or_default().push(m);
+    }
+    let mut messages = messages;
+    for m in &mut messages {
+        if let Some(mentions) = by_message.get(&m.id) {
+            m.mentions = mentions.clone();
+        }
+    }
+
+    Ok(Some(SideThreadDetail {
+        id: row.id,
+        conversation_id: row.conversation_id,
+        conversation_number: row.conversation_number,
+        title: row.title,
+        team_local_id: row.team_local_id,
+        team_name: row.team_name,
+        status: row.status,
+        created_by_user_local_id: row.created_by_user_local_id,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        resolved_at: row.resolved_at,
+        message_count: row.message_count,
+        last_message_at: row.last_message_at,
+        participants,
+        messages,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
