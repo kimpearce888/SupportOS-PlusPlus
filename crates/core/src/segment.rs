@@ -775,14 +775,37 @@ impl<'a> SegmentEngine<'a> {
     }
 
     fn ids(&self, sql: &str, params: &[rusqlite::types::Value]) -> Vec<i64> {
-        let Ok(mut stmt) = self.conn.prepare(sql) else {
-            return Vec::new();
+        // Audit SG-02 / C4: never silently swallow prepare/query errors.
+        // The previous implementation returned `Vec::new()` on any
+        // prepare or query_map failure, which made a malformed SQL string
+        // (e.g. the double-backslash ESCAPE bug fixed in this same commit)
+        // look like "no matches" — the user saw an empty segment preview
+        // with zero diagnostics. Surface the error to the application log
+        // so it is at least visible; downstream behavior (empty result) is
+        // preserved so the preview never panics on a bad condition tree.
+        let mut stmt = match self.conn.prepare(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    sql = sql.chars().take(300).collect::<String>(),
+                    "SegmentEngine::ids: prepare failed — returning empty result"
+                );
+                return Vec::new();
+            }
         };
         let refs: Vec<&dyn rusqlite::ToSql> =
             params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
         stmt.query_map(refs.as_slice(), |r| r.get::<_, i64>(0))
             .map(|rows| rows.filter_map(|x| x.ok()).collect())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    sql = sql.chars().take(300).collect::<String>(),
+                    "SegmentEngine::ids: query_map failed — returning empty result"
+                );
+                Vec::new()
+            })
     }
 
     // ─── Row building (explainability) ──────────────────────────────────────
@@ -1657,15 +1680,15 @@ impl<'a> SegmentEngine<'a> {
                         &[text(&val)],
                     ),
                     "contains" if !val.is_empty() => self.ids(
-                        &format!("SELECT c.id AS cid {from} WHERE c.deleted_at IS NULL AND {expr} LIKE ?1 ESCAPE '\\\\'"),
+                        &format!("SELECT c.id AS cid {from} WHERE c.deleted_at IS NULL AND {expr} LIKE ?1 ESCAPE '\\'"),
                         &[text(&format!("%{}%", escape_like(&val)))],
                     ),
                     "starts_with" if !val.is_empty() => self.ids(
-                        &format!("SELECT c.id AS cid {from} WHERE c.deleted_at IS NULL AND {expr} LIKE ?1 ESCAPE '\\\\'"),
+                        &format!("SELECT c.id AS cid {from} WHERE c.deleted_at IS NULL AND {expr} LIKE ?1 ESCAPE '\\'"),
                         &[text(&format!("{}%", escape_like(&val)))],
                     ),
                     "ends_with" if !val.is_empty() => self.ids(
-                        &format!("SELECT c.id AS cid {from} WHERE c.deleted_at IS NULL AND {expr} LIKE ?1 ESCAPE '\\\\'"),
+                        &format!("SELECT c.id AS cid {from} WHERE c.deleted_at IS NULL AND {expr} LIKE ?1 ESCAPE '\\'"),
                         &[text(&format!("%{}", escape_like(&val)))],
                     ),
                     _ => Vec::new(),
@@ -3586,5 +3609,168 @@ mod tests {
         assert!(props.iter().any(
             |p| p["name"].as_str().unwrap() == "Plan" && p["value"].as_str().unwrap() == "pro"
         ));
+    }
+
+    // ---- SG-02 / C4: Contact LIKE operators (contains/starts/ends) --------
+
+    /// Helper that returns just the matched customer_local_id set for a
+    /// single contact-name condition — keeps the three operator tests below
+    /// concise + focused on the audit's exact gap.
+    fn contact_name_matches(op: &str, value: &str) -> Vec<i64> {
+        let conn = fresh_db();
+        seed(&conn);
+        let engine = SegmentEngine::new(&conn);
+        let def = tree(
+            "all",
+            vec![SegmentNode::Contact {
+                field: "name".to_string(),
+                op: op.to_string(),
+                value: Some(value.to_string()),
+            }],
+            vec![],
+        );
+        let out = engine.preview(&def, 1, 25);
+        out["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["customer_local_id"].as_i64().unwrap())
+            .collect()
+    }
+
+    /// SG-02 / C4 regression: the `contains` operator on the customer-name
+    /// Contact field previously produced SQL with `ESCAPE '\\'` (two
+    /// backslashes in SQL), which SQLite rejects because ESCAPE expects a
+    /// single character. `ids()` swallowed the prepare error and returned
+    /// an empty Vec — so the user saw "0 matches" with zero diagnostics.
+    /// After the fix the SQL is `ESCAPE '\'` (single backslash) and the
+    /// query returns the real matches.
+    #[test]
+    fn contact_name_contains_returns_matches_after_scape_fix() {
+        let m = contact_name_matches("contains", "Byr");
+        assert_eq!(m, vec![1], "Ada Byron contains 'Byr'");
+        let m = contact_name_matches("contains", "rac");
+        assert_eq!(m, vec![2], "Grace Hopper contains 'rac'");
+        let m = contact_name_matches("contains", "a");
+        // Both 'Ada Byron' and 'Grace Hopper' contain 'a' (case-sensitive —
+        // the contains path does not LOWER the column; Ada's 'a' and Grace's
+        // 'a' both match).
+        assert_eq!(m.len(), 2, "both names contain lowercase 'a'");
+    }
+
+    /// SG-02 / C4 regression: same as `contains` but for `starts_with`.
+    #[test]
+    fn contact_name_starts_with_returns_matches_after_scape_fix() {
+        let m = contact_name_matches("starts_with", "Ada");
+        assert_eq!(m, vec![1], "Ada Byron starts with 'Ada'");
+        let m = contact_name_matches("starts_with", "Grace");
+        assert_eq!(m, vec![2], "Grace Hopper starts with 'Grace'");
+        let m = contact_name_matches("starts_with", "ZZZ");
+        assert!(m.is_empty(), "no name starts with 'ZZZ'");
+    }
+
+    /// SG-02 / C4 regression: same as `contains` but for `ends_with`.
+    #[test]
+    fn contact_name_ends_with_returns_matches_after_scape_fix() {
+        let m = contact_name_matches("ends_with", "Byron");
+        assert_eq!(m, vec![1], "Ada Byron ends with 'Byron'");
+        let m = contact_name_matches("ends_with", "Hopper");
+        assert_eq!(m, vec![2], "Grace Hopper ends with 'Hopper'");
+        let m = contact_name_matches("ends_with", "xyz");
+        assert!(m.is_empty(), "no name ends with 'xyz'");
+    }
+
+    /// SG-02 / C4: SQLite LIKE wildcards (`%` and `_`) in the user's
+    /// search value must be escaped (by `escape_like`) so they match
+    /// literally, not as wildcards. This is a regression test for the
+    /// `escape_like` helper that pairs with the now-correct `ESCAPE '\'`
+    /// SQL clause.
+    #[test]
+    fn contact_name_contains_escapes_like_wildcards() {
+        // Seed a customer whose name contains an underscore + percent so we
+        // can confirm they match LITERALLY (not as wildcards).
+        let conn = fresh_db();
+        seed(&conn);
+        conn.execute(
+            "INSERT INTO customers (id, remote_id, first_name, last_name)
+             VALUES (3, 103, 'special_name', '100%bug')",
+            [],
+        )
+        .unwrap();
+        let engine = SegmentEngine::new(&conn);
+
+        // Search for the literal '%' — only customer 3's last name contains
+        // it; without escape, '%' in the user value would be a wildcard and
+        // would match EVERY row.
+        let def = tree(
+            "all",
+            vec![SegmentNode::Contact {
+                field: "name".to_string(),
+                op: "contains".to_string(),
+                value: Some("%".to_string()),
+            }],
+            vec![],
+        );
+        let out = engine.preview(&def, 1, 25);
+        assert_eq!(
+            out["matched"].as_i64().unwrap(),
+            1,
+            "literal '%' matches only customer 3 (not a wildcard)"
+        );
+        assert_eq!(out["rows"][0]["customer_local_id"].as_i64().unwrap(), 3);
+
+        // Search for the literal '_' — without escape, '_' in user value
+        // would match any single character in every row.
+        let def = tree(
+            "all",
+            vec![SegmentNode::Contact {
+                field: "name".to_string(),
+                op: "contains".to_string(),
+                value: Some("_".to_string()),
+            }],
+            vec![],
+        );
+        let out = engine.preview(&def, 1, 25);
+        assert_eq!(
+            out["matched"].as_i64().unwrap(),
+            1,
+            "literal '_' matches only customer 3 (not a wildcard)"
+        );
+        assert_eq!(out["rows"][0]["customer_local_id"].as_i64().unwrap(), 3);
+    }
+
+    /// SG-02 / C4: `ids()` must surface prepare errors (via tracing::warn!)
+    /// instead of silently returning an empty Vec. The behavioral contract
+    /// is preserved (still returns empty) — the surfacing is the warning
+    /// that now lands in the application log. This test confirms the
+    /// behavioral contract (empty Vec on bad SQL) so the fix is
+    /// non-regressive; the warning's content is verified by `cargo test
+    /// -- --nocapture` eyeballing the captured stderr.
+    #[test]
+    fn ids_returns_empty_on_malformed_sql_and_logs_warning() {
+        // Initialize the global tracing subscriber so the warning lands in
+        // the test's stderr (visible with --nocapture).
+        crate::logging::init();
+
+        let conn = fresh_db();
+        seed(&conn);
+        let engine = SegmentEngine::new(&conn);
+
+        // Deliberately malformed SQL — unterminated string literal.
+        let bad_sql = "SELECT c.id FROM customers c WHERE c.first_name = 'Ada";
+        let result = engine.ids(bad_sql, &[]);
+        assert!(
+            result.is_empty(),
+            "malformed SQL must still return an empty Vec (behavior preserved)"
+        );
+
+        // And a query_map error: valid SQL but bad parameter binding
+        // (placeholder count mismatch).
+        let bad_param_sql = "SELECT c.id FROM customers c WHERE c.id = ?1 AND c.first_name = ?2";
+        let result = engine.ids(bad_param_sql, &[integer(1)]); // only 1 param, SQL has 2 placeholders
+        assert!(
+            result.is_empty(),
+            "query_map error must still return an empty Vec (behavior preserved)"
+        );
     }
 }
