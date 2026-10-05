@@ -1098,11 +1098,7 @@ impl HelpScoutProvider for RealHelpScoutProvider {
     }
 
     async fn list_users(&self) -> Result<Vec<HsUser>> {
-        let v = self.request("/v2/users", "GET", None).await?;
-        Ok(v["_embedded"]["users"]
-            .as_array()
-            .map(|a| a.iter().map(Self::map_user).collect())
-            .unwrap_or_default())
+        self.list_all_v2("/v2/users", "users", Self::map_user).await
     }
 
     async fn list_teams(&self) -> Result<Vec<HsTeam>> {
@@ -1130,54 +1126,66 @@ impl HelpScoutProvider for RealHelpScoutProvider {
     }
 
     async fn list_tags(&self) -> Result<Vec<HsTag>> {
-        let v = self.request("/v2/tags", "GET", None).await?;
-        Ok(v["_embedded"]["tags"]
-            .as_array()
-            .map(|a| a.iter().map(Self::map_tag).collect())
-            .unwrap_or_default())
+        self.list_all_v2("/v2/tags", "tags", Self::map_tag).await
     }
 
     async fn list_conversations(&self, query: &ConversationQuery) -> Result<Page<HsConversation>> {
-        let mut path = String::from("/v3/conversations?status=");
-        path.push_str(query.status.as_deref().unwrap_or("all"));
-        if let Some(mb) = query.mailbox_id {
-            path.push_str(&format!("&mailbox={mb}"));
-        }
-        if let Some(since) = &query.modified_since {
-            path.push_str(&format!("&modifiedSince={}", urlencode(since)));
-        }
-        if let Some(cursor) = &query.cursor {
-            path.push_str(&format!("&cursor={}", urlencode(cursor)));
-        }
+        // SY-06 (C5): the reference wire protocol — `inboxId=` (not
+        // `mailbox=`) and HAL `_links.next.href` pagination. A cursor from a
+        // previous page is already the next-page path (see `hal_next_path`),
+        // so it is requested verbatim.
+        let path = if let Some(cursor) = query.cursor.as_deref().filter(|c| c.starts_with('/')) {
+            cursor.to_string()
+        } else {
+            let mut path = String::from("/v3/conversations?status=");
+            path.push_str(query.status.as_deref().unwrap_or("all"));
+            if let Some(mb) = query.mailbox_id {
+                path.push_str(&format!("&inboxId={mb}"));
+            }
+            if let Some(since) = &query.modified_since {
+                path.push_str(&format!("&modifiedSince={}", urlencode(since)));
+            }
+            if let Some(cursor) = &query.cursor {
+                path.push_str(&format!("&cursor={}", urlencode(cursor)));
+            }
+            path
+        };
         let v = self.request(&path, "GET", None).await?;
         Ok(Page {
             items: v["_embedded"]["conversations"]
                 .as_array()
                 .map(|a| a.iter().map(Self::map_conversation).collect())
                 .unwrap_or_default(),
-            next_cursor: v["page"]["nextCursor"].as_str().map(|s| s.to_string()),
+            next_cursor: hal_next_path(&v),
         })
     }
 
     async fn list_customers(&self, query: &CustomerQuery) -> Result<Page<HsCustomer>> {
-        let mut path = String::from("/v3/customers");
-        let mut sep = '?';
-        if let Some(since) = &query.modified_since {
-            path.push(sep);
-            path.push_str(&format!("modifiedSince={}", urlencode(since)));
-            sep = '&';
-        }
-        if let Some(cursor) = &query.cursor {
-            path.push(sep);
-            path.push_str(&format!("cursor={}", urlencode(cursor)));
-        }
+        // SY-06 (C5): HAL `_links.next.href` cursor pagination — a cursor
+        // from a previous page is the next-page path, requested verbatim.
+        let path = if let Some(cursor) = query.cursor.as_deref().filter(|c| c.starts_with('/')) {
+            cursor.to_string()
+        } else {
+            let mut path = String::from("/v3/customers");
+            let mut sep = '?';
+            if let Some(since) = &query.modified_since {
+                path.push(sep);
+                path.push_str(&format!("modifiedSince={}", urlencode(since)));
+                sep = '&';
+            }
+            if let Some(cursor) = &query.cursor {
+                path.push(sep);
+                path.push_str(&format!("cursor={}", urlencode(cursor)));
+            }
+            path
+        };
         let v = self.request(&path, "GET", None).await?;
         Ok(Page {
             items: v["_embedded"]["customers"]
                 .as_array()
                 .map(|a| a.iter().map(Self::map_customer).collect())
                 .unwrap_or_default(),
-            next_cursor: v["page"]["nextCursor"].as_str().map(|s| s.to_string()),
+            next_cursor: hal_next_path(&v),
         })
     }
 
@@ -1301,22 +1309,15 @@ impl HelpScoutProvider for RealHelpScoutProvider {
     }
 
     async fn list_workflows(&self) -> Result<Vec<HsWorkflow>> {
-        let v = self.request("/v2/workflows", "GET", None).await?;
-        Ok(v["_embedded"]["workflows"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|w| HsWorkflow {
-                        remote_id: w["id"].as_i64().unwrap_or(0),
-                        mailbox_id: w["mailboxId"].as_i64(),
-                        name: w["name"].as_str().unwrap_or_default().to_string(),
-                        kind: w["type"].as_str().unwrap_or("manual").to_string(),
-                        status: w["status"].as_str().unwrap_or("inactive").to_string(),
-                        sort_order: w["order"].as_i64().unwrap_or(0),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        self.list_all_v2("/v2/workflows", "workflows", |w| HsWorkflow {
+            remote_id: w["id"].as_i64().unwrap_or(0),
+            mailbox_id: w["mailboxId"].as_i64(),
+            name: w["name"].as_str().unwrap_or_default().to_string(),
+            kind: w["type"].as_str().unwrap_or("manual").to_string(),
+            status: w["status"].as_str().unwrap_or("inactive").to_string(),
+            sort_order: w["order"].as_i64().unwrap_or(0),
+        })
+        .await
     }
 
     async fn list_webhooks(&self) -> Result<Vec<HsWebhookConfig>> {
@@ -1390,11 +1391,8 @@ impl HelpScoutProvider for RealHelpScoutProvider {
     }
 
     async fn list_organizations(&self) -> Result<Vec<HsOrganization>> {
-        let v = self.request("/v2/organizations", "GET", None).await?;
-        Ok(v["_embedded"]["organizations"]
-            .as_array()
-            .map(|a| a.iter().map(Self::map_organization).collect())
-            .unwrap_or_default())
+        self.list_all_v2("/v2/organizations", "organizations", Self::map_organization)
+            .await
     }
 
     async fn get_conversation(&self, conversation_id: i64) -> Result<Option<HsConversation>> {
@@ -1467,11 +1465,25 @@ impl HelpScoutProvider for RealHelpScoutProvider {
     }
 
     async fn list_system_users(&self) -> Result<Vec<HsUser>> {
-        let v = self.request("/v2/users?status=system", "GET", None).await?;
-        Ok(v["_embedded"]["users"]
-            .as_array()
-            .map(|a| a.iter().map(Self::map_user).collect())
-            .unwrap_or_default())
+        // SY-06 (C5): the reference fetches system users from the V3
+        // endpoint (HAL `_embedded` + `_links.next.href` cursor pagination).
+        let mut out = Vec::new();
+        let mut path = String::from("/v3/system-users");
+        loop {
+            let v = self.request(&path, "GET", None).await?;
+            let embedded = v["_embedded"]["system-users"]
+                .as_array()
+                .or_else(|| v["_embedded"]["users"].as_array())
+                .cloned()
+                .unwrap_or_default();
+            let n = embedded.len();
+            out.extend(embedded.iter().map(Self::map_user));
+            match hal_next_path(&v) {
+                Some(next) if n > 0 => path = next,
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     async fn list_doc_collections(&self) -> Result<Vec<HsDocCollection>> {
@@ -1711,6 +1723,73 @@ impl RealHelpScoutProvider {
             sort_order: v["order"].as_i64().unwrap_or(0),
         }
     }
+
+    /// SY-06 (C5): the V2 page loop the reference runs for
+    /// users/tags/organizations/workflows — request `?page=N` and keep
+    /// turning pages while `page.number + 1 < page.totalPages`, collecting
+    /// every `_embedded[<key>]` element. A missing `page` object degrades to
+    /// the single-page behavior (defensive against shape drift).
+    async fn list_all_v2<T>(
+        &self,
+        base: &str,
+        embedded_key: &str,
+        map: impl Fn(&Value) -> T,
+    ) -> Result<Vec<T>> {
+        let mut out: Vec<T> = Vec::new();
+        let mut page_no: u32 = 0;
+        loop {
+            let sep = if base.contains('?') { '&' } else { '?' };
+            let v = self
+                .request(&format!("{base}{sep}page={page_no}"), "GET", None)
+                .await?;
+            let embedded = v["_embedded"][embedded_key]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let n = embedded.len();
+            out.extend(embedded.iter().map(&map));
+            let total_pages = v["page"]["totalPages"].as_u64().unwrap_or(1);
+            let number = v["page"]["number"].as_u64().unwrap_or(0);
+            // Last page: no embedded rows, or the page object says so.
+            if n == 0 || number + 1 >= total_pages {
+                break;
+            }
+            page_no += 1;
+            // Hard stop against a pathological server response (1000 pages
+            // of 50 = 50k rows is far beyond any real account).
+            if page_no > 1_000 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// SY-06 (C5): the next-page request path from a HAL `_links.next.href`
+/// (Help Scout V3 cursor pagination). The href is absolute; the request
+/// layer prepends the API base, so only the `/path?query` part is returned.
+/// Falls back to `page.nextCursor` when `_links` is absent.
+fn hal_next_path(v: &Value) -> Option<String> {
+    if let Some(href) = v["_links"]["next"]["href"]
+        .as_str()
+        .filter(|h| !h.is_empty())
+    {
+        let path = if let Some(pos) = href.find("://") {
+            let rest = &href[pos + 3..];
+            let slash = rest.find('/')?;
+            &rest[slash..]
+        } else {
+            href
+        };
+        if path.starts_with('/') {
+            return Some(path.to_string());
+        }
+        return None;
+    }
+    v["page"]["nextCursor"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .map(|c| c.to_string())
 }
 
 /// Whether an API error is a 404 (used for Option-returning fetches).
@@ -1832,5 +1911,367 @@ mod tests {
         assert!(is_retryable(504));
         assert!(!is_retryable(404));
         assert!(!is_retryable(400));
+    }
+
+    // ---- SY-06 (C5): wire-protocol tests against a local mock Help Scout ---
+    //
+    // A mock API serves canned HAL pages and records every request
+    // path+query; the recorded requests prove the exact wire shape the
+    // reference uses (inboxId=, _links.next.href cursor, /v3/system-users,
+    // ?page=N loops for users/tags/orgs/workflows).
+
+    mod wire {
+        use super::super::*;
+        use std::sync::{Arc, Mutex};
+
+        /// The mock Help Scout API: pops canned responses in order and
+        /// records every request URI (path + query).
+        struct MockApi {
+            requests: Mutex<Vec<String>>,
+            responses: Mutex<Vec<Value>>,
+        }
+
+        async fn spawn_mock(responses: Vec<Value>) -> (String, Arc<MockApi>) {
+            let api = Arc::new(MockApi {
+                requests: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses),
+            });
+            let app = {
+                let api = api.clone();
+                axum::Router::new().fallback(move |uri: axum::http::Uri| {
+                    let api = api.clone();
+                    async move {
+                        {
+                            let mut reqs = api.requests.lock().unwrap();
+                            let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                            reqs.push(format!("{}{q}", uri.path()));
+                        }
+                        let body = {
+                            let mut resps = api.responses.lock().unwrap();
+                            if resps.is_empty() {
+                                json!({})
+                            } else {
+                                resps.remove(0)
+                            }
+                        };
+                        axum::Json(body)
+                    }
+                })
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock");
+            let addr = listener.local_addr().expect("mock addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            (format!("http://{addr}"), api)
+        }
+
+        fn recorded(api: &MockApi) -> Vec<String> {
+            api.requests.lock().unwrap().clone()
+        }
+
+        /// A provider against the mock with a seeded non-refreshable token.
+        fn provider(base: &str) -> RealHelpScoutProvider {
+            let mut conn = Connection::open_in_memory().expect("db");
+            crate::db::ensure_migrations_table(&conn).expect("migrations table");
+            crate::migrations::run_all(&mut conn).expect("migrations");
+            // The reference-shaped token columns (account/revoked), then the
+            // seeded token: an access token, no refresh token and no expiry —
+            // the provider uses the token as-is and never calls the token
+            // endpoint.
+            ensure_account_row(&conn);
+            let _ = conn.execute(
+                "INSERT INTO oauth_tokens (id, access_token, account, revoked)
+                 VALUES (1, 'wire-token', 'default', 0)
+                 ON CONFLICT(id) DO UPDATE SET
+                    access_token = 'wire-token', account = 'default', revoked = 0",
+                [],
+            );
+            RealHelpScoutProvider::new(
+                Arc::new(Mutex::new(conn)),
+                HsCredentials {
+                    client_id: "cid".into(),
+                    client_secret: "sec".into(),
+                    api_base: base.to_string(),
+                    ..Default::default()
+                },
+            )
+        }
+
+        #[tokio::test]
+        async fn conversations_use_inbox_id_and_hal_links_cursor() {
+            let (base, api) = spawn_mock(vec![
+                // Page 1: one conversation + a _links.next href pointing at
+                // the next page.
+                json!({
+                    "_embedded": { "conversations": [
+                        { "id": 1, "number": 101, "status": "active", "mailboxId": 7,
+                          "subject": "first", "primaryCustomer": { "id": 3001 } }
+                    ]},
+                    "_links": { "next": { "href": "SY06_PAGE2" } }
+                }),
+                // Page 2: last page (no _links.next).
+                json!({
+                    "_embedded": { "conversations": [
+                        { "id": 2, "number": 102, "status": "active", "mailboxId": 7,
+                          "subject": "second", "primaryCustomer": { "id": 3002 } }
+                    ]}
+                }),
+            ])
+            .await;
+            let base = base; // keep alive
+                             // Patch the canned href with the real mock host (the provider
+                             // requests the path verbatim, so it must be absolute-shaped).
+            {
+                let mut resps = api.responses.lock().unwrap();
+                resps[0]["_links"]["next"]["href"] = json!(format!(
+                    "{base}/v3/conversations?status=all&inboxId=7&cursor=NEXT"
+                ));
+            }
+            let p = provider(&base);
+
+            // Page 1 — the wire request uses inboxId= (C5: was mailbox=).
+            let page1 = p
+                .list_conversations(&ConversationQuery {
+                    mailbox_id: Some(7),
+                    status: Some("all".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .expect("page 1");
+            let reqs = recorded(&api);
+            assert_eq!(
+                reqs.last().map(String::as_str),
+                Some("/v3/conversations?status=all&inboxId=7"),
+                "inboxId= wire param (C5)"
+            );
+            assert_eq!(page1.items.len(), 1);
+            assert_eq!(page1.items[0].remote_id, 1);
+            // The next cursor is the _links.next.href PATH (not
+            // page.nextCursor — that field is absent in V3 responses).
+            assert_eq!(
+                page1.next_cursor.as_deref(),
+                Some("/v3/conversations?status=all&inboxId=7&cursor=NEXT"),
+                "cursor comes from _links.next.href"
+            );
+
+            // Page 2 — the engine feeds the cursor back; the provider
+            // requests it verbatim.
+            let page2 = p
+                .list_conversations(&ConversationQuery {
+                    mailbox_id: Some(7),
+                    status: Some("all".to_string()),
+                    cursor: page1.next_cursor.clone(),
+                    ..Default::default()
+                })
+                .await
+                .expect("page 2");
+            let reqs = recorded(&api);
+            assert_eq!(
+                reqs.last().map(String::as_str),
+                Some("/v3/conversations?status=all&inboxId=7&cursor=NEXT"),
+                "the HAL next path is requested verbatim"
+            );
+            assert_eq!(page2.items.len(), 1);
+            assert_eq!(page2.items[0].remote_id, 2);
+            assert!(page2.next_cursor.is_none(), "last page has no cursor");
+
+            assert_eq!(recorded(&api).len(), 2, "no extra wire calls");
+        }
+
+        #[tokio::test]
+        async fn customers_follow_hal_links_cursor() {
+            let (base, api) = spawn_mock(vec![
+                json!({
+                    "_embedded": { "customers": [
+                        { "id": 3001, "firstName": "Ada" }
+                    ]},
+                    "_links": { "next": { "href": "SY06_C2" } }
+                }),
+                json!({
+                    "_embedded": { "customers": [
+                        { "id": 3002, "firstName": "Lin" }
+                    ]}
+                }),
+            ])
+            .await;
+            {
+                let mut resps = api.responses.lock().unwrap();
+                resps[0]["_links"]["next"]["href"] =
+                    json!(format!("{base}/v3/customers?cursor=CNEXT"));
+            }
+            let p = provider(&base);
+
+            let page1 = p
+                .list_customers(&CustomerQuery::default())
+                .await
+                .expect("customers page 1");
+            assert_eq!(
+                recorded(&api).last().map(String::as_str),
+                Some("/v3/customers")
+            );
+            assert_eq!(page1.items.len(), 1);
+            assert_eq!(
+                page1.next_cursor.as_deref(),
+                Some("/v3/customers?cursor=CNEXT")
+            );
+
+            let page2 = p
+                .list_customers(&CustomerQuery {
+                    cursor: page1.next_cursor.clone(),
+                    ..Default::default()
+                })
+                .await
+                .expect("customers page 2");
+            assert_eq!(
+                recorded(&api).last().map(String::as_str),
+                Some("/v3/customers?cursor=CNEXT")
+            );
+            assert_eq!(page2.items.len(), 1);
+            assert!(page2.next_cursor.is_none());
+        }
+
+        #[tokio::test]
+        async fn users_page_loop_turns_every_v2_page() {
+            let (_base, api) = spawn_mock(vec![
+                json!({
+                    "_embedded": { "users": [
+                        { "id": 1, "firstName": "A", "email": "a@x.test" },
+                        { "id": 2, "firstName": "B", "email": "b@x.test" }
+                    ]},
+                    "page": { "size": 2, "totalElements": 3, "totalPages": 2, "number": 0 }
+                }),
+                json!({
+                    "_embedded": { "users": [
+                        { "id": 3, "firstName": "C", "email": "c@x.test" }
+                    ]},
+                    "page": { "size": 2, "totalElements": 3, "totalPages": 2, "number": 1 }
+                }),
+            ])
+            .await;
+            let p = provider(&_base);
+
+            let users = p.list_users().await.expect("users");
+            assert_eq!(users.len(), 3, "every page collected");
+            let ids: Vec<i64> = users.iter().map(|u| u.remote_id).collect();
+            assert_eq!(ids, vec![1, 2, 3]);
+            let reqs = recorded(&api);
+            assert_eq!(
+                reqs,
+                vec![
+                    "/v2/users?page=0".to_string(),
+                    "/v2/users?page=1".to_string()
+                ],
+                "the ?page=N loop the reference runs"
+            );
+        }
+
+        #[tokio::test]
+        async fn tags_orgs_and_workflows_page_loop_too() {
+            let (_base, api) = spawn_mock(vec![
+                json!({
+                    "_embedded": { "tags": [
+                        { "id": 1, "tag": "alpha" }, { "id": 2, "tag": "beta" }
+                    ]},
+                    "page": { "size": 2, "totalElements": 3, "totalPages": 2, "number": 0 }
+                }),
+                json!({
+                    "_embedded": { "tags": [ { "id": 3, "tag": "gamma" } ]},
+                    "page": { "size": 2, "totalElements": 3, "totalPages": 2, "number": 1 }
+                }),
+                json!({
+                    "_embedded": { "organizations": [
+                        { "id": 10, "name": "Acme", "domains": ["acme.test"] }
+                    ]},
+                    "page": { "size": 50, "totalElements": 2, "totalPages": 2, "number": 0 }
+                }),
+                json!({
+                    "_embedded": { "organizations": [
+                        { "id": 11, "name": "Globex", "domains": ["globex.test"] }
+                    ]},
+                    "page": { "size": 50, "totalElements": 2, "totalPages": 2, "number": 1 }
+                }),
+                json!({
+                    "_embedded": { "workflows": [
+                        { "id": 20, "name": "Auto-note", "type": "manual",
+                          "status": "active", "order": 0, "mailboxId": 7 }
+                    ]},
+                    "page": { "size": 25, "totalElements": 2, "totalPages": 2, "number": 0 }
+                }),
+                json!({
+                    "_embedded": { "workflows": [
+                        { "id": 21, "name": "Urgent", "type": "manual",
+                          "status": "active", "order": 1, "mailboxId": 7 }
+                    ]},
+                    "page": { "size": 25, "totalElements": 2, "totalPages": 2, "number": 1 }
+                }),
+            ])
+            .await;
+            let p = provider(&_base);
+
+            let tags = p.list_tags().await.expect("tags");
+            assert_eq!(tags.len(), 3);
+            assert_eq!(tags[2].name, "gamma");
+
+            let orgs = p.list_organizations().await.expect("orgs");
+            assert_eq!(orgs.len(), 2);
+            assert_eq!(orgs[1].name, "Globex");
+
+            let wfs = p.list_workflows().await.expect("workflows");
+            assert_eq!(wfs.len(), 2);
+            assert_eq!(wfs[1].name, "Urgent");
+
+            assert_eq!(
+                recorded(&api),
+                vec![
+                    "/v2/tags?page=0",
+                    "/v2/tags?page=1",
+                    "/v2/organizations?page=0",
+                    "/v2/organizations?page=1",
+                    "/v2/workflows?page=0",
+                    "/v2/workflows?page=1",
+                ],
+                "page loops for users/tags/orgs/workflows (C5)"
+            );
+        }
+
+        #[tokio::test]
+        async fn system_users_use_the_v3_endpoint_with_hal_loop() {
+            let (base, api) = spawn_mock(vec![
+                json!({
+                    "_embedded": { "system-users": [
+                        { "id": 900, "firstName": "SupportOS", "type": "system-user" }
+                    ]},
+                    "_links": { "next": { "href": "SY06_SU2" } }
+                }),
+                json!({
+                    "_embedded": { "system-users": [
+                        { "id": 901, "firstName": "Copilot", "type": "system-user" }
+                    ]}
+                }),
+            ])
+            .await;
+            {
+                let mut resps = api.responses.lock().unwrap();
+                resps[0]["_links"]["next"]["href"] =
+                    json!(format!("{base}/v3/system-users?cursor=SUNEXT"));
+            }
+            let p = provider(&base);
+
+            let users = p.list_system_users().await.expect("system users");
+            assert_eq!(users.len(), 2, "the HAL loop collects both pages");
+            assert_eq!(users[0].remote_id, 900);
+            assert_eq!(users[0].user_type, "system-user");
+            assert_eq!(
+                recorded(&api),
+                vec![
+                    "/v3/system-users".to_string(),
+                    "/v3/system-users?cursor=SUNEXT".to_string(),
+                ],
+                "system users come from /v3/system-users (C5), not /v2/users?status=system"
+            );
+        }
     }
 }
