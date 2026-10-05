@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **113 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **108 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
 |---|---|---|---|---|---|---|---|
-| 4 | AI-19 | Interaction routes (GET card/evidence/profile, refresh) | Divergent | Critical | M | C7 | Fix GET queries to real schema; create evidence table; implement refresh; serve profile from signals |
-| 5 | SEC-02 | HTML sanitizing (40 tags, attr map, schemes, css clip, a-hardening) | Partial | Critical | S | T11 inv.8 | Strip protocol-relative URLs (UrlRelative::Custom deny) ; remove whole img on data:text/html |
-| 6 | SY-06 | Real provider wire protocol (inboxId, _links cursor, HAL docs, /v3/system-users, pagination loops) | Divergent | Critical | M | C5 | Use inboxId=, _links.next.href cursor, /v3/system-users, HAL _embedded parsing, page loops for users/tags/orgs/workflows |
-| 7 | WK-03 | Job-kind executor coverage (~34 kinds) | Partial | Critical | L | C6 | Add missing job handlers (AI family, bulk ops, attachments, outreach send/reconcile, refresh_report) or stop enqueuing unrunnable kinds |
-| 8 | SY-05 | Mirror write fidelity (tags/fields/emails/properties/recipients/ratings) | Divergent | Critical | L | C8 | Persist emails/properties/phones on customer upsert; store thread recipients/attachments |
 | 9 | BK-04 | .sosync schema guard (prevent incompatible import) | Divergent | Critical | M | C1 | Real schema fingerprint in header (e.g. canonical DDL hash) checked on import; stop fabricating history |
 | 10 | C3 | panic=abort profile + unrecovered panics kill the packaged app | Defect | Critical | M | T16 C3 | Switch release profile to unwind and add catch_unwind containment at handler/task boundary (Cargo.toml:85 panic=abort; operations.rs:276-278 tile panic; rate_limit.rs:69 poisoned-mutex expects). |
 | 11 | AI-22 | LM Studio client (models/chat/embeddings, timeout, /v1 normalization) | Partial | Major | S | M10 | Add timeout from lmstudio_timeout_ms; normalize base URL /v1 on all paths |
