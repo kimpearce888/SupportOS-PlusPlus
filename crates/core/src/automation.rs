@@ -683,6 +683,1160 @@ pub fn fire_trigger(
     Ok(runs)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN rule model (audit B4 / plan item AU-01).
+//
+// The reference stores automation rules with a MAIN trigger enum string, a
+// conditions JSON array, an actions JSON array, priority and
+// requires_approval (migration 003 + engine.ts:34-104), and validates the
+// whole surface with `automationRuleSchema` (shared/schemas.ts:499-545). The
+// port's M007 table keeps its own column names (trigger_json / action_json —
+// audit DB-04) and lacked conditions / priority / requires_approval /
+// last_run_at / run_count entirely, and the create route INSERT named
+// nonexistent `trigger` / `action` columns — silently swallowed, so rule
+// creation never persisted anything (B4).
+//
+// This section adds the missing columns (guarded ALTERs — the established
+// bootstrap pattern), a zod-equivalent validator, MAIN-shaped storage
+// functions and the reference fire semantics for the manual-trigger route.
+// The old Trigger/Action-enum model above stays untouched (dormant: its only
+// callers were the routes replaced here; the vocabulary port is AU-02).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The reference trigger vocabulary (shared/schemas.ts:502).
+pub const MAIN_TRIGGERS: [&str; 4] = [
+    "new_conversation",
+    "customer_reply",
+    "ai_low_confidence",
+    "manual",
+];
+
+/// The reference action-kind vocabulary (shared/schemas.ts:528-538).
+pub const MAIN_ACTION_KINDS: [&str; 9] = [
+    "analyze_ticket",
+    "search_similar",
+    "check_known_issues",
+    "create_ai_note",
+    "create_ai_draft",
+    "add_tag",
+    "set_status",
+    "assign",
+    "manual_review_queue",
+];
+
+/// The reference condition-field vocabulary (shared/schemas.ts:510).
+pub const MAIN_CONDITION_FIELDS: [&str; 8] = [
+    "subject",
+    "body",
+    "tag",
+    "mailbox",
+    "confidence",
+    "known_issue_match",
+    "ai_attribute",
+    "ai_verification",
+];
+
+/// The reference condition-operator vocabulary (shared/schemas.ts:511).
+pub const MAIN_CONDITION_OPERATORS: [&str; 7] =
+    ["contains", "equals", "not_equals", "gt", "gte", "lt", "lte"];
+
+/// The AI attribute catalog keys a `field: 'ai_attribute'` condition may
+/// target (shared/constants.ts:114-129 — closed catalog).
+pub const MAIN_AI_ATTRIBUTE_KEYS: [&str; 14] = [
+    "intent",
+    "product",
+    "feature",
+    "issue",
+    "urgency",
+    "frustration_cues",
+    "technical_familiarity",
+    "customer_goal",
+    "question_count",
+    "risk",
+    "known_issue",
+    "issue_cluster",
+    "response_style",
+    "escalation_signal",
+];
+
+/// The reference risk-tier table (engine.ts:35-45): read /
+/// non_destructive / higher_risk per action kind. Unknown kinds read as
+/// 'read' in the reference (`RISK_TIERS[kind] ?? 'read'`).
+#[must_use]
+pub fn risk_tier(kind: &str) -> Option<&'static str> {
+    match kind {
+        "analyze_ticket" | "search_similar" | "check_known_issues" => Some("read"),
+        "create_ai_note" | "create_ai_draft" | "add_tag" | "manual_review_queue" => {
+            Some("non_destructive")
+        }
+        "set_status" | "assign" => Some("higher_risk"),
+        _ => None,
+    }
+}
+
+/// Complete the automation_rules / automation_runs tables with the columns
+/// the reference schema has and M007 lacked (guarded, idempotent — the
+/// bootstrap `ensure` pattern). `automation_rules.enabled` keeps M007's
+/// DEFAULT 1 for raw inserts, but every insert through the validated CRUD
+/// surface stores the zod default `false` explicitly ("disabled by default —
+/// enable it when ready").
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the DDL fails.
+pub fn ensure_main_rule_columns(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "automation_rules",
+        "conditions",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    add_column_if_missing(conn, "automation_rules", "priority", "INTEGER DEFAULT 100")?;
+    add_column_if_missing(
+        conn,
+        "automation_rules",
+        "requires_approval",
+        "INTEGER DEFAULT 1",
+    )?;
+    add_column_if_missing(conn, "automation_rules", "last_run_at", "TEXT")?;
+    add_column_if_missing(conn, "automation_rules", "run_count", "INTEGER DEFAULT 0")?;
+    // The reference automation_runs carries a human-readable detail string
+    // (engine.ts record()); the port's M035 table lacks the column.
+    crate::intelligence_features::apply_m035(conn)?;
+    add_column_if_missing(conn, "automation_runs", "detail", "TEXT")
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let exists: bool = conn
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == column);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// One zod-style validation issue: a dot-joined path + message, mirroring
+/// `{ path: [...], message }` from the reference's ZodError issues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub path: String,
+    pub message: String,
+}
+
+impl ValidationIssue {
+    fn new(path: &str, message: impl Into<String>) -> Self {
+        Self {
+            path: path.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+/// A validated rule in the reference `automationRuleSchema` shape — the
+/// parsed output WITH zod defaults applied (enabled=false, conditions=[],
+/// params={}, priority=100, requires_approval=true).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleInput {
+    pub name: String,
+    pub enabled: bool,
+    pub trigger: String,
+    /// Validated conditions array (reference shape, `attribute` only on
+    /// `ai_attribute` conditions).
+    pub conditions: serde_json::Value,
+    /// Validated actions array (reference shape, `params` always present).
+    pub actions: serde_json::Value,
+    pub priority: i64,
+    pub requires_approval: bool,
+}
+
+/// Render a JSON value the way zod names the received type in messages
+/// ("null", "number", "string", "boolean", "array", "object").
+fn received(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Bool(_) => "boolean".into(),
+        serde_json::Value::Number(_) => "number".into(),
+        serde_json::Value::String(_) => "string".into(),
+        serde_json::Value::Array(_) => "array".into(),
+        serde_json::Value::Object(_) => "object".into(),
+    }
+}
+
+/// Render a received value inside an enum message — zod prints the literal
+/// ('single-quoted string', bare number/boolean).
+fn received_literal(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => format!("'{s}'"),
+        other => other.to_string(),
+    }
+}
+
+fn enum_message(expected: &[&str], received_value: &serde_json::Value) -> String {
+    let list = expected
+        .iter()
+        .map(|e| format!("'{e}'"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(
+        "Invalid enum value. Expected {list}, received {}",
+        received_literal(received_value)
+    )
+}
+
+/// Validate a request body against the reference `automationRuleSchema`
+/// (shared/schemas.ts:499-545): same fields, same enums, same defaults, same
+/// superRefine rules. Collects ALL issues (zod behavior) in schema-key
+/// order; `Ok` returns the parsed rule with defaults applied.
+///
+/// # Errors
+///
+/// `Err(issues)` — never panics.
+pub fn validate_rule(
+    body: &serde_json::Value,
+) -> std::result::Result<RuleInput, Vec<ValidationIssue>> {
+    let mut issues: Vec<ValidationIssue> = Vec::new();
+    let obj: &serde_json::Map<String, serde_json::Value> = match body.as_object() {
+        Some(o) => o,
+        None => {
+            issues.push(ValidationIssue::new(
+                "",
+                format!("Expected object, received {}", received(body)),
+            ));
+            return Err(issues);
+        }
+    };
+
+    // ---- name: z.string().min(1) (required) --------------------------------
+    let name = match obj.get("name") {
+        None => {
+            issues.push(ValidationIssue::new("name", "Required"));
+            String::new()
+        }
+        Some(serde_json::Value::String(s)) => {
+            if s.is_empty() {
+                issues.push(ValidationIssue::new(
+                    "name",
+                    "String must contain at least 1 character(s)",
+                ));
+            }
+            s.clone()
+        }
+        Some(other) => {
+            issues.push(ValidationIssue::new(
+                "name",
+                format!("Expected string, received {}", received(other)),
+            ));
+            String::new()
+        }
+    };
+
+    // ---- enabled: z.boolean().default(false) --------------------------------
+    let enabled = match obj.get("enabled") {
+        None => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(other) => {
+            issues.push(ValidationIssue::new(
+                "enabled",
+                format!("Expected boolean, received {}", received(other)),
+            ));
+            false
+        }
+    };
+
+    // ---- trigger: z.enum([...4]) (required) ---------------------------------
+    let trigger = match obj.get("trigger") {
+        None => {
+            issues.push(ValidationIssue::new("trigger", "Required"));
+            String::new()
+        }
+        Some(serde_json::Value::String(s)) if MAIN_TRIGGERS.contains(&s.as_str()) => s.clone(),
+        Some(other) => {
+            issues.push(ValidationIssue::new(
+                "trigger",
+                enum_message(&MAIN_TRIGGERS, other),
+            ));
+            String::new()
+        }
+    };
+
+    // ---- conditions: z.array(conditionSchema).default([]) --------------------
+    let conditions = match obj.get("conditions") {
+        None => serde_json::Value::Array(Vec::new()),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let base = format!("conditions.{i}");
+                match item {
+                    serde_json::Value::Object(_) => {}
+                    serde_json::Value::Null => {
+                        issues.push(ValidationIssue::new(
+                            &base,
+                            "Expected object, received null",
+                        ));
+                        continue;
+                    }
+                    other => {
+                        issues.push(ValidationIssue::new(
+                            &base,
+                            format!("Expected object, received {}", received(other)),
+                        ));
+                        continue;
+                    }
+                }
+                // field / operator / value / attribute
+                let cond_field = match item_field(item, "field") {
+                    FieldGet::Missing => {
+                        issues.push(ValidationIssue::new(&format!("{base}.field"), "Required"));
+                        String::new()
+                    }
+                    FieldGet::Value(serde_json::Value::String(s))
+                        if MAIN_CONDITION_FIELDS.contains(&s.as_str()) =>
+                    {
+                        s.clone()
+                    }
+                    FieldGet::Value(other) => {
+                        issues.push(ValidationIssue::new(
+                            &format!("{base}.field"),
+                            enum_message(&MAIN_CONDITION_FIELDS, other),
+                        ));
+                        String::new()
+                    }
+                };
+                let operator = match item_field(item, "operator") {
+                    FieldGet::Missing => {
+                        issues.push(ValidationIssue::new(
+                            &format!("{base}.operator"),
+                            "Required",
+                        ));
+                        String::new()
+                    }
+                    FieldGet::Value(serde_json::Value::String(s))
+                        if MAIN_CONDITION_OPERATORS.contains(&s.as_str()) =>
+                    {
+                        s.clone()
+                    }
+                    FieldGet::Value(other) => {
+                        issues.push(ValidationIssue::new(
+                            &format!("{base}.operator"),
+                            enum_message(&MAIN_CONDITION_OPERATORS, other),
+                        ));
+                        String::new()
+                    }
+                };
+                let value = match item_field(item, "value") {
+                    FieldGet::Missing => {
+                        issues.push(ValidationIssue::new(&format!("{base}.value"), "Required"));
+                        String::new()
+                    }
+                    FieldGet::Value(serde_json::Value::String(s)) => {
+                        if s.chars().count() > 200 {
+                            issues.push(ValidationIssue::new(
+                                &format!("{base}.value"),
+                                "String must contain at most 200 character(s)",
+                            ));
+                        }
+                        s.clone()
+                    }
+                    FieldGet::Value(other) => {
+                        issues.push(ValidationIssue::new(
+                            &format!("{base}.value"),
+                            format!("Expected string, received {}", received(other)),
+                        ));
+                        String::new()
+                    }
+                };
+                let attribute = match item_field(item, "attribute") {
+                    FieldGet::Missing => None,
+                    FieldGet::Value(serde_json::Value::Null) => None,
+                    FieldGet::Value(serde_json::Value::String(s))
+                        if MAIN_AI_ATTRIBUTE_KEYS.contains(&s.as_str()) =>
+                    {
+                        Some(s.clone())
+                    }
+                    FieldGet::Value(other) => {
+                        issues.push(ValidationIssue::new(
+                            &format!("{base}.attribute"),
+                            enum_message(&MAIN_AI_ATTRIBUTE_KEYS, other),
+                        ));
+                        None
+                    }
+                };
+                // superRefine (schemas.ts:515-522) — runs on every parsed object.
+                if cond_field == "ai_attribute" && attribute.is_none() {
+                    issues.push(ValidationIssue::new(
+                        &format!("{base}.attribute"),
+                        "field 'ai_attribute' requires the catalog attribute key (e.g. urgency).",
+                    ));
+                }
+                if cond_field == "ai_verification"
+                    && !["failed", "passed", "none"].contains(&value.as_str())
+                {
+                    issues.push(ValidationIssue::new(
+                        &format!("{base}.value"),
+                        "field 'ai_verification' value must be 'failed', 'passed' or 'none'.",
+                    ));
+                }
+                let mut c = serde_json::Map::new();
+                c.insert("field".into(), serde_json::Value::String(cond_field));
+                c.insert("operator".into(), serde_json::Value::String(operator));
+                c.insert("value".into(), serde_json::Value::String(value));
+                if let Some(a) = attribute {
+                    c.insert("attribute".into(), serde_json::Value::String(a));
+                }
+                out.push(serde_json::Value::Object(c));
+            }
+            serde_json::Value::Array(out)
+        }
+        Some(other) => {
+            issues.push(ValidationIssue::new(
+                "conditions",
+                format!("Expected array, received {}", received(other)),
+            ));
+            serde_json::Value::Array(Vec::new())
+        }
+    };
+
+    // ---- actions: z.array(actionSchema).min(1) (required) --------------------
+    let actions = match obj.get("actions") {
+        None => {
+            issues.push(ValidationIssue::new("actions", "Required"));
+            serde_json::Value::Array(Vec::new())
+        }
+        Some(serde_json::Value::Array(items)) => {
+            if items.is_empty() {
+                issues.push(ValidationIssue::new(
+                    "actions",
+                    "Array must contain at least 1 element(s)",
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let base = format!("actions.{i}");
+                match item {
+                    serde_json::Value::Null => {
+                        issues.push(ValidationIssue::new(
+                            &base,
+                            "Expected object, received null",
+                        ));
+                        continue;
+                    }
+                    serde_json::Value::Object(_) => {}
+                    other => {
+                        issues.push(ValidationIssue::new(
+                            &base,
+                            format!("Expected object, received {}", received(other)),
+                        ));
+                        continue;
+                    }
+                }
+                let kind = match item_field(item, "kind") {
+                    FieldGet::Missing => {
+                        issues.push(ValidationIssue::new(&format!("{base}.kind"), "Required"));
+                        String::new()
+                    }
+                    FieldGet::Value(serde_json::Value::String(s))
+                        if MAIN_ACTION_KINDS.contains(&s.as_str()) =>
+                    {
+                        s.clone()
+                    }
+                    FieldGet::Value(other) => {
+                        issues.push(ValidationIssue::new(
+                            &format!("{base}.kind"),
+                            enum_message(&MAIN_ACTION_KINDS, other),
+                        ));
+                        String::new()
+                    }
+                };
+                // params: z.record(z.string()).default({})
+                let params = match obj_get(item, "params") {
+                    None => serde_json::Map::new(),
+                    Some(serde_json::Value::Null) => {
+                        issues.push(ValidationIssue::new(
+                            &format!("{base}.params"),
+                            "Expected object, received null",
+                        ));
+                        serde_json::Map::new()
+                    }
+                    Some(serde_json::Value::Object(map)) => {
+                        for (k, pv) in map {
+                            if !pv.is_string() {
+                                issues.push(ValidationIssue::new(
+                                    &format!("{base}.params.{k}"),
+                                    format!("Expected string, received {}", received(pv)),
+                                ));
+                            }
+                        }
+                        map.clone()
+                    }
+                    Some(other) => {
+                        issues.push(ValidationIssue::new(
+                            &format!("{base}.params"),
+                            format!("Expected object, received {}", received(other)),
+                        ));
+                        serde_json::Map::new()
+                    }
+                };
+                let mut a = serde_json::Map::new();
+                a.insert("kind".into(), serde_json::Value::String(kind));
+                a.insert("params".into(), serde_json::Value::Object(params));
+                out.push(serde_json::Value::Object(a));
+            }
+            serde_json::Value::Array(out)
+        }
+        Some(other) => {
+            issues.push(ValidationIssue::new(
+                "actions",
+                format!("Expected array, received {}", received(other)),
+            ));
+            serde_json::Value::Array(Vec::new())
+        }
+    };
+
+    // ---- priority: z.number().int().default(100) -----------------------------
+    let priority = match obj.get("priority") {
+        None => 100,
+        Some(v @ serde_json::Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                i
+            } else if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && f.abs() < 9.0e15 {
+                    f as i64
+                } else {
+                    issues.push(ValidationIssue::new(
+                        "priority",
+                        "Expected int, received float",
+                    ));
+                    100
+                }
+            } else {
+                issues.push(ValidationIssue::new(
+                    "priority",
+                    format!("Expected number, received {}", received(v)),
+                ));
+                100
+            }
+        }
+        Some(other) => {
+            issues.push(ValidationIssue::new(
+                "priority",
+                format!("Expected number, received {}", received(other)),
+            ));
+            100
+        }
+    };
+
+    // ---- requires_approval: z.boolean().default(true) ------------------------
+    let requires_approval = match obj.get("requires_approval") {
+        None => true,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(other) => {
+            issues.push(ValidationIssue::new(
+                "requires_approval",
+                format!("Expected boolean, received {}", received(other)),
+            ));
+            true
+        }
+    };
+
+    if issues.is_empty() {
+        Ok(RuleInput {
+            name,
+            enabled,
+            trigger,
+            conditions,
+            actions,
+            priority,
+            requires_approval,
+        })
+    } else {
+        Err(issues)
+    }
+}
+
+enum FieldGet<'a> {
+    Missing,
+    Value(&'a serde_json::Value),
+}
+
+fn item_field<'a>(item: &'a serde_json::Value, key: &str) -> FieldGet<'a> {
+    match item.as_object().and_then(|o| o.get(key)) {
+        None => FieldGet::Missing,
+        Some(v) => FieldGet::Value(v),
+    }
+}
+
+fn obj_get<'a>(item: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    item.as_object().and_then(|o| o.get(key))
+}
+
+/// A stored rule in the reference `AutomationRule` shape (engine.ts
+/// listRules:47-60): booleans as 0/1, conditions/actions as parsed arrays,
+/// plus last_run_at / run_count.
+#[derive(Debug, Clone)]
+pub struct RuleRecord {
+    pub id: i64,
+    pub name: String,
+    pub enabled: bool,
+    pub trigger: String,
+    pub conditions: serde_json::Value,
+    pub actions: serde_json::Value,
+    pub priority: i64,
+    pub requires_approval: bool,
+    pub last_run_at: Option<String>,
+    pub run_count: i64,
+}
+
+impl RuleRecord {
+    /// The reference listRules payload (engine.ts:47-60 + AutomationRule
+    /// type): enabled / requires_approval served as 0|1 ints.
+    #[must_use]
+    pub fn to_main_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "name": self.name,
+            "enabled": if self.enabled { 1 } else { 0 },
+            "trigger": self.trigger,
+            "conditions": self.conditions,
+            "actions": self.actions,
+            "priority": self.priority,
+            "requires_approval": if self.requires_approval { 1 } else { 0 },
+            "last_run_at": self.last_run_at,
+            "run_count": self.run_count,
+        })
+    }
+}
+
+const RULE_RECORD_SELECT: &str =
+    "SELECT id, name, trigger_json, action_json, COALESCE(enabled, 0), conditions,
+            COALESCE(priority, 0), COALESCE(requires_approval, 0), last_run_at,
+            COALESCE(run_count, 0)
+     FROM automation_rules";
+
+/// The automation_rules row shape read at the query boundary (before JSON
+/// parsing): id, name, trigger_json, action_json, enabled, conditions,
+/// priority, requires_approval, last_run_at, run_count.
+type RuleRow = (
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    i64,
+);
+
+fn read_rule_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RuleRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+    ))
+}
+
+fn parse_rule_record(row: RuleRow) -> Result<RuleRecord> {
+    let (
+        id,
+        name,
+        trigger_json,
+        action_json,
+        enabled,
+        conditions_json,
+        priority,
+        requires_approval,
+        last_run_at,
+        run_count,
+    ) = row;
+    let trigger: String = serde_json::from_str(&trigger_json)
+        .map_err(|e| crate::error::Error::Config(format!("trigger deserialization failed: {e}")))?;
+    let actions: serde_json::Value = serde_json::from_str(&action_json)
+        .map_err(|e| crate::error::Error::Config(format!("actions deserialization failed: {e}")))?;
+    let conditions: serde_json::Value = serde_json::from_str(&conditions_json).map_err(|e| {
+        crate::error::Error::Config(format!("conditions deserialization failed: {e}"))
+    })?;
+    Ok(RuleRecord {
+        id,
+        name,
+        enabled: enabled == 1,
+        trigger,
+        conditions,
+        actions,
+        priority,
+        requires_approval: requires_approval == 1,
+        last_run_at,
+        run_count,
+    })
+}
+
+/// Insert a validated rule (reference engine.createRule:62-65). The MAIN
+/// trigger string is stored in `trigger_json` (JSON-encoded string) and the
+/// actions array in `action_json` — the port's column names (DB-04).
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the INSERT fails (surfaced by the routes —
+/// the B4 fix: no more swallowed errors).
+pub fn create_rule_record(conn: &Connection, input: &RuleInput) -> Result<i64> {
+    let trigger_json = serde_json::to_string(&input.trigger)
+        .map_err(|e| crate::error::Error::Config(format!("trigger serialization failed: {e}")))?;
+    let action_json = serde_json::to_string(&input.actions)
+        .map_err(|e| crate::error::Error::Config(format!("actions serialization failed: {e}")))?;
+    let conditions_json = serde_json::to_string(&input.conditions).map_err(|e| {
+        crate::error::Error::Config(format!("conditions serialization failed: {e}"))
+    })?;
+    conn.execute(
+        "INSERT INTO automation_rules
+             (name, trigger_json, action_json, enabled, conditions, priority, requires_approval)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            input.name,
+            trigger_json,
+            action_json,
+            input.enabled as i64,
+            conditions_json,
+            input.priority,
+            input.requires_approval as i64
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Load one rule by id (`None` when missing — the route answers 404).
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite`/`Error::Config` on DB or deserialization errors.
+pub fn load_rule_record(conn: &Connection, rule_id: i64) -> Result<Option<RuleRecord>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<RuleRow> = conn
+        .query_row(
+            &format!("{RULE_RECORD_SELECT} WHERE id = ?1"),
+            params![rule_id],
+            read_rule_row,
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some(row) => Ok(Some(parse_rule_record(row)?)),
+    }
+}
+
+/// List all rules in the reference order (`ORDER BY priority, id`).
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite`/`Error::Config` on DB or deserialization errors.
+pub fn list_rule_records(conn: &Connection) -> Result<Vec<RuleRecord>> {
+    let mut stmt = conn.prepare(&format!("{RULE_RECORD_SELECT} ORDER BY priority, id"))?;
+    let rows = stmt
+        .query_map([], read_rule_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(parse_rule_record).collect()
+}
+
+/// A single SQL bind value for the dynamic PATCH update (the reference
+/// binds raw JS values; booleans bind as 0/1, absent≠null).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlValue {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(String),
+}
+
+/// The PATCH field set (reference engine.updateRule:67-91: one SET clause
+/// per provided field). `None` = field not in the patch.
+#[derive(Debug, Default)]
+pub struct RuleUpdate {
+    pub name: Option<String>,
+    pub enabled: Option<i64>,
+    pub trigger: Option<String>,
+    pub conditions: Option<serde_json::Value>,
+    pub actions: Option<serde_json::Value>,
+    pub priority: Option<SqlValue>,
+    pub requires_approval: Option<i64>,
+}
+
+/// Apply a PATCH (dynamic SET per provided field, reference
+/// engine.updateRule:67-91). Returns the number of updated rows.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite`/`Error::Config` on DB or serialization errors.
+pub fn update_rule_record(conn: &Connection, rule_id: i64, u: &RuleUpdate) -> Result<usize> {
+    let mut sets: Vec<String> = Vec::new();
+    let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(v) = &u.name {
+        sets.push(format!("name = ?{}", vals.len() + 1));
+        vals.push(rusqlite::types::Value::Text(v.clone()));
+    }
+    if let Some(v) = u.enabled {
+        sets.push(format!("enabled = ?{}", vals.len() + 1));
+        vals.push(rusqlite::types::Value::Integer(v));
+    }
+    if let Some(v) = &u.trigger {
+        let trigger_json = serde_json::to_string(v).map_err(|e| {
+            crate::error::Error::Config(format!("trigger serialization failed: {e}"))
+        })?;
+        sets.push(format!("trigger_json = ?{}", vals.len() + 1));
+        vals.push(rusqlite::types::Value::Text(trigger_json));
+    }
+    if let Some(v) = &u.conditions {
+        let s = serde_json::to_string(v).map_err(|e| {
+            crate::error::Error::Config(format!("conditions serialization failed: {e}"))
+        })?;
+        sets.push(format!("conditions = ?{}", vals.len() + 1));
+        vals.push(rusqlite::types::Value::Text(s));
+    }
+    if let Some(v) = &u.actions {
+        let s = serde_json::to_string(v).map_err(|e| {
+            crate::error::Error::Config(format!("actions serialization failed: {e}"))
+        })?;
+        sets.push(format!("action_json = ?{}", vals.len() + 1));
+        vals.push(rusqlite::types::Value::Text(s));
+    }
+    if let Some(v) = &u.priority {
+        sets.push(format!("priority = ?{}", vals.len() + 1));
+        vals.push(match v {
+            SqlValue::Null => rusqlite::types::Value::Null,
+            SqlValue::Int(i) => rusqlite::types::Value::Integer(*i),
+            SqlValue::Real(f) => rusqlite::types::Value::Real(*f),
+            SqlValue::Text(t) => rusqlite::types::Value::Text(t.clone()),
+        });
+    }
+    if let Some(v) = u.requires_approval {
+        sets.push(format!("requires_approval = ?{}", vals.len() + 1));
+        vals.push(rusqlite::types::Value::Integer(v));
+    }
+    if sets.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!(
+        "UPDATE automation_rules SET {} WHERE id = ?{}",
+        sets.join(", "),
+        vals.len() + 1
+    );
+    vals.push(rusqlite::types::Value::Integer(rule_id));
+    let n = conn.execute(&sql, rusqlite::params_from_iter(vals))?;
+    Ok(n)
+}
+
+/// Delete a rule (reference engine.deleteRule:93-95).
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the DELETE fails.
+pub fn delete_rule_record(conn: &Connection, rule_id: i64) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM automation_rules WHERE id = ?1",
+        params![rule_id],
+    )?;
+    Ok(n)
+}
+
+/// An automation run in the reference payload shape (AutomationRunRecord:
+/// id, rule_id, conversation_id, triggered_at, status, detail).
+#[derive(Debug, Clone)]
+pub struct RunRecord {
+    pub id: i64,
+    pub rule_id: i64,
+    pub conversation_id: Option<i64>,
+    pub triggered_at: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+impl RunRecord {
+    #[must_use]
+    pub fn to_main_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "rule_id": self.rule_id,
+            "conversation_id": self.conversation_id,
+            "triggered_at": self.triggered_at,
+            "status": self.status,
+            "detail": self.detail,
+        })
+    }
+
+    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            rule_id: r.get(1)?,
+            conversation_id: r.get(2)?,
+            triggered_at: r.get(3)?,
+            status: r.get(4)?,
+            detail: r.get(5)?,
+        })
+    }
+}
+
+/// The port's automation_runs column set (M035 + the detail column) mapped
+/// to the reference run payload at the query boundary (DB-04).
+const RUN_SELECT: &str =
+    "SELECT id, rule_id, conversation_id, created_at, outcome, detail FROM automation_runs";
+
+fn record_run(
+    conn: &Connection,
+    rule_id: i64,
+    conversation_id: Option<i64>,
+    status: &str,
+    detail: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO automation_runs (rule_id, conversation_id, triggered_by, outcome, detail)
+         VALUES (?1, ?2, 'manual', ?3, ?4)",
+        params![rule_id, conversation_id, status, detail],
+    )?;
+    Ok(())
+}
+
+/// List runs newest-first (reference engine.listRuns: `ORDER BY id DESC
+/// LIMIT ?`).
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the query fails.
+pub fn list_run_records(conn: &Connection, limit: i64) -> Result<Vec<RunRecord>> {
+    let mut stmt = conn.prepare(&format!("{RUN_SELECT} ORDER BY id DESC LIMIT ?1"))?;
+    let rows = stmt
+        .query_map(params![limit], RunRecord::read)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// JS truthiness for PATCH passthrough values (the reference binds
+/// `patch.enabled ? 1 : 0` etc.).
+#[must_use]
+pub fn js_truthy(v: &serde_json::Value) -> i64 {
+    match v {
+        serde_json::Value::Null => 0,
+        serde_json::Value::Bool(b) => i64::from(*b),
+        serde_json::Value::Number(n) => i64::from(n.as_f64().unwrap_or(0.0) != 0.0),
+        serde_json::Value::String(s) => i64::from(!s.is_empty()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => 1,
+    }
+}
+
+/// Park a higher-risk / gated action as a pending approval (the port's
+/// approval tier — the awaiting-approval mechanism AU-04 wires routes for).
+fn park_approval(
+    conn: &Connection,
+    rule_id: i64,
+    conversation_id: i64,
+    action: &serde_json::Value,
+) -> Result<()> {
+    let action_json = serde_json::to_string(action)
+        .map_err(|e| crate::error::Error::Config(format!("action serialization failed: {e}")))?;
+    conn.execute(
+        "INSERT INTO automation_approvals (rule_id, conversation_id, proposed_action_json, status)
+         VALUES (?1, ?2, ?3, 'pending')",
+        params![rule_id, conversation_id, action_json],
+    )?;
+    Ok(())
+}
+
+/// Fire a trigger for a conversation — the reference manual-trigger path
+/// (engine.fireTrigger:110-160 behind routes/automation.ts:82-88):
+///
+/// - `automation_enabled` OFF ⇒ no runs;
+/// - unknown conversation (local id, like the reference `WHERE c.id = ?`)
+///   ⇒ no runs;
+/// - every ENABLED rule with the fired trigger runs, in `priority, id`
+///   order: read actions enqueue + record `completed`, non-destructive
+///   actions execute (or park when `requires_approval` and write actions
+///   are disabled), higher-risk actions always park an approval;
+/// - each fired rule records one run per action, bumps `run_count` /
+///   `last_run_at`, and the LAST recorded run row is returned (the
+///   reference pushes the last run per rule).
+///
+/// Conditions are stored and validated (AU-01) but evaluated by the AU-02
+/// condition-model port — until then rules fire as matched.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite`/`Error::Config` on DB failures (surfaced by the
+/// route as 500 — the B4 fix).
+pub fn fire_trigger_for_conversation(
+    conn: &mut Connection,
+    fired: &str,
+    conversation_id: i64,
+) -> Result<Vec<RunRecord>> {
+    if !crate::settings::get_bool(conn, "automation_enabled", false)? {
+        return Ok(Vec::new());
+    }
+    let conversation_exists = conn
+        .query_row(
+            "SELECT 1 FROM conversations WHERE id = ?1",
+            params![conversation_id],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !conversation_exists {
+        return Ok(Vec::new());
+    }
+    ensure_main_rule_columns(conn)?;
+    let write_enabled = crate::settings::get_bool(conn, "automation_write_actions_enabled", false)?;
+    let mut runs = Vec::new();
+    for rule in list_rule_records(conn)? {
+        if !rule.enabled || rule.trigger != fired {
+            continue;
+        }
+        if let Some(actions) = rule.actions.as_array() {
+            for action in actions {
+                let kind = action
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or_default();
+                let params = action
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                let tier = risk_tier(kind).unwrap_or("read"); // reference: ?? 'read'
+                match tier {
+                    "read" => {
+                        if kind == "analyze_ticket" {
+                            // Reference executeReadAction: enqueued as a job so
+                            // the AI worker handles it with normal retries.
+                            let _ = crate::jobs::enqueue_on(
+                                conn,
+                                "ai",
+                                "analyze_ticket",
+                                &format!("{{\"conversationId\":{conversation_id}}}"),
+                                3,
+                            );
+                        }
+                        record_run(
+                            conn,
+                            rule.id,
+                            Some(conversation_id),
+                            "completed",
+                            &format!("Executed read action {kind}"),
+                        )?;
+                    }
+                    "non_destructive" => {
+                        if rule.requires_approval && !write_enabled {
+                            park_approval(conn, rule.id, conversation_id, action)?;
+                            record_run(
+                                conn,
+                                rule.id,
+                                Some(conversation_id),
+                                "awaiting_approval",
+                                &format!("Action {kind} requires approval (non-destructive)"),
+                            )?;
+                        } else {
+                            match kind {
+                                "create_ai_note" => {
+                                    let _ = crate::jobs::enqueue_on(
+                                        conn,
+                                        "ai",
+                                        "create_ai_note",
+                                        &format!("{{\"conversationId\":{conversation_id}}}"),
+                                        2,
+                                    );
+                                }
+                                "create_ai_draft" => {
+                                    let _ = crate::jobs::enqueue_on(
+                                        conn,
+                                        "ai",
+                                        "generate_draft",
+                                        &format!("{{\"conversationId\":{conversation_id}}}"),
+                                        2,
+                                    );
+                                }
+                                "add_tag" => {
+                                    // The reference routes add_tag through the
+                                    // API queue (a Help Scout write); the port
+                                    // applies the local tag (the remote write
+                                    // path is the SY-10 provider gap).
+                                    if let Some(tag) = params.get("tag").and_then(|t| t.as_str()) {
+                                        let mut tags =
+                                            crate::conversation_ops::read_conversation_tags(
+                                                conn,
+                                                conversation_id,
+                                            );
+                                        if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                                            tags.push(tag.to_string());
+                                            crate::conversation_ops::write_conversation_tags(
+                                                conn,
+                                                conversation_id,
+                                                &tags,
+                                            );
+                                        }
+                                    }
+                                }
+                                "manual_review_queue" => {
+                                    let _ = conn.execute(
+                                        "UPDATE conversations SET is_unread = 1 WHERE id = ?1",
+                                        params![conversation_id],
+                                    );
+                                }
+                                _ => {}
+                            }
+                            record_run(
+                                conn,
+                                rule.id,
+                                Some(conversation_id),
+                                "completed",
+                                &format!("Executed {kind}"),
+                            )?;
+                        }
+                    }
+                    _ => {
+                        // higher_risk: always requires explicit approval.
+                        park_approval(conn, rule.id, conversation_id, action)?;
+                        record_run(
+                            conn,
+                            rule.id,
+                            Some(conversation_id),
+                            "awaiting_approval",
+                            &format!(
+                                "Action {kind} is a write action and requires explicit approval"
+                            ),
+                        )?;
+                    }
+                }
+            }
+        }
+        conn.execute(
+            "UPDATE automation_rules
+             SET run_count = COALESCE(run_count, 0) + 1,
+                 last_run_at = datetime('now')
+             WHERE id = ?1",
+            params![rule.id],
+        )?;
+        // The reference returns the last recorded run row per rule.
+        let last: Option<RunRecord> = conn
+            .query_row(
+                &format!(
+                    "{RUN_SELECT} WHERE id = (SELECT MAX(id) FROM automation_runs WHERE rule_id = ?1)"
+                ),
+                params![rule.id],
+                RunRecord::read,
+            )
+            .ok();
+        if let Some(r) = last {
+            runs.push(r);
+        }
+    }
+    Ok(runs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,5 +2451,280 @@ mod tests {
         assert_eq!(back.name, "Test rule");
         assert_eq!(back.trigger, r.trigger);
         assert_eq!(back.action, r.action);
+    }
+
+    // ---- MAIN rule model (AU-01) -------------------------------------------
+
+    #[test]
+    fn main_validate_rule_applies_zod_defaults() {
+        let parsed = validate_rule(&serde_json::json!({
+            "name": "Escalate refunds",
+            "trigger": "manual",
+            "actions": [{ "kind": "add_tag" }]
+        }))
+        .expect("valid with defaults");
+        assert!(!parsed.enabled); // z.boolean().default(false)
+        assert_eq!(parsed.priority, 100); // z.number().int().default(100)
+        assert!(parsed.requires_approval); // z.boolean().default(true)
+        assert_eq!(
+            parsed.conditions,
+            serde_json::json!([]), // z.array(...).default([])
+        );
+        // params default {} filled in
+        assert_eq!(
+            parsed.actions,
+            serde_json::json!([{ "kind": "add_tag", "params": {} }])
+        );
+    }
+
+    #[test]
+    fn main_validate_rule_full_schema() {
+        let parsed = validate_rule(&serde_json::json!({
+            "name": "Refund escalation",
+            "enabled": true,
+            "trigger": "new_conversation",
+            "conditions": [
+                { "field": "subject", "operator": "contains", "value": "refund" },
+                { "field": "ai_attribute", "operator": "equals", "value": "high",
+                  "attribute": "urgency" },
+                { "field": "ai_verification", "operator": "equals", "value": "failed" }
+            ],
+            "actions": [
+                { "kind": "analyze_ticket", "params": {} },
+                { "kind": "add_tag", "params": { "tag": "vip" } }
+            ],
+            "priority": 5,
+            "requires_approval": false
+        }))
+        .expect("valid");
+        assert!(parsed.enabled);
+        assert_eq!(parsed.trigger, "new_conversation");
+        assert_eq!(parsed.priority, 5);
+        assert!(!parsed.requires_approval);
+        // attribute only present on the ai_attribute condition
+        assert_eq!(parsed.conditions[1]["attribute"], "urgency");
+        assert!(parsed.conditions[0].get("attribute").is_none());
+    }
+
+    #[test]
+    fn main_validate_rule_collects_all_issues_in_zod_phrasing() {
+        let issues = validate_rule(&serde_json::json!({
+            "name": "",
+            "enabled": "yes",
+            "trigger": "status_changed",
+            "conditions": [{ "field": "subject", "operator": "bogus", "value": "x" }],
+            "actions": [],
+            "priority": 1.5,
+            "requires_approval": 1
+        }))
+        .expect_err("invalid");
+        let msgs: Vec<(String, String)> = issues
+            .iter()
+            .map(|i| (i.path.clone(), i.message.clone()))
+            .collect();
+        assert!(msgs.contains(&(
+            "name".into(),
+            "String must contain at least 1 character(s)".into()
+        )));
+        assert!(msgs.contains(&("enabled".into(), "Expected boolean, received string".into())));
+        assert!(
+            msgs.iter()
+                .any(|(p, m)| p == "trigger"
+                    && m.starts_with(
+                        "Invalid enum value. Expected 'new_conversation' | 'customer_reply' | 'ai_low_confidence' | 'manual', received 'status_changed'"
+                    )),
+            "got: {msgs:?}"
+        );
+        assert!(msgs.contains(&(
+            "conditions.0.operator".into(),
+            "Invalid enum value. Expected 'contains' | 'equals' | 'not_equals' | 'gt' | 'gte' | 'lt' | 'lte', received 'bogus'".into()
+        )));
+        assert!(msgs.contains(&(
+            "actions".into(),
+            "Array must contain at least 1 element(s)".into()
+        )));
+        assert!(msgs.contains(&("priority".into(), "Expected int, received float".into())));
+        assert!(msgs.contains(&(
+            "requires_approval".into(),
+            "Expected boolean, received number".into()
+        )));
+    }
+
+    #[test]
+    fn main_validate_rule_super_refines() {
+        // ai_attribute without the attribute key
+        let issues = validate_rule(&serde_json::json!({
+            "name": "x",
+            "trigger": "manual",
+            "conditions": [{ "field": "ai_attribute", "operator": "equals", "value": "high" }],
+            "actions": [{ "kind": "add_tag" }]
+        }))
+        .expect_err("superRefine must fire");
+        assert!(issues.iter().any(|i| i.path == "conditions.0.attribute"
+            && i.message
+                == "field 'ai_attribute' requires the catalog attribute key (e.g. urgency)."));
+
+        // ai_verification with a non-vocabulary value
+        let issues = validate_rule(&serde_json::json!({
+            "name": "x",
+            "trigger": "manual",
+            "conditions": [{ "field": "ai_verification", "operator": "equals", "value": "maybe" }],
+            "actions": [{ "kind": "add_tag" }]
+        }))
+        .expect_err("superRefine must fire");
+        assert!(issues.iter().any(|i| i.path == "conditions.0.value"
+            && i.message == "field 'ai_verification' value must be 'failed', 'passed' or 'none'."));
+
+        // unknown catalog attribute key
+        let issues = validate_rule(&serde_json::json!({
+            "name": "x",
+            "trigger": "manual",
+            "conditions": [{ "field": "ai_attribute", "operator": "equals", "value": "high",
+                             "attribute": "mood" }],
+            "actions": [{ "kind": "add_tag" }]
+        }))
+        .expect_err("closed catalog");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "conditions.0.attribute" && i.message.contains("received 'mood'")));
+
+        // value over 200 chars
+        let long = "a".repeat(201);
+        let issues = validate_rule(&serde_json::json!({
+            "name": "x",
+            "trigger": "manual",
+            "conditions": [{ "field": "subject", "operator": "contains", "value": long }],
+            "actions": [{ "kind": "add_tag" }]
+        }))
+        .expect_err("max length");
+        assert!(issues.iter().any(|i| i.path == "conditions.0.value"
+            && i.message == "String must contain at most 200 character(s)"));
+
+        // params values must be strings
+        let issues = validate_rule(&serde_json::json!({
+            "name": "x",
+            "trigger": "manual",
+            "actions": [{ "kind": "add_tag", "params": { "tag": 5 } }]
+        }))
+        .expect_err("record of strings");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "actions.0.params.tag"
+                && i.message == "Expected string, received number"));
+
+        // missing required keys
+        let issues = validate_rule(&serde_json::json!({})).expect_err("required");
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "name" && i.message == "Required"));
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "trigger" && i.message == "Required"));
+        assert!(issues
+            .iter()
+            .any(|i| i.path == "actions" && i.message == "Required"));
+    }
+
+    #[test]
+    fn main_rule_storage_roundtrip_and_ordering() {
+        let conn = fresh_db();
+        ensure_main_rule_columns(&conn).unwrap();
+        let a = create_rule_record(
+            &conn,
+            &validate_rule(&serde_json::json!({
+                "name": "Low prio", "trigger": "manual",
+                "actions": [{ "kind": "analyze_ticket" }], "priority": 200
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let b = create_rule_record(
+            &conn,
+            &validate_rule(&serde_json::json!({
+                "name": "High prio", "trigger": "customer_reply",
+                "conditions": [{ "field": "subject", "operator": "contains", "value": "refund" }],
+                "actions": [{ "kind": "set_status", "params": { "status": "pending" } }],
+                "priority": 10, "requires_approval": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let rules = list_rule_records(&conn).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].id, b, "ORDER BY priority, id (reference order)");
+        assert_eq!(rules[0].name, "High prio");
+        assert_eq!(rules[0].trigger, "customer_reply");
+        assert_eq!(rules[0].conditions[0]["value"], "refund");
+        assert_eq!(rules[0].actions[0]["params"]["status"], "pending");
+        assert!(rules[0].requires_approval);
+        assert!(!rules[1].enabled, "created disabled (zod default)");
+        assert_eq!(rules[1].priority, 200);
+
+        let loaded = load_rule_record(&conn, a).unwrap().expect("row a");
+        assert_eq!(loaded.name, "Low prio");
+
+        // dynamic PATCH (reference updateRule)
+        update_rule_record(
+            &conn,
+            a,
+            &RuleUpdate {
+                name: Some("Renamed".into()),
+                enabled: Some(1),
+                trigger: Some("manual".into()),
+                priority: Some(SqlValue::Null), // MAIN quirk: raw null binds NULL
+                ..RuleUpdate::default()
+            },
+        )
+        .unwrap();
+        let patched = load_rule_record(&conn, a).unwrap().unwrap();
+        assert_eq!(patched.name, "Renamed");
+        assert!(patched.enabled);
+        assert_eq!(patched.trigger, "manual");
+        assert_eq!(
+            patched.priority, 0,
+            "NULL priority reads back as 0 (Number(null))"
+        );
+
+        assert_eq!(delete_rule_record(&conn, a).unwrap(), 1);
+        assert!(load_rule_record(&conn, a).unwrap().is_none());
+        assert_eq!(
+            delete_rule_record(&conn, a).unwrap(),
+            0,
+            "idempotent delete"
+        );
+    }
+
+    #[test]
+    fn main_ensure_columns_is_idempotent_and_completes_m007() {
+        let conn = fresh_db(); // apply_m007 only
+        ensure_main_rule_columns(&conn).unwrap();
+        ensure_main_rule_columns(&conn).unwrap(); // idempotent
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(automation_rules)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for c in [
+            "conditions",
+            "priority",
+            "requires_approval",
+            "last_run_at",
+            "run_count",
+        ] {
+            assert!(
+                cols.contains(&c.to_string()),
+                "missing column {c}: {cols:?}"
+            );
+        }
+        let runs_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(automation_runs)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(runs_cols.contains(&"detail".to_string()), "{runs_cols:?}");
     }
 }

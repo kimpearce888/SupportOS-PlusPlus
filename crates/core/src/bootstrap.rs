@@ -39,6 +39,11 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     crate::notifications::apply_m005(conn)?;
     crate::side_threads::apply_m006(conn)?;
     crate::automation::apply_m007(conn)?;
+    // Complete the automation tables with the reference rule columns
+    // (conditions/priority/requires_approval/last_run_at/run_count + the
+    // runs detail column) — M007 created a reduced shape; every runtime
+    // read (rule CRUD, manual trigger, runs list) depends on them.
+    crate::automation::ensure_main_rule_columns(conn)?;
     crate::embeddings::apply_m008(conn)?;
     crate::ai_center::apply_m009(conn)?;
     crate::ai_analysis::apply_m010(conn)?;
