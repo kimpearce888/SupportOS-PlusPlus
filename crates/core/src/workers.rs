@@ -800,6 +800,23 @@ impl WorkerManager {
                     let n = crate::search::rebuild_indexes(&conn)?;
                     tracing::info!(operation = kind, conversations = n, "Search index rebuilt");
                 }
+                // AC-03: the rebuildAll admin action — POST
+                // /api/conversations/activity/rebuild enqueues this job; the
+                // handler re-derives every conversation's activity events
+                // from the thread mirror and recomputes the derived columns
+                // (was an ok:true no-op stub before the route learned to
+                // queue real work).
+                "rebuild_activity" => {
+                    let conn = self.lock();
+                    let summary = crate::activity::rebuild_all(&conn)?;
+                    tracing::info!(
+                        operation = kind,
+                        conversations = summary.conversations,
+                        events_written = summary.events_written,
+                        events_total = summary.events_total,
+                        "Activity rebuilt from the thread mirror (rebuildAll)"
+                    );
+                }
                 "rebuild_embeddings" => {
                     {
                         let conn = self.lock();

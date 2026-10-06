@@ -874,12 +874,32 @@ pub async fn events(
         .into_response()
 }
 
-/// POST /api/conversations/activity/rebuild — rebuild activity events.
+/// POST /api/conversations/activity/rebuild — the rebuildAll admin action
+/// (audit AC-03: this route used to answer `ok:true "Activity rebuild
+/// queued."` without queueing or running ANYTHING). It now enqueues the
+/// real `rebuild_activity` maintenance job — the same shape as the
+/// rebuild-search-index / rebuild-embeddings siblings — and the worker
+/// executes `activity::rebuild_all`: every conversation's activity events
+/// are re-derived from the thread mirror (deduped on `thread:{remote_id}`,
+/// idempotent with the sync path) and the derived columns (timestamps +
+/// response state) are recomputed from the event table. The job is visible
+/// in the queue panel (`GET /api/queue`) while queued/running.
 pub async fn activity_rebuild(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(json!({"ok": true, "message": "Activity rebuild queued."})),
-    )
+    let conn = state.conn_lock();
+    match crate::jobs::enqueue_on(&conn, "maintenance", "rebuild_activity", "{}", 4, 1) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "message": "Activity rebuild queued."})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": format!("Could not queue the activity rebuild: {e}"),
+            })),
+        ),
+    }
 }
 
 /// GET /api/ticket-states — list custom ticket states.

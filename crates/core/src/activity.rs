@@ -314,6 +314,281 @@ pub fn update_derived_columns(conn: &Connection, conversation_remote_id: i64) ->
     Ok(())
 }
 
+/// Counts returned by [`rebuild_all`] — the rebuildAll admin-action summary
+/// (audit AC-03: `POST /api/conversations/activity/rebuild` used to answer
+/// `ok:true` without touching any data).
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct RebuildSummary {
+    /// Conversations scanned (every row in `conversations`).
+    pub conversations: i64,
+    /// NEW activity events derived from the thread mirror — re-derivations
+    /// of events the sync path already wrote (deduped on `thread:{remote_id}`)
+    /// count as zero.
+    pub events_written: i64,
+    /// Total activity events in the table after the rebuild.
+    pub events_total: i64,
+}
+
+/// One row of the thread mirror as the rebuild reads it.
+struct MirrorThread {
+    id: i64,
+    remote_id: Option<i64>,
+    thread_type: String,
+    state: Option<String>,
+    body: Option<String>,
+    actor_type: String,
+    actor_id: Option<i64>,
+    created_at: Option<String>,
+}
+
+/// Derive the event triple for one mirror thread — the same mapping the
+/// sync path's `record_thread_event` applies (sync_engine.rs), read from
+/// the stored mirror instead of a provider payload:
+/// `note` → `internal_note` (user actor); `lineitem` → the conservative
+/// status/assign/moved/tag text mapping with `system_user`; everything else
+/// splits on the stored actor (`customer` → customer message, `user` →
+/// human agent message, unknown fallback).
+fn derive_mirror_event(t: &MirrorThread) -> Option<(String, String, Option<i64>)> {
+    // Drafts / scheduled replies are not history yet — the sync path only
+    // derives events for `state = 'published'` (a NULL state on an older
+    // row means "was never a draft").
+    if t.state.as_deref().is_some_and(|s| s != "published") {
+        return None;
+    }
+    match t.thread_type.as_str() {
+        "note" => Some(("internal_note".into(), "user".into(), t.actor_id)),
+        "lineitem" => {
+            let text = t.body.as_deref().unwrap_or("").to_lowercase();
+            let event_type = if text.contains("status") {
+                "status_changed"
+            } else if text.contains("assign") {
+                "assignment_changed"
+            } else if text.contains("moved") {
+                "moved"
+            } else if text.contains("tag") {
+                "tag_added"
+            } else {
+                "lineitem_action"
+            };
+            Some((event_type.into(), "system_user".into(), None))
+        }
+        _ => match t.actor_type.as_str() {
+            "customer" => Some(("customer_message".into(), "customer".into(), t.actor_id)),
+            "user" | "agent" => Some(("human_agent_message".into(), "user".into(), t.actor_id)),
+            _ => Some(("customer_message".into(), "unknown".into(), None)),
+        },
+    }
+}
+
+/// Recompute the derived columns for one conversation keyed by its LOCAL id
+/// — the join the rebuild uses, because sync-written events (and the
+/// rebuild's own) carry the local `conversations.id`, the same key the
+/// timeline reads use (audit AC-04). Unlike [`update_derived_columns`]
+/// (keyed by remote id for the local-mutation paths), this reads the full
+/// event set. The agent-side actor is matched on both the sync vocabulary
+/// (`user`) and the legacy local one (`agent`).
+fn update_derived_columns_by_local_id(conn: &Connection, conv_local: i64) -> Result<()> {
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM conversations WHERE id = ?1",
+            params![conv_local],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+
+    // Response state: closed wins; otherwise the LAST event's actor side
+    // decides (customer → waiting on us, agent/user → waiting on them;
+    // system-ish events leave the state unchanged at the default).
+    let state = if status.as_deref() == Some("closed") {
+        ResponseState::Closed
+    } else {
+        let last_event: Option<String> = conn
+            .query_row(
+                "SELECT actor_type FROM activity_events
+                 WHERE conversation_id = ?1
+                 ORDER BY julianday(occurred_at) DESC, id DESC
+                 LIMIT 1",
+                params![conv_local],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        match last_event.as_deref() {
+            Some("customer") => ResponseState::CustomerWaiting,
+            Some("user" | "agent") => ResponseState::AgentWaiting,
+            _ => ResponseState::NeedsFirstResponse,
+        }
+    };
+
+    // Derived timestamps from the (now complete) event set.
+    let first_customer_message_at: Option<String> = conn
+        .query_row(
+            "SELECT MIN(occurred_at) FROM activity_events
+             WHERE conversation_id = ?1 AND actor_type = 'customer'",
+            params![conv_local],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let first_response_at: Option<String> = conn
+        .query_row(
+            "SELECT MIN(occurred_at) FROM activity_events
+             WHERE conversation_id = ?1 AND actor_type IN ('agent','user')
+               AND event_type IN ('reply','human_agent_message')",
+            params![conv_local],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let last_customer_reply_at: Option<String> = conn
+        .query_row(
+            "SELECT MAX(occurred_at) FROM activity_events
+             WHERE conversation_id = ?1 AND actor_type = 'customer'",
+            params![conv_local],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let last_human_agent_response_at: Option<String> = conn
+        .query_row(
+            "SELECT MAX(occurred_at) FROM activity_events
+             WHERE conversation_id = ?1 AND actor_type IN ('agent','user')",
+            params![conv_local],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let customer_waiting_since = match state {
+        ResponseState::CustomerWaiting => last_customer_reply_at.clone(),
+        _ => None,
+    };
+
+    conn.execute(
+        "UPDATE conversations SET
+            first_customer_message_at = ?1,
+            first_response_at = ?2,
+            last_customer_reply_at = ?3,
+            last_human_agent_response_at = ?4,
+            customer_waiting_since = ?5,
+            response_state = ?6
+         WHERE id = ?7",
+        params![
+            first_customer_message_at,
+            first_response_at,
+            last_customer_reply_at,
+            last_human_agent_response_at,
+            customer_waiting_since,
+            state.as_str(),
+            conv_local,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The rebuildAll admin action (audit AC-03): re-derive every conversation's
+/// activity events from the thread mirror, then recompute the derived
+/// columns (timestamps + response state) from the event table.
+///
+/// Idempotent by design — "Dedup keys on every derived event so rebuilds
+/// and re-syncs are idempotent": mirrored threads derive `thread:{remote_id}`
+/// (the exact keys the sync path writes, so a rebuild after a healthy sync
+/// adds nothing), and local-only threads without a remote id derive the
+/// stable `rebuild:thread:{local_id}`. Rebuilt events carry
+/// `source='rebuild'` (the reference EventSource vocabulary) and the
+/// conversation's LOCAL id (the canonical timeline join).
+///
+/// This is the function behind the `rebuild_activity` maintenance job the
+/// `POST /api/conversations/activity/rebuild` route enqueues; it never
+/// touches the provider — the mirror is the source of truth.
+pub fn rebuild_all(conn: &Connection) -> Result<RebuildSummary> {
+    let mut summary = RebuildSummary::default();
+
+    let conversations: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM conversations")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    summary.conversations = conversations.len() as i64;
+
+    for conv_local in conversations {
+        // 1. Re-derive events from the thread mirror (published, not
+        //    soft-deleted threads only).
+        let threads: Vec<MirrorThread> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, remote_id, thread_type, state, body, actor_type, actor_id, created_at
+                 FROM conversation_threads
+                 WHERE conversation_id = ?1 AND deleted_at IS NULL",
+            )?;
+            let rows = stmt.query_map(params![conv_local], |r| {
+                Ok(MirrorThread {
+                    id: r.get(0)?,
+                    remote_id: r.get(1)?,
+                    thread_type: r.get(2)?,
+                    state: r.get(3)?,
+                    body: r.get(4)?,
+                    actor_type: r.get(5)?,
+                    actor_id: r.get(6)?,
+                    created_at: r.get(7)?,
+                })
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        for t in &threads {
+            let Some((event_type, actor_type, actor_id)) = derive_mirror_event(t) else {
+                continue;
+            };
+            let dedup_key = match t.remote_id {
+                Some(remote) => format!("thread:{remote}"),
+                None => format!("rebuild:thread:{}", t.id),
+            };
+            // A missing timestamp only happens on hand-inserted rows; the
+            // observation time is the honest fallback (an empty string would
+            // poison the julianday ordering).
+            let occurred_at = t
+                .created_at
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(now_iso);
+            let wrote = record_full_event(
+                conn,
+                &FullActivityEvent {
+                    base: ActivityEvent {
+                        id: None,
+                        conversation_id: conv_local,
+                        event_type,
+                        actor_type,
+                        actor_id,
+                        occurred_at,
+                        dedup_key,
+                    },
+                    thread_local_id: Some(t.id),
+                    source: "rebuild".into(),
+                    metadata: Some(
+                        serde_json::json!({
+                            "thread_remote_id": t.remote_id,
+                            "thread_type": t.thread_type,
+                        })
+                        .to_string(),
+                    ),
+                },
+            )?;
+            if wrote {
+                summary.events_written += 1;
+            }
+        }
+
+        // 2. Recompute the derived columns from the (now complete) event set.
+        update_derived_columns_by_local_id(conn, conv_local)?;
+    }
+
+    summary.events_total = conn
+        .query_row("SELECT COUNT(*) FROM activity_events", [], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +883,435 @@ mod tests {
         let conn = fresh_db();
         // Running M003 again should not error (columns already exist).
         apply_m003(&conn).unwrap();
+    }
+
+    // ---- AC-03: the rebuildAll admin action --------------------------------
+
+    /// The minimal thread-mirror shape the rebuild reads (the full chain's
+    /// table comes from later migrations; the unit tests here run a slim
+    /// M003-only database).
+    fn ensure_thread_mirror(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversation_threads (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                remote_id       INTEGER,
+                thread_type     TEXT NOT NULL,
+                state           TEXT DEFAULT 'published',
+                body            TEXT,
+                actor_type      TEXT NOT NULL,
+                actor_id        INTEGER,
+                created_at      TEXT,
+                deleted_at      TEXT
+            );",
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)] // a test fixture row — the mirror's shape
+    fn insert_thread(
+        conn: &Connection,
+        conv_local: i64,
+        remote_id: Option<i64>,
+        thread_type: &str,
+        state: Option<&str>,
+        body: &str,
+        actor_type: &str,
+        actor_id: Option<i64>,
+        created_at: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO conversation_threads
+                (conversation_id, remote_id, thread_type, state, body, actor_type, actor_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![conv_local, remote_id, thread_type, state, body, actor_type, actor_id, created_at],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    // The shared rebuild-fixture: a fresh DB with the thread mirror + one
+    // conversation whose local id (9) and remote id (5001) differ.
+    fn rebuild_db() -> Connection {
+        let conn = fresh_db();
+        ensure_thread_mirror(&conn);
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, status, mailbox_id, customer_id)
+             VALUES (9, 5001, 101, 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn event_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM activity_events", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn rebuild_all_derives_events_from_the_thread_mirror() {
+        let conn = rebuild_db();
+        insert_thread(
+            &conn,
+            9,
+            Some(7001),
+            "customer",
+            Some("published"),
+            "I want a refund",
+            "customer",
+            Some(1),
+            "2026-01-01T10:00:00Z",
+        );
+        insert_thread(
+            &conn,
+            9,
+            Some(7002),
+            "reply",
+            Some("published"),
+            "We are on it",
+            "user",
+            Some(2),
+            "2026-01-01T10:05:00Z",
+        );
+        insert_thread(
+            &conn,
+            9,
+            Some(7003),
+            "note",
+            Some("published"),
+            "VIP customer",
+            "user",
+            Some(2),
+            "2026-01-01T10:06:00Z",
+        );
+        // A draft reply and a scheduled one must NOT become history.
+        insert_thread(
+            &conn,
+            9,
+            Some(7004),
+            "reply",
+            Some("draft"),
+            "unsent draft",
+            "user",
+            Some(2),
+            "2026-01-01T11:00:00Z",
+        );
+        insert_thread(
+            &conn,
+            9,
+            Some(7005),
+            "reply",
+            Some("scheduled"),
+            "scheduled reply",
+            "user",
+            Some(2),
+            "2026-01-01T12:00:00Z",
+        );
+        // A lineitem maps through the conservative text classification
+        // (deliberately before the note: lineitems are system events).
+        insert_thread(
+            &conn,
+            9,
+            Some(7006),
+            "lineitem",
+            Some("published"),
+            "changed status from active to pending",
+            "system_user",
+            None,
+            "2026-01-01T10:04:00Z",
+        );
+
+        let summary = rebuild_all(&conn).unwrap();
+
+        assert_eq!(summary.conversations, 1);
+        assert_eq!(
+            summary.events_written, 4,
+            "customer+reply+note+lineitem (draft/scheduled skipped)"
+        );
+        assert_eq!(summary.events_total, 4);
+
+        // The events carry the LOCAL conversation id (the canonical join the
+        // timeline reads use) and the sync-path dedup keys. (source lives on
+        // the full-bootstrap schema; record_full_event falls back to the
+        // base columns on the slim M003-only chain — the integration test
+        // covers the source='rebuild' stamp end-to-end.)
+        let rows: Vec<(i64, String, String, Option<i64>, String)> = conn
+            .prepare(
+                "SELECT conversation_id, event_type, actor_type, actor_id, dedup_key
+                 FROM activity_events ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0],
+            (
+                9,
+                "customer_message".into(),
+                "customer".into(),
+                Some(1),
+                "thread:7001".into()
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                9,
+                "human_agent_message".into(),
+                "user".into(),
+                Some(2),
+                "thread:7002".into()
+            )
+        );
+        assert_eq!(
+            rows[2],
+            (
+                9,
+                "internal_note".into(),
+                "user".into(),
+                Some(2),
+                "thread:7003".into()
+            )
+        );
+        assert_eq!(
+            rows[3],
+            (
+                9,
+                "status_changed".into(),
+                "system_user".into(),
+                None,
+                "thread:7006".into()
+            )
+        );
+
+        // Derived columns recomputed from the LOCAL-id event join: the note
+        // (user, 10:06) is the last actor-bearing event → agent_waiting.
+        let (first_msg, first_reply, state): (Option<String>, Option<String>, String) = conn
+            .query_row(
+                "SELECT first_customer_message_at, first_response_at, response_state
+                 FROM conversations WHERE id = 9",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(first_msg.as_deref(), Some("2026-01-01T10:00:00Z"));
+        assert_eq!(first_reply.as_deref(), Some("2026-01-01T10:05:00Z"));
+        assert_eq!(state, "agent_waiting");
+    }
+
+    #[test]
+    fn rebuild_all_dedupes_against_sync_written_events() {
+        let conn = rebuild_db();
+        insert_thread(
+            &conn,
+            9,
+            Some(7001),
+            "customer",
+            Some("published"),
+            "I want a refund",
+            "customer",
+            Some(1),
+            "2026-01-01T10:00:00Z",
+        );
+        // Exactly what the sync path would have written for that thread.
+        record_full_event(
+            &conn,
+            &FullActivityEvent {
+                base: ActivityEvent {
+                    id: None,
+                    conversation_id: 9,
+                    event_type: "customer_message".into(),
+                    actor_type: "customer".into(),
+                    actor_id: Some(1),
+                    occurred_at: "2026-01-01T10:00:00Z".into(),
+                    dedup_key: "thread:7001".into(),
+                },
+                thread_local_id: None,
+                source: "sync".into(),
+                metadata: None,
+            },
+        )
+        .unwrap();
+
+        let summary = rebuild_all(&conn).unwrap();
+
+        assert_eq!(
+            summary.events_written, 0,
+            "the sync-written event must not duplicate"
+        );
+        assert_eq!(summary.events_total, 1);
+        // The derived columns still got recomputed from the existing event.
+        let (state, waiting_since): (String, Option<String>) = conn
+            .query_row(
+                "SELECT response_state, customer_waiting_since FROM conversations WHERE id = 9",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "customer_waiting");
+        assert_eq!(waiting_since.as_deref(), Some("2026-01-01T10:00:00Z"));
+    }
+
+    #[test]
+    fn rebuild_all_is_idempotent_across_runs() {
+        let conn = rebuild_db();
+        // A local-only thread (no remote id) still derives an event — with
+        // the stable rebuild-scoped dedup key.
+        insert_thread(
+            &conn,
+            9,
+            None,
+            "customer",
+            Some("published"),
+            "walk-in message",
+            "customer",
+            Some(1),
+            "2026-01-01T10:00:00Z",
+        );
+
+        let first = rebuild_all(&conn).unwrap();
+        assert_eq!(first.events_written, 1);
+        assert_eq!(first.events_total, 1);
+        let dedup: String = conn
+            .query_row("SELECT dedup_key FROM activity_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dedup, "rebuild:thread:1");
+
+        let second = rebuild_all(&conn).unwrap();
+        assert_eq!(second.events_written, 0, "second run writes nothing");
+        assert_eq!(second.events_total, 1, "no duplicates");
+    }
+
+    #[test]
+    fn rebuild_all_marks_closed_conversations() {
+        let conn = rebuild_db();
+        conn.execute(
+            "UPDATE conversations SET status = 'closed' WHERE id = 9",
+            [],
+        )
+        .unwrap();
+        insert_thread(
+            &conn,
+            9,
+            Some(7001),
+            "customer",
+            Some("published"),
+            "I want a refund",
+            "customer",
+            Some(1),
+            "2026-01-01T10:00:00Z",
+        );
+
+        rebuild_all(&conn).unwrap();
+
+        let state: String = conn
+            .query_row(
+                "SELECT response_state FROM conversations WHERE id = 9",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "closed");
+        // Waiting-since only applies while actually waiting.
+        let waiting: Option<String> = conn
+            .query_row(
+                "SELECT customer_waiting_since FROM conversations WHERE id = 9",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(waiting.is_none());
+    }
+
+    #[test]
+    fn rebuild_all_skips_soft_deleted_threads() {
+        let conn = rebuild_db();
+        let tid = insert_thread(
+            &conn,
+            9,
+            Some(7001),
+            "customer",
+            Some("published"),
+            "I want a refund",
+            "customer",
+            Some(1),
+            "2026-01-01T10:00:00Z",
+        );
+        conn.execute(
+            "UPDATE conversation_threads SET deleted_at = '2026-01-02T00:00:00Z' WHERE id = ?1",
+            params![tid],
+        )
+        .unwrap();
+
+        let summary = rebuild_all(&conn).unwrap();
+        assert_eq!(
+            summary.events_written, 0,
+            "soft-deleted threads are not history"
+        );
+        assert_eq!(summary.events_total, 0);
+        // No events → the state stays at the default.
+        let state: String = conn
+            .query_row(
+                "SELECT response_state FROM conversations WHERE id = 9",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "needs_first_response");
+    }
+
+    #[test]
+    fn rebuild_all_recomputes_stale_derived_columns() {
+        let conn = rebuild_db();
+        // The event exists but the derived columns were never maintained
+        // (the exact stale-mirror state the rebuild exists to repair).
+        insert_event(
+            &conn,
+            9,
+            "customer_message",
+            "customer",
+            "2026-01-01T10:00:00Z",
+            "evt_x",
+        );
+
+        let before: String = conn
+            .query_row(
+                "SELECT response_state FROM conversations WHERE id = 9",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, "needs_first_response", "stale pre-state");
+
+        rebuild_all(&conn).unwrap();
+
+        let (state, waiting_since, first_msg): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT response_state, customer_waiting_since, first_customer_message_at
+                 FROM conversations WHERE id = 9",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "customer_waiting");
+        assert_eq!(waiting_since.as_deref(), Some("2026-01-01T10:00:00Z"));
+        assert_eq!(first_msg.as_deref(), Some("2026-01-01T10:00:00Z"));
+    }
+
+    #[test]
+    fn rebuild_all_on_empty_db_is_a_no_op() {
+        let conn = fresh_db();
+        ensure_thread_mirror(&conn);
+        let summary = rebuild_all(&conn).unwrap();
+        assert_eq!(summary.conversations, 0);
+        assert_eq!(summary.events_written, 0);
+        assert_eq!(summary.events_total, 0);
+        assert_eq!(event_count(&conn), 0);
     }
 }
