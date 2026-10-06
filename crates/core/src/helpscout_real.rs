@@ -6,19 +6,24 @@
 //! - Central rate limiter honoring Help Scout's
 //!   `X-RateLimit-*` headers (writes count double), persisted under the
 //!   `hs_rate_limit` application_settings key
-//! - Bounded-concurrency priority queue stats (visible on /api/sync/status)
+//! - Bounded-concurrency priority queue wrapping every provider call
+//!   (SY-09 / audit M13: the reference ApiQueue — priority sort +
+//!   concurrency 2 + rate-limited dispatch, stats on /api/sync/status)
 //! - 60 s request timeout; retry on 429 (Retry-After) and 5xx with backoff
 //! - Friendly, contextual error messages (never raw "HTTP 412")
 //! - OAuth: authorization-code + refresh + client-credentials flows against
 //!   `POST {apiBase}/v2/oauth2/token`
 
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
+use crate::api_queue::{
+    ApiQueue, DEFAULT_CONCURRENCY, PRIORITY_ANALYTICS, PRIORITY_INDEXING, PRIORITY_INTERACTIVE,
+    PRIORITY_SYNC, PRIORITY_USER_SEND,
+};
 use crate::error::{Error, Result};
 
 use crate::helpscout::{
@@ -274,30 +279,6 @@ impl HsRateLimiter {
     }
 }
 
-/// Queue stats (apiQueue.ts statsSnapshot parity).
-#[derive(Default)]
-pub struct ApiQueueStats {
-    pub queued: AtomicI64,
-    pub active: AtomicI64,
-    pub dispatched: AtomicI64,
-    pub completed: AtomicI64,
-    pub failed: AtomicI64,
-    pub high_water: AtomicI64,
-}
-
-impl ApiQueueStats {
-    pub fn snapshot(&self) -> Value {
-        json!({
-            "queued": self.queued.load(Ordering::Relaxed),
-            "active": self.active.load(Ordering::Relaxed),
-            "dispatched": self.dispatched.load(Ordering::Relaxed),
-            "completed": self.completed.load(Ordering::Relaxed),
-            "failed": self.failed.load(Ordering::Relaxed),
-            "highWater": self.high_water.load(Ordering::Relaxed),
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Token store (authService.ts parity — account='default' single row)
 // ---------------------------------------------------------------------------
@@ -404,13 +385,22 @@ pub struct RealHelpScoutProvider {
     api_base: String,
     conn: Arc<Mutex<Connection>>,
     pub credentials: HsCredentials,
-    pub limiter: HsRateLimiter,
-    pub queue: Arc<ApiQueueStats>,
+    /// The shared account-wide limiter (queue + request recording).
+    pub limiter: Arc<HsRateLimiter>,
+    /// The main-API command queue (reference `client.http.queue`).
+    pub queue: Arc<ApiQueue>,
+    /// The Docs API gets its own queue — the reference builds a second
+    /// `HelpScoutHttpClient` (docsHttp) with the same ApiQueue class and its
+    /// own RateLimiter instance (held inside the queue).
+    docs_queue: Arc<ApiQueue>,
 }
 
 impl RealHelpScoutProvider {
     #[must_use]
     pub fn new(conn: Arc<Mutex<Connection>>, credentials: HsCredentials) -> Self {
+        let limiter = Arc::new(HsRateLimiter::new(None));
+        let queue = ApiQueue::new(Arc::clone(&limiter), DEFAULT_CONCURRENCY);
+        let docs_queue = ApiQueue::new(Arc::new(HsRateLimiter::new(None)), DEFAULT_CONCURRENCY);
         Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -418,10 +408,17 @@ impl RealHelpScoutProvider {
                 .unwrap_or_default(),
             api_base: credentials.api_base.trim_end_matches('/').to_string(),
             conn,
-            limiter: HsRateLimiter::new(None),
-            queue: Arc::new(ApiQueueStats::default()),
+            limiter,
+            queue,
+            docs_queue,
             credentials,
         }
+    }
+
+    /// Reference `setConcurrency` exposure: adjust the main-API queue's
+    /// bound (min 1) and immediately pump waiting items.
+    pub fn set_api_concurrency(&self, n: usize) {
+        self.queue.set_concurrency(n);
     }
 
     fn conn_lock(&self) -> MutexGuard<'_, Connection> {
@@ -437,6 +434,15 @@ impl RealHelpScoutProvider {
         if self.credentials.docs_api_key.is_empty() {
             return Ok(Value::Null);
         }
+        // SY-09: docs HTTP goes through the docs queue (the reference's
+        // docsHttp is a second HelpScoutHttpClient — its own ApiQueue +
+        // RateLimiter). GET default priority: SYNC.
+        let path = path.to_string();
+        let fut = self.docs_request_inner(&path);
+        self.docs_queue.enqueue(PRIORITY_SYNC, false, fut).await
+    }
+
+    async fn docs_request_inner(&self, path: &str) -> Result<Value> {
         let basic = base64_of(&format!("{}:X", self.credentials.docs_api_key));
         let url = format!(
             "{}{path}",
@@ -684,11 +690,36 @@ impl RealHelpScoutProvider {
 
     // ---------------- Core HTTP ----------------
 
-    /// Single point for all Help Scout HTTP: bearer token, rate limiting,
-    /// retries (429 + 5xx + network), friendly error mapping. Public so the
+    /// Single point for all Help Scout HTTP: the request goes through the
+    /// central ApiQueue (priority + rate limiting, concurrency 2) before the
+    /// bearer-token / retry / error-mapping attempt runs. Public so the
     /// operations layer can issue the reference's remote writes.
+    ///
+    /// Priority default (reference `client.request`):
+    /// `isWrite ? PRIORITY.INTERACTIVE : PRIORITY.SYNC`.
     pub async fn request(&self, path: &str, method: &str, body: Option<Value>) -> Result<Value> {
-        self.request_inner(path, method, body, 3).await
+        let priority = if method != "GET" {
+            PRIORITY_INTERACTIVE
+        } else {
+            PRIORITY_SYNC
+        };
+        self.request_pri(path, method, body, priority).await
+    }
+
+    /// `request` with an explicit queue priority — the reference's
+    /// `http.request(path, { priority: PRIORITY.x })` call sites.
+    pub async fn request_pri(
+        &self,
+        path: &str,
+        method: &str,
+        body: Option<Value>,
+        priority: u8,
+    ) -> Result<Value> {
+        let is_write = method != "GET";
+        let path = path.to_string();
+        let method = method.to_string();
+        let fut = self.request_inner(&path, &method, body, 3);
+        self.queue.enqueue(priority, is_write, fut).await
     }
 
     async fn request_inner(
@@ -698,11 +729,10 @@ impl RealHelpScoutProvider {
         body: Option<Value>,
         retries_left: u32,
     ) -> Result<Value> {
-        // Rate-limit gate (mirror of ApiQueue.pump's wait).
-        let wait = self.limiter.wait_time_ms(method != "GET");
-        if wait > 0 {
-            tokio::time::sleep(Duration::from_millis(wait.min(5_000) as u64)).await;
-        }
+        // NOTE(SY-09): the rate-limit gate lives in ApiQueue.pump now — the
+        // reference defers dispatch in the queue, and `attempt` runs
+        // immediately once a slot is granted (the limiter wait + the
+        // min(wait, 5000) timer are inside pump).
 
         let token = self.access_token().await?;
         let url = format!("{}{path}", self.api_base);
@@ -718,15 +748,14 @@ impl RealHelpScoutProvider {
             req = req.json(b);
         }
 
-        self.queue.dispatched.fetch_add(1, Ordering::Relaxed);
-        self.queue.active.fetch_add(1, Ordering::Relaxed);
+        // Queue stats (dispatched/active/completed/failed) are owned by the
+        // ApiQueue — they cover the whole attempt incl. retries, exactly
+        // like the reference's enqueue(...).then/.catch/.finally chain.
         let res = req.send().await;
-        self.queue.active.fetch_sub(1, Ordering::Relaxed);
 
         let res = match res {
             Ok(r) => r,
             Err(e) => {
-                self.queue.failed.fetch_add(1, Ordering::Relaxed);
                 let msg = e.to_string();
                 if retries_left > 0
                     && (msg.contains("timeout")
@@ -824,7 +853,6 @@ impl RealHelpScoutProvider {
         }
 
         if (200..300).contains(&status) {
-            self.queue.completed.fetch_add(1, Ordering::Relaxed);
             let text = res.text().await.unwrap_or_default();
             if text.is_empty() {
                 return Ok(Value::Null);
@@ -840,7 +868,6 @@ impl RealHelpScoutProvider {
             });
         }
 
-        self.queue.failed.fetch_add(1, Ordering::Relaxed);
         let body_text = res.text().await.unwrap_or_default();
         let detail: String = body_text.chars().take(400).collect();
         Err(HsApiError {
@@ -1144,7 +1171,10 @@ impl HelpScoutProvider for RealHelpScoutProvider {
     }
 
     async fn get_me(&self) -> Result<HsUser> {
-        let v = self.request("/v2/users/me", "GET", None).await?;
+        // services.ts:158: /v2/users/me rides PRIORITY.INTERACTIVE.
+        let v = self
+            .request_pri("/v2/users/me", "GET", None, PRIORITY_INTERACTIVE)
+            .await?;
         Ok(Self::map_user(&v))
     }
 
@@ -1274,8 +1304,14 @@ impl HelpScoutProvider for RealHelpScoutProvider {
 
     async fn get_rating(&self, rating_id: i64) -> Result<Option<HsRating>> {
         // GET /v2/ratings/:id — 404 maps to None like the reference.
+        // realProvider.ts:244: ratings ride PRIORITY.ANALYTICS.
         let raw = match self
-            .request(&format!("/v2/ratings/{rating_id}"), "GET", None)
+            .request_pri(
+                &format!("/v2/ratings/{rating_id}"),
+                "GET",
+                None,
+                PRIORITY_ANALYTICS,
+            )
             .await
         {
             Ok(v) => v,
@@ -1455,8 +1491,15 @@ impl HelpScoutProvider for RealHelpScoutProvider {
     }
 
     async fn get_conversation(&self, conversation_id: i64) -> Result<Option<HsConversation>> {
+        // services.ts:474: single-conversation read serves the interactive
+        // routes — PRIORITY.INTERACTIVE, not the SYNC default.
         let res = self
-            .request(&format!("/v3/conversations/{conversation_id}"), "GET", None)
+            .request_pri(
+                &format!("/v3/conversations/{conversation_id}"),
+                "GET",
+                None,
+                PRIORITY_INTERACTIVE,
+            )
             .await;
         match res {
             Ok(v) => Ok(Some(Self::map_conversation(&v))),
@@ -1630,10 +1673,11 @@ impl HelpScoutProvider for RealHelpScoutProvider {
             body["assignTo"] = json!(assign_to);
         }
         let res = self
-            .request(
+            .request_pri(
                 &format!("/v2/conversations/{}/reply", input.conversation_id),
                 "POST",
                 Some(body),
+                PRIORITY_USER_SEND,
             )
             .await?;
         Ok(ThreadCreated {
@@ -1644,10 +1688,11 @@ impl HelpScoutProvider for RealHelpScoutProvider {
 
     async fn create_note_thread(&self, input: CreateThreadInput) -> Result<ThreadCreated> {
         let res = self
-            .request(
+            .request_pri(
                 &format!("/v2/conversations/{}/notes", input.conversation_id),
                 "POST",
                 Some(json!({ "text": input.text })),
+                PRIORITY_USER_SEND,
             )
             .await?;
         Ok(ThreadCreated {
@@ -1739,8 +1784,10 @@ impl HelpScoutProvider for RealHelpScoutProvider {
         if !input.tags.is_empty() {
             body["tags"] = json!(input.tags);
         }
+        // realProvider.ts:313: conversation creation is a user send —
+        // PRIORITY.USER_SEND.
         let res = self
-            .request("/v3/conversations", "POST", Some(body))
+            .request_pri("/v3/conversations", "POST", Some(body), PRIORITY_USER_SEND)
             .await?;
         let conversation_id = res["id"].as_i64().unwrap_or(0);
         let number = res["number"].as_i64().unwrap_or(0);
@@ -1898,11 +1945,13 @@ impl HelpScoutProvider for RealHelpScoutProvider {
         // HelpScoutAttachmentService.getData (services.ts:571-583): the
         // wire carries base64 `data`; 404 degrades to None. The thread id
         // is part of the provider contract but not the v2 URL.
+        // services.ts:575: attachment downloads ride PRIORITY.INDEXING.
         match self
-            .request(
+            .request_pri(
                 &format!("/v2/conversations/{conversation_id}/attachments/{attachment_id}/data"),
                 "GET",
                 None,
+                PRIORITY_INDEXING,
             )
             .await
         {

@@ -137,73 +137,17 @@ pub async fn dashboard(
     )
 }
 
-/// GET /api/analytics/ai — AI run analytics.
+/// GET /api/analytics/ai — AI run analytics (audit AI-21).
 ///
-/// Reference response shape:
-/// ```json
-/// {
-///   "tickets_analyzed": N, "analysis_success_rate": N,
-///   "draft_count": N, "draft_accepted": N, "draft_rejected": N,
-///   "draft_edit_rate": N, "verification_warnings": N,
-///   "unsupported_claim_rate": N, "common_failure_patterns": [],
-///   "source": "local"
-/// }
-/// ```
+/// The reference serves this from the SAME implementation as
+/// `/api/ai/analytics` (`ctx.analytics.aiAnalytics()`, analytics.ts:45):
+/// every metric is a stored-data read (ai_runs / ai_drafts / ai_feedback /
+/// ai_verifications), rates are rounded percents, and the failure patterns
+/// come from the first verification warning of each draft. This route now
+/// delegates to the port of that implementation — `super::ai::ai_analytics`
+/// — instead of a divergent local query set.
 pub async fn ai_analytics(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM ai_runs", [], |r| r.get(0))
-        .unwrap_or(0);
-    let successful: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM ai_runs WHERE response_json IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let draft_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM verified_drafts", [], |r| r.get(0))
-        .unwrap_or(0);
-    let draft_accepted: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM verified_drafts WHERE status = 'accepted'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let draft_rejected: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM verified_drafts WHERE status = 'rejected'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let analysis_success_rate = if total > 0 {
-        (successful as f64) / (total as f64)
-    } else {
-        0.0
-    };
-    let draft_edit_rate = if draft_count > 0 {
-        // We don't track edits separately; use 0.
-        0.0
-    } else {
-        0.0
-    };
-    (
-        StatusCode::OK,
-        Json(json!({
-            "tickets_analyzed": total,
-            "analysis_success_rate": analysis_success_rate,
-            "draft_count": draft_count,
-            "draft_accepted": draft_accepted,
-            "draft_rejected": draft_rejected,
-            "draft_edit_rate": draft_edit_rate,
-            "verification_warnings": 0,
-            "unsupported_claim_rate": 0,
-            "common_failure_patterns": [],
-            "source": "local",
-        })),
-    )
+    super::ai::ai_analytics(State(state)).await
 }
 
 /// GET /api/reports/sla
@@ -287,12 +231,136 @@ fn clamp_days_param(raw: Option<&String>, fallback: i64, min: i64, max: i64) -> 
     }
 }
 
-pub async fn why_contacting(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"reasons": []})))
+/// GET /api/reports/why-contacting?days=30 — "Why are customers contacting
+/// us?" (spec #50, audit M3 / AN-04): data-driven categories from the local
+/// ticket analyses. Reference `analyticsService.whyCustomersContact(days)`:
+/// the latest completed `ticket_analysis` per conversation, grouped by the
+/// analysis' `issue_cluster_candidate` (lowercased + trimmed), with the
+/// conversation ids attached, sorted by count desc.
+///
+/// Route shape (reference analytics.ts:65-68):
+/// `{ categories: [...], source: "ai-derived" }`.
+pub async fn why_contacting(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let days = clamp_days_param(params.get("days"), 30, 1, 3650);
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let categories = why_contacting_impl(&conn, days);
+    (
+        StatusCode::OK,
+        Json(json!({ "categories": categories, "source": "ai-derived" })),
+    )
 }
-pub async fn top_questions(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"questions": []})))
+
+/// `analyticsService.whyCustomersContact(days)` — latest completed analysis
+/// per conversation, grouped by issue-cluster candidate.
+fn why_contacting_impl(conn: &rusqlite::Connection, days: i64) -> Vec<Value> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT json_extract(a.response_json, '$.issue_cluster_candidate') AS category,
+                a.conversation_id
+           FROM ai_runs a
+          WHERE a.type = 'ticket_analysis' AND a.status = 'completed'
+            AND a.conversation_id IS NOT NULL
+            AND a.id IN (SELECT MAX(id) FROM ai_runs
+                          WHERE type = 'ticket_analysis' AND status = 'completed'
+                         GROUP BY conversation_id)
+            AND json_extract(a.response_json, '$.issue_cluster_candidate') IS NOT NULL
+            AND a.created_at >= datetime('now', '-' || ?1 || ' days')",
+    ) else {
+        return Vec::new();
+    };
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([days], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    let mut by_category: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (category, conversation_id) in rows {
+        let cat = category.trim().to_lowercase();
+        by_category.entry(cat).or_default().push(conversation_id);
+    }
+    let mut out: Vec<Value> = by_category
+        .into_iter()
+        .map(|(category, ids)| {
+            json!({ "category": category, "count": ids.len(), "conversation_ids": ids })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b["count"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["count"].as_i64().unwrap_or(0))
+    });
+    out
 }
+
+/// GET /api/reports/top-questions?days=30 — top customer questions from the
+/// local AI analyses (audit M3 / AN-05). Reference
+/// `analyticsService.topQuestions(days)`: the latest completed
+/// `ticket_analysis` per conversation, grouped by the lowercased + trimmed
+/// `primary_question`, sorted by count desc, capped at 20.
+///
+/// Route shape (reference analytics.ts:70-72): `{ questions: [...] }`.
+pub async fn top_questions(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let days = clamp_days_param(params.get("days"), 30, 1, 3650);
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let questions = top_questions_impl(&conn, days);
+    (StatusCode::OK, Json(json!({ "questions": questions })))
+}
+
+/// `analyticsService.topQuestions(days)` — latest completed analysis per
+/// conversation, grouped by primary question, top 20.
+fn top_questions_impl(conn: &rusqlite::Connection, days: i64) -> Vec<Value> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT LOWER(TRIM(json_extract(a.response_json, '$.primary_question'))) AS question,
+                a.conversation_id
+           FROM ai_runs a
+          WHERE a.type = 'ticket_analysis' AND a.status = 'completed'
+            AND a.conversation_id IS NOT NULL
+            AND a.id IN (SELECT MAX(id) FROM ai_runs
+                          WHERE type = 'ticket_analysis' AND status = 'completed'
+                         GROUP BY conversation_id)
+            AND json_extract(a.response_json, '$.primary_question') IS NOT NULL
+            AND a.created_at >= datetime('now', '-' || ?1 || ' days')",
+    ) else {
+        return Vec::new();
+    };
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([days], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    let mut by_question: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (question, conversation_id) in rows {
+        by_question
+            .entry(question)
+            .or_default()
+            .push(conversation_id);
+    }
+    let mut out: Vec<Value> = by_question
+        .into_iter()
+        .map(|(question, ids)| {
+            json!({ "question": question, "count": ids.len(), "conversation_ids": ids })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b["count"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["count"].as_i64().unwrap_or(0))
+    });
+    out.truncate(20);
+    out
+}
+
 pub async fn doc_gaps(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"gaps": []})))
 }
@@ -335,14 +403,125 @@ pub async fn helpscout_report(
 ) -> impl IntoResponse {
     (StatusCode::OK, Json(json!({"data": []})))
 }
+/// AI-written report narrative (audit AI-14; spec #105, reference
+/// analytics.ts:146-160 + `AiPipeline.reportNarrative`). Clearly labeled
+/// AI-generated: the route runs the existing `ai_pipeline::report_narrative`
+/// (startRun -> chatJson(REPORT_NARRATIVE_SYSTEM, facts-only user prompt)
+/// -> completeRun/failRun) off the DB mutex (M28).
+///
+/// Body (zod `reportNarrativeSchema`): `{ reportName: string 1..=200,
+/// facts?: record<string, string|number|boolean|null> }` — a zod failure
+/// is the reference 422 ValidationError envelope with issue list; a
+/// provider failure is the route's own 503 `{ok:false, error}` shape.
 pub async fn narrative(
     State(state): State<AppState>,
-    Json(_body): Json<Value>,
-) -> impl IntoResponse {
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    let body = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
+
+    // --- zod `reportNarrativeSchema` equivalent ---
+    let report_name = match body.get("reportName") {
+        Some(Value::String(s)) => {
+            let n = s.chars().count();
+            if n == 0 {
+                return narrative_422("reportName", "String must contain at least 1 character(s)");
+            }
+            if n > 200 {
+                return narrative_422("reportName", "String must contain at most 200 character(s)");
+            }
+            s.clone()
+        }
+        None => return narrative_422("reportName", "Required"),
+        Some(other) => {
+            return narrative_422(
+                "reportName",
+                &format!("Expected string, received {}", zod_type_of(other)),
+            )
+        }
+    };
+    let facts = match body.get("facts") {
+        None | Some(Value::Null) => json!({}),
+        Some(v @ Value::Object(map)) => {
+            for (k, val) in map {
+                if !matches!(
+                    val,
+                    Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null
+                ) {
+                    return narrative_422(
+                        &format!("facts.{k}"),
+                        &format!("Expected string, received {}", zod_type_of(val)),
+                    );
+                }
+            }
+            v.clone()
+        }
+        Some(other) => {
+            return narrative_422(
+                "facts",
+                &format!("Expected object, received {}", zod_type_of(other)),
+            )
+        }
+    };
+
+    // --- run the pipeline (reference `ctx.aiPipeline.reportNarrative`) ---
+    let result = state
+        .run_ai(move |conn| {
+            Box::pin(async move {
+                crate::ai_pipeline::ensure_pipeline_schema(conn).ok();
+                let backend = crate::ai_pipeline::backend_from_settings(conn);
+                crate::ai_pipeline::report_narrative(conn, &backend, &report_name, &facts).await
+            })
+        })
+        .await;
+    match result {
+        Ok(Ok(narrative)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "narrative": narrative,
+                "ai_generated": true,
+                "note": "This narrative was AI-generated locally from the computed facts above."
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": e.message })),
+        )
+            .into_response(),
+        Err(join) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": join })),
+        )
+            .into_response(),
+    }
+}
+
+/// The reference's zod-error 422 envelope for the narrative route
+/// (`Invalid request (path): message` + the issue list).
+fn narrative_422(path: &str, message: &str) -> axum::response::Response {
     (
-        StatusCode::OK,
-        Json(json!({"narrative": "Not implemented."})),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "statusCode": 422,
+            "error": "ValidationError",
+            "message": format!("Invalid request ({path}): {message}"),
+            "issues": [{ "path": path, "message": message }]
+        })),
     )
+        .into_response()
+}
+
+/// Zod's `received x` phrasing for type mismatches.
+fn zod_type_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 /// GET /api/reports/effectiveness?days=90 — the observational response-style
 /// report (reference `ctx.effectiveness.report(daysParam(q, 90))`).
@@ -762,5 +941,94 @@ mod tests {
             m["first_response"]["avg_wall_min"]
         );
         assert_eq!(m["first_response"]["avg_business_min"], json!(30));
+    }
+
+    /// AI-14: the narrative route rides `ai_pipeline::report_narrative`;
+    /// with AI disabled the pipeline fails and the route serves the
+    /// reference's own 503 `{ok:false, error}` shape (analytics.ts:157-160).
+    #[tokio::test]
+    async fn narrative_503_when_ai_disabled() {
+        let state = make_state();
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::ai_pipeline::ensure_pipeline_schema(&conn).unwrap();
+            crate::settings::set_string(&conn, "ai_enabled", "false").unwrap();
+        }
+        let conn = state.conn.clone();
+        let (status, body) = body_json(
+            narrative(
+                State(state),
+                Some(Json(json!({ "reportName": "Weekly Overview" }))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], json!(false));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("disabled"),
+            "error: {body}"
+        );
+        // The failed run is recorded (reference failRun on provider error).
+        {
+            let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+            let (kind, status): (String, String) = c
+                .query_row(
+                    "SELECT type, status FROM ai_runs ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(kind, "report_narrative");
+            assert_eq!(status, "failed");
+        }
+    }
+
+    /// AI-14: zod 422 envelopes — the reference's first-issue message with
+    /// the path in parens, and the issues array.
+    #[tokio::test]
+    async fn narrative_422_envelopes() {
+        let state = make_state();
+        let (status, body) =
+            body_json(narrative(State(state.clone()), Some(Json(json!({})))).await).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], json!("ValidationError"));
+        assert_eq!(
+            body["message"],
+            json!("Invalid request (reportName): Required")
+        );
+
+        let (status, body) = body_json(
+            narrative(
+                State(state.clone()),
+                Some(Json(json!({ "reportName": 42 }))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["message"],
+            json!("Invalid request (reportName): Expected string, received number")
+        );
+
+        let (status, body) = body_json(
+            narrative(
+                State(state),
+                Some(Json(json!({ "reportName": "R", "facts": { "n": 1.5 } }))),
+            )
+            .await,
+        )
+        .await;
+        // numbers ARE legal fact values — validation passes; the pipeline
+        // runs (and fails on the disabled-by-default... no: default is
+        // enabled with LM Studio unreachable). This asserts we got PAST
+        // validation (not a 422).
+        assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let _ = body;
     }
 }

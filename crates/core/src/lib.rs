@@ -38,6 +38,7 @@ pub mod ai_pipeline;
 pub mod ai_prompts;
 pub mod ai_provider;
 pub mod ai_tools;
+pub mod api_queue;
 pub mod audit;
 pub mod automation;
 pub mod backup;
