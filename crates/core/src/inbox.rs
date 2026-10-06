@@ -190,6 +190,14 @@ pub fn list_conversations(
     let mut where_parts: Vec<String> = Vec::new();
     let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
 
+    // DB-05 (M18): soft-delete + merge semantics — the inbox list only ever
+    // serves live conversations (conversationRepo.ts listConversations:
+    // `where = ["c.deleted_at IS NULL", "c.merged_into_conversation_id IS
+    // NULL"]`). Soft-deleted rows stay in the mirror (history/reporting) but
+    // leave every listing.
+    where_parts.push("c.deleted_at IS NULL".to_string());
+    where_parts.push("c.merged_into_conversation_id IS NULL".to_string());
+
     if let Some(ref status) = filters.status {
         where_parts.push("c.status = ?".to_string());
         params_vec.push(status.clone().into());
@@ -414,6 +422,15 @@ mod tests {
         crate::outreach::apply_m023_to_m025(&conn).unwrap();
         crate::data_tools::apply_m026_to_m027(&conn).unwrap();
         apply_m028(&conn).unwrap();
+        // DB-05: the boot-invariant soft-delete + merge columns (sla owns
+        // deleted_at; m036 owns merged_into_conversation_id) — the list query
+        // filters on both, so the fixture must match the booted schema. The
+        // guarded ALTERs are exactly what those boot ensures do.
+        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN deleted_at TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE conversations ADD COLUMN merged_into_conversation_id INTEGER",
+            [],
+        );
         conn
     }
 
@@ -444,6 +461,100 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    // ---- DB-05 (M18): soft-delete + merge semantics -------------------------
+
+    #[test]
+    fn list_conversations_excludes_soft_deleted_and_merged() {
+        let mut conn = fresh_db();
+        let live = seed_test_data(&mut conn);
+        // Two more conversations for the same customer.
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id)
+             VALUES (1002, 1002, 'To be deleted', 'active', 101,
+                      (SELECT customer_id FROM conversations WHERE id = ?1))",
+            params![live],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id)
+             VALUES (1003, 1003, 'To be merged', 'active', 101,
+                      (SELECT customer_id FROM conversations WHERE id = ?1))",
+            params![live],
+        )
+        .unwrap();
+        // Soft-delete one, merge-mark the other (conversationRepo.ts:386).
+        conn.execute(
+            "UPDATE conversations SET deleted_at = datetime('now') WHERE remote_id = 1002",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE conversations SET merged_into_conversation_id = ?1 WHERE remote_id = 1003",
+            params![live],
+        )
+        .unwrap();
+        let (items, total) =
+            list_conversations(&conn, &crate::inbox::InboxFilters::default()).unwrap();
+        assert_eq!(total, 1, "soft-deleted + merged rows leave the listing");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, live, "the live row is the one served");
+    }
+
+    #[test]
+    fn upsert_conversation_resurrects_soft_deleted_rows() {
+        use crate::helpscout::HsConversation;
+        let f = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        let upsert = |remote: i64| {
+            crate::sync::upsert_conversation(
+                &conn,
+                &HsConversation {
+                    remote_id: remote,
+                    number: remote,
+                    subject: Some("resurrect me".into()),
+                    preview: None,
+                    status: "active".into(),
+                    mailbox_id: 101,
+                    customer_id: 301,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+        upsert(1001);
+        conn.execute(
+            "UPDATE conversations SET deleted_at = datetime('now') WHERE remote_id = 1001",
+            [],
+        )
+        .unwrap();
+        let hidden: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE remote_id = 1001 AND deleted_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hidden, 1, "soft-deleted first");
+        // The row reappears remotely (undelete / restore) — the next sync's
+        // upsert must resurrect it (conversationRepo.ts:136 `deleted_at=NULL`).
+        upsert(1001);
+        let resurrected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE remote_id = 1001 AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resurrected, 1, "upsert resurrects the soft-deleted row");
+        let listed = list_conversations(&conn, &crate::inbox::InboxFilters::default()).unwrap();
+        assert_eq!(listed.1, 1, "back in the listing");
     }
 
     #[test]

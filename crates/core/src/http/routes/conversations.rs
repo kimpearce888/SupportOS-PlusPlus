@@ -1258,35 +1258,21 @@ pub async fn update_tags_route(
             return rejected("Conversation not found locally.");
         }
     }
-    // Real mode: PUT the complete desired state (fresh-read happens remotely).
-    if let Some(real) = state.real.clone() {
+    // SY-10: fresh-read-merge-write through the PROVIDER boundary
+    // (operations.ts updateTags:269-303) — the fake provider serves its world
+    // state, the real provider hits the v2 API, so demo mode now behaves like
+    // the remote instead of skipping the provider write entirely.
+    if let Some(provider) = crate::conversation_ops::op_provider(&state) {
         let remote_id: i64 = {
             let conn = state.conn_lock();
             conv_by_local_id(&conn, conversation_id)
                 .map(|c| c.remote_id)
                 .unwrap_or_default()
         };
-        if let Ok(remote) = real
-            .request(&format!("/v2/conversations/{remote_id}"), "GET", None)
-            .await
-        {
-            let current: Vec<String> = remote["tags"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|t| t["name"].as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+        if let Ok(Some(remote)) = provider.get_conversation(remote_id).await {
+            let current = remote.tags.clone();
             let desired = crate::conversation_ops::merge_tags(&current, &change);
-            if let Err(e) = real
-                .request(
-                    &format!("/v2/conversations/{remote_id}/tags"),
-                    "PUT",
-                    Some(json!({ "tags": desired })),
-                )
-                .await
-            {
+            if let Err(e) = provider.update_tags(remote_id, desired).await {
                 return rejected(&format!("Tags were NOT changed. {e}"));
             }
         }
@@ -1333,25 +1319,32 @@ pub async fn update_fields_route(
             return rejected("Conversation not found locally.");
         }
     }
-    if let Some(real) = state.real.clone() {
+    // SY-10: provider boundary with the reference's fresh-read merge
+    // (operations.ts updateCustomFields:307-341): system fields are
+    // preserved, user fields merge with the change set, and the complete
+    // state is PUT.
+    if let Some(provider) = crate::conversation_ops::op_provider(&state) {
         let remote_id: i64 = {
             let conn = state.conn_lock();
             conv_by_local_id(&conn, conversation_id)
                 .map(|c| c.remote_id)
                 .unwrap_or_default()
         };
-        let payload = json!({ "fields": parsed.iter().map(|(id, v)| json!({
-            "id": id, "value": v.clone().unwrap_or_default()
-        })).collect::<Vec<_>>() });
-        if let Err(e) = real
-            .request(
-                &format!("/v2/conversations/{remote_id}/fields"),
-                "PUT",
-                Some(payload),
-            )
-            .await
-        {
-            return rejected(&format!("Fields were NOT changed. {e}"));
+        if let Ok(Some(remote)) = provider.get_conversation(remote_id).await {
+            let changed_ids: std::collections::HashSet<i64> =
+                parsed.iter().map(|(id, _)| *id).collect();
+            let mut merged: Vec<(i64, Option<String>)> = Vec::new();
+            for f in &remote.custom_fields {
+                if f.system_type.is_some() {
+                    merged.push((f.field_id, f.value.clone()));
+                } else if !changed_ids.contains(&f.field_id) {
+                    merged.push((f.field_id, f.value.clone()));
+                }
+            }
+            merged.extend(parsed.iter().cloned());
+            if let Err(e) = provider.update_custom_fields(remote_id, merged).await {
+                return rejected(&format!("Fields were NOT changed. {e}"));
+            }
         }
     }
     let conn = state.conn_lock();
@@ -1389,21 +1382,16 @@ pub async fn snooze_route(
             return rejected("Conversation not found locally.");
         }
     }
-    if let Some(real) = state.real.clone() {
+    // SY-10: provider boundary (operations.ts snooze:345-364).
+    if let Some(provider) = crate::conversation_ops::op_provider(&state) {
         let remote_id: i64 = {
             let conn = state.conn_lock();
             conv_by_local_id(&conn, conversation_id)
                 .map(|c| c.remote_id)
                 .unwrap_or_default()
         };
-        if let Err(e) = real
-            .request(
-                &format!("/v2/conversations/{remote_id}/snooze"),
-                "PUT",
-                Some(
-                    json!({ "snoozedUntil": snoozed_until, "unsnoozeOnCustomerReply": _unsnooze }),
-                ),
-            )
+        if let Err(e) = provider
+            .snooze_conversation(remote_id, snoozed_until.clone(), _unsnooze)
             .await
         {
             return rejected(&format!("Snooze was NOT applied. {e}"));
@@ -1428,21 +1416,15 @@ pub async fn unsnooze_route(State(state): State<AppState>, Path(id): Path<String
             return rejected("Conversation not found locally.");
         }
     }
-    if let Some(real) = state.real.clone() {
+    // SY-10: provider boundary (operations.ts unsnooze:366-382).
+    if let Some(provider) = crate::conversation_ops::op_provider(&state) {
         let remote_id: i64 = {
             let conn = state.conn_lock();
             conv_by_local_id(&conn, conversation_id)
                 .map(|c| c.remote_id)
                 .unwrap_or_default()
         };
-        if let Err(e) = real
-            .request(
-                &format!("/v2/conversations/{remote_id}/snooze"),
-                "DELETE",
-                None,
-            )
-            .await
-        {
+        if let Err(e) = provider.unsnooze_conversation(remote_id).await {
             return rejected(&format!("Snooze was NOT removed. {e}"));
         }
     }
@@ -1497,7 +1479,10 @@ pub async fn schedule_route(
             return rejected(msg);
         }
     }
-    if let Some(real) = state.real.clone() {
+    // SY-10: provider boundary with the thread's REMOTE id
+    // (operations.ts scheduleReply:384-405 — the port previously sent the
+    // LOCAL thread id in the v2 URL).
+    if let Some(provider) = crate::conversation_ops::op_provider(&state) {
         let remote_ids = {
             let conn = state.conn_lock();
             let c = conv_by_local_id(&conn, conversation_id);
@@ -1511,13 +1496,9 @@ pub async fn schedule_route(
             (c.map(|c| c.remote_id), t_remote)
         };
         match remote_ids {
-            (Some(conv_remote), Some(_thread_remote)) => {
-                if let Err(e) = real
-                    .request(
-                        &format!("/v2/conversations/{conv_remote}/threads/{thread_id}/schedule"),
-                        "PUT",
-                        Some(json!({ "scheduledFor": scheduled_for, "unscheduleOnCustomerReply": _u, "sendAsCreator": false })),
-                    )
+            (Some(conv_remote), Some(thread_remote)) => {
+                if let Err(e) = provider
+                    .schedule_thread(conv_remote, thread_remote, scheduled_for.clone(), _u)
                     .await
                 {
                     return rejected(&format!("Schedule was NOT applied. {e}"));
@@ -1550,19 +1531,25 @@ pub async fn schedule_publish_route(
             return rejected(msg);
         }
     }
-    if let Some(real) = state.real.clone() {
-        let conv_remote: i64 = {
+    // SY-10: provider boundary (operations.ts publishSchedule:407-428).
+    if let Some(provider) = crate::conversation_ops::op_provider(&state) {
+        let (conv_remote, thread_remote): (i64, Option<i64>) = {
             let conn = state.conn_lock();
-            conv_by_local_id(&conn, conversation_id)
-                .map(|c| c.remote_id)
-                .unwrap_or_default()
+            let c = conv_by_local_id(&conn, conversation_id).map(|c| c.remote_id);
+            let t = conn
+                .query_row(
+                    "SELECT remote_id FROM conversation_threads WHERE id = ?1",
+                    rusqlite::params![thread_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            (c.unwrap_or_default(), t)
         };
-        if let Err(e) = real
-            .request(
-                &format!("/v2/conversations/{conv_remote}/threads/{thread_id}/schedule"),
-                "PATCH",
-                Some(json!({ "op": "replace", "path": "/state", "value": "published" })),
-            )
+        let Some(thread_remote) = thread_remote else {
+            return rejected("Conversation or thread not found locally.");
+        };
+        if let Err(e) = provider
+            .publish_scheduled_thread(conv_remote, thread_remote)
             .await
         {
             return rejected(&format!("Publish failed. {e}"));
@@ -1592,19 +1579,25 @@ pub async fn schedule_delete_route(
             return rejected(msg);
         }
     }
-    if let Some(real) = state.real.clone() {
-        let conv_remote: i64 = {
+    // SY-10: provider boundary (operations.ts deleteSchedule:430-448).
+    if let Some(provider) = crate::conversation_ops::op_provider(&state) {
+        let (conv_remote, thread_remote): (i64, Option<i64>) = {
             let conn = state.conn_lock();
-            conv_by_local_id(&conn, conversation_id)
-                .map(|c| c.remote_id)
-                .unwrap_or_default()
+            let c = conv_by_local_id(&conn, conversation_id).map(|c| c.remote_id);
+            let t = conn
+                .query_row(
+                    "SELECT remote_id FROM conversation_threads WHERE id = ?1",
+                    rusqlite::params![thread_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            (c.unwrap_or_default(), t)
         };
-        if let Err(e) = real
-            .request(
-                &format!("/v2/conversations/{conv_remote}/threads/{thread_id}/schedule"),
-                "DELETE",
-                None,
-            )
+        let Some(thread_remote) = thread_remote else {
+            return rejected("Conversation or thread not found locally.");
+        };
+        if let Err(e) = provider
+            .delete_thread_schedule(conv_remote, thread_remote)
             .await
         {
             return rejected(&format!("Delete failed. {e}"));
@@ -1723,21 +1716,17 @@ pub async fn workflow_route(
             return rejected("Conversation not found locally.");
         }
     }
-    if let Some(real) = state.real.clone() {
+    // SY-10: provider boundary (operations.ts runWorkflow:521-533). The
+    // reference body is `conversationIds: [id]` (services.ts:347) — the
+    // port's old inline call sent `conversationId`, which Help Scout ignores.
+    if let Some(provider) = crate::conversation_ops::op_provider(&state) {
         let remote_id: i64 = {
             let conn = state.conn_lock();
             conv_by_local_id(&conn, conversation_id)
                 .map(|c| c.remote_id)
                 .unwrap_or_default()
         };
-        if let Err(e) = real
-            .request(
-                &format!("/v2/workflows/{workflow_id}/run"),
-                "POST",
-                Some(json!({ "conversationId": remote_id })),
-            )
-            .await
-        {
+        if let Err(e) = provider.run_workflow(workflow_id, remote_id).await {
             return rejected(&format!("Workflow failed. {e}"));
         }
     }
@@ -1756,8 +1745,7 @@ pub async fn attachment_download_route(
         _ => return zod_422("id", "Expected number, received nan"),
     };
     let attachments_dir = state.data_dir.join("attachments");
-    let conn = state.conn_lock();
-    crate::conversation_ops::op_download_attachment(&conn, &attachments_dir, attachment_id)
+    crate::conversation_ops::op_download_attachment(&state, &attachments_dir, attachment_id).await
 }
 
 #[cfg(test)]

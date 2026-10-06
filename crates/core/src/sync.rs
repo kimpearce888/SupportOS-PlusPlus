@@ -197,7 +197,11 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
             updated_at = excluded.updated_at,
             closed_at = excluded.closed_at,
             snoozed_until = excluded.snoozed_until,
-            thread_count = excluded.thread_count",
+            thread_count = excluded.thread_count,
+            -- DB-05 (M18): resurrect on upsert — a soft-deleted row that
+            -- reappears remotely (undelete, restore, re-merge-out target)
+            -- comes back to life (conversationRepo.ts:136 `deleted_at=NULL`).
+            deleted_at = NULL",
         params![
             c.remote_id,
             c.number,
@@ -540,6 +544,7 @@ mod tests {
             thread_count: 2,
             merged_into: None,
             tags: vec!["timezone".into(), "vip".into()],
+            custom_fields: Vec::new(),
         };
         upsert_conversation(&conn, &c).unwrap();
 
@@ -655,6 +660,7 @@ mod tests {
                 thread_count: 0,
                 merged_into: None,
                 tags: vec![],
+                custom_fields: Vec::new(),
             },
         )
         .unwrap();
@@ -728,6 +734,7 @@ mod tests {
                 thread_count: 0,
                 merged_into: None,
                 tags: vec![],
+                custom_fields: Vec::new(),
             },
         )
         .unwrap();

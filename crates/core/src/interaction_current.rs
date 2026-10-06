@@ -173,7 +173,38 @@ const RESPONSE_PREFERENCE_VALUES: [&str; 6] = [
 
 /// Enum guard: heuristic values must always be in the observable vocabulary
 /// (reference `isValidValue`).
-#[must_use]
+/// The full ranked vocabulary for a dimension (engine.ts `RANKED_DIMENSIONS`)
+/// — powers baseline dominance, change magnitude and rank spans.
+pub fn dimension_vocabulary(dimension: &str) -> Option<&'static [&'static str]> {
+    match dimension {
+        "tone" => Some(&TONE_VALUES),
+        "directness" => Some(&DIRECTNESS_VALUES),
+        "detail" => Some(&DETAIL_VALUES),
+        "technical_language" => Some(&TECHNICAL_VALUES),
+        "question_structure" => Some(&QUESTION_STRUCTURE_VALUES),
+        "urgency" => Some(&URGENCY_VALUES),
+        "frustration" => Some(&FRUSTRATION_VALUES),
+        "expectation" => Some(&EXPECTATION_VALUES),
+        "response_preference" => Some(&RESPONSE_PREFERENCE_VALUES),
+        _ => None,
+    }
+}
+
+/// `needsDeEscalation` (heuristics.ts:195-197): strong frustration alone, or
+/// high urgency combined with at least moderate frustration.
+pub fn needs_de_escalation(signals: &[InteractionSignal]) -> bool {
+    let frustration = |level: &str| {
+        signals
+            .iter()
+            .any(|s| s.dimension == "frustration" && s.value == level)
+    };
+    frustration("strong")
+        || (signals
+            .iter()
+            .any(|s| s.dimension == "urgency" && s.value == "high")
+            && (frustration("moderate") || frustration("strong")))
+}
+
 pub fn is_valid_value(dimension: &str, value: &str) -> bool {
     let vocab: &[&str] = match dimension {
         "tone" => &TONE_VALUES,
@@ -858,7 +889,7 @@ pub fn infer_customer_goal(signals: &[InteractionSignal], subject: Option<&str>)
 /// The computed current interaction (reference `CurrentInteraction`, kept
 /// part — `is_returning_client` comes from history the port's coaching
 /// domain owns; here it is computed from the mirror).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CurrentInteraction {
     pub conversation_local_id: i64,
     pub customer_local_id: Option<i64>,
@@ -866,6 +897,13 @@ pub struct CurrentInteraction {
     pub signals: Vec<InteractionSignal>,
     pub customer_goal: Option<String>,
     pub message_stats: MessageStats,
+    /// 'heuristic' | 'heuristic+ai' | 'ai' (reference field; the card
+    /// surfaces it on `current`).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub sources: String,
+    /// When the snapshot was generated (reference field).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub generated_at: Option<String>,
 }
 
 /// One customer thread row pulled by [`customer_messages`].
@@ -874,7 +912,10 @@ type CustomerThreadRow = (i64, Option<String>, Option<String>, Option<String>, S
 /// Load the customer-authored messages of a conversation (reference
 /// `customerMessages` — threads type='customer', state='published',
 /// non-deleted, oldest first; `body_html ?? body_text` via htmlToText).
-fn customer_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<MessageForAnalysis>> {
+pub(crate) fn customer_messages(
+    conn: &Connection,
+    conversation_id: i64,
+) -> Result<Vec<MessageForAnalysis>> {
     let mut stmt = conn.prepare(
         "SELECT id, body_html, body, remote_created_at, created_at
            FROM conversation_threads
@@ -974,18 +1015,34 @@ pub fn compute_current_interaction(
         signals,
         customer_goal: goal,
         message_stats: stats,
+        sources: "heuristic".to_string(),
+        generated_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
     }))
 }
 
 /// Persist the current-signals snapshot (reference `recordCurrentInteraction`
 /// write path + `interactionRepo.saveCurrentInteraction` — ONE row per
-/// conversation, upsert in place).
+/// conversation, upsert in place) AND record the snapshot's signals as
+/// longitudinal observations for the customer (spec #29/#30 — idempotent
+/// per conversation+dimension+source), rebuilding the baseline unless
+/// `rebuild_baseline` is false (the history-backfill pass rebuilds ONCE
+/// after its loop instead of per conversation).
 ///
 /// # Errors
 /// Returns [`crate::error::Error::Sqlite`] when the write fails.
 pub fn record_current_interaction(
     conn: &Connection,
     conversation_id: i64,
+) -> Result<Option<CurrentInteraction>> {
+    record_current_interaction_opts(conn, conversation_id, true)
+}
+
+/// [`record_current_interaction`] with the reference's
+/// `opts.rebuildBaseline` switch (engine.ts:104-141).
+pub fn record_current_interaction_opts(
+    conn: &Connection,
+    conversation_id: i64,
+    rebuild_baseline: bool,
 ) -> Result<Option<CurrentInteraction>> {
     let Some(current) = compute_current_interaction(conn, conversation_id)? else {
         return Ok(None);
@@ -1020,6 +1077,16 @@ pub fn record_current_interaction(
     // refresh the evidence rows must not fail the snapshot write (the
     // reference engine treats evidence persistence as best-effort).
     let _ = replace_evidence_rows(conn, conversation_id, &current.signals);
+    // AI-16: longitudinal observations (spec #29/#30) + baseline rebuild.
+    // Observation failures never break the sync-path snapshot (the
+    // reference wraps the whole record in try/catch on the backfill path).
+    let _ = crate::interaction_engine::ensure_schema(conn);
+    let _ = crate::interaction_engine::record_observations_for(conn, &current);
+    if rebuild_baseline {
+        if let Some(cid) = current.customer_local_id {
+            let _ = crate::interaction_engine::rebuild_baseline(conn, cid);
+        }
+    }
     Ok(Some(current))
 }
 

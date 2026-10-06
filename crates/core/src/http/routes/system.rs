@@ -52,28 +52,9 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse {
     // All guard use is confined to this block — the awaits below must never
     // hold the connection mutex (the future must stay Send).
-    let (db_ok, helpscout_connected, lmstudio_base, lmstudio_embedding) = {
+    let (db_ok, lmstudio_base, lmstudio_embedding) = {
         let conn = state.conn_lock();
         let db_ok = conn.execute_batch("SELECT 1").is_ok();
-
-        // Help Scout connectivity (reference: fake provider => connected, no ping).
-        let helpscout_connected = state.demo_mode || {
-            // Real provider: use the cached ping (60s) like the reference.
-            let cached: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM application_settings WHERE key='hs_last_ping'",
-                    [],
-                    |r| r.get(0),
-                )
-                .ok();
-            match cached
-                .as_deref()
-                .and_then(|v| serde_json::from_str::<Value>(v).ok())
-            {
-                Some(p) if p.get("connected").and_then(Value::as_bool) == Some(true) => true,
-                _ => false,
-            }
-        };
 
         // Subsystem: LM Studio (reference pings listModels; the port probes the
         // configured base URL). AI-22: the probe is bounded by 5 s (a hung
@@ -87,12 +68,57 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
             crate::settings::get_string(&conn, "ai_embedding_model")
                 .ok()
                 .flatten();
-        (
-            db_ok,
-            helpscout_connected,
-            lmstudio_base,
-            lmstudio_embedding,
-        )
+        (db_ok, lmstudio_base, lmstudio_embedding)
+    };
+    // Help Scout connectivity (system.ts:41-67): the fake provider is
+    // connected; the real provider answers a cached PING (60 s) — SY-10
+    // completes the flow: on a stale/missing cache the provider's `ping()`
+    // runs and the result is written back.
+    let helpscout_connected = if state.demo_mode {
+        true
+    } else {
+        let cached: Option<String> = {
+            let conn = state.conn_lock();
+            conn.query_row(
+                "SELECT value FROM application_settings WHERE key='hs_last_ping'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        let parsed = cached
+            .as_deref()
+            .and_then(|v| serde_json::from_str::<Value>(v).ok());
+        let fresh = parsed.as_ref().is_some_and(|p| {
+            p.get("at").and_then(Value::as_i64).is_some_and(|at| {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                now_ms.saturating_sub(at) < 60_000
+            })
+        });
+        if fresh {
+            parsed
+                .as_ref()
+                .and_then(|p| p.get("connected").and_then(Value::as_bool))
+                .unwrap_or(false)
+        } else {
+            let provider = state.sync.as_ref().map(|s| s.provider().clone());
+            let connected = match provider {
+                Some(p) => p.ping().await.is_ok(),
+                None => false,
+            };
+            let entry = json!({
+                "connected": connected,
+                "error": if connected { Value::Null } else { json!("Help Scout is unreachable") },
+                "at": chrono::Utc::now().timestamp_millis(),
+            });
+            let conn = state.conn_lock();
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO application_settings (key, value, updated_at)
+                 VALUES ('hs_last_ping', ?1, datetime('now'))",
+                rusqlite::params![entry.to_string()],
+            );
+            connected
+        }
     };
     let lm_probe =
         crate::ai_lm_studio::OpenAiCompatibleClient::new_with_timeout(&lmstudio_base, 5_000)

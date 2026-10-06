@@ -1029,38 +1029,93 @@ pub fn attachment_by_id(conn: &Connection, id: i64) -> Option<AttachmentRow> {
     .ok()
 }
 
-/// Demo-mode attachment download: synthesize deterministic bytes for the
-/// fake attachment, persist to the attachments dir with the reference's
-/// `{conversationId}-{attachmentId}-{safeName}` layout + sha256.
-pub fn op_download_attachment(
-    conn: &Connection,
+/// Attachment download (operations.ts downloadAttachment:537-561): fetch
+/// the bytes through the PROVIDER boundary (SY-10 — the real provider hits
+/// `/v2/conversations/:id/attachments/:aid/data`, the fake serves simulated
+/// content), then persist with the reference's
+/// `{conversationId}-{attachmentId}-{safeName}` layout + sha256. A provider
+/// `None` marks the attachment failed ("no longer available").
+pub async fn op_download_attachment(
+    state: &crate::http::server::AppState,
     attachments_dir: &std::path::Path,
     attachment_id: i64,
 ) -> Response {
-    let Some(att) = attachment_by_id(conn, attachment_id) else {
+    let att = {
+        let conn = state.conn_lock();
+        attachment_by_id(&conn, attachment_id)
+    };
+    let Some(att) = att else {
         return rejected("Attachment not found.");
     };
-    let conv_ok = conv_by_local_id(conn, att.conversation_id).is_some();
+    // Parent conversation + its remote id (the provider keys on remote ids).
+    let (conv_ok, conv_remote, thread_remote): (bool, i64, Option<i64>) = {
+        let conn = state.conn_lock();
+        let conv = conv_by_local_id(&conn, att.conversation_id);
+        let t_remote: Option<i64> = att
+            .thread_id
+            .and_then(|tid| {
+                conn.query_row(
+                    "SELECT remote_id FROM conversation_threads WHERE id = ?1",
+                    params![tid],
+                    |r| r.get(0),
+                )
+                .ok()
+            })
+            .flatten();
+        (
+            conv.is_some(),
+            conv.map(|c| c.remote_id).unwrap_or_default(),
+            t_remote,
+        )
+    };
     if !conv_ok {
         return rejected("Parent conversation not found.");
     }
-    match download_attachment_to(conn, attachments_dir, attachment_id) {
-        Ok(path) => ok_result("Attachment downloaded.", Some(json!({ "path": path }))),
-        Err(msg) => rejected(&msg),
+    let Some(provider) = op_provider(state) else {
+        return internal_error("no provider available");
+    };
+    match provider
+        .get_attachment_data(
+            conv_remote,
+            thread_remote.unwrap_or(0),
+            att.remote_id.unwrap_or(0),
+        )
+        .await
+    {
+        Ok(Some(bytes)) => {
+            let conn = state.conn_lock();
+            match persist_attachment_bytes(&conn, attachments_dir, attachment_id, &bytes.data) {
+                Ok(path) => ok_result("Attachment downloaded.", Some(json!({ "path": path }))),
+                Err(msg) => rejected(&msg),
+            }
+        }
+        Ok(None) => {
+            let conn = state.conn_lock();
+            set_attachment_state(&conn, attachment_id, "failed", None, None);
+            rejected(
+                "Attachment is no longer available in Help Scout (it may have expired or been removed).",
+            )
+        }
+        Err(e) => {
+            let conn = state.conn_lock();
+            set_attachment_state(&conn, attachment_id, "failed", None, None);
+            rejected(&format!(
+                "Attachment download failed. {}",
+                failure_message(&e)
+            ))
+        }
     }
 }
 
-/// The attachment download itself (WK-03): writes the bytes to the
-/// attachments dir with the reference's `{conversationId}-{attachmentId}-
-/// {safeName}` layout, records the sha256 and flips the state to
-/// `downloaded`. Shared by the route (`POST /api/attachments/:id/download`)
-/// and the worker's `download_recent_attachments` job.
-///
-/// Returns the local path on success; a friendly error message on failure.
-pub fn download_attachment_to(
+/// Persist downloaded attachment bytes: the reference's
+/// `{conversationId}-{attachmentId}-{safeName}` layout, sha256 + the
+/// `downloaded` state flip (the write-to-disk half of the old
+/// `download_attachment_to`).
+pub fn persist_attachment_bytes(
     conn: &Connection,
     attachments_dir: &std::path::Path,
     attachment_id: i64,
+    data: &[u8],
 ) -> std::result::Result<String, String> {
     let Some(att) = attachment_by_id(conn, attachment_id) else {
         return Err("Attachment not found.".into());
@@ -1068,14 +1123,6 @@ pub fn download_attachment_to(
     if conv_by_local_id(conn, att.conversation_id).is_none() {
         return Err("Parent conversation not found.".into());
     }
-    // Demo data: deterministic placeholder bytes (the reference fake
-    // generates real random data; content itself is not part of the API
-    // contract — the path/hash/state transitions are).
-    let data = format!(
-        "SupportOS demo attachment {} for conversation {}\n",
-        attachment_id, att.conversation_id
-    )
-    .into_bytes();
     let safe_name = att
         .filename
         .as_deref()
@@ -1086,12 +1133,12 @@ pub fn download_attachment_to(
         "{}-{}-{}",
         att.conversation_id, attachment_id, safe_name
     ));
-    if let Err(e) = std::fs::write(&target, &data) {
+    if let Err(e) = std::fs::write(&target, data) {
         set_attachment_state(conn, attachment_id, "failed", None, None);
         return Err(format!("Attachment download failed. {e}"));
     }
     use sha2::{Digest, Sha256};
-    let hash = hex(&Sha256::digest(&data));
+    let hash = hex(&Sha256::digest(data));
     let path_str = target.to_string_lossy().to_string();
     set_attachment_state(
         conn,
@@ -1103,7 +1150,73 @@ pub fn download_attachment_to(
     Ok(path_str)
 }
 
-fn set_attachment_state(
+/// Worker-path attachment download (WK-03 + SY-10): fetch the bytes through
+/// the provider (fake serves simulated content; the real provider decodes
+/// the v2 wire data — real-provider rows no longer stay pending), then
+/// persist. Shared by the `download_recent_attachments` job; the route uses
+/// the full [`op_download_attachment`] pipeline.
+pub async fn download_attachment_via_provider(
+    state: &crate::http::server::AppState,
+    attachments_dir: &std::path::Path,
+    attachment_id: i64,
+) -> std::result::Result<String, String> {
+    let att = {
+        let conn = state.conn_lock();
+        attachment_by_id(&conn, attachment_id)
+    };
+    let Some(att) = att else {
+        return Err("Attachment not found.".into());
+    };
+    let (conv_remote, thread_remote): (i64, Option<i64>) = {
+        let conn = state.conn_lock();
+        let conv = conv_by_local_id(&conn, att.conversation_id)
+            .map(|c| c.remote_id)
+            .unwrap_or_default();
+        let t_remote: Option<i64> = att
+            .thread_id
+            .and_then(|tid| {
+                conn.query_row(
+                    "SELECT remote_id FROM conversation_threads WHERE id = ?1",
+                    params![tid],
+                    |r| r.get(0),
+                )
+                .ok()
+            })
+            .flatten();
+        (conv, t_remote)
+    };
+    let Some(provider) = op_provider(state) else {
+        return Err("no provider available".into());
+    };
+    match provider
+        .get_attachment_data(
+            conv_remote,
+            thread_remote.unwrap_or(0),
+            att.remote_id.unwrap_or(0),
+        )
+        .await
+    {
+        Ok(Some(bytes)) => {
+            let conn = state.conn_lock();
+            persist_attachment_bytes(&conn, attachments_dir, attachment_id, &bytes.data)
+        }
+        Ok(None) => {
+            let conn = state.conn_lock();
+            set_attachment_state(&conn, attachment_id, "failed", None, None);
+            Err("Attachment is no longer available in Help Scout.".into())
+        }
+        Err(e) => {
+            let conn = state.conn_lock();
+            set_attachment_state(&conn, attachment_id, "failed", None, None);
+            Err(format!(
+                "Attachment download failed. {}",
+                failure_message(&e)
+            ))
+        }
+    }
+}
+
+pub fn set_attachment_state(
     conn: &Connection,
     id: i64,
     state: &str,
@@ -1272,7 +1385,7 @@ fn not_connected(message: &str) -> Response {
 
 /// The provider the ops write through (one instance with the sync engine —
 /// reference AppContext binding).
-fn op_provider(
+pub fn op_provider(
     state: &crate::http::server::AppState,
 ) -> Option<std::sync::Arc<dyn HelpScoutProvider>> {
     if let Some(sync) = &state.sync {

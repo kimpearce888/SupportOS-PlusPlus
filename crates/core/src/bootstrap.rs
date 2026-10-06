@@ -82,6 +82,11 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     // AI-19 (C7): the interaction evidence table the interactions routes
     // read — ensured at boot so the routes never depend on a prior refresh.
     crate::interaction_current::ensure_interaction_evidence_table(conn)?;
+    // AI-16: the interaction-intelligence layer (migration 005 shapes —
+    // observations/baselines/preferences/human-overrides/outcomes + the
+    // recommendation column). Ensured at boot so card/profile reads and the
+    // sync-path observation writes never depend on call order.
+    crate::interaction_engine::ensure_schema(conn)?;
     // The SLA schema owns `conversations.deleted_at` (reference migration
     // 003). It used to be ensured lazily by the first SLA report — every
     // `deleted_at IS NULL` mirror query that ran before that (incident

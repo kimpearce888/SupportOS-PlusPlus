@@ -1,8 +1,10 @@
 //! Interactions routes — mirrors src/server/routes/interactions.ts
 //!
-//! Interaction signals — AI-derived signals about a customer's
-//! engagement (response times, sentiment, escalation risk). Used by
-//! the customer support health score. Stored in `interaction_signals`.
+//! Client Interaction Intelligence API (interaction spec #25, #26, #22, #45,
+//! #57). Every response is derived data, clearly labeled heuristic /
+//! ai_generated. AI-16/AI-17: the routes now serve the reference engine's
+//! card / two-stage enrichment / observations-evidence / full profile, with
+//! the human override precedence (spec #22, #56).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -12,16 +14,17 @@ use serde_json::{json, Value};
 
 use super::super::server::AppState;
 
-/// GET /api/interaction/:conversationId — the conversation's current
-/// interaction snapshot (reference `getCurrentInteraction`).
-///
-/// AI-19 (C7): the old handler queried `interaction_signals` with columns
-/// that do not exist in the real schema (conversation_id/signal_type/
-/// confidence/created_at) — the prepare failed and was swallowed into an
-/// empty list. The snapshot the engine actually writes lives in
-/// `client_current_signals` (LOCAL conversation id key) and is served here.
-///
-/// Returns 404 when the conversation does not exist (matching the reference).
+/// The labels object MAIN attaches to the card route (interactions.ts:24).
+fn card_labels() -> Value {
+    json!({
+        "featureTitle": "Client Interaction Profile",
+        "note": "Observable support-communication behavior only — never a psychological assessment."
+    })
+}
+
+/// GET /api/interaction/:conversationId — the ticket-scoped interaction card
+/// (reference `buildCard`, interactions.ts:13-25). Serves `{card, labels}`;
+/// 404 when the conversation does not exist.
 pub async fn get(
     State(state): State<AppState>,
     Path(conversation_id): Path<i64>,
@@ -44,59 +47,40 @@ pub async fn get(
             })),
         );
     }
-    // Pure read of the stored snapshot (never computes — refresh does that).
-    let snapshot = crate::interaction_current::get_current_interaction(&conn, conversation_id)
-        .ok()
-        .flatten();
-    match snapshot {
-        Some(s) => (
-            StatusCode::OK,
+    match crate::interaction_engine::build_card(&conn, conversation_id, None) {
+        Ok(Some(card)) => {
+            let card = serde_json::to_value(&card).unwrap_or_else(|_| json!({}));
+            (
+                StatusCode::OK,
+                Json(json!({ "card": card, "labels": card_labels() })),
+            )
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
             Json(json!({
-                "conversationId": conversation_id,
-                "signals": s.signals,
-                "customerGoal": s.customer_goal,
-                "messageStats": s.message_stats,
-                "generatedAt": s.generated_at,
-                "provenance": s.provenance,
-                "analysisVersion": s.analysis_version,
-            })),
-        ),
-        // The conversation exists but has not been analyzed yet — an empty
-        // snapshot, not an error (reference getCurrentInteraction null row).
-        None => (
-            StatusCode::OK,
-            Json(json!({
-                "conversationId": conversation_id,
-                "signals": [],
-                "customerGoal": null,
-                "messageStats": null,
-                "generatedAt": null,
-                "provenance": null,
-                "analysisVersion": null,
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
             })),
         ),
     }
 }
 
-/// POST /api/interaction/:conversationId/refresh — recompute and persist the
-/// conversation's interaction snapshot (reference `recordCurrentInteraction`).
-///
-/// AI-19 (C7): this used to be a no-op that answered ok:true without touching
-/// any data. It now runs the deterministic engine over the customer's
-/// messages (heuristic signals + explicit preference + goal), upserts the
-/// `client_current_signals` row and refreshes the evidence rows, then serves
-/// the fresh snapshot.
-///
-/// Returns 404 when the conversation does not exist (matching the reference).
+/// POST /api/interaction/:conversationId/refresh — recompute the
+/// deterministic snapshot, then run the two-stage AI enrichment when the
+/// backend is enabled (reference `analyzeInteraction` + `buildCard`,
+/// interactions.ts:28-47). Serves `{ok, ai_enriched, error, card}`; 404 for an
+/// unknown conversation, 503 when the analysis throws.
 pub async fn refresh(State(state): State<AppState>, Path(conversation_id): Path<i64>) -> Response {
-    let mut conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let exists: i64 = conn
-        .query_row(
+    let exists: i64 = {
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
             "SELECT COUNT(*) FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
             rusqlite::params![conversation_id],
             |r| r.get(0),
         )
-        .unwrap_or(0);
+        .unwrap_or(0)
+    };
     if exists == 0 {
         return (
             StatusCode::NOT_FOUND,
@@ -108,50 +92,55 @@ pub async fn refresh(State(state): State<AppState>, Path(conversation_id): Path<
         )
             .into_response();
     }
-    match crate::interaction_current::record_current_interaction(&conn, conversation_id) {
-        Ok(Some(current)) => {
-            let _ = crate::interaction_current::ensure_interaction_evidence_table(&conn);
+    let result = state
+        .run_ai(move |conn| {
+            Box::pin(async move {
+                crate::ai_pipeline::ensure_pipeline_schema(conn).ok();
+                crate::interaction_engine::ensure_schema(conn).ok();
+                let backend = crate::ai_pipeline::backend_from_settings(conn);
+                let analysis =
+                    crate::ai_pipeline::analyze_interaction(conn, &backend, conversation_id).await;
+                let card = crate::interaction_engine::build_card(conn, conversation_id, None);
+                (analysis, card)
+            })
+        })
+        .await;
+    match result {
+        Ok((Ok(analysis), Ok(Some(card)))) => {
+            let card = serde_json::to_value(&card).unwrap_or_else(|_| json!({}));
             (
                 StatusCode::OK,
                 Json(json!({
                     "ok": true,
-                    "conversationId": conversation_id,
-                    "message": "Interaction signals refreshed.",
-                    "signals": current.signals,
-                    "customerGoal": current.customer_goal,
-                    "messageStats": current.message_stats,
+                    "ai_enriched": analysis.ai_enriched,
+                    "error": analysis.error,
+                    "card": card,
                 })),
             )
                 .into_response()
         }
-        Ok(None) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        // The card build failed — the conversation vanished mid-analysis.
+        Ok((_, _)) => (
+            StatusCode::NOT_FOUND,
             Json(json!({
-                "statusCode": 500,
-                "error": "InternalError",
-                "message": "Conversation not found locally."
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
             })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "statusCode": 500,
-                "error": "InternalError",
-                "message": e.to_string()
-            })),
+        Err(join) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": join })),
         )
             .into_response(),
     }
 }
 
-/// GET /api/interaction/:conversationId/evidence — the evidence rows backing
-/// the conversation's signals.
-///
-/// AI-19 (C7): the old handler queried an `interaction_evidence` table that
-/// was never created (prepare failed → silently empty). The table now exists
-/// (bootstrap guard) and is written by the engine's snapshot path
-/// (replace-per-conversation) — one row per signal that carries evidence.
+/// GET /api/interaction/:conversationId/evidence — the observations backing
+/// the conversation's signals (reference interactions.ts:50-73): the
+/// customer's observation rows scoped to this conversation (plus
+/// conversation-null rows), each with its provenance label.
 pub async fn evidence(
     State(state): State<AppState>,
     Path(conversation_id): Path<i64>,
@@ -174,49 +163,39 @@ pub async fn evidence(
             })),
         );
     }
-    let evidence: Vec<Value> = conn
-        .prepare(
-            "SELECT id, conversation_id, evidence_type, evidence_data, created_at
-             FROM interaction_evidence WHERE conversation_id = ?1
-             ORDER BY created_at DESC, id DESC",
-        )
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![conversation_id], |r| {
-                // evidence_data stores a JSON object; serve it parsed when it
-                // parses, else the raw string.
-                let raw: String = r.get(3)?;
-                let data: Value = serde_json::from_str(&raw).unwrap_or(Value::String(raw));
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "conversation_id": r.get::<_, i64>(1)?,
-                    "evidence_type": r.get::<_, String>(2)?,
-                    "evidence_data": data,
-                    "created_at": r.get::<_, String>(4)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    let observations: Vec<Value> =
+        match crate::interaction_engine::conversation_customer(&conn, conversation_id) {
+            None => Vec::new(),
+            Some(customer_id) => crate::interaction_engine::get_observations_for_customer(
+                &conn,
+                customer_id,
+            )
             .unwrap_or_default()
-        })
-        .unwrap_or_default();
+            .into_iter()
+            .filter(|o| o.conversation_id == Some(conversation_id) || o.conversation_id.is_none())
+            .map(|o| {
+                json!({
+                    "dimension": o.dimension,
+                    "value": o.value,
+                    "confidence": o.confidence,
+                    "evidence_excerpt": o.evidence_excerpt,
+                    "conversation_local_id": o.conversation_id,
+                    "thread_local_id": o.thread_local_id,
+                    "observed_at": o.observed_at,
+                    "provenance": if o.source == "ai" { "ai_generated" } else { "heuristic" },
+                })
+            })
+            .collect(),
+        };
     (
         StatusCode::OK,
-        Json(json!({"conversationId": conversation_id, "evidence": evidence})),
+        Json(json!({ "observations": observations })),
     )
 }
 
-/// GET /api/interaction/profile/:customerId — the customer's interaction
-/// profile, aggregated from their signals (AI-19 / C7: "serve profile from
-/// signals").
-///
-/// The old handler joined `interaction_signals` through fictional columns
-/// (prepare failed → zeros). The profile now aggregates the REAL
-/// `client_current_signals` layer: per-dimension majorities, the response
-/// preference (explicit human override first, then the inferred majority
-/// once it is a confirmed pattern), and the most recent goal/refresh stamp.
-///
-/// Returns 404 when the customer does not exist (matching the reference).
+/// GET /api/interaction/profile/:customerId — the customer-scoped profile
+/// (reference `buildProfile`, interactions.ts:76-88): baseline, preferences,
+/// timeline, outcomes, playbook, overrides. 404 when the customer is unknown.
 pub async fn profile(
     State(state): State<AppState>,
     Path(customer_id): Path<i64>,
@@ -239,30 +218,17 @@ pub async fn profile(
             })),
         );
     }
-    match crate::interaction_current::interaction_profile(&conn, customer_id) {
-        Ok(p) => {
-            let override_row =
-                crate::interaction_current::get_interaction_override(&conn, customer_id)
-                    .ok()
-                    .flatten();
-            let mut body = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
-            body["customerId"] = json!(customer_id);
-            if let Some(o) = override_row {
-                body["override"] = json!({
-                    "field": o.field,
-                    "value": o.value,
-                    "reason": o.reason,
-                    "updatedAt": o.updated_at,
-                });
-            }
-            (StatusCode::OK, Json(body))
+    match crate::interaction_engine::build_profile(&conn, customer_id) {
+        Ok(Some(profile)) => {
+            let profile = serde_json::to_value(&profile).unwrap_or_else(|_| json!({}));
+            (StatusCode::OK, Json(json!({ "profile": profile })))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        _ => (
+            StatusCode::NOT_FOUND,
             Json(json!({
-                "statusCode": 500,
-                "error": "InternalError",
-                "message": e.to_string()
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Customer not found or no interaction data."
             })),
         ),
     }
@@ -299,7 +265,9 @@ fn customer_exists_by_local_id(
 
 /// POST /api/interaction/profile/:customerId/override — human override
 /// (spec #22, #45, #56): takes precedence over AI inference. Only the
-/// response preference is overridable (reference interactions.ts:93-109).
+/// response preference is overridable (reference interactions.ts:93-109);
+/// the decision is recorded through the reference's `setHumanOverride`
+/// (deactivate-previous + record + materialize on the preference row).
 pub async fn set_override(
     State(state): State<AppState>,
     Path(customer_id): Path<String>,
@@ -364,29 +332,43 @@ pub async fn set_override(
     let b = body.unwrap_or_default();
     let value = b.get("value").and_then(Value::as_str).unwrap_or_default();
     let reason = b.get("reason").and_then(Value::as_str);
-    // Upsert the single override row per (customer, field).
-    let _ = conn.execute(
-        "INSERT INTO interaction_overrides (customer_id, field, value, reason)
-         VALUES (?1, 'response_preference', ?2, ?3)
-         ON CONFLICT (customer_id, field) DO UPDATE SET
-            value = excluded.value,
-            reason = excluded.reason,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-        rusqlite::params![customer_id, value, reason],
+    // The reference records the previously-effective value as the ai_value.
+    let effective = crate::interaction_engine::get_preferences(&conn, customer_id)
+        .unwrap_or_default()
+        .iter()
+        .find(|p| p.origin == "human_entered")
+        .map(|p| p.preference.clone());
+    let res = crate::interaction_engine::set_human_override(
+        &conn,
+        customer_id,
+        value,
+        effective.as_deref(),
+        reason,
     );
     let _ = crate::audit::audit(
         &conn,
         &crate::audit::AuditEntry::user("interaction_override_set:response_preference")
             .with_after_state(json!({ "value": value })),
     );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "message": "Human preference saved. It takes precedence over AI-inferred preferences."
-        })),
-    )
-        .into_response()
+    match res {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "message": "Human preference saved. It takes precedence over AI-inferred preferences."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// DELETE /api/interaction/profile/:customerId/override/:field — clear the
@@ -430,35 +412,31 @@ pub async fn clear_override(
         )
             .into_response();
     }
-    let removed = conn
-        .execute(
-            "DELETE FROM interaction_overrides
-             WHERE customer_id = ?1 AND field = 'response_preference'",
-            rusqlite::params![customer_id],
-        )
-        .unwrap_or(0)
-        > 0;
-    if !removed {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "statusCode": 404,
-                "error": "NotFound",
-                "message": "No override set for this customer."
-            })),
-        )
-            .into_response();
-    }
+    // The reference clears unconditionally (interactions.ts:123-125) — the
+    // delete is idempotent and always reports success; the audit row lands
+    // either way.
+    let res = crate::interaction_engine::clear_human_override(&conn, customer_id);
     let _ = crate::audit::audit(
         &conn,
         &crate::audit::AuditEntry::user("interaction_override_cleared:response_preference"),
     );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "message": "Override removed. AI-inferred preferences (if any) apply again."
-        })),
-    )
-        .into_response()
+    match res {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "message": "Override removed. AI-inferred preferences (if any) apply again."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
 }

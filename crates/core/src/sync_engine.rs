@@ -453,7 +453,10 @@ fn upsert_thread(conn: &Connection, conversation_local: i64, t: &HsThread) -> Re
             conversation_id = excluded.conversation_id, thread_type = excluded.thread_type,
             state = excluded.state,
             body = excluded.body, actor_type = excluded.actor_type, actor_id = excluded.actor_id,
-            created_at = excluded.created_at",
+            created_at = excluded.created_at,
+            -- DB-05 (M18): threads resurrect on upsert too
+            -- (conversationRepo.ts:667 `deleted_at=NULL`).
+            deleted_at = NULL",
         params![conversation_local, t.kind, t.state, t.body, actor_type, actor_id, t.created_at, t.remote_id],
     )?;
     record_thread_event(conn, conversation_local, t, actor_type, actor_id)?;
@@ -2277,6 +2280,7 @@ mod tests {
                 id: None,
                 email: Some("boss@example.com".into()),
             }],
+            scheduled_for: None,
             attachments: vec![crate::helpscout::HsThreadAttachment {
                 remote_id: 61001,
                 filename: Some("report.pdf".into()),
@@ -2385,6 +2389,66 @@ mod tests {
             .unwrap();
         assert_eq!(state.as_deref(), Some("downloaded"), "download state kept");
         assert_eq!(path.as_deref(), Some("/tmp/x"), "local path kept");
+    }
+    #[test]
+    fn upsert_thread_resurrects_soft_deleted_threads() {
+        // DB-05 (M18): a soft-deleted thread that reappears remotely comes
+        // back to life (conversationRepo.ts:667 `deleted_at=NULL`).
+        let f = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+             VALUES (12345, 12345, 'active', 1, 301)",
+            [],
+        )
+        .unwrap();
+        let conv_local: i64 = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = 12345",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let t = crate::helpscout::HsThread {
+            remote_id: 61234,
+            conversation_id: 12345,
+            kind: "customer".into(),
+            state: Some("published".into()),
+            body: Some("resurrect me".into()),
+            created_by_customer_id: Some(301),
+            created_at: Some("2026-01-01T10:00:00Z".into()),
+            ..Default::default()
+        };
+        upsert_thread(&conn, conv_local, &t).unwrap();
+        conn.execute(
+            "UPDATE conversation_threads SET deleted_at = datetime('now') WHERE remote_id = 61234",
+            [],
+        )
+        .unwrap();
+        let hidden: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_threads
+                  WHERE remote_id = 61234 AND deleted_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hidden, 1, "soft-deleted first");
+        upsert_thread(&conn, conv_local, &t).unwrap();
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_threads
+                  WHERE remote_id = 61234 AND deleted_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1, "the re-synced thread resurrects in place");
     }
 
     /// SY-05 (C8): the demo world's customers carry emails/phones/properties —

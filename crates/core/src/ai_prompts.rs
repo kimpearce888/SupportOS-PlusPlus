@@ -553,6 +553,141 @@ pub fn truncate(s: &str, n: usize) -> &str {
     }
 }
 
+/// A Stage-2 change input (dimension + baseline/current values + flag).
+pub struct InteractionChangeInput {
+    pub dimension: String,
+    pub baseline_value: Option<String>,
+    pub current_value: Option<String>,
+    pub significant: bool,
+}
+
+// ─── Client Interaction Intelligence user prompts (prompts.ts:171-224) ────
+
+/// Reference `buildInteractionObservationUser` (prompts.ts:171-189) — Stage 1
+/// input: client framing, current-ticket customer messages (thread-id
+/// stamped), the recency-weighted baseline summary and recent previous
+/// tickets for context.
+pub fn build_interaction_observation_user(
+    customer_name: &str,
+    client_kind: &str,
+    current_messages: &[(String, Option<i64>)],
+    baseline_summary: Option<&str>,
+    recent_history: &[(i64, Option<&str>, &str)],
+) -> String {
+    let mut out = format!(
+        "Client: {customer_name} ({})\n\nCURRENT TICKET customer messages:\n",
+        if client_kind == "returning" {
+            "returning client"
+        } else {
+            "first-time client"
+        }
+    );
+    let msgs = current_messages
+        .iter()
+        .map(|(text, tid)| {
+            format!(
+                "[thread {}] {}",
+                tid.map(|i| i.to_string()).unwrap_or_else(|| "?".into()),
+                text.chars().take(900).collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    out.push_str(&msgs);
+    out.push('\n');
+    out.push('\n');
+    match baseline_summary {
+        Some(b) => out.push_str(&format!(
+            "HISTORICAL BASELINE (observed, recency-weighted):\n{b}\n"
+        )),
+        None => out.push_str(
+            "No historical baseline exists (first-time client). Do NOT claim any historical pattern.\n",
+        ),
+    }
+    if !recent_history.is_empty() {
+        let hist = recent_history
+            .iter()
+            .map(|(number, subject, excerpt)| {
+                format!(
+                    "#{number} {}: {}",
+                    subject.unwrap_or(""),
+                    excerpt.chars().take(200).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push_str(&format!(
+            "\nRECENT PREVIOUS TICKETS (for context):\n{hist}\n"
+        ));
+    }
+    out.push_str(
+        "\nAnalyze observable communication behavior for support purposes. Signal what is happening in THIS interaction; only mention a historical pattern if the baseline above supports it.",
+    );
+    out
+}
+
+/// Reference `buildInteractionRecommendationUser` (prompts.ts:206-224) —
+/// Stage 2 input: client kind, stored signals, baseline changes, preferences,
+/// repeat-issue flag and the effort score so far.
+pub fn build_interaction_recommendation_user(
+    client_kind: &str,
+    current_signals: &[(String, String, String)],
+    changes: &[InteractionChangeInput],
+    // The reference declares baselineSummary on the input type but its
+    // template renders only the CHANGES section — kept for signature parity.
+    _baseline_summary: Option<&str>,
+    preferences: &[(String, String)],
+    repeat_issue: bool,
+    effort_score: Option<f64>,
+) -> String {
+    let mut out = format!("Client kind: {client_kind}\n\nCURRENT INTERACTION SIGNALS:\n");
+    let sigs = current_signals
+        .iter()
+        .map(|(d, v, c)| format!("- {d}: {v} (confidence {c})"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push_str(&sigs);
+    out.push_str("\n\n");
+    if changes.is_empty() {
+        out.push_str("No baseline comparison available.\n");
+    } else {
+        let ch = changes
+            .iter()
+            .map(|c| {
+                format!(
+                    "- {}: {} -> {}{}",
+                    c.dimension,
+                    c.baseline_value.as_deref().unwrap_or("\u{2014}"),
+                    c.current_value.as_deref().unwrap_or("\u{2014}"),
+                    if c.significant { " [SIGNIFICANT]" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push_str(&format!("CHANGES VS HISTORICAL BASELINE:\n{ch}\n"));
+    }
+    if !preferences.is_empty() {
+        let prefs = preferences
+            .iter()
+            .map(|(p, o)| format!("- {p} ({o})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push_str(&format!(
+            "\nOBSERVED PREFERENCES (human-entered overrides take precedence):\n{prefs}\n"
+        ));
+    }
+    if repeat_issue {
+        out.push_str(
+            "\nNOTE: this appears to be a RECURRING unresolved issue for this client \u{2014} review previous cases before replying.\n",
+        );
+    }
+    if let Some(score) = effort_score {
+        out.push_str(&format!("Customer effort score so far: {score}/10.\n"));
+    }
+    out.push_str("\nRecommend a support approach for this conversation.");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -183,7 +183,7 @@ pub struct HsCustomerPropertyValue {
 /// (provider.ts:135) — the v1.3.0 channel fields (`type`, source
 /// attribution) and the snooze/thread-count fields land with serde defaults
 /// so older payloads still deserialize.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct HsConversation {
     pub remote_id: i64,
     pub number: i64,
@@ -228,6 +228,25 @@ pub struct HsConversation {
     /// `tags: [{name}]`; the port models the names).
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Custom-field values (reference `customFields`: fieldId/value/text/
+    /// systemType; replaced wholesale by `updateCustomFields`). Populated by
+    /// the fake provider's write and the real provider's v2 GET.
+    #[serde(default, rename = "fields")]
+    pub custom_fields: Vec<HsCustomFieldValue>,
+}
+
+/// A conversation custom-field value (reference `HsConversation
+/// ['customFields'][]`: `{fieldId, value, text?, systemType?}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct HsCustomFieldValue {
+    #[serde(rename = "fieldId")]
+    pub field_id: i64,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub system_type: Option<String>,
 }
 
 /// A paginated response page.
@@ -416,6 +435,10 @@ pub struct HsThread {
     /// SY-05 (C8): thread attachment metadata.
     #[serde(default)]
     pub attachments: Vec<HsThreadAttachment>,
+    /// SY-10: the scheduled-send time (`scheduleThread` writes it; a
+    /// scheduled draft publishes at this time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_for: Option<String>,
 }
 
 /// A user's availability status (email/chat).
@@ -668,6 +691,131 @@ pub trait HelpScoutProvider: Send + Sync {
     /// Reset the provider's state (Fake only; Real is a no-op).
     /// Used by tests to get a clean slate.
     fn reset(&self) {}
+
+    // -----------------------------------------------------------------
+    // SY-10: the remaining documented v2 write operations + the health /
+    // routing reads (provider.ts:407-423). Default impls keep bounded
+    // implementors compiling; the Fake and Real providers override all.
+    // -----------------------------------------------------------------
+
+    /// PUT `/v2/conversations/:id/tags` — replace the tag set (provider.ts
+    /// `updateTags`). The caller computes the complete desired state.
+    async fn update_tags(&self, _conversation_id: i64, _tags: Vec<String>) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "update_tags is not supported by this provider".into(),
+        ))
+    }
+
+    /// PUT `/v2/conversations/:id/fields` — replace custom fields
+    /// (provider.ts `updateCustomFields`; null values send as '').
+    async fn update_custom_fields(
+        &self,
+        _conversation_id: i64,
+        _fields: Vec<(i64, Option<String>)>,
+    ) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "update_custom_fields is not supported by this provider".into(),
+        ))
+    }
+
+    /// PUT `/v2/conversations/:id/snooze` (provider.ts `snoozeConversation`).
+    async fn snooze_conversation(
+        &self,
+        _conversation_id: i64,
+        _snoozed_until: String,
+        _unsnooze_on_customer_reply: bool,
+    ) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "snooze_conversation is not supported by this provider".into(),
+        ))
+    }
+
+    /// DELETE `/v2/conversations/:id/snooze` (provider.ts
+    /// `unsnoozeConversation`).
+    async fn unsnooze_conversation(&self, _conversation_id: i64) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "unsnooze_conversation is not supported by this provider".into(),
+        ))
+    }
+
+    /// PUT `/v2/conversations/:id/threads/:tid/schedule` (provider.ts
+    /// `scheduleThread`; sendAsCreator stays false).
+    async fn schedule_thread(
+        &self,
+        _conversation_id: i64,
+        _thread_id: i64,
+        _scheduled_for: String,
+        _unschedule_on_customer_reply: bool,
+    ) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "schedule_thread is not supported by this provider".into(),
+        ))
+    }
+
+    /// PATCH `.../threads/:tid/schedule` — publish now (provider.ts
+    /// `publishScheduledThread`).
+    async fn publish_scheduled_thread(
+        &self,
+        _conversation_id: i64,
+        _thread_id: i64,
+    ) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "publish_scheduled_thread is not supported by this provider".into(),
+        ))
+    }
+
+    /// DELETE `.../threads/:tid/schedule` — keep the draft, drop the send
+    /// time (provider.ts `deleteThreadSchedule`).
+    async fn delete_thread_schedule(&self, _conversation_id: i64, _thread_id: i64) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "delete_thread_schedule is not supported by this provider".into(),
+        ))
+    }
+
+    /// POST `/v2/workflows/:wid/run` with `{conversationIds: [id]}`
+    /// (provider.ts `runWorkflow` — HelpScoutWorkflowService.run).
+    async fn run_workflow(&self, _workflow_id: i64, _conversation_id: i64) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "run_workflow is not supported by this provider".into(),
+        ))
+    }
+
+    /// GET `/v2/conversations/:id/attachments/:aid/data` — base64 wire data
+    /// decoded to bytes (provider.ts `getAttachmentData`; 404 → None).
+    async fn get_attachment_data(
+        &self,
+        _conversation_id: i64,
+        _thread_id: i64,
+        _attachment_id: i64,
+    ) -> Result<Option<AttachmentData>> {
+        Ok(None)
+    }
+
+    /// GET `/v2/mailboxes/:id/routing` (provider.ts
+    /// `getRoutingConfiguration`; 404 → None).
+    async fn get_routing_configuration(
+        &self,
+        _mailbox_id: i64,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    /// Health check: one cheap authenticated call (provider.ts `ping` —
+    /// the real provider calls `get_me`).
+    async fn ping(&self) -> Result<bool> {
+        Err(crate::error::Error::Other(
+            "ping is not supported by this provider".into(),
+        ))
+    }
+}
+
+/// Attachment bytes returned by [`HelpScoutProvider::get_attachment_data`]
+/// (provider.ts `getAttachmentData` return).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachmentData {
+    pub data: Vec<u8>,
+    pub mime_type: Option<String>,
+    pub filename: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1946,6 +2094,7 @@ impl WorldBuilder {
             thread_count: 0,
             merged_into: None,
             tags: opts.tags.iter().map(|t| (*t).into()).collect(),
+            custom_fields: Vec::new(),
         };
         self.conversations.push(c);
         remote_id
@@ -1982,6 +2131,7 @@ impl WorldBuilder {
             thread_count: 0,
             merged_into: None,
             tags: opts.tags.iter().map(|t| (*t).into()).collect(),
+            custom_fields: Vec::new(),
         };
         self.conversations.push(c);
         remote_id
@@ -2160,6 +2310,34 @@ impl FakeHelpScoutProvider {
     }
 
     /// Lock the world mutex (poison-recovering).
+    /// Test-only world read (SY-10 fake-write assertions).
+    #[cfg(test)]
+    pub(crate) fn snapshot_world<R>(&self, f: impl FnOnce(&FakeWorld) -> R) -> R {
+        let guard = self.lock_world();
+        f(&guard)
+    }
+
+    /// Test-only: attach metadata to a world thread (the V3 wire mapping does
+    /// this for the real provider; the demo world seeds no thread
+    /// attachments). Returns the (thread, conversation) remote ids the
+    /// fixture should key on.
+    #[cfg(test)]
+    pub(crate) fn seed_thread_attachment(
+        &self,
+        att_remote: i64,
+        filename: &str,
+    ) -> Option<(i64, i64)> {
+        let mut guard = self.lock_world();
+        let t = guard.threads.first_mut()?;
+        t.attachments.push(crate::helpscout::HsThreadAttachment {
+            remote_id: att_remote,
+            filename: Some(filename.into()),
+            mime_type: Some("application/pdf".into()),
+            size: Some(1234),
+        });
+        Some((t.remote_id, t.conversation_id))
+    }
+
     fn lock_world(&self) -> std::sync::MutexGuard<'_, FakeWorld> {
         self.world.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -2721,6 +2899,7 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             thread_count: 1,
             merged_into: None,
             tags: input.tags.clone(),
+            custom_fields: Vec::new(),
         };
         world.conversations.push(conv);
 
@@ -2744,6 +2923,220 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             number: next_number,
             thread_id: next_thread_remote,
         })
+    }
+
+    // -----------------------------------------------------------------
+    // SY-10: the remaining documented v2 write operations + health/routing
+    // reads (fakeProvider.ts:448-528) — the demo world behaves like the
+    // remote; writes land here first, then the ops layer persists locally.
+    // -----------------------------------------------------------------
+
+    async fn update_tags(&self, conversation_id: i64, tags: Vec<String>) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let world: &mut FakeWorld = &mut guard;
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conversation_id)
+        else {
+            return Err(not_found_remote("PUT"));
+        };
+        conv.tags = tags;
+        // fakeProvider.ts stamps userUpdatedAt on tag writes.
+        conv.updated_at = Some(now);
+        Ok(true)
+    }
+
+    async fn update_custom_fields(
+        &self,
+        conversation_id: i64,
+        fields: Vec<(i64, Option<String>)>,
+    ) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let world: &mut FakeWorld = &mut guard;
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conversation_id)
+        else {
+            return Err(not_found_remote("PUT"));
+        };
+        // Replacement semantics, but system fields are preserved when
+        // omitted (fakeProvider.ts:459-468 documented behavior).
+        let preserved_system: Vec<crate::helpscout::HsCustomFieldValue> = conv
+            .custom_fields
+            .iter()
+            .filter(|f| f.system_type.is_some() && !fields.iter().any(|(id, _)| *id == f.field_id))
+            .cloned()
+            .collect();
+        conv.custom_fields = preserved_system;
+        for (id, value) in fields {
+            let def = world.fields.iter().find(|d| d.remote_id == id);
+            let value_str = value.unwrap_or_default();
+            let text = def
+                .and_then(|d| {
+                    d.options
+                        .iter()
+                        .find(|o| o.id.to_string() == value_str)
+                        .map(|o| o.label.clone())
+                })
+                .unwrap_or_else(|| value_str.clone());
+            conv.custom_fields
+                .push(crate::helpscout::HsCustomFieldValue {
+                    field_id: id,
+                    value: Some(value_str),
+                    text: Some(text),
+                    system_type: def.and_then(|d| d.system_type.clone()),
+                });
+        }
+        conv.updated_at = Some(now);
+        Ok(true)
+    }
+
+    async fn snooze_conversation(
+        &self,
+        conversation_id: i64,
+        snoozed_until: String,
+        _unsnooze_on_customer_reply: bool,
+    ) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conversation_id)
+        else {
+            return Err(not_found_remote("PUT"));
+        };
+        conv.snoozed_until = Some(snoozed_until);
+        Ok(true)
+    }
+
+    async fn unsnooze_conversation(&self, conversation_id: i64) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conversation_id)
+        else {
+            return Err(not_found_remote("DELETE"));
+        };
+        conv.snoozed_until = None;
+        Ok(true)
+    }
+
+    async fn schedule_thread(
+        &self,
+        conversation_id: i64,
+        thread_id: i64,
+        scheduled_for: String,
+        _unschedule_on_customer_reply: bool,
+    ) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let Some(t) = world.threads.iter_mut().find(|t| t.remote_id == thread_id) else {
+            return Err(not_found_remote("PUT"));
+        };
+        t.scheduled_for = Some(scheduled_for);
+        t.state = Some("scheduled".into());
+        let _ = conversation_id;
+        Ok(true)
+    }
+
+    async fn publish_scheduled_thread(&self, conversation_id: i64, thread_id: i64) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let Some(t) = world.threads.iter_mut().find(|t| t.remote_id == thread_id) else {
+            return Err(not_found_remote("PATCH"));
+        };
+        t.state = Some("published".into());
+        let _ = conversation_id;
+        Ok(true)
+    }
+
+    async fn delete_thread_schedule(&self, conversation_id: i64, thread_id: i64) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let Some(t) = world.threads.iter_mut().find(|t| t.remote_id == thread_id) else {
+            return Err(not_found_remote("DELETE"));
+        };
+        t.state = Some("draft".into());
+        t.scheduled_for = None;
+        let _ = conversation_id;
+        Ok(true)
+    }
+
+    async fn run_workflow(&self, workflow_id: i64, conversation_id: i64) -> Result<bool> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let wf = world.workflows.iter().find(|w| w.remote_id == workflow_id);
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conversation_id)
+        else {
+            return Err(not_found_remote("POST"));
+        };
+        if wf.is_none() {
+            return Err(not_found_remote("POST"));
+        }
+        // fakeProvider.ts: a "Tier 1" workflow assigns user 1001.
+        if wf.unwrap().name.contains("Tier 1") {
+            conv.assignee_id = Some(1001);
+            conv.assignee_type = Some("user".into());
+        }
+        Ok(true)
+    }
+
+    async fn get_attachment_data(
+        &self,
+        conversation_id: i64,
+        thread_id: i64,
+        attachment_id: i64,
+    ) -> Result<Option<crate::helpscout::AttachmentData>> {
+        let guard = self.lock_world();
+        let world: &FakeWorld = &guard;
+        let t = world.threads.iter().find(|x| {
+            x.conversation_id == conversation_id
+                && x.attachments.iter().any(|a| a.remote_id == attachment_id)
+        });
+        let att = t.and_then(|t| t.attachments.iter().find(|a| a.remote_id == attachment_id));
+        let Some(att) = att else {
+            return Ok(None);
+        };
+        let content = format!(
+            "Simulated attachment content for {} (thread {})\nGenerated by FakeHelpScoutProvider.\n",
+            att.filename.clone().unwrap_or_default(),
+            thread_id
+        );
+        Ok(Some(crate::helpscout::AttachmentData {
+            data: content.into_bytes(),
+            mime_type: att.mime_type.clone(),
+            filename: att.filename.clone(),
+        }))
+    }
+
+    async fn get_routing_configuration(
+        &self,
+        mailbox_id: i64,
+    ) -> Result<Option<serde_json::Value>> {
+        let guard = self.lock_world();
+        let world: &FakeWorld = &guard;
+        Ok(Some(serde_json::json!({
+            "state": "enabled",
+            "assignmentLimit": 10,
+            "assignmentMethod": "round_robin",
+            "userIds": world.users.iter().map(|u| u.remote_id).collect::<Vec<_>>(),
+            "rotation": [],
+            "mailboxId": mailbox_id,
+        })))
+    }
+
+    async fn ping(&self) -> Result<bool> {
+        Ok(true)
     }
 }
 
@@ -3095,5 +3488,213 @@ mod tests {
         // getRating by remote id resolves the same rows.
         let r605 = p.get_rating(605).await.unwrap().unwrap();
         assert_eq!(r605.customer_name.as_deref(), Some("Daniel Kim"));
+    }
+
+    // ---- SY-10: fake-provider write semantics (fakeProvider.ts:448-528) ----
+
+    fn first_conv_remote(p: &FakeHelpScoutProvider) -> i64 {
+        p.snapshot_world(|w| w.conversations[0].remote_id)
+    }
+
+    #[tokio::test]
+    async fn update_tags_replaces_the_world_tag_set() {
+        let p = provider();
+        let rid = first_conv_remote(&p);
+        assert!(p
+            .update_tags(rid, vec!["billing".into(), "vip".into()])
+            .await
+            .unwrap());
+        let tags = p.snapshot_world(|w| {
+            w.conversations
+                .iter()
+                .find(|c| c.remote_id == rid)
+                .unwrap()
+                .tags
+                .clone()
+        });
+        assert_eq!(tags, vec!["billing".to_string(), "vip".to_string()]);
+        // Unknown conversation: the remote-style 404.
+        assert!(p.update_tags(999_999, vec![]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_custom_fields_preserves_system_fields() {
+        let p = provider();
+        let rid = first_conv_remote(&p);
+        // Seed a system field + a user field on the conversation.
+        {
+            let mut guard = p.lock_world();
+            let conv = guard
+                .conversations
+                .iter_mut()
+                .find(|c| c.remote_id == rid)
+                .unwrap();
+            conv.custom_fields = vec![
+                crate::helpscout::HsCustomFieldValue {
+                    field_id: 900,
+                    value: Some("topic".into()),
+                    text: None,
+                    system_type: Some("topics".into()),
+                },
+                crate::helpscout::HsCustomFieldValue {
+                    field_id: 901,
+                    value: Some("old".into()),
+                    text: None,
+                    system_type: None,
+                },
+            ];
+        }
+        assert!(p
+            .update_custom_fields(rid, vec![(901, Some("new".into()))])
+            .await
+            .unwrap());
+        let fields = p.snapshot_world(|w| {
+            w.conversations
+                .iter()
+                .find(|c| c.remote_id == rid)
+                .unwrap()
+                .custom_fields
+                .clone()
+        });
+        // System field preserved (not in the change set), user field replaced.
+        assert!(fields
+            .iter()
+            .any(|f| f.field_id == 900 && f.value.as_deref() == Some("topic")));
+        assert!(fields
+            .iter()
+            .any(|f| f.field_id == 901 && f.value.as_deref() == Some("new")));
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn snooze_lifecycle_sets_and_clears_snoozed_until() {
+        let p = provider();
+        let rid = first_conv_remote(&p);
+        assert!(p
+            .snooze_conversation(rid, "2026-01-01T09:00:00Z".into(), true)
+            .await
+            .unwrap());
+        assert_eq!(
+            p.snapshot_world(|w| w
+                .conversations
+                .iter()
+                .find(|c| c.remote_id == rid)
+                .unwrap()
+                .snoozed_until
+                .clone()),
+            Some("2026-01-01T09:00:00Z".to_string())
+        );
+        assert!(p.unsnooze_conversation(rid).await.unwrap());
+        assert_eq!(
+            p.snapshot_world(|w| w
+                .conversations
+                .iter()
+                .find(|c| c.remote_id == rid)
+                .unwrap()
+                .snoozed_until
+                .clone()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_schedule_lifecycle_states() {
+        let p = provider();
+        let (rid, tid) =
+            p.snapshot_world(|w| (w.threads[0].conversation_id, w.threads[0].remote_id));
+        assert!(p
+            .schedule_thread(rid, tid, "2026-01-02T10:00:00Z".into(), true)
+            .await
+            .unwrap());
+        assert_eq!(
+            p.snapshot_world(|w| (
+                w.threads[0].state.clone(),
+                w.threads[0].scheduled_for.clone()
+            )),
+            (
+                Some("scheduled".into()),
+                Some("2026-01-02T10:00:00Z".into())
+            )
+        );
+        assert!(p.publish_scheduled_thread(rid, tid).await.unwrap());
+        assert_eq!(
+            p.snapshot_world(|w| w.threads[0].state.clone()),
+            Some("published".into())
+        );
+        assert!(p.delete_thread_schedule(rid, tid).await.unwrap());
+        assert_eq!(
+            p.snapshot_world(|w| (
+                w.threads[0].state.clone(),
+                w.threads[0].scheduled_for.clone()
+            )),
+            (Some("draft".into()), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_workflow_tier1_assigns_user_1001() {
+        let p = provider();
+        let (rid, wid) =
+            p.snapshot_world(|w| (w.conversations[0].remote_id, w.workflows[0].remote_id));
+        assert!(p.run_workflow(wid, rid).await.unwrap());
+        if p.snapshot_world(|w| w.workflows[0].name.contains("Tier 1")) {
+            let assignee = p.snapshot_world(|w| {
+                w.conversations
+                    .iter()
+                    .find(|c| c.remote_id == rid)
+                    .unwrap()
+                    .assignee_id
+            });
+            assert_eq!(assignee, Some(1001));
+        }
+        // Unknown workflow or conversation: 404.
+        assert!(p.run_workflow(999_999, rid).await.is_err());
+        assert!(p.run_workflow(wid, 999_999).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_attachment_data_serves_simulated_content() {
+        let p = provider();
+        // The demo world carries no thread attachments (the reference's
+        // fakeData seeds none either) — seed one on the first thread like
+        // the V3 wire mapping would.
+        let (rid, tid, aid) = {
+            let mut guard = p.lock_world();
+            let t = guard.threads.first_mut().unwrap();
+            t.attachments.push(crate::helpscout::HsThreadAttachment {
+                remote_id: 555_001,
+                filename: Some("invoice.pdf".into()),
+                mime_type: Some("application/pdf".into()),
+                size: Some(1024),
+            });
+            (t.conversation_id, t.remote_id, 555_001)
+        };
+        let data = p
+            .get_attachment_data(rid, tid, aid)
+            .await
+            .unwrap()
+            .expect("simulated content");
+        assert!(String::from_utf8_lossy(&data.data).contains("Simulated attachment content"));
+        // Unknown attachment: None (the remote-style 404 degrade).
+        assert!(p
+            .get_attachment_data(rid, tid, 999_999)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn get_routing_configuration_serves_round_robin_shape() {
+        let p = provider();
+        let cfg = p.get_routing_configuration(1).await.unwrap().unwrap();
+        assert_eq!(cfg["state"], serde_json::json!("enabled"));
+        assert_eq!(cfg["assignmentMethod"], serde_json::json!("round_robin"));
+        assert!(cfg["userIds"].as_array().is_some_and(|a| !a.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn ping_answers_true() {
+        let p = provider();
+        assert!(p.ping().await.unwrap());
     }
 }

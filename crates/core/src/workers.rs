@@ -1339,42 +1339,84 @@ impl WorkerManager {
     }
 
     /// `download_recent_attachments` (attachments queue): download up to 100
-    /// pending attachment rows. The fake provider's downloads land with
-    /// deterministic bytes; the real provider has no attachment-fetch support
-    /// yet (the SY-10 provider gap) — those rows stay pending and the job
-    /// completes with a trace note instead of fabricating content.
+    /// pending attachment rows through the PROVIDER boundary (SY-10 — the
+    /// fake provider serves simulated content, the real provider decodes the
+    /// v2 `/attachments/:id/data` wire; real-provider rows no longer stay
+    /// pending).
     async fn run_attachment_downloads(&self) {
-        let ids: Vec<i64> = {
+        let rows: Vec<(i64, i64, Option<i64>, Option<i64>)> = {
             let conn = self.lock();
             let Ok(mut stmt) = conn.prepare(
-                "SELECT id FROM attachments
-                  WHERE state IS NULL OR state NOT IN ('downloaded')
-                  ORDER BY id DESC LIMIT 100",
+                "SELECT a.id, a.conversation_id, a.thread_id, a.remote_id
+                   FROM attachments a
+                   JOIN conversations c ON c.id = a.conversation_id
+                  WHERE (a.state IS NULL OR a.state NOT IN ('downloaded'))
+                    AND c.deleted_at IS NULL
+                  ORDER BY a.id DESC LIMIT 100",
             ) else {
                 return;
             };
-            stmt.query_map([], |r| r.get(0))
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default()
         };
-        if ids.is_empty() {
-            return;
-        }
-        if self.provider.kind() != "fake" {
-            tracing::info!(
-                count = ids.len(),
-                "Attachment download skipped: the real provider does not support attachment fetch yet"
-            );
+        if rows.is_empty() {
             return;
         }
         let attachments_dir = self.data_dir.join("attachments");
         let mut downloaded = 0usize;
-        for id in ids {
-            let conn = self.lock();
-            match crate::conversation_ops::download_attachment_to(&conn, &attachments_dir, id) {
-                Ok(_) => downloaded += 1,
-                Err(msg) => {
-                    tracing::warn!(attachment_id = id, error = %msg, "Attachment download failed");
+        for (id, conversation_id, thread_id, att_remote) in rows {
+            let (conv_remote, thread_remote): (i64, Option<i64>) = {
+                let conn = self.lock();
+                let conv: i64 = conn
+                    .query_row(
+                        "SELECT remote_id FROM conversations WHERE id = ?1",
+                        rusqlite::params![conversation_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let t: Option<i64> = thread_id.and_then(|tid| {
+                    conn.query_row(
+                        "SELECT remote_id FROM conversation_threads WHERE id = ?1",
+                        rusqlite::params![tid],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                });
+                (conv, t)
+            };
+            match self
+                .provider
+                .get_attachment_data(
+                    conv_remote,
+                    thread_remote.unwrap_or(0),
+                    att_remote.unwrap_or(0),
+                )
+                .await
+            {
+                Ok(Some(bytes)) => {
+                    let conn = self.lock();
+                    match crate::conversation_ops::persist_attachment_bytes(
+                        &conn,
+                        &attachments_dir,
+                        id,
+                        &bytes.data,
+                    ) {
+                        Ok(_) => downloaded += 1,
+                        Err(msg) => {
+                            tracing::warn!(attachment_id = id, error = %msg, "Attachment download failed");
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let conn = self.lock();
+                    crate::conversation_ops::set_attachment_state(&conn, id, "failed", None, None);
+                    tracing::warn!(attachment_id = id, "Attachment no longer available");
+                }
+                Err(e) => {
+                    let conn = self.lock();
+                    crate::conversation_ops::set_attachment_state(&conn, id, "failed", None, None);
+                    tracing::warn!(attachment_id = id, error = %e, "Attachment download failed");
                 }
             }
         }
@@ -1382,9 +1424,10 @@ impl WorkerManager {
     }
 
     /// `bulk_{action}` jobs (api queue, one per conversation): execute the
-    /// action against the provider + local mirror. `tag`/`untag` are local
-    /// mirror writes (the provider trait has no tag-write method — the SY-10
-    /// gap, same as the automation add_tag path).
+    /// action against the provider + local mirror. SY-10: tag/untag now run
+    /// the reference's fresh-read-merge-write through the provider's
+    /// `update_tags` (MAIN bulk_tag -> operations.updateTags) instead of a
+    /// local-only mirror write.
     async fn execute_bulk_action(&self, action: &str, payload: &serde_json::Value) -> Result<()> {
         use crate::helpscout::ConversationPatch;
         let Some(conv_id) = payload.get("conversationId").and_then(|v| v.as_i64()) else {
@@ -1407,17 +1450,31 @@ impl WorkerManager {
                 let Some(tag) = payload.get("tag").and_then(|v| v.as_str()) else {
                     return Err(Error::Other(format!("bulk_{action} missing tag").into()));
                 };
+                // SY-10: fresh-read-merge-write through the provider
+                // (operations.ts updateTags:269-303) — the fake world AND the
+                // real v2 API both receive the complete desired tag set.
+                let remote = self.provider.get_conversation(remote_id).await?;
+                let current = remote.as_ref().map(|r| r.tags.clone()).unwrap_or_default();
+                let mut tags = current;
+                if action == "tag" {
+                    if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                        tags.push(tag.to_string());
+                    }
+                } else {
+                    tags.retain(|t| !t.eq_ignore_ascii_case(tag));
+                }
+                self.provider.update_tags(remote_id, tags).await?;
                 {
                     let conn = self.lock();
-                    let mut tags = crate::conversation_ops::read_conversation_tags(&conn, conv_id);
+                    let mut local = crate::conversation_ops::read_conversation_tags(&conn, conv_id);
                     if action == "tag" {
-                        if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
-                            tags.push(tag.to_string());
+                        if !local.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                            local.push(tag.to_string());
                         }
                     } else {
-                        tags.retain(|t| !t.eq_ignore_ascii_case(tag));
+                        local.retain(|t| !t.eq_ignore_ascii_case(tag));
                     }
-                    crate::conversation_ops::write_conversation_tags(&conn, conv_id, &tags);
+                    crate::conversation_ops::write_conversation_tags(&conn, conv_id, &local);
                 }
             }
             "assign" | "unassign" | "status" | "close" => {
@@ -2444,22 +2501,42 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attachment_download_job_downloads_pending_rows() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (shared, manager) = demo_worker(&tmp.path().join("wk03-att.db"), tmp.path()).await;
+        // SY-10: the download now goes through the PROVIDER boundary — the
+        // fixture seeds a world-thread attachment (like the V3 wire mapping
+        // would), syncs it into the mirror, then the job fetches the
+        // simulated content through the fake provider.
+        let fake = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo());
+        let (thread_remote, _conv_remote) = fake
+            .seed_thread_attachment(5001, "invoice.pdf")
+            .expect("a world thread");
+        let mut conn = crate::db::open(&tmp.path().join("wk03-att.db")).expect("open DB");
+        crate::bootstrap::apply_all(&mut conn).expect("apply all migrations");
+        let shared = Arc::new(Mutex::new(conn));
+        let provider = fake.clone() as Arc<dyn crate::helpscout::HelpScoutProvider>;
+        let engine = Arc::new(SyncEngine::new(shared.clone(), provider.clone()));
+        engine.initial_sync().await.expect("demo initial sync");
+        let manager = WorkerManager::new(
+            shared.clone(),
+            Some(engine),
+            provider,
+            EventBus::new(64),
+            tmp.path().to_path_buf(),
+            None,
+        );
         {
             let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
-            let conv: i64 = conn
+            let row: Option<i64> = conn
                 .query_row(
-                    "SELECT id FROM conversations WHERE deleted_at IS NULL ORDER BY id LIMIT 1",
+                    "SELECT id FROM attachments WHERE remote_id = 5001",
                     [],
                     |r| r.get(0),
                 )
-                .unwrap();
-            conn.execute(
-                "INSERT INTO attachments (remote_id, conversation_id, filename, mime_type, size, state)
-                 VALUES (5001, ?1, 'invoice.pdf', 'application/pdf', 1234, 'metadata')",
-                rusqlite::params![conv],
-            )
-            .unwrap();
+                .ok();
+            // SY-05: the sync already mirrored the attachment metadata (with
+            // its thread linkage) — the old fixture inserted a threadless row
+            // no provider could ever serve.
+            assert!(row.is_some(), "the synced attachment is in the mirror");
+            let _ = thread_remote;
         }
 
         let id = run_job(
@@ -2483,9 +2560,12 @@ mod tests {
         assert_eq!(state, "downloaded");
         let path = path.expect("local path recorded");
         assert!(std::path::Path::new(&path).exists(), "file on disk: {path}");
+        assert!(hash.is_some_and(|h| h.len() == 64), "sha256 recorded");
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
         assert!(
-            hash.as_deref().is_some_and(|h| h.len() == 64),
-            "sha256 recorded"
+            text.contains("Simulated attachment content for invoice.pdf"),
+            "the fake provider's simulated content: {text}"
         );
     }
 

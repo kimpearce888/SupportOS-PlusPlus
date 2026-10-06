@@ -972,6 +972,22 @@ impl RealHelpScoutProvider {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // SY-10: custom-field values (v2 `fields` / the reference's
+            // `customFields`). Present on single-conversation GETs; absent on
+            // list pages — the empty default keeps list mapping unchanged.
+            custom_fields: v["fields"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|f| crate::helpscout::HsCustomFieldValue {
+                            field_id: f["id"].as_i64().unwrap_or(0),
+                            value: f["value"].as_str().map(String::from),
+                            text: f["label"].as_str().map(String::from),
+                            system_type: f["systemType"].as_str().map(String::from),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -1099,6 +1115,7 @@ impl RealHelpScoutProvider {
             to: recipients("to"),
             cc: recipients("cc"),
             attachments,
+            scheduled_for: v["scheduledFor"].as_str().map(|s| s.to_string()),
         }
     }
 
@@ -1753,6 +1770,192 @@ impl HelpScoutProvider for RealHelpScoutProvider {
             thread_id,
         })
     }
+
+    // -----------------------------------------------------------------
+    // SY-10: the remaining documented v2 write operations + health/routing
+    // reads (realProvider.ts:367-420 + services.ts:346-349, 571-583). All
+    // match the reference wire exactly (including the workflow run body
+    // `conversationIds: [...]` — the port's old inline route call sent
+    // `conversationId`, which Help Scout ignored).
+    // -----------------------------------------------------------------
+
+    async fn update_tags(&self, conversation_id: i64, tags: Vec<String>) -> Result<bool> {
+        self.request(
+            &format!("/v2/conversations/{conversation_id}/tags"),
+            "PUT",
+            Some(json!({ "tags": tags })),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn update_custom_fields(
+        &self,
+        conversation_id: i64,
+        fields: Vec<(i64, Option<String>)>,
+    ) -> Result<bool> {
+        let body = json!({
+            "fields": fields
+                .iter()
+                .map(|(id, value)| json!({ "id": id, "value": value.clone().unwrap_or_default() }))
+                .collect::<Vec<_>>()
+        });
+        self.request(
+            &format!("/v2/conversations/{conversation_id}/fields"),
+            "PUT",
+            Some(body),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn snooze_conversation(
+        &self,
+        conversation_id: i64,
+        snoozed_until: String,
+        unsnooze_on_customer_reply: bool,
+    ) -> Result<bool> {
+        self.request(
+            &format!("/v2/conversations/{conversation_id}/snooze"),
+            "PUT",
+            Some(json!({
+                "snoozedUntil": snoozed_until,
+                "unsnoozeOnCustomerReply": unsnooze_on_customer_reply,
+            })),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn unsnooze_conversation(&self, conversation_id: i64) -> Result<bool> {
+        self.request(
+            &format!("/v2/conversations/{conversation_id}/snooze"),
+            "DELETE",
+            None,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn schedule_thread(
+        &self,
+        conversation_id: i64,
+        thread_id: i64,
+        scheduled_for: String,
+        unschedule_on_customer_reply: bool,
+    ) -> Result<bool> {
+        self.request(
+            &format!("/v2/conversations/{conversation_id}/threads/{thread_id}/schedule"),
+            "PUT",
+            Some(json!({
+                "scheduledFor": scheduled_for,
+                "unscheduleOnCustomerReply": unschedule_on_customer_reply,
+                "sendAsCreator": false,
+            })),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn publish_scheduled_thread(&self, conversation_id: i64, thread_id: i64) -> Result<bool> {
+        self.request(
+            &format!("/v2/conversations/{conversation_id}/threads/{thread_id}/schedule"),
+            "PATCH",
+            Some(json!({ "op": "replace", "path": "/state", "value": "published" })),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn delete_thread_schedule(&self, conversation_id: i64, thread_id: i64) -> Result<bool> {
+        self.request(
+            &format!("/v2/conversations/{conversation_id}/threads/{thread_id}/schedule"),
+            "DELETE",
+            None,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn run_workflow(&self, workflow_id: i64, conversation_id: i64) -> Result<bool> {
+        // HelpScoutWorkflowService.run (services.ts:346-349): the body is
+        // `conversationIds: [...]`.
+        self.request(
+            &format!("/v2/workflows/{workflow_id}/run"),
+            "POST",
+            Some(json!({ "conversationIds": [conversation_id] })),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn get_attachment_data(
+        &self,
+        conversation_id: i64,
+        _thread_id: i64,
+        attachment_id: i64,
+    ) -> Result<Option<crate::helpscout::AttachmentData>> {
+        // HelpScoutAttachmentService.getData (services.ts:571-583): the
+        // wire carries base64 `data`; 404 degrades to None. The thread id
+        // is part of the provider contract but not the v2 URL.
+        match self
+            .request(
+                &format!("/v2/conversations/{conversation_id}/attachments/{attachment_id}/data"),
+                "GET",
+                None,
+            )
+            .await
+        {
+            Ok(v) => {
+                let Some(data) = v["data"].as_str() else {
+                    return Ok(None);
+                };
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| {
+                        crate::error::Error::Other(format!("attachment data: {e}").into())
+                    })?;
+                Ok(Some(crate::helpscout::AttachmentData {
+                    data: bytes,
+                    mime_type: None,
+                    filename: None,
+                }))
+            }
+            Err(e) => {
+                if crate::helpscout_real::hs_status(&e) == Some(404) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    async fn get_routing_configuration(
+        &self,
+        mailbox_id: i64,
+    ) -> Result<Option<serde_json::Value>> {
+        match self
+            .request(&format!("/v2/mailboxes/{mailbox_id}/routing"), "GET", None)
+            .await
+        {
+            Ok(v) => Ok(Some(v)),
+            Err(e) => {
+                if crate::helpscout_real::hs_status(&e) == Some(404) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    async fn ping(&self) -> Result<bool> {
+        // realProvider.ts ping(): one cheap authenticated call.
+        self.get_me().await?;
+        Ok(true)
+    }
 }
 
 impl RealHelpScoutProvider {
@@ -1988,25 +2191,38 @@ mod tests {
             });
             let app = {
                 let api = api.clone();
-                axum::Router::new().fallback(move |uri: axum::http::Uri| {
-                    let api = api.clone();
-                    async move {
-                        {
-                            let mut reqs = api.requests.lock().unwrap();
-                            let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-                            reqs.push(format!("{}{q}", uri.path()));
-                        }
-                        let body = {
-                            let mut resps = api.responses.lock().unwrap();
-                            if resps.is_empty() {
-                                json!({})
-                            } else {
-                                resps.remove(0)
+                axum::Router::new().fallback(
+                    move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                        let api = api.clone();
+                        async move {
+                            {
+                                let mut reqs = api.requests.lock().unwrap();
+                                let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+                                let mut line = format!("{}{q}", uri.path());
+                                // SY-10 wire tests assert request BODIES;
+                                // GETs record exactly like before (no body
+                                // suffix) so the read-path assertions are
+                                // untouched.
+                                if !body.is_empty() {
+                                    line.push_str(&format!(
+                                        " BODY {}",
+                                        String::from_utf8_lossy(&body)
+                                    ));
+                                }
+                                reqs.push(line);
                             }
-                        };
-                        axum::Json(body)
-                    }
-                })
+                            let body = {
+                                let mut resps = api.responses.lock().unwrap();
+                                if resps.is_empty() {
+                                    json!({})
+                                } else {
+                                    resps.remove(0)
+                                }
+                            };
+                            axum::Json(body)
+                        }
+                    },
+                )
             };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -2320,6 +2536,147 @@ mod tests {
                     "/v3/system-users?cursor=SUNEXT".to_string(),
                 ],
                 "system users come from /v3/system-users (C5), not /v2/users?status=system"
+            );
+        }
+
+        // ---- SY-10: write-method wire contract -----------------------------
+        // Every method must hit the reference's exact v2 path + body (the
+        // mock records path and body; response payloads are irrelevant for
+        // writes — a 2xx empty object is the documented success shape).
+
+        #[tokio::test]
+        async fn update_tags_puts_the_complete_set() {
+            let (base, api) = spawn_mock(vec![json!({})]).await;
+            let p = provider(&base);
+            assert!(p
+                .update_tags(42, vec!["billing".into(), "vip".into()])
+                .await
+                .expect("update_tags"));
+            assert_eq!(
+                recorded(&api),
+                vec![r#"/v2/conversations/42/tags BODY {"tags":["billing","vip"]}"#.to_string()],
+                "PUT /tags with the complete desired set (realProvider.ts:367-370)"
+            );
+        }
+
+        #[tokio::test]
+        async fn update_custom_fields_sends_empty_string_for_null() {
+            let (base, api) = spawn_mock(vec![json!({})]).await;
+            let p = provider(&base);
+            assert!(p
+                .update_custom_fields(42, vec![(5, Some("x".into())), (9, None)])
+                .await
+                .expect("update_custom_fields"));
+            assert_eq!(
+                recorded(&api),
+                vec![
+                    r#"/v2/conversations/42/fields BODY {"fields":[{"id":5,"value":"x"},{"id":9,"value":""}]}"#
+                        .to_string()
+                ],
+                "PUT /fields — null values send as '' (realProvider.ts:371-378)"
+            );
+        }
+
+        #[tokio::test]
+        async fn snooze_and_unsnooze_wire() {
+            let (base, api) = spawn_mock(vec![json!({}), json!({})]).await;
+            let p = provider(&base);
+            assert!(p
+                .snooze_conversation(42, "2026-01-01T09:00:00Z".into(), true)
+                .await
+                .expect("snooze"));
+            assert!(p.unsnooze_conversation(42).await.expect("unsnooze"));
+            assert_eq!(
+                recorded(&api),
+                vec![
+                    r#"/v2/conversations/42/snooze BODY {"snoozedUntil":"2026-01-01T09:00:00Z","unsnoozeOnCustomerReply":true}"#
+                        .to_string(),
+                    "/v2/conversations/42/snooze".to_string(),
+                ],
+                "PUT then DELETE /snooze (realProvider.ts:379-390)"
+            );
+        }
+
+        #[tokio::test]
+        async fn thread_schedule_lifecycle_wire() {
+            let (base, api) = spawn_mock(vec![json!({}), json!({}), json!({})]).await;
+            let p = provider(&base);
+            assert!(p
+                .schedule_thread(42, 7, "2026-01-02T10:00:00Z".into(), true)
+                .await
+                .expect("schedule"));
+            assert!(p.publish_scheduled_thread(42, 7).await.expect("publish"));
+            assert!(p.delete_thread_schedule(42, 7).await.expect("delete"));
+            assert_eq!(
+                recorded(&api),
+                vec![
+                    r#"/v2/conversations/42/threads/7/schedule BODY {"scheduledFor":"2026-01-02T10:00:00Z","unscheduleOnCustomerReply":true,"sendAsCreator":false}"#
+                        .to_string(),
+                    r#"/v2/conversations/42/threads/7/schedule BODY {"op":"replace","path":"/state","value":"published"}"#
+                        .to_string(),
+                    "/v2/conversations/42/threads/7/schedule".to_string(),
+                ],
+                "PUT -> PATCH (JSON-patch publish) -> DELETE on .../threads/:id/schedule (realProvider.ts:391-410)"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_workflow_sends_conversation_ids_array() {
+            let (base, api) = spawn_mock(vec![json!({})]).await;
+            let p = provider(&base);
+            assert!(p.run_workflow(3, 42).await.expect("run_workflow"));
+            assert_eq!(
+                recorded(&api),
+                vec![r#"/v2/workflows/3/run BODY {"conversationIds":[42]}"#.to_string()],
+                "POST /workflows/:id/run with conversationIds: [...] (services.ts:347 — the                  port's old inline route call sent `conversationId`, which Help Scout ignores)"
+            );
+        }
+
+        #[tokio::test]
+        async fn get_attachment_data_decodes_base64_wire() {
+            use base64::Engine;
+            let payload = base64::engine::general_purpose::STANDARD.encode("attachment bytes");
+            let (base, api) = spawn_mock(vec![json!({ "data": payload })]).await;
+            let p = provider(&base);
+            let data = p
+                .get_attachment_data(42, 7, 9)
+                .await
+                .expect("get_attachment_data")
+                .expect("some bytes");
+            assert_eq!(data.data, b"attachment bytes".to_vec());
+            assert_eq!(
+                recorded(&api),
+                vec!["/v2/conversations/42/attachments/9/data".to_string()],
+                "GET /v2/conversations/:id/attachments/:aid/data (services.ts:575)"
+            );
+        }
+
+        #[tokio::test]
+        async fn get_routing_configuration_reads_v2_routing() {
+            let (base, api) = spawn_mock(vec![json!({ "state": "enabled" })]).await;
+            let p = provider(&base);
+            let routing = p
+                .get_routing_configuration(7)
+                .await
+                .expect("routing")
+                .expect("some config");
+            assert_eq!(routing["state"], json!("enabled"));
+            assert_eq!(
+                recorded(&api),
+                vec!["/v2/mailboxes/7/routing".to_string()],
+                "GET /v2/mailboxes/:id/routing (realProvider.ts:163-167)"
+            );
+        }
+
+        #[tokio::test]
+        async fn ping_runs_one_authenticated_call() {
+            let (base, api) = spawn_mock(vec![json!({ "id": 77 })]).await;
+            let p = provider(&base);
+            assert!(p.ping().await.expect("ping"));
+            assert_eq!(
+                recorded(&api),
+                vec!["/v2/users/me".to_string()],
+                "ping = one get_me call (realProvider.ts:417-420)"
             );
         }
     }

@@ -69,6 +69,7 @@ pub mod incident_workspace;
 pub mod intelligence;
 pub mod intelligence_features;
 pub mod interaction_current;
+pub mod interaction_engine;
 pub mod issue_impact;
 pub mod jobs;
 pub mod knowledge_store;
