@@ -560,3 +560,199 @@ async fn side_thread_create_matches_the_reference_contract() {
         .expect("invalid conversation id");
     assert_eq!(r.status().as_u16(), 422);
 }
+
+/// CL-04: POST /api/side-threads/:id/participants — insert
+/// side_thread_participants rows with existence checks
+/// (sideThreadRepo.ts:173-186) — live HTTP against the real server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn side_thread_participants_add_matches_the_reference_contract() {
+    const PORT: u16 = 3993;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().to_path_buf();
+    let db_path = data_dir.join("supportos-plusplus.db");
+    let mut conn = spp_core::db::open(&db_path).expect("open DB");
+    spp_core::bootstrap::apply_all(&mut conn).expect("apply all migrations");
+
+    // Fixtures: two users + a conversation + one side thread with user 2 as
+    // its only initial participant.
+    conn.execute_batch(
+        "INSERT INTO users (id, remote_id, first_name, last_name, mention, email) VALUES
+             (1, 501, 'Ada',  'Lovelace', 'ada',   'ada@example.com'),
+             (2, 502, 'Grace', 'Hopper',  'grace', 'grace@example.com');
+         INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+             VALUES (9, 100001, 4242, 'Refund question', 1, 1, 'active');
+         INSERT INTO side_threads (id, conversation_id, title, created_by_user_id)
+             VALUES (30, 9, 'Refund question', 1);
+         INSERT INTO side_thread_participants (side_thread_id, user_local_id, added_by_user_local_id)
+             VALUES (30, 2, 1);",
+    )
+    .expect("seed fixtures");
+
+    let http_conn = Arc::new(Mutex::new(conn));
+    let bus = spp_core::http::EventBus::default();
+    let provider = Arc::new(spp_core::helpscout::FakeHelpScoutProvider::new_demo())
+        as Arc<dyn spp_core::helpscout::HelpScoutProvider>;
+    let sync = Arc::new(
+        spp_core::sync_engine::SyncEngine::new(http_conn.clone(), provider).with_bus(bus.clone()),
+    );
+    let qdrant = spp_core::http::server::AppState::qdrant_from_settings(
+        &http_conn.lock().unwrap_or_else(|p| p.into_inner()),
+        &data_dir,
+    );
+    let state = spp_core::http::server::AppState {
+        conn: http_conn.clone(),
+        data_dir: data_dir.clone(),
+        port: PORT,
+        host: "127.0.0.1".to_string(),
+        demo_mode: true,
+        bus,
+        limiter: spp_core::http::RateLimiter::new(),
+        sync: Some(sync),
+        real: None,
+        provider_kind: "fake".to_string(),
+        workers: None,
+        qdrant,
+    };
+    let server = spp_core::http::HttpServer::new(state);
+    tokio::spawn(async move {
+        if let Err(e) = server.serve().await {
+            eprintln!("HTTP server failed: {e}");
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest client");
+    let base = format!("http://127.0.0.1:{PORT}");
+    let up = Instant::now();
+    while up.elapsed() < Duration::from_secs(15) {
+        if client
+            .get(format!("{base}/api/side-threads/30"))
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // ── 1. Adding a new user inserts the row with the auditor ──────────────
+    let r = client
+        .post(format!("{base}/api/side-threads/30/participants"))
+        .json(&serde_json::json!({"userIds": [1], "addedByUserId": 2}))
+        .send()
+        .await
+        .expect("add participant");
+    assert_eq!(r.status().as_u16(), 200);
+    let body: Value = r.json().await.expect("add body");
+    assert_eq!(body["ok"], serde_json::json!(true));
+    assert_eq!(body["added"].as_array().expect("added").len(), 1);
+    assert_eq!(body["added"][0], serde_json::json!(1));
+    {
+        let conn = http_conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (added_by,): (Option<i64>,) = conn
+            .query_row(
+                "SELECT added_by_user_local_id FROM side_thread_participants
+                 WHERE side_thread_id = 30 AND user_local_id = 1",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .expect("added_by row");
+        assert_eq!(added_by, Some(2));
+    }
+
+    // ── 2. The detail route now serves both participants ───────────────────
+    let r = client
+        .get(format!("{base}/api/side-threads/30"))
+        .send()
+        .await
+        .expect("detail probe");
+    assert_eq!(r.status().as_u16(), 200);
+    let detail: Value = r.json().await.expect("detail body");
+    assert_eq!(
+        detail["side_thread"]["participants"]
+            .as_array()
+            .expect("participants")
+            .len(),
+        2
+    );
+
+    // ── 3. Duplicate add is idempotent (no second row, ok: true) ──────────
+    let r = client
+        .post(format!("{base}/api/side-threads/30/participants"))
+        .json(&serde_json::json!({"userIds": [1]}))
+        .send()
+        .await
+        .expect("duplicate add");
+    assert_eq!(r.status().as_u16(), 200);
+    let body: Value = r.json().await.expect("dup body");
+    assert_eq!(body["ok"], serde_json::json!(true));
+    assert_eq!(
+        body["added"].as_array().expect("added"),
+        &Vec::<serde_json::Value>::new(),
+        "nothing newly added"
+    );
+    {
+        let conn = http_conn.lock().unwrap_or_else(|p| p.into_inner());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM side_thread_participants WHERE side_thread_id = 30",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 2);
+    }
+
+    // ── 4. Unknown user -> 422, nothing written ────────────────────────────
+    let r = client
+        .post(format!("{base}/api/side-threads/30/participants"))
+        .json(&serde_json::json!({"userIds": [55]}))
+        .send()
+        .await
+        .expect("unknown participant");
+    assert_eq!(r.status().as_u16(), 422);
+    let body: Value = r.json().await.expect("422 body");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("Unknown user"),
+        "{}",
+        body
+    );
+
+    // ── 5. Unknown thread 404; invalid id 422; empty/missing list 422 ──────
+    let r = client
+        .post(format!("{base}/api/side-threads/999999/participants"))
+        .json(&serde_json::json!({"userIds": [1]}))
+        .send()
+        .await
+        .expect("unknown thread");
+    assert_eq!(r.status().as_u16(), 404);
+    let r = client
+        .post(format!("{base}/api/side-threads/0/participants"))
+        .json(&serde_json::json!({"userIds": [1]}))
+        .send()
+        .await
+        .expect("invalid thread id");
+    assert_eq!(r.status().as_u16(), 422);
+    let r = client
+        .post(format!("{base}/api/side-threads/30/participants"))
+        .json(&serde_json::json!({"userIds": []}))
+        .send()
+        .await
+        .expect("empty list");
+    assert_eq!(r.status().as_u16(), 422);
+    let body: Value = r.json().await.expect("422 body");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("userIds: Required"),
+        "{}",
+        body
+    );
+}

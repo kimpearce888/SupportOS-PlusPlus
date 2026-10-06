@@ -257,13 +257,78 @@ pub async fn reopen(State(state): State<AppState>, Path(id): Path<i64>) -> Json<
     Json(json!({"ok": true}))
 }
 
-/// POST /api/side-threads/:id/participants
+/// POST /api/side-threads/:id/participants — reference
+/// sideThreadRepo.ts:173-186 (CL-04): insert `side_thread_participants`
+/// rows with existence checks. Body: `{ userIds: [local user ids] }` (the
+/// reference wire name; `user_ids` / `participant_user_ids` are accepted
+/// for the port UI's snake_case convention) plus an optional
+/// `addedByUserId`. Unknown users or an unknown thread 422/404.
 pub async fn add_participants(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(_body): Json<Value>,
-) -> Json<Value> {
-    Json(json!({"ok": true, "threadId": id}))
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    if id <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "id must be a positive integer."
+            })),
+        );
+    }
+    let Json(body) = body.unwrap_or(Json(Value::Null));
+    let user_ids: Vec<i64> = ["userIds", "user_ids", "participant_user_ids"]
+        .iter()
+        .find_map(|k| {
+            body.get(*k)
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_i64()).collect::<Vec<i64>>())
+        })
+        .unwrap_or_default();
+    if user_ids.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "userIds: Required and must be a non-empty array of user ids."
+            })),
+        );
+    }
+    let added_by = ["addedByUserId", "added_by_user_local_id"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(|v| v.as_i64()));
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let thread_exists = conn
+        .query_row(
+            "SELECT 1 FROM side_threads WHERE id = ?1",
+            rusqlite::params![id],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !thread_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Side thread not found."
+            })),
+        );
+    }
+    match crate::side_threads::add_participants_checked(&conn, id, &user_ids, added_by) {
+        Ok(inserted) => (StatusCode::OK, Json(json!({"ok": true, "added": inserted}))),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": e.to_string()
+            })),
+        ),
+    }
 }
 
 /// GET /api/mention-directory
