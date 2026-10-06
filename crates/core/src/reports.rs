@@ -564,8 +564,9 @@ fn attribute_unknown_expr() -> &'static str {
 /// - reference `remote_created_at` → port `conversations.created_at`
 /// - `customer_local_id`/`mailbox_local_id`/`assignee_local_id` → `customer_id`/
 ///   `mailbox_id`/`assignee_id`
-/// - `threads` → `conversation_threads` (`type` → `thread_type`, no
-///   state/deleted_at columns to filter on)
+/// - `threads` → `conversation_threads` (`type` → `thread_type`;
+///   `deleted_at` + `state` filtered like the reference since the mirror
+///   carries both columns)
 /// - `client_support_outcomes` → `friction_scores` (effort_score; high
 ///   friction = effort_score >= 0.6 per HIGH_FRICTION_THRESHOLD)
 /// - `known_issue_conversations`/`issue_cluster_conversations` →
@@ -621,7 +622,11 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
             from: "conversation_threads t JOIN conversations c ON c.id = t.conversation_id",
             date_expr: "t.created_at",
             value_expr: "COUNT(*)",
-            extra_where: &["t.thread_type = 'reply'"],
+            extra_where: &[
+                "t.thread_type = 'reply'",
+                "t.deleted_at IS NULL",
+                "t.state = 'published'",
+            ],
             requires_attribute: false,
             requires_state: false,
             total_only: false,
@@ -631,7 +636,11 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
             from: "conversation_threads t JOIN conversations c ON c.id = t.conversation_id",
             date_expr: "t.created_at",
             value_expr: "COUNT(*)",
-            extra_where: &["t.thread_type = 'customer_message'"],
+            extra_where: &[
+                "t.thread_type = 'customer_message'",
+                "t.deleted_at IS NULL",
+                "t.state = 'published'",
+            ],
             requires_attribute: false,
             requires_state: false,
             total_only: false,
@@ -799,12 +808,9 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
 }
 
 /// The dimension spec table, mapped onto the port's schema. The port's
-/// `teams` table carries no membership (it comes from the Help Scout
-/// provider at runtime) so the `team` dimension groups everything into
-/// '(no team)' — exactly what the reference produces when no team
-/// membership exists. The port's conversations mirror carries no channel
-/// column, so `channel` groups everything into '(unknown channel)' — what
-/// the reference produces when every source_type is NULL/empty.
+/// `teams` membership comes from the Help Scout provider at sync
+/// (`team_members`), and `channel` resolves via `source_type` — both
+/// expressions mirror the reference reportBuilder dimension SQL.
 fn dimension_spec(dimension: ReportDimensionKey) -> DimensionSpec {
     const NO_JOINS: &[&str] = &[];
     match dimension {
@@ -834,11 +840,11 @@ fn dimension_spec(dimension: ReportDimensionKey) -> DimensionSpec {
             joins: NO_JOINS,
         },
         ReportDimensionKey::Channel => DimensionSpec {
-            // No channel column in the port's mirror: every conversation
-            // carries the '(unknown channel)' label, like the reference over
-            // a mirror with NULL source_type.
-            expr: "'(unknown channel)'",
-            group_by: "'(unknown channel)'",
+            // Channel via `source_type` — the same expression the reference
+            // groups by (reportBuilder.ts:177); a NULL/empty source_type
+            // carries the '(unknown channel)' label.
+            expr: "COALESCE(NULLIF(c.source_type, ''), '(unknown channel)')",
+            group_by: "COALESCE(NULLIF(c.source_type, ''), '(unknown channel)')",
             joins: NO_JOINS,
         },
         ReportDimensionKey::Tag => DimensionSpec {
@@ -855,9 +861,14 @@ fn dimension_spec(dimension: ReportDimensionKey) -> DimensionSpec {
             joins: NO_JOINS,
         },
         ReportDimensionKey::Team => DimensionSpec {
-            // No team_members table: everything groups into '(no team)'.
-            expr: "'(no team)'",
-            group_by: "'(no team)'",
+            // MAIN groups on `c.assigned_team_local_id`; the port's
+            // conversations mirror carries no assigned-team column, so the
+            // team resolves through `team_members` of the assignee (the
+            // membership the sync populates) — the same resolution MAIN's
+            // report builder uses for its `team` dimension
+            // (reportBuilder.ts:184-187).
+            expr: "COALESCE((SELECT tm2.name FROM team_members tm JOIN teams tm2 ON tm2.id = tm.team_id WHERE tm.user_id = c.assignee_id LIMIT 1), '(no team)')",
+            group_by: "COALESCE((SELECT tm.team_id FROM team_members tm WHERE tm.user_id = c.assignee_id LIMIT 1), -1)",
             joins: NO_JOINS,
         },
         ReportDimensionKey::Status => DimensionSpec {
@@ -935,11 +946,10 @@ fn apply_conversation_filters(
     if let Some(channel) = &f.channel {
         let trimmed = channel.trim();
         if !trimmed.is_empty() {
-            // The port's conversations mirror carries no channel column, so a
-            // channel filter matches nothing — identical to the reference
-            // running against a mirror where every source_type is NULL.
-            where_sql.push("1 = 0".to_string());
-            params.push(SqlParam::Text(trimmed.to_lowercase()));
+            // Channel via source_type (reference applyConversationFilters,
+            // reportBuilder.ts:381-383).
+            where_sql.push("LOWER(COALESCE(c.source_type, '')) = LOWER(?)".to_string());
+            params.push(SqlParam::Text(trimmed.to_string()));
         }
     }
     if let Some(tags) = &f.tags_any {

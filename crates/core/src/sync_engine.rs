@@ -537,11 +537,13 @@ fn record_thread_event(
         return Ok(None); // drafts/scheduled replies are not history yet
     }
     let kind = t.kind.as_str();
-    let (event_type, actor_type) = match kind {
-        "note" => ("internal_note", "user"),
+    let (event_type, actor_type, event_actor_id): (&'static str, &str, Option<i64>) = match kind {
+        "note" => ("internal_note", "user", Some(actor_id)),
         "lineitem" => {
             // Help Scout action records — map conservatively; the raw text
-            // stays in the thread mirror.
+            // stays in the thread mirror. Reference vocabulary: lineitems are
+            // `system_user` actions with no resolvable actor id
+            // (activityRepo.recordThreadEvent).
             let text = t.body.as_deref().unwrap_or("").to_lowercase();
             let event_type = if text.contains("status") {
                 "status_changed"
@@ -554,15 +556,15 @@ fn record_thread_event(
             } else {
                 "lineitem_action"
             };
-            (event_type, "system")
+            (event_type, "system_user", None)
         }
         _ => {
             if t.created_by_customer_id.is_some() {
-                ("customer_message", actor_type)
+                ("customer_message", actor_type, Some(actor_id))
             } else if t.created_by_user_id.is_some() {
-                ("human_agent_message", actor_type)
+                ("human_agent_message", actor_type, Some(actor_id))
             } else {
-                ("customer_message", "unknown")
+                ("customer_message", "unknown", None)
             }
         }
     };
@@ -581,7 +583,7 @@ fn record_thread_event(
                 conversation_id: conversation_local,
                 event_type: event_type.into(),
                 actor_type: actor_type.into(),
-                actor_id: (actor_type != "unknown").then_some(actor_id),
+                actor_id: event_actor_id,
                 occurred_at: t.created_at.clone().unwrap_or_default(),
                 dedup_key: format!("thread:{}", t.remote_id),
             },

@@ -10,131 +10,448 @@ use axum::response::IntoResponse;
 
 /// GET /api/analytics/dashboard
 ///
-/// Reference response shape:
-/// ```json
-/// {
-///   "range": { "from": "...", "to": "..." },
-///   "new_conversations": N, "active_conversations": N,
-///   "pending_conversations": N, "closed_conversations": N,
-///   "unassigned": N, "backlog": N,
-///   "first_response_time_avg_min": null,
-///   "resolution_time_avg_min": null,
-///   "replies_sent": N,
-///   "ratings": { "great": N, "okay": N, "not-good": N },
-///   "by_mailbox": [], "by_tag": [], "by_agent": [], "by_team": [],
-///   "daily_new": [], "by_channel": [], "channel_metrics": [],
-///   "mailbox_comparison": [], "source": ["..."]
-/// }
-/// ```
+/// Reference `ctx.analytics.dashboard(from, to, scope)` (routes/analytics.ts:19-43
+/// + analyticsService.ts:32-201, audit M1 / AN-01): every one of the 20
+/// dashboard fields is computed deterministically from the Help Scout mirror
+/// by SQL — AI never computes numbers here.
+///
+/// Route contract:
+/// - `days` clamps 1..=3650 (fallback 30); `from`/`to` pass through verbatim
+///   when present (default `isoDaysAgo(days)` / now in `toISOString()` form).
+/// - `mailboxIds` = comma-separated LOCAL mailbox ids; empty tokens are
+///   dropped (`.filter(Boolean)`), any non-positive-integer token is a 422.
+/// - `channel` = 'email' or 'chat'; anything else is a 422.
+/// - Ratings scope joins back to conversations — ratings without a linked
+///   conversation cannot be attributed to a mailbox and are excluded from
+///   mailbox/channel-scoped counts.
+/// - Daily new counts are cached into `daily_metrics` (report snapshots).
+///
+/// Port schema mappings (documented renames):
+/// - `remote_created_at` -> `conversations.created_at`
+/// - `customer_local_id`/`mailbox_local_id`/`assignee_local_id` ->
+///   `customer_id`/`mailbox_id`/`assignee_id`
+/// - `threads` -> `conversation_threads` (`type` -> `thread_type`)
+/// - `first_activity_at` -> `COALESCE(c.first_customer_message_at, c.created_at)`
+///   (the port's M003-derived first customer message stands in for MAIN's
+///   first-activity marker)
+/// - backlog staleness reads `COALESCE(c.updated_at, c.created_at)` where MAIN
+///   reads `last_activity_at` (the port's `updated_at` mirrors the remote
+///   userUpdatedAt, bumped on every change)
+/// - `by_team`: MAIN groups on `c.assigned_team_local_id`; the port's
+///   conversations mirror carries no assigned-team column, so the team is
+///   resolved through `team_members` of the assignee — the same resolution
+///   MAIN's report-builder `team` dimension uses.
+/// - `mailbox_comparison`: MAIN filters `m.deleted_at IS NULL`; the port's
+///   mailboxes mirror has no deleted_at column (every synced mailbox is
+///   live), so the filter is omitted.
 pub async fn dashboard(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // clampDaysParam(q.days, 30, 1, 3650)
+    let days = clamp_days_param(params.get("days"), 30, 1, 3650);
+
+    // mailboxIds: split(',').map(trim).filter(Boolean).map(Number) — empty
+    // tokens are dropped on this route, then every remaining token must be a
+    // positive integer (analytics.ts:24-31).
+    let mailbox_tokens: Vec<Option<f64>> = params
+        .get("mailboxIds")
+        .filter(|s| !s.is_empty())
+        .map(|raw| {
+            raw.split(',')
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .map(crate::conversation_ops::js_number)
+                .collect::<Vec<Option<f64>>>()
+        })
+        .unwrap_or_default();
+    if mailbox_tokens
+        .iter()
+        .any(|id| id.is_none_or(|v| !v.is_finite() || v.fract() != 0.0 || v <= 0.0))
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "mailboxIds must be a comma-separated list of positive integers."
+            })),
+        )
+            .into_response();
+    }
+    let mailbox_ids: Vec<i64> = mailbox_tokens
+        .into_iter()
+        .map(|id| id.unwrap_or_default() as i64)
+        .collect();
+
+    // Channel scope: 'email' or 'chat' (Beacon); anything else is rejected.
+    let channel: Option<String> = match params.get("channel").filter(|s| !s.is_empty()) {
+        Some(c) if c == "email" || c == "chat" => Some(c.clone()),
+        Some(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "channel must be 'email' or 'chat'."
+                })),
+            )
+                .into_response();
+        }
+        None => None,
+    };
+
+    let from = params
+        .get("from")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| crate::business_hours::iso_days_ago(days));
+    let to = params
+        .get("to")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(crate::business_hours::now_iso_millis);
+
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let mailbox_id = params.get("mailboxId").and_then(|m| m.parse::<i64>().ok());
-    let days_back = params
-        .get("daysBack")
-        .and_then(|d| d.parse::<u32>().ok())
-        .unwrap_or(7);
-    let now = chrono::Utc::now();
-    let from = now - chrono::Duration::days(days_back as i64);
-    // Conversation status counts.
-    let active: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE status = 'active'",
-            [],
-            |r| r.get(0),
+
+    // --- scope fragments (safe: ids are sanitized integers) ---
+    let mailbox_in = if mailbox_ids.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " AND c.mailbox_id IN ({})",
+            mailbox_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )
-        .unwrap_or(0);
-    let pending: i64 = conn
+    };
+    let conv_channel = channel
+        .as_ref()
+        .map(|_| " AND c.type = ?3".to_string())
+        .unwrap_or_default();
+    // Ratings scope joins back to conversations (ratings carry
+    // conversation_id only).
+    let rating_channel = channel
+        .as_ref()
+        .map(|_| " AND c.type = ?3".to_string())
+        .unwrap_or_default();
+
+    // [from, to] (+ channel where its fragment is interpolated).
+    let range_params = |with_channel: bool| -> Vec<String> {
+        let mut p = vec![from.clone(), to.clone()];
+        if with_channel {
+            if let Some(c) = &channel {
+                p.push(c.clone());
+            }
+        }
+        p
+    };
+
+    // Conversation status counts (one scan, six SUM(CASE) columns).
+    let counts_sql = format!(
+        "SELECT
+          COALESCE(SUM(CASE WHEN c.created_at >= ?1 AND c.created_at <= ?2 THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN c.status = 'active' AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN c.status = 'pending' AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN c.closed_at IS NOT NULL AND c.closed_at >= ?1 AND c.closed_at <= ?2 THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN c.status IN ('active','pending') AND c.assignee_id IS NULL AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN c.status IN ('active','pending') AND (julianday('now') - COALESCE(julianday(c.updated_at), julianday(c.created_at))) >= 7 AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0)
+         FROM conversations c WHERE c.deleted_at IS NULL{mailbox_in}{conv_channel}"
+    );
+    let (
+        new_conversations,
+        active_conversations,
+        pending_conversations,
+        closed_conversations,
+        unassigned,
+        backlog,
+    ): (i64, i64, i64, i64, i64, i64) = conn
         .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE status = 'pending'",
-            [],
-            |r| r.get(0),
+            &counts_sql,
+            rusqlite::params_from_iter(range_params(channel.is_some())),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
-        .unwrap_or(0);
-    let closed: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE status = 'closed'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let new_convs: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE created_at >= ?1",
-            rusqlite::params![from.to_rfc3339()],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let unassigned: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE assignee_id IS NULL AND status = 'active'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let backlog: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE status = 'active' AND created_at < ?1",
-            rusqlite::params![from.to_rfc3339()],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+        .unwrap_or((0, 0, 0, 0, 0, 0));
+
+    // Replies sent: published, not-deleted reply threads in range.
     let replies_sent: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM conversation_threads WHERE thread_type = 'reply'",
-            [],
+            &format!(
+                "SELECT COUNT(*) FROM conversation_threads t
+                 JOIN conversations c ON c.id = t.conversation_id
+                 WHERE t.thread_type = 'reply' AND t.state = 'published' AND t.deleted_at IS NULL
+                   AND t.created_at >= ?1 AND t.created_at <= ?2{mailbox_in}{conv_channel}"
+            ),
+            rusqlite::params_from_iter(range_params(channel.is_some())),
             |r| r.get(0),
         )
         .unwrap_or(0);
-    // by_mailbox: count conversations per mailbox.
-    let by_mailbox: Vec<Value> = conn
-        .prepare(
-            "SELECT mailbox_id, COUNT(*) FROM conversations GROUP BY mailbox_id ORDER BY 2 DESC",
+
+    // First-response / resolution averages (calendar minutes, rounded).
+    let first_reply_join = "LEFT JOIN (SELECT conversation_id, MIN(created_at) AS first_reply FROM conversation_threads WHERE thread_type = 'reply' AND state = 'published' AND deleted_at IS NULL GROUP BY conversation_id) fr ON fr.conversation_id = c.id";
+    let first_response_avg_min: Option<f64> = conn
+        .query_row(
+            &format!(
+                "SELECT AVG((julianday(fr.first_reply) - julianday(COALESCE(c.first_customer_message_at, c.created_at))) * 1440)
+                 FROM conversations c
+                 {first_reply_join}
+                 WHERE c.created_at >= ?1 AND c.created_at <= ?2 AND c.deleted_at IS NULL{mailbox_in}{conv_channel}"
+            ),
+            rusqlite::params_from_iter(range_params(channel.is_some())),
+            |r| r.get(0),
         )
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
+        .unwrap_or(None);
+    let resolution_avg_min: Option<f64> = conn
+        .query_row(
+            &format!(
+                "SELECT AVG((julianday(c.closed_at) - julianday(COALESCE(c.first_customer_message_at, c.created_at))) * 1440)
+                 FROM conversations c
+                 WHERE c.closed_at IS NOT NULL AND c.closed_at >= ?1 AND c.closed_at <= ?2 AND c.deleted_at IS NULL{mailbox_in}{conv_channel}"
+            ),
+            rusqlite::params_from_iter(range_params(channel.is_some())),
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+
+    // Ratings by value (scoped through the linked conversation).
+    let (great, okay, not_good): (i64, i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT
+                   COALESCE(SUM(CASE WHEN r.rating = 'great' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN r.rating = 'okay' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN r.rating = 'not-good' THEN 1 ELSE 0 END), 0)
+                 FROM ratings r LEFT JOIN conversations c ON c.id = r.conversation_id
+                 WHERE r.remote_created_at >= ?1 AND r.remote_created_at <= ?2{mailbox_in}{rating_channel}"
+            ),
+            rusqlite::params_from_iter(range_params(channel.is_some())),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap_or((0, 0, 0));
+
+    // Grouped breakdowns (name + count rows).
+    let name_count_rows = |sql: &str, params: Vec<String>| -> Vec<Value> {
+        conn.prepare(sql)
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params_from_iter(params), |r| {
+                    Ok(json!({
+                        "name": r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        "count": r.get::<_, i64>(1)?,
+                    }))
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default()
+    };
+    // by_mailbox: mailbox breakdown is NOT mailbox-filtered (it IS
+    // channel-filtered) — a scope of one mailbox still shows every mailbox
+    // for comparison (reference behavior).
+    let by_mailbox = name_count_rows(
+        &format!(
+            "SELECT m.name AS name, COUNT(*) AS count FROM conversations c
+             JOIN mailboxes m ON m.id = c.mailbox_id
+             WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{conv_channel}
+             GROUP BY m.name ORDER BY count DESC"
+        ),
+        range_params(channel.is_some()),
+    );
+    let by_tag = name_count_rows(
+        &format!(
+            "SELECT t.name AS name, COUNT(*) AS count
+             FROM conversation_tags ct
+             JOIN tags t ON t.id = ct.tag_id
+             JOIN conversations c ON c.id = ct.conversation_id
+             WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{mailbox_in}{conv_channel}
+             GROUP BY t.name ORDER BY count DESC LIMIT 12"
+        ),
+        range_params(channel.is_some()),
+    );
+    let by_agent = name_count_rows(
+        &format!(
+            "SELECT TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name, COUNT(*) AS count
+             FROM conversations c JOIN users u ON u.id = c.assignee_id
+             WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{mailbox_in}{conv_channel}
+             GROUP BY u.id ORDER BY count DESC"
+        ),
+        range_params(channel.is_some()),
+    );
+    let by_team = name_count_rows(
+        &format!(
+            "SELECT tm.name AS name, COUNT(*) AS count
+             FROM conversations c
+             JOIN users u ON u.id = c.assignee_id
+             JOIN team_members tem ON tem.user_id = u.id
+             JOIN teams tm ON tm.id = tem.team_id
+             WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{mailbox_in}{conv_channel}
+             GROUP BY tm.id ORDER BY count DESC"
+        ),
+        range_params(channel.is_some()),
+    );
+
+    // Daily new conversations (cached for report snapshots below).
+    let daily_new: Vec<Value> = conn
+        .prepare(&format!(
+            "SELECT date(c.created_at) AS date, COUNT(*) AS value FROM conversations c
+             WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{mailbox_in}{conv_channel}
+             GROUP BY date(c.created_at) ORDER BY date"
+        ))
+        .and_then(|mut stmt| {
+            stmt.query_map(
+                rusqlite::params_from_iter(range_params(channel.is_some())),
+                |r| {
+                    Ok(json!({
+                        "date": r.get::<_, Option<String>>(0)?,
+                        "value": r.get::<_, i64>(1)?,
+                    }))
+                },
+            )
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    // Channel split + per-channel speed (not channel-filtered — they ARE the
+    // channel breakdown; only the mailbox scope applies).
+    let by_channel: Vec<Value> = conn
+        .prepare(&format!(
+            "SELECT COALESCE(c.type, 'unknown') AS channel, COUNT(*) AS count FROM conversations c
+             WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{mailbox_in}
+             GROUP BY COALESCE(c.type, 'unknown') ORDER BY count DESC"
+        ))
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params_from_iter(range_params(false)), |r| {
                 Ok(json!({
-                    "mailbox_id": r.get::<_, i64>(0)?,
+                    "channel": r.get::<_, Option<String>>(0)?.unwrap_or_else(|| "unknown".into()),
                     "count": r.get::<_, i64>(1)?,
                 }))
             })
-            .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
         })
         .unwrap_or_default();
-    let _ = mailbox_id;
+    let channel_metrics: Vec<Value> = conn
+        .prepare(&format!(
+            "SELECT COALESCE(c.type, 'unknown') AS channel, COUNT(*) AS count,
+                    AVG((julianday(fr.first_reply) - julianday(COALESCE(c.first_customer_message_at, c.created_at))) * 1440) AS first_response_avg_min,
+                    AVG((julianday(c.closed_at) - julianday(COALESCE(c.first_customer_message_at, c.created_at))) * 1440) AS resolution_avg_min
+             FROM conversations c
+             {first_reply_join}
+             WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{mailbox_in}
+             GROUP BY COALESCE(c.type, 'unknown') ORDER BY count DESC"
+        ))
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params_from_iter(range_params(false)), |r| {
+                Ok(json!({
+                    "channel": r.get::<_, Option<String>>(0)?.unwrap_or_else(|| "unknown".into()),
+                    "count": r.get::<_, i64>(1)?,
+                    "first_response_avg_min": r.get::<_, Option<f64>>(2)?.map(round_min),
+                    "resolution_avg_min": r.get::<_, Option<f64>>(3)?.map(round_min),
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    // Multi-mailbox comparison: one full KPI row per mailbox in scope.
+    let cmp_channel_join = channel.as_ref().map(|_| " AND c.type = ?3").unwrap_or("");
+    let cmp_channel_sub = channel.as_ref().map(|_| " AND c2.type = ?3").unwrap_or("");
+    let mailbox_comparison: Vec<Value> = conn
+        .prepare(&format!(
+            "SELECT m.id AS mailbox_id, m.name AS name,
+                    COALESCE(SUM(CASE WHEN c.created_at >= ?1 AND c.created_at <= ?2 THEN 1 ELSE 0 END), 0) AS new_conversations,
+                    COALESCE(SUM(CASE WHEN c.status = 'active' AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0) AS active_conversations,
+                    COALESCE(SUM(CASE WHEN c.closed_at IS NOT NULL AND c.closed_at >= ?1 AND c.closed_at <= ?2 THEN 1 ELSE 0 END), 0) AS closed_conversations,
+                    COALESCE(SUM(CASE WHEN c.status IN ('active','pending') AND (julianday('now') - COALESCE(julianday(c.updated_at), julianday(c.created_at))) >= 7 AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0) AS backlog,
+                    AVG((julianday(fr.first_reply) - julianday(COALESCE(c.first_customer_message_at, c.created_at))) * 1440) AS first_response_avg_min,
+                    AVG((julianday(c.closed_at) - julianday(COALESCE(c.first_customer_message_at, c.created_at))) * 1440) AS resolution_avg_min,
+                    (SELECT COUNT(*) FROM ratings r JOIN conversations c2 ON c2.id = r.conversation_id
+                      WHERE c2.mailbox_id = m.id AND r.rating = 'great' AND r.remote_created_at >= ?1 AND r.remote_created_at <= ?2{cmp_channel_sub}) AS great_ratings,
+                    (SELECT COUNT(*) FROM ratings r JOIN conversations c2 ON c2.id = r.conversation_id
+                      WHERE c2.mailbox_id = m.id AND r.remote_created_at >= ?1 AND r.remote_created_at <= ?2{cmp_channel_sub}) AS total_ratings
+             FROM mailboxes m
+             LEFT JOIN conversations c ON c.mailbox_id = m.id AND c.deleted_at IS NULL{cmp_channel_join}
+             {first_reply_join}
+             WHERE 1 = 1{mailbox_in}
+             GROUP BY m.id, m.name ORDER BY new_conversations DESC"
+        ))
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params_from_iter(range_params(channel.is_some())), |r| {
+                Ok(json!({
+                    "mailbox_id": r.get::<_, i64>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "new_conversations": r.get::<_, i64>(2)?,
+                    "active_conversations": r.get::<_, i64>(3)?,
+                    "closed_conversations": r.get::<_, i64>(4)?,
+                    "backlog": r.get::<_, i64>(5)?,
+                    "first_response_avg_min": r.get::<_, Option<f64>>(6)?.map(round_min),
+                    "resolution_avg_min": r.get::<_, Option<f64>>(7)?.map(round_min),
+                    "great_ratings": r.get::<_, i64>(8)?,
+                    "total_ratings": r.get::<_, i64>(9)?,
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    // Cache daily new metrics for report snapshots (upsertDailyMetric).
+    for point in &daily_new {
+        if let (Some(date), Some(value)) = (
+            point.get("date").and_then(|d| d.as_str()),
+            point.get("value").and_then(|v| v.as_i64()),
+        ) {
+            let _ = conn.execute(
+                "INSERT INTO daily_metrics (metric_key, date, value, updated_at)
+                 VALUES ('new_conversations', ?1, ?2, datetime('now'))
+                 ON CONFLICT(metric_key, date) DO UPDATE SET
+                   value = excluded.value, updated_at = excluded.updated_at",
+                rusqlite::params![date, value],
+            );
+        }
+    }
+
     (
         StatusCode::OK,
         Json(json!({
-            "range": {
-                "from": from.to_rfc3339(),
-                "to": now.to_rfc3339(),
-            },
-            "new_conversations": new_convs,
-            "active_conversations": active,
-            "pending_conversations": pending,
-            "closed_conversations": closed,
+            "range": { "from": from, "to": to },
+            "new_conversations": new_conversations,
+            "active_conversations": active_conversations,
+            "pending_conversations": pending_conversations,
+            "closed_conversations": closed_conversations,
             "unassigned": unassigned,
             "backlog": backlog,
-            "first_response_time_avg_min": null,
-            "resolution_time_avg_min": null,
+            "first_response_time_avg_min": first_response_avg_min.map(round_min),
+            "resolution_time_avg_min": resolution_avg_min.map(round_min),
             "replies_sent": replies_sent,
-            "ratings": { "great": 0, "okay": 0, "not-good": 0 },
+            "ratings": { "great": great, "okay": okay, "not-good": not_good },
             "by_mailbox": by_mailbox,
-            "by_tag": [],
-            "by_agent": [],
-            "by_team": [],
-            "daily_new": [],
-            "by_channel": [],
-            "channel_metrics": [],
-            "mailbox_comparison": [],
+            "by_tag": by_tag,
+            "by_agent": by_agent,
+            "by_team": by_team,
+            "daily_new": daily_new,
+            "by_channel": by_channel,
+            "channel_metrics": channel_metrics,
+            "mailbox_comparison": mailbox_comparison,
             "source": ["local"],
         })),
     )
+        .into_response()
+}
+
+/// `Math.round` on a minute average (dashboard/channel/mailbox-comparison
+/// fields keep MAIN's whole-minute rounding).
+fn round_min(v: f64) -> i64 {
+    v.round() as i64
 }
 
 /// GET /api/analytics/ai — AI run analytics (audit AI-21).

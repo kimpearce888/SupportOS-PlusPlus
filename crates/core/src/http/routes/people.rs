@@ -150,15 +150,18 @@ pub async fn customer_timeline(
     }
 }
 
-/// GET /api/customers/:id/support-health — the deterministic compute over
-/// the customer's real conversations (was a hardcoded `"unknown"`).
+/// GET /api/customers/:id/support-health — the no-score support-health
+/// report (audit M22 / AN-15; reference people.ts:98-106 +
+/// `SupportHealthService.forCustomer`): operational metrics + attention
+/// flags + incident exposure, each traceable to conversations, wrapped in
+/// the reference `{ report }` envelope.
 pub async fn customer_support_health(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match people_store::customer_support_health(&conn, id) {
-        Ok(Some(health)) => (StatusCode::OK, Json(health)).into_response(),
+        Ok(Some(report)) => (StatusCode::OK, Json(json!({ "report": report }))).into_response(),
         Ok(None) => not_found("Customer not found."),
         Err(e) => internal(e),
     }
@@ -251,15 +254,16 @@ pub async fn organization_timeline(
     }
 }
 
-/// GET /api/organizations/:id/support-health — the deterministic compute
-/// over the union of member conversations (was `"unknown"`).
+/// GET /api/organizations/:id/support-health — the no-score support-health
+/// report over the union of member conversations (reference people.ts:120-128
+/// + `SupportHealthService.forOrganization`), in the `{ report }` envelope.
 pub async fn organization_support_health(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match people_store::organization_support_health(&conn, id) {
-        Ok(Some(health)) => (StatusCode::OK, Json(health)).into_response(),
+        Ok(Some(report)) => (StatusCode::OK, Json(json!({ "report": report }))).into_response(),
         Ok(None) => not_found("Organization not found."),
         Err(e) => internal(e),
     }
@@ -874,12 +878,27 @@ mod tests {
         assert_eq!(body["organization"]["domains"], json!(["acme.com"]));
         let id = body["organization"]["id"].as_i64().unwrap();
 
-        // Support health: no conversations → unknown.
+        // Support health: the no-score report in the { report } envelope —
+        // metrics + flags + incident exposure, never a single verdict.
         let (status, health) =
             body_json(organization_support_health(State(state_clone(&state)), Path(id)).await)
                 .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(health["health"], json!("unknown"));
+        let report = &health["report"];
+        assert_eq!(report["subject_kind"], json!("organization"));
+        assert_eq!(report["subject_label"], json!("Acme"));
+        assert!(report.get("health").is_none(), "no verdict key by design");
+        assert!(
+            report["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["key"] == json!("support_volume_total")),
+            "metric set present: {}",
+            report["metrics"]
+        );
+        assert_eq!(report["flags"].as_array().unwrap().len(), 0);
+        assert_eq!(report["incident_exposure"].as_array().unwrap().len(), 0);
 
         // Rename keeps the shape; unknown id → 404.
         let (status, body) = body_json(

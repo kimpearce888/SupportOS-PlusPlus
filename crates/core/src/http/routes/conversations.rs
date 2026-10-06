@@ -738,39 +738,140 @@ fn parse_reply_body(
     Ok((text, draft, cc, bcc, status_after, assign_to))
 }
 
-/// GET /api/conversations/:id/events — activity events for a conversation.
-pub async fn events(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+/// GET /api/conversations/:id/events — the full event timeline for one
+/// conversation (v1.7.0; reference conversations.ts:265-272 +
+/// `activityRepo.listEvents`/`eventCounts`, audit AC-04): 404 when the
+/// conversation is not in the mirror; `limit` clamps 1..=1000 (fallback 200);
+/// every event carries its actor NAME resolved through
+/// users/customers/system_users by actor type, its metadata parsed from the
+/// stored JSON (non-objects collapse to `{}` like the reference `safeParse`),
+/// the thread link and the source; `counts` summarizes events per type for
+/// the UI chips.
+///
+/// Route shape (reference): `{ conversation_id, events, counts }`.
+pub async fn events(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    // clampListParam(q.limit, 200, 1, 1000): Number(value), NaN/garbage falls
+    // back to the default, then clamps [min, max] after truncation.
+    let limit: i64 = match params
+        .get("limit")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| crate::conversation_ops::js_number(s))
+    {
+        Some(n) if n.is_finite() => (n.trunc() as i64).clamp(1, 1000),
+        _ => 200,
+    };
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let mut stmt = match conn.prepare(
-        "SELECT id, conversation_id, event_type, actor_type, actor_id, occurred_at
-         FROM activity_events WHERE conversation_id = ?1 ORDER BY occurred_at ASC",
+
+    // 404 when the conversation is not in the mirror (reference
+    // repo.getConversationByLocalId — a plain existence check).
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM conversations WHERE id = ?1",
+            rusqlite::params![id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found locally."
+            })),
+        )
+            .into_response();
+    }
+
+    // Chronological timeline with actor names resolved (reference
+    // listEvents, activityRepo.ts:172-191).
+    let events: Vec<Value> = match conn.prepare(
+        "SELECT e.id, e.conversation_id, e.thread_local_id, e.event_type, e.actor_type, e.actor_id,
+                e.occurred_at, e.source, e.metadata, e.created_at,
+                CASE
+                  WHEN e.actor_type = 'user' THEN
+                    (SELECT TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, ''))
+                     FROM users u WHERE u.id = e.actor_id)
+                  WHEN e.actor_type = 'customer' THEN
+                    (SELECT TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, ''))
+                     FROM customers cu WHERE cu.id = e.actor_id)
+                  WHEN e.actor_type = 'system_user' THEN
+                    (SELECT TRIM(COALESCE(su.first_name, '') || ' ' || COALESCE(su.last_name, ''))
+                     FROM system_users su WHERE su.id = e.actor_id)
+                  ELSE NULL
+                END AS actor_name
+         FROM activity_events e
+         WHERE e.conversation_id = ?1
+         ORDER BY COALESCE(e.occurred_at, e.created_at) ASC, e.id ASC
+         LIMIT ?2",
     ) {
-        Ok(s) => s,
+        Ok(mut stmt) => stmt
+            .query_map(rusqlite::params![id, limit], |r| {
+                // safeParse: a stored metadata string parses to an object or
+                // collapses to {} (never an error).
+                let metadata = r
+                    .get::<_, Option<String>>(8)?
+                    .and_then(|m| serde_json::from_str::<Value>(&m).ok())
+                    .filter(|v| v.is_object())
+                    .unwrap_or_else(|| json!({}));
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "conversation_id": r.get::<_, i64>(1)?,
+                    "thread_local_id": r.get::<_, Option<i64>>(2)?,
+                    "event_type": r.get::<_, String>(3)?,
+                    "actor_type": r.get::<_, Option<String>>(4)?,
+                    "actor_local_id": r.get::<_, Option<i64>>(5)?,
+                    "occurred_at": r.get::<_, Option<String>>(6)?,
+                    "source": r.get::<_, Option<String>>(7)?,
+                    "metadata": metadata,
+                    "created_at": r.get::<_, Option<String>>(9)?,
+                    "actor_name": r.get::<_, Option<String>>(10)?,
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default(),
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(
                     json!({"statusCode": 500, "error": "InternalError", "message": e.to_string()}),
                 ),
-            );
+            )
+                .into_response();
         }
     };
-    let events: Vec<Value> = stmt
-        .query_map(rusqlite::params![id], |r| {
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?,
-                "conversation_id": r.get::<_, i64>(1)?,
-                "event_type": r.get::<_, String>(2)?,
-                "actor_type": r.get::<_, String>(3)?,
-                "actor_id": r.get::<_, Option<i64>>(4)?,
-                "occurred_at": r.get::<_, String>(5)?,
-            }))
-        })
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
 
-    (StatusCode::OK, Json(json!({"events": events})))
+    // Count events per type (UI summary chips; reference eventCounts).
+    let count_pairs: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT event_type, COUNT(*) FROM activity_events
+             WHERE conversation_id = ?1 GROUP BY event_type",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    let mut counts = serde_json::Map::new();
+    for (kind, n) in count_pairs {
+        counts.insert(kind, json!(n));
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "conversation_id": id,
+            "events": events,
+            "counts": Value::Object(counts),
+        })),
+    )
+        .into_response()
 }
 
 /// POST /api/conversations/activity/rebuild — rebuild activity events.

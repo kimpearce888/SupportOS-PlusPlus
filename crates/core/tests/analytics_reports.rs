@@ -593,6 +593,24 @@ async fn analytics_reports_batch() {
     let mut sorted = keys.clone();
     sorted.sort_unstable();
     assert_eq!(keys, sorted, "definitions ordered by key");
+    // The exact reference key set (migration 003), in key order.
+    assert_eq!(
+        keys,
+        [
+            "active_conversations",
+            "ai_draft_acceptance",
+            "backlog",
+            "closed_conversations",
+            "first_response_time_local",
+            "new_conversations",
+            "pending_conversations",
+            "ratings",
+            "replies_sent",
+            "resolution_time_local",
+            "unassigned",
+        ],
+        "AN-09: the 11 seeded metric definitions match the reference key set"
+    );
     assert_eq!(keys.first(), Some(&"active_conversations"));
     for d in definitions {
         assert!(d["limitations"].is_string(), "limitations defaulted: {d:?}");
