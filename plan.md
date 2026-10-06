@@ -2,19 +2,14 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **103 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **98 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
 - Workflow: one item at a time — plan.md → progress.md → implementation → verification → completed.md (see rule.md).
 
-| # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
 |---|---|---|---|---|---|---|---|
-| 14 | AU-03 | Auto-fire on conversation update (workers hook) | Missing | Major | M | - | Hook conversation-updated events to fire triggers (worker side) |
-| 15 | AU-04 | Awaiting-approval gating (parked jobs + approve/reject) | Divergent | Major | M | - | Expose approve/reject routes; park via jobs (parity) or rewire tile+sweep to approvals |
-| 16 | AU-02 | Trigger vocabulary (new_conversation/customer_reply/ai_low_confidence/manual) | Divergent | Major | L | M27 | Port MAIN trigger/condition/action vocabulary and risk tiers |
-| 17 | DB-09 | jobRepo (enqueue/claim/complete/fail backoff min(300,5*2^n)s/park/recover) | Partial | Major | S | M17 | Port exact backoff seconds; add queue filter to claimNext; add max_attempts to enqueue |
-| 18 | M15 | Thread delete skips FTS rows and runs outside a transaction | Defect | Major | S | T16 M15 | Delete fts_threads rows for deleted threads inside one transaction (sync_engine.rs:1802-1807 vs MAIN coordinator.ts:698-704). |
+| # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
 | 19 | M20 | SIGTERM not handled (ctrl_c only) | Defect | Major | S | T16 M20 | Handle SIGTERM alongside ctrl_c for graceful shutdown (crates/core/src/http/server.rs:1307-1312 vs MAIN index.ts:88-89). |
 | 20 | SY-07 | OAuth (authorize-url, callback, refresh, client-credentials, disconnect, status) | Partial | Major | M | M21 | Implement or remove the Tauri loopback OAuth/webhook receiver (loopback.rs binds then drops; handlers are {ok:true,todo:M2} stubs); delete the dead exchange_code legacy path (oauth.rs:200-247). |
 | 21 | TH-09 | bodyLimit 20MB (attachments) | Missing | Major | Add tower_http DefaultBodyLimit(20MB) to router | M19 | DefaultBodyLimit' crates/core/src (0 hits) |
