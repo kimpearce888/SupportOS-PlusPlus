@@ -61,17 +61,110 @@ pub async fn list_side_threads(
     }
 }
 
-/// POST /api/conversations/:id/side-threads
+/// POST /api/conversations/:id/side-threads — create with the FULL
+/// reference schema (CL-01 / audit M14): title, anchor team, initial
+/// participants and an optional first message. 422 with `path: message`
+/// issues on schema violations (missing title, wrong types, unknown
+/// participants/teams/creator); 404 for unknown or soft-deleted
+/// conversations; 404/422 for invalid thread ids mirror the read routes.
 pub async fn create_side_thread(
     State(state): State<AppState>,
     Path(conversation_id): Path<i64>,
     Json(body): Json<Value>,
-) -> Json<Value> {
-    let created_by = body.get("createdByUserId").and_then(|v| v.as_i64());
+) -> impl IntoResponse {
+    if conversation_id <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "id must be a positive integer."
+            })),
+        );
+    }
+    // Parse the full schema first (pure zod-equivalent, no DB).
+    let input = match crate::side_threads::parse_create_side_thread_input(&body) {
+        Ok(input) => input,
+        Err(issues) => {
+            let message = issues
+                .iter()
+                .map(|(path, msg)| format!("{path}: {msg}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": message
+                })),
+            );
+        }
+    };
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::side_threads::create_side_thread(&conn, conversation_id, created_by) {
-        Ok(id) => Json(json!({"ok": true, "id": id})),
-        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    // The conversation must exist (LOCAL id + soft-delete filter, like the
+    // list route / routes/collaboration.ts:31-43).
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![conversation_id],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Conversation not found."
+            })),
+        );
+    }
+    // Existence checks for the referenced team / participants / creator
+    // (CL-01: 422 on unknown participants/teams).
+    let issues = crate::side_threads::check_create_references(&conn, &input);
+    if !issues.is_empty() {
+        let message = issues
+            .iter()
+            .map(|(path, msg)| format!("{path}: {msg}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": message
+            })),
+        );
+    }
+    match crate::side_threads::create_side_thread_full(
+        &conn,
+        Some(&state.bus),
+        conversation_id,
+        &input,
+    ) {
+        Ok(id) => {
+            // Serve the reference-shaped detail alongside the id so callers
+            // can render without a follow-up GET (the payload mirrors the
+            // GET /api/side-threads/:id contract).
+            let detail = crate::side_threads::get_side_thread_detail(&conn, id)
+                .ok()
+                .flatten();
+            (
+                StatusCode::OK,
+                Json(json!({"ok": true, "id": id, "side_thread": detail})),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "Internal Server Error",
+                "message": e.to_string()
+            })),
+        ),
     }
 }
 

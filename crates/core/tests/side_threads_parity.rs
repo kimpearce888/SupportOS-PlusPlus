@@ -318,3 +318,245 @@ async fn side_threads_list_and_detail_match_the_reference_contract() {
         "soft-deleted conversations must not list side threads (reference deleted_at filter)"
     );
 }
+
+/// CL-01: POST create with the full schema (title/team/participants/
+/// first_message, 422 on unknown participants/teams, 404 on unknown
+/// conversations) — live HTTP against the real server (same boot pattern as
+/// the test above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn side_thread_create_matches_the_reference_contract() {
+    const PORT: u16 = 3992;
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().to_path_buf();
+    let db_path = data_dir.join("supportos-plusplus.db");
+    let mut conn = spp_core::db::open(&db_path).expect("open DB");
+    spp_core::bootstrap::apply_all(&mut conn).expect("apply all migrations");
+
+    // Fixtures: two users, a team, one conversation.
+    conn.execute_batch(
+        "INSERT INTO users (id, remote_id, first_name, last_name, mention, email) VALUES
+             (1, 501, 'Ada',  'Lovelace', 'ada',   'ada@example.com'),
+             (2, 502, 'Grace', 'Hopper',  'grace', 'grace@example.com');
+         INSERT INTO teams (id, remote_id, name) VALUES (7, 71, 'Support');
+         INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+             VALUES (9, 100001, 4242, 'Refund question', 1, 1, 'active');",
+    )
+    .expect("seed fixtures");
+
+    let http_conn = Arc::new(Mutex::new(conn));
+    let bus = spp_core::http::EventBus::default();
+    let provider = Arc::new(spp_core::helpscout::FakeHelpScoutProvider::new_demo())
+        as Arc<dyn spp_core::helpscout::HelpScoutProvider>;
+    let sync = Arc::new(
+        spp_core::sync_engine::SyncEngine::new(http_conn.clone(), provider).with_bus(bus.clone()),
+    );
+    let qdrant = spp_core::http::server::AppState::qdrant_from_settings(
+        &http_conn.lock().unwrap_or_else(|p| p.into_inner()),
+        &data_dir,
+    );
+    let state = spp_core::http::server::AppState {
+        conn: http_conn.clone(),
+        data_dir: data_dir.clone(),
+        port: PORT,
+        host: "127.0.0.1".to_string(),
+        demo_mode: true,
+        bus,
+        limiter: spp_core::http::RateLimiter::new(),
+        sync: Some(sync),
+        real: None,
+        provider_kind: "fake".to_string(),
+        workers: None,
+        qdrant,
+    };
+    let server = spp_core::http::server::HttpServer::new(state);
+    tokio::spawn(async move {
+        if let Err(e) = server.serve().await {
+            eprintln!("HTTP server failed: {e}");
+        }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest client");
+    let base = format!("http://127.0.0.1:{PORT}");
+    let up = Instant::now();
+    while up.elapsed() < Duration::from_secs(15) {
+        if client
+            .get(format!("{base}/api/conversations/9/side-threads"))
+            .send()
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // ── 1. Create with the FULL schema (reference camelCase names) ─────────
+    let r = client
+        .post(format!("{base}/api/conversations/9/side-threads"))
+        .json(&serde_json::json!({
+            "title": "Pricing escalation",
+            "teamId": 7,
+            "participantUserIds": [1, 2],
+            "createdByUserId": 1,
+            "firstMessage": "Kicking this off"
+        }))
+        .send()
+        .await
+        .expect("create side thread");
+    assert_eq!(r.status().as_u16(), 200, "full-schema create must succeed");
+    let body: Value = r.json().await.expect("create body");
+    assert_eq!(body["ok"], serde_json::json!(true));
+    let thread_id = body["id"].as_i64().expect("thread id");
+    assert!(thread_id > 0);
+    // The response carries the reference-shaped detail.
+    assert_eq!(
+        body["side_thread"]["title"].as_str(),
+        Some("Pricing escalation")
+    );
+    assert_eq!(body["side_thread"]["team_name"].as_str(), Some("Support"));
+
+    // Everything is stored: title/team/creator, participants, first message.
+    {
+        let conn = http_conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (title, team, creator): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT title, team_local_id, created_by_user_id FROM side_threads WHERE id = ?1",
+                [thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("thread row");
+        assert_eq!(title, "Pricing escalation");
+        assert_eq!(team, Some(7));
+        assert_eq!(creator, Some(1));
+        let participants: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM side_thread_participants WHERE side_thread_id = ?1",
+                [thread_id],
+                |r| r.get(0),
+            )
+            .expect("participants count");
+        assert_eq!(participants, 2);
+        let (msg_body, msg_author): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT body, author_user_id FROM side_thread_messages WHERE thread_id = ?1",
+                [thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("first message row");
+        assert_eq!(msg_body, "Kicking this off");
+        assert_eq!(msg_author, Some(1));
+    }
+
+    // The detail route serves the same state over HTTP.
+    let r = client
+        .get(format!("{base}/api/side-threads/{thread_id}"))
+        .send()
+        .await
+        .expect("detail probe");
+    assert_eq!(r.status().as_u16(), 200);
+    let detail: Value = r.json().await.expect("detail body");
+    assert_eq!(
+        detail["side_thread"]["title"].as_str(),
+        Some("Pricing escalation")
+    );
+    assert_eq!(
+        detail["side_thread"]["participants"]
+            .as_array()
+            .expect("participants")
+            .len(),
+        2
+    );
+    assert_eq!(
+        detail["side_thread"]["messages"]
+            .as_array()
+            .expect("messages")
+            .len(),
+        1
+    );
+
+    // ── 2. The port UI's snake_case names work identically ─────────────────
+    let r = client
+        .post(format!("{base}/api/conversations/9/side-threads"))
+        .json(&serde_json::json!({
+            "title": "Quick huddle",
+            "team_local_id": null,
+            "participant_user_ids": [2],
+            "first_message": null
+        }))
+        .send()
+        .await
+        .expect("snake-case create");
+    assert_eq!(r.status().as_u16(), 200, "snake_case create must work too");
+
+    // ── 3. Validation: 422 with path: message issues ───────────────────────
+    // Missing title.
+    let r = client
+        .post(format!("{base}/api/conversations/9/side-threads"))
+        .json(&serde_json::json!({"teamId": 7}))
+        .send()
+        .await
+        .expect("missing title");
+    assert_eq!(r.status().as_u16(), 422);
+    let body: Value = r.json().await.expect("422 body");
+    assert_eq!(body["error"], serde_json::json!("ValidationError"));
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("title: Required"),
+        "{}",
+        body
+    );
+    // Unknown team + unknown participants + unknown creator in one pass.
+    let r = client
+        .post(format!("{base}/api/conversations/9/side-threads"))
+        .json(&serde_json::json!({
+            "title": "Bad refs",
+            "teamId": 999,
+            "participantUserIds": [77, 88],
+            "createdByUserId": 66
+        }))
+        .send()
+        .await
+        .expect("unknown references");
+    assert_eq!(r.status().as_u16(), 422);
+    let body: Value = r.json().await.expect("422 body");
+    let msg = body["message"].as_str().expect("message");
+    assert!(msg.contains("teamId: Unknown team 999"), "{msg}");
+    assert!(
+        msg.contains("participantUserIds: Unknown user(s): 77, 88"),
+        "{msg}"
+    );
+    assert!(msg.contains("createdByUserId: Unknown user 66"), "{msg}");
+    // Nothing was written for the rejected create.
+    {
+        let conn = http_conn.lock().unwrap_or_else(|p| p.into_inner());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM side_threads WHERE title = 'Bad refs'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 0, "a rejected create must not write");
+    }
+
+    // ── 4. Unknown conversation 404; invalid id 422 ────────────────────────
+    let r = client
+        .post(format!("{base}/api/conversations/424242/side-threads"))
+        .json(&serde_json::json!({"title": "X"}))
+        .send()
+        .await
+        .expect("unknown conversation");
+    assert_eq!(r.status().as_u16(), 404);
+    let r = client
+        .post(format!("{base}/api/conversations/0/side-threads"))
+        .json(&serde_json::json!({"title": "X"}))
+        .send()
+        .await
+        .expect("invalid conversation id");
+    assert_eq!(r.status().as_u16(), 422);
+}

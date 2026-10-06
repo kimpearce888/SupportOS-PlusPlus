@@ -160,6 +160,296 @@ pub fn create_side_thread(
     Ok(conn.last_insert_rowid())
 }
 
+// ---------------------------------------------------------------------------
+// Create with the full reference schema (CL-01 / audit M14) + participants
+// add with existence checks (CL-04 / sideThreadRepo.ts:173-186).
+// ---------------------------------------------------------------------------
+
+/// A parsed create-side-thread request (reference `createThread` zod
+/// schema). Both the reference's camelCase wire names (`title`, `teamId`,
+/// `participantUserIds`, `createdByUserId`, `firstMessage`) and the port
+/// UI's snake_case names (`team_local_id`, `participant_user_ids`,
+/// `created_by_user_id`, `first_message`) are accepted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSideThreadInput {
+    pub title: String,
+    pub team_local_id: Option<i64>,
+    pub participant_user_ids: Vec<i64>,
+    pub created_by_user_id: Option<i64>,
+    pub first_message: Option<String>,
+}
+
+/// Validation issues collected while parsing a create request — rendered as
+/// `path: message` pairs like the reference's Zod 422s.
+pub type ValidationIssues = Vec<(String, String)>;
+
+fn body_i64(body: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|k| body.get(*k).and_then(|v| v.as_i64()))
+}
+
+fn body_str<'a>(body: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|k| body.get(*k).and_then(|v| v.as_str()))
+}
+
+fn body_i64_array(body: &serde_json::Value, keys: &[&str]) -> Option<Vec<i64>> {
+    for k in keys {
+        if let Some(v) = body.get(*k) {
+            if v.is_null() {
+                return Some(Vec::new());
+            }
+            if let Some(arr) = v.as_array() {
+                return Some(arr.iter().filter_map(|x| x.as_i64()).collect::<Vec<i64>>());
+            }
+        }
+    }
+    None
+}
+
+/// Parse + validate a create-side-thread body (CL-01). Collects ALL issues
+/// (missing title, wrong types) the way the reference's zod schema does.
+pub fn parse_create_side_thread_input(
+    body: &serde_json::Value,
+) -> std::result::Result<CreateSideThreadInput, ValidationIssues> {
+    let mut issues: ValidationIssues = Vec::new();
+    let title = body_str(body, &["title"]).unwrap_or("").trim().to_string();
+    if title.is_empty() {
+        issues.push((
+            "title".into(),
+            "Required and must be a non-empty string.".into(),
+        ));
+    }
+    if let Some(v) = body.get("title") {
+        if !v.is_string() {
+            issues.push((
+                "title".into(),
+                "Expected string, received other type.".into(),
+            ));
+        }
+    }
+    let mut team_local_id = body_i64(body, &["teamId", "team_local_id"]);
+    if let Some(v) = body.get("teamId").or_else(|| body.get("team_local_id")) {
+        if !v.is_null() && v.as_i64().is_none() {
+            issues.push((
+                "teamId".into(),
+                "Expected number, received other type.".into(),
+            ));
+            team_local_id = None;
+        }
+    }
+    let participant_user_ids =
+        body_i64_array(body, &["participantUserIds", "participant_user_ids"]).unwrap_or_default();
+    if let Some(v) = body
+        .get("participantUserIds")
+        .or_else(|| body.get("participant_user_ids"))
+    {
+        if !v.is_null() && v.as_array().is_none() {
+            issues.push((
+                "participantUserIds".into(),
+                "Expected array of numbers.".into(),
+            ));
+        }
+    }
+    let mut created_by_user_id = body_i64(body, &["createdByUserId", "created_by_user_id"]);
+    if let Some(v) = body
+        .get("createdByUserId")
+        .or_else(|| body.get("created_by_user_id"))
+    {
+        if !v.is_null() && v.as_i64().is_none() {
+            issues.push((
+                "createdByUserId".into(),
+                "Expected number, received other type.".into(),
+            ));
+            created_by_user_id = None;
+        }
+    }
+    let mut first_message = body_str(body, &["firstMessage", "first_message"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(v) = body
+        .get("firstMessage")
+        .or_else(|| body.get("first_message"))
+    {
+        if !v.is_null() && !v.is_string() {
+            issues.push((
+                "firstMessage".into(),
+                "Expected string, received other type.".into(),
+            ));
+            first_message = None;
+        }
+    }
+    if issues.is_empty() {
+        Ok(CreateSideThreadInput {
+            title,
+            team_local_id,
+            participant_user_ids,
+            created_by_user_id,
+            first_message,
+        })
+    } else {
+        Err(issues)
+    }
+}
+
+/// Cross-field existence checks the reference performs before writing
+/// (CL-01: 422 on unknown participants/teams; CL-04). Returns one issue per
+/// unknown reference.
+pub fn check_create_references(
+    conn: &Connection,
+    input: &CreateSideThreadInput,
+) -> ValidationIssues {
+    let mut issues = ValidationIssues::new();
+    if let Some(team_id) = input.team_local_id {
+        let known: bool = conn
+            .query_row(
+                "SELECT 1 FROM teams WHERE id = ?1",
+                params![team_id],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !known {
+            issues.push(("teamId".into(), format!("Unknown team {team_id}.")));
+        }
+    }
+    let unknown = unknown_user_ids(conn, &input.participant_user_ids);
+    if !unknown.is_empty() {
+        issues.push((
+            "participantUserIds".into(),
+            format!(
+                "Unknown user(s): {}.",
+                unknown
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    if let Some(creator) = input.created_by_user_id {
+        let known: bool = conn
+            .query_row(
+                "SELECT 1 FROM users WHERE id = ?1",
+                params![creator],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !known {
+            issues.push(("createdByUserId".into(), format!("Unknown user {creator}.")));
+        }
+    }
+    issues
+}
+
+/// The ids in `ids` that do not exist in `users` (deduplicated, order kept).
+fn unknown_user_ids(conn: &Connection, ids: &[i64]) -> Vec<i64> {
+    let mut unknown = Vec::new();
+    for id in ids {
+        if unknown.contains(id) {
+            continue;
+        }
+        let known: bool = conn
+            .query_row("SELECT 1 FROM users WHERE id = ?1", params![id], |_| Ok(()))
+            .is_ok();
+        if !known {
+            unknown.push(*id);
+        }
+    }
+    unknown
+}
+
+/// Create a side thread with the FULL reference schema (CL-01): title,
+/// anchor team, initial participants and an optional first message (stored
+/// through the mention-aware message path so the fan-out matches
+/// `addMessage`). The caller has already validated `input` (conversation
+/// existence + `check_create_references`).
+///
+/// Returns the new thread's row id.
+///
+/// # Errors
+///
+/// `Error::Sqlite` if any write fails, `Error::Other` if the first message
+/// body exceeds `mentions::MAX_BODY_BYTES`.
+pub fn create_side_thread_full(
+    conn: &Connection,
+    bus: Option<&crate::http::EventBus>,
+    conversation_id: i64,
+    input: &CreateSideThreadInput,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO side_threads (conversation_id, title, team_local_id, created_by_user_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            conversation_id,
+            input.title,
+            input.team_local_id,
+            input.created_by_user_id
+        ],
+    )?;
+    let thread_id = conn.last_insert_rowid();
+    // Initial participants (reference createThread: participantUserIds each
+    // become side_thread_participants rows, added_by = the creator).
+    add_participants_checked(
+        conn,
+        thread_id,
+        &input.participant_user_ids,
+        input.created_by_user_id,
+    )?;
+    // The optional first message runs through the same mention-aware path
+    // as POST /messages (reference sideThreadService.addMessage).
+    if let Some(first) = &input.first_message {
+        add_side_thread_message(conn, bus, thread_id, first, input.created_by_user_id)?;
+    }
+    Ok(thread_id)
+}
+
+/// Insert `side_thread_participants` rows with existence checks (CL-04,
+/// reference sideThreadRepo.ts:173-186): every user must exist, otherwise
+/// the whole call fails with `Error::Other` listing the unknown ids.
+/// Already-present participants are skipped (the PK is
+/// (side_thread_id, user_local_id) — idempotent re-adds like the
+/// reference's INSERT OR IGNORE).
+///
+/// Returns the ids actually inserted.
+///
+/// # Errors
+///
+/// `Error::Other` listing unknown users; `Error::Sqlite` on insert failure.
+pub fn add_participants_checked(
+    conn: &Connection,
+    thread_id: i64,
+    user_ids: &[i64],
+    added_by_user_local_id: Option<i64>,
+) -> Result<Vec<i64>> {
+    let unknown = unknown_user_ids(conn, user_ids);
+    if !unknown.is_empty() {
+        return Err(crate::error::Error::Other(
+            format!(
+                "Unknown user(s): {}",
+                unknown
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into(),
+        ));
+    }
+    let mut inserted = Vec::new();
+    for uid in user_ids {
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO side_thread_participants
+                (side_thread_id, user_local_id, added_by_user_local_id)
+             VALUES (?1, ?2, ?3)",
+            params![thread_id, uid, added_by_user_local_id],
+        )?;
+        if rows > 0 {
+            inserted.push(*uid);
+        }
+    }
+    Ok(inserted)
+}
+
 /// Add a message to a side thread — the reference
 /// `SideThreadService.addMessage`: the body is scanned for mentions, the
 /// RESOLVED mentions are stored in `side_thread_mentions`, and every
@@ -879,6 +1169,248 @@ mod tests {
             )
             .unwrap();
         assert!(author.is_none());
+    }
+
+    // ---- CL-01: create with the full schema ------------------------------
+
+    #[test]
+    fn parse_create_input_accepts_reference_camel_case() {
+        let body = serde_json::json!({
+            "title": "  Escalation ",
+            "teamId": 7,
+            "participantUserIds": [1, 2],
+            "createdByUserId": 1,
+            "firstMessage": " looking into this "
+        });
+        let input = parse_create_side_thread_input(&body).unwrap();
+        assert_eq!(input.title, "Escalation");
+        assert_eq!(input.team_local_id, Some(7));
+        assert_eq!(input.participant_user_ids, vec![1, 2]);
+        assert_eq!(input.created_by_user_id, Some(1));
+        assert_eq!(input.first_message.as_deref(), Some("looking into this"));
+    }
+
+    #[test]
+    fn parse_create_input_accepts_port_snake_case() {
+        let body = serde_json::json!({
+            "title": "Escalation",
+            "team_local_id": 7,
+            "participant_user_ids": [2],
+            "created_by_user_id": 1,
+            "first_message": null
+        });
+        let input = parse_create_side_thread_input(&body).unwrap();
+        assert_eq!(input.team_local_id, Some(7));
+        assert_eq!(input.participant_user_ids, vec![2]);
+        assert_eq!(input.first_message, None);
+    }
+
+    #[test]
+    fn parse_create_input_collects_missing_and_mistyped_issues() {
+        // Missing title + wrong-typed team + non-array participants.
+        let body = serde_json::json!({
+            "teamId": "seven",
+            "participantUserIds": 5
+        });
+        let issues = parse_create_side_thread_input(&body).unwrap_err();
+        let joined = issues
+            .iter()
+            .map(|(p, m)| format!("{p}: {m}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(joined.contains("title: Required"), "{joined}");
+        assert!(joined.contains("teamId: Expected number"), "{joined}");
+        assert!(
+            joined.contains("participantUserIds: Expected array"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn check_create_references_flags_unknown_team_participants_and_creator() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let input = CreateSideThreadInput {
+            title: "Escalation".into(),
+            team_local_id: Some(999),
+            participant_user_ids: vec![1, 77, 88],
+            created_by_user_id: Some(66),
+            first_message: None,
+        };
+        let issues = check_create_references(&conn, &input);
+        let joined = issues
+            .iter()
+            .map(|(p, m)| format!("{p}: {m}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(joined.contains("teamId: Unknown team 999"), "{joined}");
+        assert!(
+            joined.contains("participantUserIds: Unknown user(s): 77, 88"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("createdByUserId: Unknown user 66"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn create_side_thread_full_persists_everything() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        // The seeded conversation (remote 105000) lands as the local id.
+        let conv_id: i64 = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = 105000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let input = CreateSideThreadInput {
+            title: "Pricing escalation".into(),
+            team_local_id: Some(1),
+            participant_user_ids: vec![1, 2],
+            created_by_user_id: Some(1),
+            first_message: Some("Kicking this off - @priya can you take a look?".into()),
+        };
+        let id = create_side_thread_full(&conn, None, conv_id, &input).unwrap();
+
+        // Thread row: title + team + creator.
+        let (title, team, creator): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT title, team_local_id, created_by_user_id FROM side_threads WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Pricing escalation");
+        assert_eq!(team, Some(1));
+        assert_eq!(creator, Some(1));
+
+        // Participants: both users, added_by = the creator.
+        let mut rows = conn
+            .prepare(
+                "SELECT user_local_id, added_by_user_local_id FROM side_thread_participants
+                 WHERE side_thread_id = ?1 ORDER BY user_local_id",
+            )
+            .unwrap()
+            .query_map(params![id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+            })
+            .unwrap()
+            .flatten()
+            .collect::<Vec<_>>();
+        rows.sort();
+        assert_eq!(rows, vec![(1, Some(1)), (2, Some(1))]);
+
+        // First message stored through the mention-aware path with the
+        // creator as author + the @priya mention resolved.
+        let (body, author, mentions): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT body, author_user_id, mentions_json FROM side_thread_messages
+                 WHERE thread_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "Kicking this off - @priya can you take a look?");
+        assert_eq!(author, Some(1));
+        assert!(mentions.is_some(), "the @priya mention must be recorded");
+
+        // The detail payload serves all of it.
+        let detail = get_side_thread_detail(&conn, id).unwrap().unwrap();
+        assert_eq!(detail.title, "Pricing escalation");
+        assert_eq!(detail.team_name.as_deref(), Some("Tier 1"));
+        assert_eq!(detail.participants.len(), 2);
+        assert_eq!(detail.messages.len(), 1);
+        assert_eq!(detail.messages[0].body, body);
+    }
+
+    #[test]
+    fn create_side_thread_full_without_optionals_stores_minimal_row() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let conv_id: i64 = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = 105000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let input = CreateSideThreadInput {
+            title: "Quick huddle".into(),
+            team_local_id: None,
+            participant_user_ids: vec![],
+            created_by_user_id: None,
+            first_message: None,
+        };
+        let id = create_side_thread_full(&conn, None, conv_id, &input).unwrap();
+        let n_messages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM side_thread_messages WHERE thread_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_messages, 0, "no first message -> no message row");
+    }
+
+    // ---- CL-04: participants add with existence checks --------------------
+
+    #[test]
+    fn add_participants_checked_inserts_rows() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 105000, Some(1)).unwrap();
+        let inserted = add_participants_checked(&conn, thread_id, &[1, 2], Some(1)).unwrap();
+        assert_eq!(inserted, vec![1, 2]);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM side_thread_participants WHERE side_thread_id = ?1",
+                params![thread_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn add_participants_checked_rejects_unknown_users_without_partial_writes() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 105000, Some(1)).unwrap();
+        let err = add_participants_checked(&conn, thread_id, &[1, 55], None).unwrap_err();
+        assert!(err.to_string().contains("Unknown user"), "{err}");
+        // No partial write: the known user 1 was NOT inserted.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM side_thread_participants WHERE side_thread_id = ?1",
+                params![thread_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn add_participants_checked_skips_duplicates() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 105000, Some(1)).unwrap();
+        add_participants_checked(&conn, thread_id, &[1], None).unwrap();
+        // Re-adding the same user is a no-op; a new user in the same call is
+        // still inserted.
+        let inserted = add_participants_checked(&conn, thread_id, &[1, 2], Some(2)).unwrap();
+        assert_eq!(inserted, vec![2]);
+        let (added_by_2,): (Option<i64>,) = conn
+            .query_row(
+                "SELECT added_by_user_local_id FROM side_thread_participants
+                 WHERE side_thread_id = ?1 AND user_local_id = 2",
+                params![thread_id],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        assert_eq!(added_by_2, Some(2));
     }
 
     // ---- add_side_thread_message --------------------------------------------
