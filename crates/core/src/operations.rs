@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::catalog::OperationsTileKey;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::saved_views::RESPONSE_STATE_SQL;
 
 /// The settings key for the waiting threshold (reference
@@ -274,8 +274,13 @@ pub fn snapshot(conn: &Connection, mailbox_ids: Option<&[i64]>) -> Result<Operat
     let threshold = waiting_threshold_minutes(conn);
 
     let conv_count = |key: &str| -> Result<u32> {
-        let (frag_sql, frag_params) = tile_fragment(key, threshold)
-            .unwrap_or_else(|| panic!("conversation tile {key} must have a fragment"));
+        // C3 (audit T16): this was a `panic!` on an unknown tile key —
+        // with `panic = "abort"` in the release profile it killed the whole
+        // packaged app from one operations tile. Return an internal error
+        // instead (the route surfaces the standard 500 envelope).
+        let (frag_sql, frag_params) = tile_fragment(key, threshold).ok_or_else(|| {
+            Error::Config(format!("conversation tile {key} must have a fragment"))
+        })?;
         let mut sql = format!("SELECT COUNT(*) FROM conversations c WHERE {frag_sql}");
         let mut params = frag_params;
         if let Some(scope_sql) = scope_sql.as_ref() {

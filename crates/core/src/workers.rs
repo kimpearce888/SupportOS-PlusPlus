@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use rusqlite::Connection;
+use std::panic::AssertUnwindSafe;
 
 use crate::error::{Error, Result};
 use crate::helpscout::HelpScoutProvider;
@@ -98,6 +100,19 @@ impl WorkerManager {
             .push(handle);
     }
 
+    /// Run one tick of a timer body with panic containment (C3, audit
+    /// T16): a panicking tick is logged and skipped, and the timer keeps
+    /// running. Previously, with the release profile on `panic = "abort"`, an
+    /// unrecovered panic in ANY timer body killed the whole packaged app.
+    async fn contained<F: std::future::Future>(label: &'static str, f: F) {
+        if AssertUnwindSafe(f).catch_unwind().await.is_err() {
+            tracing::error!(
+                timer = label,
+                "timer tick panicked (contained at the task boundary; timer continues)"
+            );
+        }
+    }
+
     /// Start every timer. Idempotent (a second call is a no-op).
     /// Callers hold the manager inside an `Arc` (the server boot path
     /// wraps it once and stores it on the AppState), so every timer task
@@ -139,7 +154,7 @@ impl WorkerManager {
                 let mut interval = tokio::time::interval(Duration::from_secs(2));
                 loop {
                     interval.tick().await;
-                    this.tick().await;
+                    Self::contained("job_loop", this.tick()).await;
                 }
             });
         }
@@ -159,7 +174,7 @@ impl WorkerManager {
                 ));
                 loop {
                     interval.tick().await;
-                    this.auto_sync().await;
+                    Self::contained("auto_sync", this.auto_sync()).await;
                 }
             });
             tracing::info!(
@@ -188,7 +203,7 @@ impl WorkerManager {
                     ));
                     loop {
                         interval.tick().await;
-                        this.refresh_ratings().await;
+                        Self::contained("refresh_ratings", this.refresh_ratings()).await;
                     }
                 });
             }
@@ -200,7 +215,7 @@ impl WorkerManager {
                 let mut interval = tokio::time::interval(Duration::from_secs(6 * 3600));
                 loop {
                     interval.tick().await;
-                    this.maintenance().await;
+                    Self::contained("maintenance", this.maintenance()).await;
                 }
             });
         }
@@ -212,16 +227,19 @@ impl WorkerManager {
                 let mut interval = tokio::time::interval(Duration::from_secs(10 * 60));
                 loop {
                     interval.tick().await;
-                    let conn = this.lock();
-                    match jobs::recover_stale_jobs(&conn) {
-                        Ok(n) if n > 0 => tracing::warn!(
-                            count = n,
-                            operation = "stale_job_sweep",
-                            "Re-queued stale running job(s) (running longer than 30 minutes)"
-                        ),
-                        Ok(_) => {}
-                        Err(_) => {}
-                    }
+                    Self::contained("stale_job_sweep", async {
+                        let conn = this.lock();
+                        match jobs::recover_stale_jobs(&conn) {
+                            Ok(n) if n > 0 => tracing::warn!(
+                                count = n,
+                                operation = "stale_job_sweep",
+                                "Re-queued stale running job(s) (running longer than 30 minutes)"
+                            ),
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
+                    })
+                    .await;
                 }
             });
         }
@@ -243,7 +261,10 @@ impl WorkerManager {
                 ));
                 loop {
                     interval.tick().await;
-                    this.notification_sweep_tick();
+                    Self::contained("notification_sweep", async {
+                        this.notification_sweep_tick();
+                    })
+                    .await;
                 }
             });
         }
@@ -263,7 +284,10 @@ impl WorkerManager {
                 ));
                 loop {
                     interval.tick().await;
-                    this.customer_event_sweep_tick();
+                    Self::contained("customer_event_sweep", async {
+                        this.customer_event_sweep_tick();
+                    })
+                    .await;
                 }
             });
         }
@@ -275,7 +299,7 @@ impl WorkerManager {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    this.connector_refresh_tick().await;
+                    Self::contained("connector_refresh", this.connector_refresh_tick()).await;
                 }
             });
         }
@@ -308,7 +332,23 @@ impl WorkerManager {
                 jobs::claim_next(&mut conn).unwrap_or(None)
             };
             let Some(job) = claimed else { break };
-            self.execute_job(job.id, &job.kind, &job.payload).await;
+            // C3 (audit T16): contain job panics at the task boundary —
+            // the panicking job is marked failed (with backoff) and the
+            // loop claims the next job instead of unwinding the worker's
+            // timer task (or aborting the whole app, pre-unwind).
+            if AssertUnwindSafe(self.execute_job(job.id, &job.kind, &job.payload))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    job_id = job.id,
+                    kind = %job.kind,
+                    "job panicked (contained at the worker boundary): marking failed"
+                );
+                let conn = self.lock();
+                let _ = jobs::fail(&conn, job.id, "job panicked (contained at worker boundary)");
+            }
         }
         self.processing.store(false, Ordering::SeqCst);
     }
@@ -1467,6 +1507,107 @@ pub fn start_workers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- C3: panic containment at the task boundary -----------------------
+
+    #[tokio::test]
+    async fn contained_swallows_panicking_tick_and_keeps_going() {
+        // A panicking timer body must be contained — the helper returns
+        // normally instead of unwinding the caller (the timer loop).
+        WorkerManager::contained("test_boom", async {
+            panic!("timer body boom");
+        })
+        .await;
+        // And the very next tick runs fine afterwards.
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ran2 = ran.clone();
+        WorkerManager::contained("test_ok", async move {
+            ran2.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tick_marks_a_panicking_job_failed_and_survives() {
+        // The tick loop's post-panic recovery contract (C3): after a job
+        // body panics and the catch_unwind in tick() contains it, the
+        // follow-up jobs::fail must dead-letter the claimed job. Drive it
+        // against a real DB with a job in the exact 'running' state a
+        // claimed job has.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut conn = Connection::open(tmp.path().join("t.db")).unwrap();
+        crate::db::ensure_migrations_table(&conn).unwrap();
+        crate::migrations::run_all(&mut conn).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        let shared = Arc::new(Mutex::new(conn));
+        let bus = EventBus::default();
+        let provider = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+            as Arc<dyn HelpScoutProvider>;
+        let engine = Arc::new(crate::sync_engine::SyncEngine::new(
+            shared.clone(),
+            provider.clone(),
+        ));
+        let manager = WorkerManager::new(
+            shared.clone(),
+            Some(engine),
+            provider,
+            bus,
+            tmp.path().to_path_buf(),
+            None,
+        );
+
+        // A claimed job to dead-letter.
+        jobs::enqueue_on(&shared.lock().unwrap(), "api", "boom_kind", "{}", 1).unwrap();
+        let (job_id,) = {
+            let c = shared.lock().unwrap();
+            c.query_row(
+                "SELECT id FROM jobs WHERE type = 'boom_kind' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?,)),
+            )
+            .unwrap()
+        };
+        // Claimed jobs run as 'running' — the state the tick loop sees when
+        // the body panics mid-execution. max_attempts = 1 so the post-panic
+        // jobs::fail dead-letters immediately (attempt >= max_attempts);
+        // with attempts left it would be requeued with backoff instead.
+        {
+            let c = shared.lock().unwrap();
+            c.execute(
+                "UPDATE jobs SET status = 'running', attempt = 1, max_attempts = 1 WHERE id = ?1",
+                rusqlite::params![job_id],
+            )
+            .unwrap();
+        }
+        // (Silence the panic hook so the expected panic is not printed
+        // into the test output.)
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = AssertUnwindSafe(async { panic!("job body boom") })
+            .catch_unwind()
+            .await
+            .is_err();
+        std::panic::set_hook(prev_hook);
+        assert!(panicked);
+        {
+            let c = shared.lock().unwrap();
+            jobs::fail(&c, job_id, "job panicked (contained at worker boundary)").unwrap();
+        }
+        let status: String = {
+            let c = shared.lock().unwrap();
+            c.query_row(
+                "SELECT status FROM jobs WHERE id = ?1",
+                rusqlite::params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // attempt 1 of max_attempts 1 -> dead-lettered, ready for the
+        // stale-job sweep instead of an aborted process.
+        assert_eq!(status, "failed");
+        assert!(!manager.is_running(), "manager not started in this test");
+    }
 
     #[test]
     fn iso_now_is_parseable_round_trip() {

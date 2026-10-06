@@ -66,7 +66,19 @@ impl RateLimiter {
         }
 
         let now = Instant::now();
-        let mut hits = self.hits.lock().expect("RateLimiter mutex poisoned");
+        // C3 (audit T16): recover from a poisoned mutex instead of
+        // panicking. Previously `.expect("RateLimiter mutex poisoned")`
+        // made EVERY subsequent request panic after one panicking handler
+        // left the lock poisoned — with the release profile on
+        // `panic = "abort"` that killed the packaged app on the next
+        // mutation. The map is still structurally valid (std collections
+        // are never left corrupt by unwinding); the same
+        // `unwrap_or_else(|p| p.into_inner())` convention the port uses for
+        // its DB connection lock.
+        let mut hits = self
+            .hits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Opportunistic pruning: sweep expired entries once the map grows
         // past the threshold so long-lived processes cannot accumulate
@@ -233,5 +245,34 @@ mod tests {
         // After pruning, the map should be smaller. We can't easily check
         // the size from outside, but the fact that no panic occurred is
         // the contract.
+    }
+
+    // ---- C3: poisoned-mutex recovery ---------------------------------------
+
+    #[test]
+    fn poisoned_mutex_does_not_break_the_limiter() {
+        let limiter = RateLimiter::new();
+        // Seed one entry so the poisoned guard is taken with data present.
+        assert!(limiter.check(&Method::POST, "/x", "127.0.0.1").is_ok());
+        // Poison the inner mutex: a panicking critical section while the
+        // lock is held (the audit's scenario).
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = limiter.hits.lock().expect("test takes the lock");
+            panic!("boom inside the rate limiter's critical section");
+        }));
+        assert!(poisoned.is_err(), "the critical section must have panicked");
+        assert!(
+            limiter.hits.is_poisoned(),
+            "precondition: the mutex is poisoned"
+        );
+        // C3: check() must RECOVER instead of panicking — the limiter keeps
+        // admitting (and counting) mutations after the poison.
+        assert!(limiter.check(&Method::POST, "/x", "127.0.0.1").is_ok());
+        for _ in 0..(RATE_LIMIT_MAX - 2) {
+            assert!(limiter.check(&Method::POST, "/x", "127.0.0.1").is_ok());
+        }
+        // The recovered map still rate-limits (count carried over: 2 +
+        // RATE_LIMIT_MAX - 2 == RATE_LIMIT_MAX uses, so the next one tips).
+        assert!(limiter.check(&Method::POST, "/x", "127.0.0.1").is_err());
     }
 }

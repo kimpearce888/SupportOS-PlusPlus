@@ -56,7 +56,7 @@ subtle = "2.5"
 
 # HTTP (loopback listener only, D-002)
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "tower-log", "macros", "json", "query"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "catch-panic"] }
 
 # Regex (bounded NFA — no ReDoS surface; default features include unicode
 # look-around support which we need for the negative-lookbehind in mentions)
@@ -82,7 +82,11 @@ supportos-plusplus-ui = { path = "crates/ui" }
 codegen-units = 1
 lto = true
 opt-level = "s"
-panic = "abort"
+# C3 (audit T16): panic=abort killed the whole packaged app on any
+# unrecovered panic (tile invariant, poisoned mutex, ...). unwind lets the
+# handler/task-boundary containment (CatchPanicLayer + worker catch_unwind)
+# convert panics into 500 responses / failed jobs instead.
+panic = "unwind"
 strip = true
 
 # Faster dev builds. debug = 0: test binaries link the whole workspace

@@ -13,6 +13,7 @@ use axum::{
     Router,
 };
 use tokio::net::TcpListener;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -1226,6 +1227,13 @@ impl HttpServer {
             // 404 fallback for unknown /api/* routes
             .fallback(any(routes::not_found))
             .with_state(state)
+            // C3 (audit T16): panic containment at the handler boundary.
+            // Innermost layer: every route handler (and the fallback) runs
+            // inside it. An unrecovered panic (tile invariant, poisoned
+            // mutex, ...) becomes the standard 500 envelope instead of
+            // killing the request task — and, with the release profile now
+            // on unwind, instead of aborting the whole packaged app.
+            .layer(CatchPanicLayer::custom(catch_panic_response))
             // Fastify parity: a request whose PATH matches a registered
             // route but whose METHOD does not gets the 404 "Unknown API
             // endpoint." body in the reference (Fastify's router has no
@@ -1349,6 +1357,38 @@ async fn rewrite_405_to_404(
             .into_response();
     }
     resp
+}
+
+/// C3 (audit T16): panic containment at the HTTP handler boundary.
+/// `CatchPanicLayer::custom` response builder: an unrecovered panic in any
+/// route handler is logged and answered with the port's standard 500
+/// envelope — the server keeps serving (previously, with the release
+/// profile on `panic = "abort"`, the whole packaged app died).
+///
+/// Public so the panic-containment integration test can build a router
+/// with the exact same response contract.
+pub fn catch_panic_response(
+    err: Box<dyn std::any::Any + Send + 'static>,
+) -> axum::response::Response {
+    let detail = if let Some(s) = err.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "no panic message".to_string()
+    };
+    tracing::error!(panic = %detail, "handler panic contained (C3): serving 500");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        [("Content-Type", "application/json")],
+        serde_json::json!({
+            "statusCode": 500,
+            "error": "InternalError",
+            "message": format!("Internal error: {detail}")
+        })
+        .to_string(),
+    )
+        .into_response()
 }
 
 /// Check if a Host header is a loopback address.
