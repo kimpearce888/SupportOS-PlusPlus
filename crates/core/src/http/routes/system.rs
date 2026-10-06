@@ -76,7 +76,9 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
         };
 
         // Subsystem: LM Studio (reference pings listModels; the port probes the
-        // configured base URL with the same 5s timeout).
+        // configured base URL). AI-22: the probe is bounded by 5 s (a hung
+        // LM Studio must not hang the health route; real AI calls use the
+        // full lmstudio_timeout_ms).
         let lmstudio_base = crate::settings::get_string(&conn, "lmstudio_base_url")
             .ok()
             .flatten()
@@ -92,9 +94,10 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
             lmstudio_embedding,
         )
     };
-    let lm_probe = crate::ai_lm_studio::OpenAiCompatibleClient::new(&lmstudio_base)
-        .list_models()
-        .await;
+    let lm_probe =
+        crate::ai_lm_studio::OpenAiCompatibleClient::new_with_timeout(&lmstudio_base, 5_000)
+            .list_models()
+            .await;
     let (lm_connected, lm_models, lm_error) = match lm_probe {
         Ok(models) => (
             true,

@@ -399,9 +399,9 @@ pub async fn test_lmstudio(State(state): State<AppState>) -> axum::response::Res
     // Scoped guard: the probe below awaits, so the lock must not live
     // across it (block scope, not drop() — generator analysis keeps the
     // guard alive through the await otherwise).
-    let base_url = {
+    let (base_url, timeout_ms) = {
         let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-        crate::settings::get_string(&conn, "lmstudio_base_url")
+        let base_url = crate::settings::get_string(&conn, "lmstudio_base_url")
             .ok()
             .flatten()
             .filter(|s| !s.is_empty())
@@ -411,10 +411,19 @@ pub async fn test_lmstudio(State(state): State<AppState>) -> axum::response::Res
                     .and_then(|s| s.base_url)
                     .filter(|s| !s.is_empty())
             })
-            .unwrap_or_else(|| "http://127.0.0.1:1234".to_string())
+            .unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
+        // AI-22: the probe runs with the configured lmstudio_timeout_ms —
+        // a hung LM Studio fails the test-connection instead of hanging it.
+        let timeout_ms = u64::try_from(
+            crate::settings::get_i64(&conn, "lmstudio_timeout_ms", 120_000).unwrap_or(120_000),
+        )
+        .unwrap_or(crate::ai_lm_studio::LM_STUDIO_DEFAULT_TIMEOUT_MS);
+        (base_url, timeout_ms)
     };
-    let base = crate::embeddings::normalize_lm_base_url(&base_url);
-    let client = crate::ai_lm_studio::OpenAiCompatibleClient::new(format!("{base}/v1"));
+    // The client normalizes the base to the /v1 root (AI-22) — the manual
+    // normalize+append here would now double the suffix.
+    let client =
+        crate::ai_lm_studio::OpenAiCompatibleClient::new_with_timeout(&base_url, timeout_ms);
     match client.list_models().await {
         Ok(models) => (
             StatusCode::OK,

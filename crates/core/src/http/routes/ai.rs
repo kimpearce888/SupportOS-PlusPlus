@@ -101,7 +101,13 @@ pub async fn status(State(state): State<AppState>) -> Json<Value> {
         )
     };
     // Live probe: connected + model list, or the reference error message.
-    let client = crate::ai_lm_studio::OpenAiCompatibleClient::new(&base_url);
+    // AI-22: the probe runs with the configured lmstudio_timeout_ms (a hung
+    // LM Studio can no longer hang the status route) and the base URL is
+    // normalized to the /v1 root inside the client.
+    let client = crate::ai_lm_studio::OpenAiCompatibleClient::new_with_timeout(
+        &base_url,
+        u64::try_from(timeout_ms).unwrap_or(crate::ai_lm_studio::LM_STUDIO_DEFAULT_TIMEOUT_MS),
+    );
     let lmstudio = match client.list_models().await {
         Ok(models) => json!({
             "connected": true,

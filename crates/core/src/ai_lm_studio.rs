@@ -25,6 +25,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::ai_provider::{
     ChatMessage, ChatResponse, EmbedResponse, LocalAiProvider, ModelInfo, ModelRole, TokenUsage,
@@ -33,6 +34,20 @@ use crate::error::{Error, Result};
 
 /// The default LM Studio base URL.
 pub const LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+
+/// The default request timeout (reference `lmstudio_timeout_ms`, 120 s).
+pub const LM_STUDIO_DEFAULT_TIMEOUT_MS: u64 = 120_000;
+
+/// Normalize a base URL so every request path (`/models`,
+/// `/chat/completions`, `/embeddings`) resolves against the OpenAI-compatible
+/// `/v1` root (AI-22 / M10): strip ONE trailing `/`, strip ONE trailing
+/// `/v1`, then append `/v1` — so `http://x:1234`, `http://x:1234/`,
+/// `http://x:1234/v1` and `http://x:1234/v1/` all resolve to
+/// `http://x:1234/v1`.
+#[must_use]
+pub fn normalize_v1_base_url(url: &str) -> String {
+    format!("{}/v1", crate::embeddings::normalize_lm_base_url(url))
+}
 
 /// The LM Studio AI provider — wraps an OpenAI-compatible HTTP client.
 ///
@@ -47,18 +62,32 @@ pub struct LmStudioProvider {
 
 impl LmStudioProvider {
     /// Create a new LM Studio provider with the default base URL
-    /// (`http://127.0.0.1:1234/v1`).
+    /// (`http://127.0.0.1:1234/v1`) and the default 120 s request timeout.
     #[must_use]
     pub fn new() -> Self {
         Self::with_base_url(LM_STUDIO_BASE_URL)
     }
 
     /// Create a new LM Studio provider with a custom base URL (for tests
-    /// or non-default LM Studio configs).
+    /// or non-default LM Studio configs). The URL is normalized to the
+    /// `/v1` root (AI-22) so `http://x:1234` and `http://x:1234/v1` behave
+    /// identically.
     #[must_use]
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            client: OpenAiCompatibleClient::new(base_url.into()),
+            client: OpenAiCompatibleClient::new(base_url),
+        }
+    }
+
+    /// Create a new LM Studio provider with a custom base URL AND a request
+    /// timeout in milliseconds (`lmstudio_timeout_ms`, AI-22 / M10). Every
+    /// request through the client — `/models`, `/chat/completions`,
+    /// `/embeddings` — is bounded by it; a hung LM Studio can no longer hang
+    /// the caller forever.
+    #[must_use]
+    pub fn with_base_url_and_timeout(base_url: impl Into<String>, timeout_ms: u64) -> Self {
+        Self {
+            client: OpenAiCompatibleClient::new_with_timeout(base_url, timeout_ms),
         }
     }
 }
@@ -109,13 +138,35 @@ pub struct OpenAiCompatibleClient {
 }
 
 impl OpenAiCompatibleClient {
-    /// Create a new client with the given base URL.
+    /// Create a new client with the given base URL and the default request
+    /// timeout (120 s). The URL is normalized to the `/v1` root (AI-22).
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::new_with_timeout(base_url, LM_STUDIO_DEFAULT_TIMEOUT_MS)
+    }
+
+    /// Create a new client with the given base URL and a request timeout in
+    /// milliseconds (reference `lmstudio_timeout_ms`, AI-22 / M10). The
+    /// timeout bounds the WHOLE request (connect + headers + body), so a
+    /// hung LM Studio process fails the caller instead of blocking it
+    /// forever.
+    #[must_use]
+    pub fn new_with_timeout(base_url: impl Into<String>, timeout_ms: u64) -> Self {
         Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
+            base_url: normalize_v1_base_url(&base_url.into()),
+            http: build_http_client(timeout_ms),
             api_key: None,
+        }
+    }
+
+    /// Rebuild the HTTP client with a different request timeout, preserving
+    /// the normalized base URL and API key (AI-22).
+    #[must_use]
+    pub fn with_timeout_ms(self, timeout_ms: u64) -> Self {
+        Self {
+            base_url: self.base_url,
+            http: build_http_client(timeout_ms),
+            api_key: self.api_key,
         }
     }
 
@@ -339,6 +390,16 @@ impl OpenAiCompatibleClient {
             .map_err(|e| Error::Config(format!("LM Studio embed parse failed: {e}")))?;
         Ok(parse_embed_response(body))
     }
+}
+
+/// Build the reqwest client with the given whole-request timeout (AI-22:
+/// `lmstudio_timeout_ms`). Falls back to a default client if the builder
+/// fails (e.g. a broken TLS environment) — never to an unbounded one.
+fn build_http_client(timeout_ms: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms.max(1)))
+        .build()
+        .unwrap_or_default()
 }
 
 // ─── Pure request/response types (testable without HTTP) ──────────────────
@@ -800,11 +861,50 @@ mod tests {
         assert_eq!(client.base_url(), "http://127.0.0.1:1234/v1");
     }
 
+    // ---- AI-22: /v1 normalization on all paths -----------------------------
+
+    #[test]
+    fn client_normalizes_missing_v1_suffix() {
+        // The settings default and user-entered URLs often omit /v1 — every
+        // request path must still resolve against the /v1 root.
+        let client = OpenAiCompatibleClient::new("http://127.0.0.1:1234");
+        assert_eq!(client.base_url(), "http://127.0.0.1:1234/v1");
+    }
+
+    #[test]
+    fn client_normalizes_trailing_slash_without_v1() {
+        let client = OpenAiCompatibleClient::new("http://127.0.0.1:1234/");
+        assert_eq!(client.base_url(), "http://127.0.0.1:1234/v1");
+    }
+
+    #[test]
+    fn client_normalizes_doubled_v1() {
+        let client = OpenAiCompatibleClient::new("http://127.0.0.1:1234/v1/");
+        assert_eq!(client.base_url(), "http://127.0.0.1:1234/v1");
+        // exactly one /v1, not two
+        assert!(!client.base_url().ends_with("/v1/v1"));
+    }
+
     #[test]
     fn client_with_api_key_stores_key() {
         let client =
             OpenAiCompatibleClient::new("http://localhost:1234/v1").with_api_key("sk-test");
         assert!(client.api_key.is_some());
+    }
+
+    #[test]
+    fn with_timeout_preserves_base_url_and_api_key() {
+        let client = OpenAiCompatibleClient::new("http://localhost:1234")
+            .with_api_key("sk-test")
+            .with_timeout_ms(2_500);
+        assert_eq!(client.base_url(), "http://localhost:1234/v1");
+        assert_eq!(client.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn lm_studio_provider_with_timeout_normalizes_base() {
+        let provider = LmStudioProvider::with_base_url_and_timeout("http://localhost:9999", 5_000);
+        assert_eq!(provider.client.base_url(), "http://localhost:9999/v1");
     }
 
     // ---- LmStudioProvider config -------------------------------------------
@@ -903,5 +1003,181 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<LmStudioProvider>();
         assert_send_sync::<OpenAiCompatibleClient>();
+    }
+
+    // ---- AI-22: live wire tests against a mock LM Studio -------------------
+
+    mod ai22_wire {
+        use super::super::*;
+        use axum::response::IntoResponse;
+        use std::sync::{Arc, Mutex};
+
+        /// A mock LM Studio that records every request path and serves
+        /// canned OpenAI-shaped bodies (same pattern as the SY-06 wire tests).
+        struct MockLmStudio {
+            requests: Mutex<Vec<String>>,
+        }
+
+        async fn spawn_mock() -> (String, Arc<MockLmStudio>) {
+            let api = Arc::new(MockLmStudio {
+                requests: Mutex::new(Vec::new()),
+            });
+            let api_for_routes = api.clone();
+            let app = axum::Router::new().fallback(
+                move |method: axum::http::Method, uri: axum::http::Uri| {
+                    let api = api_for_routes.clone();
+                    async move {
+                        {
+                            let mut reqs = api.requests.lock().unwrap();
+                            reqs.push(format!("{method} {}", uri.path()));
+                        }
+                        match uri.path() {
+                            "/v1/models" => axum::Json(serde_json::json!({
+                                "object": "list",
+                                "data": [
+                                    { "id": "qwen-chat", "object": "model" },
+                                    { "id": "text-embedding", "object": "model" }
+                                ]
+                            }))
+                            .into_response(),
+                            "/v1/chat/completions" => axum::Json(serde_json::json!({
+                                "model": "qwen-chat",
+                                "choices": [{
+                                    "message": { "role": "assistant", "content": "hello there" },
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": { "prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5 }
+                            }))
+                            .into_response(),
+                            "/v1/embeddings" => axum::Json(serde_json::json!({
+                                "model": "text-embedding",
+                                "data": [{ "embedding": [0.1, 0.2, 0.3] }],
+                                "usage": { "prompt_tokens": 2, "completion_tokens": 0, "total_tokens": 2 }
+                            }))
+                            .into_response(),
+                            _ => (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({"error": "unknown path"})),
+                            )
+                                .into_response(),
+                        }
+                    }
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock");
+            let addr = listener.local_addr().expect("mock addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            (format!("http://{addr}"), api)
+        }
+
+        fn recorded(api: &MockLmStudio) -> Vec<String> {
+            api.requests.lock().unwrap().clone()
+        }
+
+        #[tokio::test]
+        async fn all_request_paths_hit_the_v1_root_from_a_bare_base() {
+            let (base, api) = spawn_mock().await;
+            // A base URL WITHOUT /v1 (the stored-settings form) — the client
+            // must normalize so every endpoint resolves under /v1.
+            let client = OpenAiCompatibleClient::new(&base);
+            assert_eq!(client.base_url(), format!("{base}/v1"));
+
+            let models = client.list_models().await.expect("models");
+            assert_eq!(models.len(), 2);
+            assert_eq!(models[0].id, "qwen-chat");
+
+            let chat = client
+                .chat(
+                    "qwen-chat",
+                    &[ChatMessage {
+                        role: "user".into(),
+                        content: "hi".into(),
+                    }],
+                )
+                .await
+                .expect("chat");
+            assert_eq!(chat.content, "hello there");
+
+            let embed = client.embed("text-embedding", "hi").await.expect("embed");
+            assert_eq!(embed.vector, vec![0.1, 0.2, 0.3]);
+
+            let requests = recorded(&api);
+            assert_eq!(
+                requests,
+                vec![
+                    "GET /v1/models",
+                    "POST /v1/chat/completions",
+                    "POST /v1/embeddings",
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn v1_suffixed_base_hits_the_same_paths() {
+            let (base, api) = spawn_mock().await;
+            // The already-suffixed form must behave identically (no /v1/v1).
+            let client = OpenAiCompatibleClient::new(format!("{base}/v1/"));
+            assert!(client.list_models().await.is_ok());
+            assert_eq!(recorded(&api), vec!["GET /v1/models"]);
+        }
+
+        #[tokio::test]
+        async fn timeout_bounds_a_hanging_lm_studio() {
+            // A server that accepts the connection and never answers —
+            // without a request timeout this hangs forever (the AI-22 gap:
+            // one hung LM Studio call froze the status route / AI runs).
+            let app = axum::Router::new().fallback(|| async {
+                futures_util::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                axum::Json(serde_json::json!({}))
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind hanging mock");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let client = OpenAiCompatibleClient::new_with_timeout(format!("http://{addr}"), 150);
+            let started = std::time::Instant::now();
+            let result = client.list_models().await;
+            let elapsed = started.elapsed();
+            assert!(result.is_err(), "a hanging server must fail, not hang");
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "the 150 ms timeout must bound the call (took {elapsed:?})"
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("LM Studio list_models failed"),
+                "error should name the failing call: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn is_available_is_bounded_by_the_timeout_too() {
+            // The status-route probe must not hang either.
+            let app = axum::Router::new().fallback(|| async {
+                futures_util::future::pending::<()>().await;
+                #[allow(unreachable_code)]
+                axum::Json(serde_json::json!({}))
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind hanging mock");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let client = OpenAiCompatibleClient::new_with_timeout(format!("http://{addr}"), 150);
+            let started = std::time::Instant::now();
+            assert!(!client.is_available().await);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
     }
 }

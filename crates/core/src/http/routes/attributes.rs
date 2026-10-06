@@ -257,15 +257,29 @@ pub async fn recompute(
     };
 
     // Provider selection (reference ctx provider: LM Studio when configured).
-    let (model, use_ai) = {
+    let (model, use_ai, base_url, timeout_ms) = {
         let conn = state.conn_lock();
         let status = crate::ai_center::get_ai_status(&conn).unwrap_or_default();
         let model = status.chat_model.clone().unwrap_or_default();
         let use_ai = crate::ai_center::ai_features_enabled(&status);
-        (model, use_ai)
+        // AI-22: the configured base URL + lmstudio_timeout_ms (the old
+        // code ignored both and always dialed the default URL unbounded).
+        let base_url = crate::settings::get_string(&conn, "lmstudio_base_url")
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .or_else(|| status.base_url.clone())
+            .unwrap_or_else(|| crate::ai_lm_studio::LM_STUDIO_BASE_URL.to_string());
+        let timeout_ms = u64::try_from(
+            crate::settings::get_i64(&conn, "lmstudio_timeout_ms", 120_000).unwrap_or(120_000),
+        )
+        .unwrap_or(crate::ai_lm_studio::LM_STUDIO_DEFAULT_TIMEOUT_MS);
+        (model, use_ai, base_url, timeout_ms)
     };
     let provider: Box<dyn crate::ai_provider::LocalAiProvider> = if use_ai {
-        Box::new(crate::ai_lm_studio::LmStudioProvider::new())
+        Box::new(
+            crate::ai_lm_studio::LmStudioProvider::with_base_url_and_timeout(base_url, timeout_ms),
+        )
     } else {
         Box::new(crate::ai_provider::NoopAiProvider)
     };

@@ -96,13 +96,20 @@ pub fn backend_from_settings(conn: &Connection) -> AiBackend {
         .filter(|s| !s.is_empty())
         .or_else(|| status.base_url.clone())
         .unwrap_or_else(|| crate::ai_lm_studio::LM_STUDIO_BASE_URL.to_string());
+    // AI-22: the pipeline's client runs with lmstudio_timeout_ms — one
+    // hung LM Studio call is bounded instead of freezing the pipeline
+    // (and, pre-C3, the whole app).
+    let timeout_ms = u64::try_from(
+        crate::settings::get_i64(conn, "lmstudio_timeout_ms", 120_000).unwrap_or(120_000),
+    )
+    .unwrap_or(crate::ai_lm_studio::LM_STUDIO_DEFAULT_TIMEOUT_MS);
     let model = crate::settings::get_string(conn, "lmstudio_chat_model")
         .ok()
         .flatten()
         .map(|s| if s.is_empty() { None } else { Some(s) })
         .unwrap_or(status.chat_model.clone());
     AiBackend::LmStudio {
-        client: OpenAiCompatibleClient::new(base_url),
+        client: OpenAiCompatibleClient::new_with_timeout(base_url, timeout_ms),
         model,
     }
 }
