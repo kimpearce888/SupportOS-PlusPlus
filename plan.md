@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **78 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **73 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 39 | AN-01 | Dashboard (20 fields incl. by_tag/agent/team/channel/daily/mailbox_comparison/ratings/avg times) | Divergent | Major | M | M1 | Compute all 20 dashboard fields from mirror; accept days + mailboxIds + channel params |
-| 40 | AN-09 | Metric definitions endpoint | Missing | Major | M | M3 | Implement release-correlation + release-events CRUD |
-| 41 | AN-12 | Report builder run (metrics->SQL, parameterized, dimensions) | Partial | Major | M | M2 | Fix metric SQL to MAIN semantics (published+not-deleted, customer kind, channel via source_type) |
-| 42 | AN-15 | Support health (no-score design, metrics+flags+incidents) | Divergent | Major | M | M22 | Replace verdict with MAIN's metrics+flags+incidents model |
-| 43 | AC-04 | Events endpoint (actor names, metadata, counts) | Partial | Major | S | - | Join actor names, metadata, counts, limit param |
 | 44 | AC-03 | rebuildAll admin action | Stub | Major | M | - | Run the rebuild (or enqueue a real job once workers support it) |
 | 45 | DC-01 | Docs channel API (collections/stats/hybrid search/article read) | Stub | Major | M | - | Point docs routes at the synced docs mirror; implement hybrid search + article read |
 | 46 | GR-02 | Human edges (5 relations, dup/self/404 checks) | Divergent | Major | M | M4 | Adopt MAIN wire contract + dup/self/404 checks + 5-relation vocab |
