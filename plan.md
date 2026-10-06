@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **93 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **88 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 24 | SY-10 | Provider write methods (createConversation, updateTags/Fields, snooze/schedule, runWorkflow, getAttachmentData, ping, routing) | Partial | Major | run_workflow\\ | - | snooze\\ |
-| 25 | AI-18 | Interaction forbidden-claim text safety scan | Missing | Major | S | - | Port FORBIDDEN_PATTERNS text scan used on interaction free text |
-| 26 | AI-17 | Interaction 2-stage AI enrichment (observe/recommend prompts + safety gates) | Missing | Major | Add 2-stage AI enrichment with enum filter + evidence whitelist + forbidden-claim gates | - | recommendInteraction' crates/core (absent); read ai_prompts.rs:399,420 (unused) |
-| 27 | AI-16 | Interaction intelligence engine (observations/baselines/outcomes/recommendations/card/profile) | Partial | Major | XL | - | Port observation inserts, baseline rebuild, outcome/recommendation engines, profile assembly, playbook |
-| 28 | DB-05 | Soft-delete + merge semantics (deleted_at filter, resurrect on upsert) | Divergent | Major | Add deleted_at/merged filters to inbox list; resurrect deleted rows on upsert | M18 | merged_into' crates/core/src/inbox.rs (0 hits); read sync.rs:183-200 |
 | 29 | SY-09 | Priority API queue (concurrency 2, priority sort) | Missing | Major | Implement priority queue with concurrency 2 wrapping provider calls | M13 | api_queue' crates/core (stats counters only, helpscout_real.rs:279-299) |
 | 30 | AI-14 | Report narrative (facts-only prompt) | Divergent | Major | S | - | Route /api/reports/narrative to the existing ai_pipeline implementation |
 | 31 | AI-21 | /api/analytics/ai draft stats | Divergent | Major | S | - | Point /api/analytics/ai at the same implementation as /api/ai/analytics |
