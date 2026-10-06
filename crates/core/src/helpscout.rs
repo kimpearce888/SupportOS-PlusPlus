@@ -371,8 +371,30 @@ pub struct HsOrganization {
     pub updated_at: Option<String>,
 }
 
+/// A thread recipient reference (V3 wire `{id, email}`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HsThreadRecipient {
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
+/// A thread attachment (V3 wire `{id, filename, mimeType, size}`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HsThreadAttachment {
+    #[serde(default)]
+    pub remote_id: i64,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(rename = "mimeType", default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<i64>,
+}
+
 /// A conversation thread (message/note/chat line).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct HsThread {
     pub remote_id: i64,
     pub conversation_id: i64,
@@ -385,6 +407,15 @@ pub struct HsThread {
     pub created_by_user_id: Option<i64>,
     pub assigned_to_id: Option<i64>,
     pub created_at: Option<String>,
+    /// SY-05 (C8): thread recipients (`to` on the V3 wire).
+    #[serde(default)]
+    pub to: Vec<HsThreadRecipient>,
+    /// SY-05 (C8): thread CC recipients.
+    #[serde(default)]
+    pub cc: Vec<HsThreadRecipient>,
+    /// SY-05 (C8): thread attachment metadata.
+    #[serde(default)]
+    pub attachments: Vec<HsThreadAttachment>,
 }
 
 /// A user's availability status (email/chat).
@@ -1979,6 +2010,7 @@ impl WorldBuilder {
             created_by_user_id: user_id,
             assigned_to_id: None,
             created_at: Some(created_at),
+            ..Default::default()
         });
         let count = self
             .threads
@@ -2489,6 +2521,15 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
         else {
             return Err(not_found_remote("POST"));
         };
+        let customer_email = world
+            .customers
+            .iter()
+            .find(|c| c.remote_id == conv.customer_id)
+            .and_then(|c| c.email.clone())
+            .map(|email| HsThreadRecipient {
+                id: Some(conv.customer_id),
+                email: Some(email),
+            });
         let thread = HsThread {
             remote_id: next_id,
             conversation_id: input.conversation_id,
@@ -2500,6 +2541,18 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             created_by_user_id: Some(me.remote_id),
             assigned_to_id: None,
             created_at: Some(now.clone()),
+            // SY-05 (C8): the reply's recipients mirror the reference wire —
+            // to = the conversation customer, cc = the request's cc list.
+            to: customer_email.into_iter().collect(),
+            cc: input
+                .cc
+                .iter()
+                .map(|email| HsThreadRecipient {
+                    id: None,
+                    email: Some(email.clone()),
+                })
+                .collect(),
+            ..Default::default()
         };
         world.threads.push(thread);
         // fakeProvider.ts refreshes conv.threadCount after every thread push.
@@ -2553,6 +2606,7 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             created_by_user_id: Some(me.remote_id),
             assigned_to_id: None,
             created_at: Some(now.clone()),
+            ..Default::default()
         };
         world.threads.push(thread);
         conv.thread_count = world
@@ -2681,6 +2735,7 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             created_by_user_id: None,
             assigned_to_id: None,
             created_at: Some(now.clone()),
+            ..Default::default()
         };
         world.threads.push(thread);
 

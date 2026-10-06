@@ -1046,6 +1046,34 @@ impl RealHelpScoutProvider {
     }
 
     fn map_thread(v: &Value, conversation_id: i64) -> HsThread {
+        // SY-05 (C8): the V3 wire carries to/cc recipients and attachment
+        // metadata on every thread — both were dropped before.
+        let recipients = |key: &str| -> Vec<crate::helpscout::HsThreadRecipient> {
+            v[key]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|r| crate::helpscout::HsThreadRecipient {
+                            id: r["id"].as_i64(),
+                            email: r["email"].as_str().map(|s| s.to_string()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let attachments = v["attachments"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|at| crate::helpscout::HsThreadAttachment {
+                        remote_id: at["id"].as_i64().unwrap_or(0),
+                        filename: at["filename"].as_str().map(|s| s.to_string()),
+                        mime_type: at["mimeType"].as_str().map(|s| s.to_string()),
+                        size: at["size"].as_i64(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         HsThread {
             remote_id: v["id"].as_i64().unwrap_or(0),
             conversation_id,
@@ -1057,6 +1085,9 @@ impl RealHelpScoutProvider {
             created_by_user_id: v["createdByUser"]["id"].as_i64(),
             assigned_to_id: v["assignedTo"]["id"].as_i64(),
             created_at: v["createdAt"].as_str().map(|s| s.to_string()),
+            to: recipients("to"),
+            cc: recipients("cc"),
+            attachments,
         }
     }
 

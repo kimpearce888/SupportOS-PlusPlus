@@ -6,7 +6,11 @@
 use rusqlite::{params, Connection};
 
 use crate::error::Result;
-use crate::helpscout::{HsConversation, HsCustomer, HsMailbox, HsTag, HsTeam, HsUser};
+use crate::helpscout::{
+    HsConversation, HsCustomer, HsCustomerAddress, HsCustomerEmail, HsCustomerPhone,
+    HsCustomerPropertyValue, HsCustomerSocialProfile, HsCustomerWebsite, HsMailbox, HsTag, HsTeam,
+    HsUser,
+};
 
 // ---------------------------------------------------------------------------
 // Write helpers (upsert data into SQLite)
@@ -273,7 +277,8 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
 
 /// Upsert a customer into the `customers` table.
 pub fn upsert_customer(conn: &Connection, c: &HsCustomer) -> Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO customers (remote_id, first_name, last_name, email, organization, job_title,
             phone, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -298,6 +303,168 @@ pub fn upsert_customer(conn: &Connection, c: &HsCustomer) -> Result<()> {
             c.updated_at,
         ],
     )?;
+    // SY-05 (C8): mirror write fidelity — the contact side tables and the
+    // property values are part of the provider's customer object and were
+    // dropped before. Replace-set semantics: the mirror reflects the
+    // provider's current state (removals propagate).
+    let local: i64 = tx.query_row(
+        "SELECT id FROM customers WHERE remote_id = ?1",
+        params![c.remote_id],
+        |r| r.get(0),
+    )?;
+    let replace_set =
+        |delete_sql: &str, insert_sql: &str, rows: Vec<Vec<Box<dyn rusqlite::ToSql>>>| {
+            tx.execute(delete_sql, params![local])?;
+            for row in rows {
+                let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(row.len() + 1);
+                bind.push(&local);
+                for v in &row {
+                    bind.push(v.as_ref());
+                }
+                tx.execute(insert_sql, bind.as_slice())?;
+            }
+            crate::error::Result::Ok(())
+        };
+    // Emails / phones / websites / social profiles.
+    replace_set(
+        "DELETE FROM customer_emails WHERE customer_id = ?1",
+        "INSERT INTO customer_emails (customer_id, value, type) VALUES (?1, ?2, ?3)",
+        c.emails
+            .iter()
+            .filter_map(|e| {
+                e.value
+                    .as_deref()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| {
+                        vec![
+                            Box::new(v.trim().to_string()) as Box<dyn rusqlite::ToSql>,
+                            Box::new(e.kind.clone()),
+                        ]
+                    })
+            })
+            .collect(),
+    )?;
+    replace_set(
+        "DELETE FROM customer_phones WHERE customer_id = ?1",
+        "INSERT INTO customer_phones (customer_id, value, type) VALUES (?1, ?2, ?3)",
+        c.phones
+            .iter()
+            .filter_map(|p| {
+                p.value
+                    .as_deref()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| {
+                        vec![
+                            Box::new(v.trim().to_string()) as Box<dyn rusqlite::ToSql>,
+                            Box::new(p.kind.clone()),
+                        ]
+                    })
+            })
+            .collect(),
+    )?;
+    replace_set(
+        "DELETE FROM customer_websites WHERE customer_id = ?1",
+        "INSERT INTO customer_websites (customer_id, value) VALUES (?1, ?2)",
+        c.websites
+            .iter()
+            .filter_map(|w| {
+                w.value
+                    .as_deref()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| vec![Box::new(v.trim().to_string()) as Box<dyn rusqlite::ToSql>])
+            })
+            .collect(),
+    )?;
+    replace_set(
+        "DELETE FROM customer_social_profiles WHERE customer_id = ?1",
+        "INSERT INTO customer_social_profiles (customer_id, value, type) VALUES (?1, ?2, ?3)",
+        c.social_profiles
+            .iter()
+            .filter_map(|s| {
+                s.value
+                    .as_deref()
+                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| {
+                        vec![
+                            Box::new(v.trim().to_string()) as Box<dyn rusqlite::ToSql>,
+                            Box::new(s.kind.clone()),
+                        ]
+                    })
+            })
+            .collect(),
+    )?;
+    // Postal address (single row per customer).
+    tx.execute(
+        "DELETE FROM customer_addresses WHERE customer_id = ?1",
+        params![local],
+    )?;
+    if let Some(a) = &c.address {
+        let lines = [a.line1.as_deref(), a.line2.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        tx.execute(
+            "INSERT INTO customer_addresses (customer_id, lines, city, state, postal_code, country)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                local,
+                if lines.is_empty() { None } else { Some(lines) },
+                a.city,
+                a.state,
+                a.postal_code,
+                a.country,
+            ],
+        )?;
+    }
+    // Property values: resolve the definition by remote id; when the
+    // definitions resource has not synced yet, write a stub from the value's
+    // own name/key so the property is not silently dropped (the later
+    // definitions sync upserts the full definition row).
+    for p in &c.properties {
+        let value = p.value.as_deref().filter(|v| !v.trim().is_empty());
+        if value.is_none() || p.definition_remote_id.is_none() {
+            continue;
+        }
+        let def_remote = p.definition_remote_id.unwrap_or(0);
+        let def_local: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM customer_property_definitions WHERE remote_id = ?1",
+                params![def_remote],
+                |r| r.get(0),
+            )
+            .ok();
+        let def_local = match def_local {
+            Some(id) => id,
+            None => {
+                let name = p
+                    .name
+                    .clone()
+                    .or_else(|| p.key.clone())
+                    .unwrap_or_else(|| format!("Property {def_remote}"));
+                tx.execute(
+                    "INSERT INTO customer_property_definitions (remote_id, name, slug, type, sort_order, last_synced_at)
+                     VALUES (?1, ?2, ?3, 'text', 0, datetime('now'))
+                     ON CONFLICT(remote_id) DO UPDATE SET name = excluded.name",
+                    params![def_remote, name, p.key],
+                )?;
+                tx.query_row(
+                    "SELECT id FROM customer_property_definitions WHERE remote_id = ?1",
+                    params![def_remote],
+                    |r| r.get(0),
+                )?
+            }
+        };
+        tx.execute(
+            "INSERT INTO customer_properties (customer_id, definition_id, value)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(customer_id, definition_id) DO UPDATE SET value = excluded.value",
+            params![local, def_local, value],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -308,6 +475,10 @@ pub fn upsert_customer(conn: &Connection, c: &HsCustomer) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::helpscout::{
+        HsCustomerAddress, HsCustomerEmail, HsCustomerPhone, HsCustomerPropertyValue,
+        HsCustomerSocialProfile, HsCustomerWebsite,
+    };
     use tempfile::NamedTempFile;
 
     fn fresh_db() -> Connection {
@@ -612,6 +783,195 @@ mod tests {
             .unwrap();
         assert_eq!(first, Some("Alice".into()));
         assert_eq!(email, Some("alice@example.com".into()));
+    }
+
+    /// SY-05 (C8): the contact side tables + property values are part of the
+    /// provider's customer object and must land in the mirror.
+    #[test]
+    fn upsert_customer_persists_side_tables_and_properties() {
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO customer_property_definitions (remote_id, name, slug, type, sort_order)
+             VALUES (4101, 'Plan', 'plan', 'dropdown', 1)",
+            [],
+        )
+        .unwrap();
+        let c = HsCustomer {
+            remote_id: 2002,
+            first_name: Some("Ada".into()),
+            last_name: Some("Lovelace".into()),
+            email: Some("ada@work.example".into()),
+            organization: None,
+            job_title: None,
+            phone: Some("+1-555-0002".into()),
+            created_at: None,
+            updated_at: None,
+            photo_url: None,
+            organization_id: None,
+            background: None,
+            age: None,
+            gender: None,
+            location: None,
+            emails: vec![
+                HsCustomerEmail {
+                    value: Some("ada@work.example".into()),
+                    kind: Some("work".into()),
+                },
+                HsCustomerEmail {
+                    value: Some("ada@home.example".into()),
+                    kind: Some("home".into()),
+                },
+            ],
+            phones: vec![HsCustomerPhone {
+                value: Some("+1-555-0002".into()),
+                kind: Some("work".into()),
+            }],
+            websites: vec![HsCustomerWebsite {
+                value: Some("https://ada.example".into()),
+            }],
+            social_profiles: vec![HsCustomerSocialProfile {
+                value: Some("https://linkedin.com/in/ada".into()),
+                kind: Some("linkedin".into()),
+            }],
+            address: Some(HsCustomerAddress {
+                line1: Some("1 Analytical Way".into()),
+                line2: None,
+                city: Some("London".into()),
+                state: None,
+                postal_code: Some("SW1".into()),
+                country: Some("UK".into()),
+            }),
+            properties: vec![
+                HsCustomerPropertyValue {
+                    definition_remote_id: Some(4101),
+                    key: None,
+                    name: None,
+                    value: Some("Pro".into()),
+                },
+                // Unknown definition -> stub definition from the value's name.
+                HsCustomerPropertyValue {
+                    definition_remote_id: Some(4105),
+                    key: Some("region".into()),
+                    name: Some("Region".into()),
+                    value: Some("EMEA".into()),
+                },
+            ],
+        };
+        upsert_customer(&conn, &c).unwrap();
+
+        let local: i64 = conn
+            .query_row("SELECT id FROM customers WHERE remote_id = 2002", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Emails with types.
+        let emails: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT value, type FROM customer_emails WHERE customer_id = ?1 ORDER BY value",
+                )
+                .unwrap();
+            stmt.query_map(params![local], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            emails,
+            vec![
+                ("ada@home.example".to_string(), Some("home".to_string())),
+                ("ada@work.example".to_string(), Some("work".to_string())),
+            ],
+            "both emails persisted with their types"
+        );
+        // Phone / website / social.
+        let (phone, ptype): (String, Option<String>) = conn
+            .query_row(
+                "SELECT value, type FROM customer_phones WHERE customer_id = ?1",
+                params![local],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phone, "+1-555-0002");
+        assert_eq!(ptype.as_deref(), Some("work"));
+        let site: String = conn
+            .query_row(
+                "SELECT value FROM customer_websites WHERE customer_id = ?1",
+                params![local],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(site, "https://ada.example");
+        let (social, stype): (String, Option<String>) = conn
+            .query_row(
+                "SELECT value, type FROM customer_social_profiles WHERE customer_id = ?1",
+                params![local],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(social, "https://linkedin.com/in/ada");
+        assert_eq!(stype.as_deref(), Some("linkedin"));
+        // Address.
+        let (lines, city, postal, country): (Option<String>, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT lines, city, postal_code, country FROM customer_addresses WHERE customer_id = ?1",
+                params![local],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(lines.as_deref(), Some("1 Analytical Way"));
+        assert_eq!(city.as_deref(), Some("London"));
+        assert_eq!(postal.as_deref(), Some("SW1"));
+        assert_eq!(country.as_deref(), Some("UK"));
+        // Properties: the known definition resolves; the unknown one creates
+        // a stub definition from the value's own name.
+        let props: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT d.name, p.value FROM customer_properties p
+                       JOIN customer_property_definitions d ON d.id = p.definition_id
+                      WHERE p.customer_id = ?1 ORDER BY d.name",
+                )
+                .unwrap();
+            stmt.query_map(params![local], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            props,
+            vec![
+                ("Plan".to_string(), "Pro".to_string()),
+                ("Region".to_string(), "EMEA".to_string()),
+            ],
+            "property values land with their definitions (stub when unknown)"
+        );
+
+        // Replace-set semantics: a re-upsert with a single email replaces the
+        // set (no duplicates, removals propagate), and a changed property
+        // value updates in place.
+        let mut c2 = c.clone();
+        c2.emails.truncate(1);
+        c2.properties[0].value = Some("Enterprise".into());
+        upsert_customer(&conn, &c2).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM customer_emails WHERE customer_id = ?1",
+                params![local],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the removed email is gone, no duplicates");
+        let plan_value: String = conn
+            .query_row(
+                "SELECT p.value FROM customer_properties p
+                   JOIN customer_property_definitions d ON d.id = p.definition_id
+                  WHERE p.customer_id = ?1 AND d.remote_id = 4101",
+                params![local],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan_value, "Enterprise", "property value updated in place");
     }
 
     #[test]

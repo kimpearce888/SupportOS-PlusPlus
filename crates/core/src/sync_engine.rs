@@ -457,11 +457,63 @@ fn upsert_thread(conn: &Connection, conversation_local: i64, t: &HsThread) -> Re
         params![conversation_local, t.kind, t.state, t.body, actor_type, actor_id, t.created_at, t.remote_id],
     )?;
     record_thread_event(conn, conversation_local, t, actor_type, actor_id)?;
+    // SY-05 (C8): store the thread's recipients + attachment metadata (the
+    // reference mirror keeps both; the port dropped them before).
+    persist_thread_details(conn, t)?;
     // Interaction intelligence: refresh the deterministic current-signals
     // snapshot on customer activity (spec #59; reference workers.ts:744-747
     // — errors never break the sync).
     if t.kind == "customer" {
         let _ = crate::interaction_current::record_current_interaction(conn, conversation_local);
+    }
+    Ok(())
+}
+
+/// SY-05 (C8): persist the thread's `to`/`cc` recipients (replace-set — the
+/// mirror reflects the provider's current state) and upsert its attachment
+/// metadata rows by remote id (a downloaded attachment keeps its local
+/// state/path on re-sync).
+fn persist_thread_details(conn: &Connection, t: &HsThread) -> Result<()> {
+    let Some(thread_local) = local_id(conn, "conversation_threads", t.remote_id) else {
+        return Ok(());
+    };
+    // Recipients: replace-set.
+    conn.execute(
+        "DELETE FROM thread_recipients WHERE thread_id = ?1",
+        params![thread_local],
+    )?;
+    for (kind, list) in [("to", &t.to), ("cc", &t.cc)] {
+        for r in list {
+            if let Some(email) = r.email.as_deref().filter(|e| !e.trim().is_empty()) {
+                conn.execute(
+                    "INSERT INTO thread_recipients (thread_id, email, type)
+                     VALUES (?1, ?2, ?3)",
+                    params![thread_local, email.trim(), kind],
+                )?;
+            }
+        }
+    }
+    // Attachment metadata: upsert by remote id, never touching the local
+    // download state (state/local_path/hash/downloaded_at stay as they are).
+    for a in &t.attachments {
+        conn.execute(
+            "INSERT INTO attachments (remote_id, thread_id, conversation_id, filename, mime_type, size, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'metadata')
+             ON CONFLICT(remote_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                conversation_id = excluded.conversation_id,
+                filename = excluded.filename,
+                mime_type = excluded.mime_type,
+                size = excluded.size",
+            params![
+                a.remote_id,
+                thread_local,
+                local_id(conn, "conversations", t.conversation_id),
+                a.filename,
+                a.mime_type,
+                a.size,
+            ],
+        )?;
     }
     Ok(())
 }
@@ -2054,5 +2106,221 @@ mod tests {
         assert_eq!(get_state(&conn), "NEW");
         set_state(&conn, "CATCHING_UP");
         assert_eq!(get_state(&conn), "CATCHING_UP");
+    }
+
+    /// SY-05 (C8): the thread's recipients + attachment metadata land in the
+    /// mirror (they were dropped before the fix).
+    #[test]
+    fn upsert_thread_persists_recipients_and_attachments() {
+        let conn = fresh_conn();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+             VALUES (7001, 7001, 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let conv_local: i64 = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = 7001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let t = HsThread {
+            remote_id: 88001,
+            conversation_id: 7001,
+            kind: "reply".into(),
+            status: None,
+            state: Some("published".into()),
+            body: Some("here is the report".into()),
+            created_by_customer_id: None,
+            created_by_user_id: Some(1001),
+            assigned_to_id: None,
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+            to: vec![crate::helpscout::HsThreadRecipient {
+                id: Some(3001),
+                email: Some("ada@example.com".into()),
+            }],
+            cc: vec![crate::helpscout::HsThreadRecipient {
+                id: None,
+                email: Some("boss@example.com".into()),
+            }],
+            attachments: vec![crate::helpscout::HsThreadAttachment {
+                remote_id: 61001,
+                filename: Some("report.pdf".into()),
+                mime_type: Some("application/pdf".into()),
+                size: Some(2048),
+            }],
+        };
+        upsert_thread(&conn, conv_local, &t).unwrap();
+        let thread_local: i64 = conn
+            .query_row(
+                "SELECT id FROM conversation_threads WHERE remote_id = 88001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let recipients: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT email, type FROM thread_recipients
+                      WHERE thread_id = ?1 ORDER BY type, email",
+                )
+                .unwrap();
+            stmt.query_map(params![thread_local], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            recipients,
+            vec![
+                ("boss@example.com".to_string(), "cc".to_string()),
+                ("ada@example.com".to_string(), "to".to_string()),
+            ],
+            "to + cc recipients stored"
+        );
+        let (att_conv, att_thread, filename, mime, size, state): (
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT conversation_id, thread_id, filename, mime_type, size, state
+                   FROM attachments WHERE remote_id = 61001",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            att_conv, conv_local,
+            "attachment linked to the conversation"
+        );
+        assert_eq!(att_thread, thread_local, "attachment linked to the thread");
+        assert_eq!(filename.as_deref(), Some("report.pdf"));
+        assert_eq!(mime.as_deref(), Some("application/pdf"));
+        assert_eq!(size, Some(2048));
+        assert_eq!(state.as_deref(), Some("metadata"));
+
+        // Mark the attachment downloaded, then re-sync the thread with
+        // changed recipients: the metadata refresh keeps the local download
+        // state, and the recipient set is REPLACED (no duplicates).
+        conn.execute(
+            "UPDATE attachments SET state = 'downloaded', local_path = '/tmp/x'
+               WHERE remote_id = 61001",
+            [],
+        )
+        .unwrap();
+        let mut t2 = t.clone();
+        t2.to.clear();
+        t2.cc = vec![crate::helpscout::HsThreadRecipient {
+            id: None,
+            email: Some("new-boss@example.com".into()),
+        }];
+        upsert_thread(&conn, conv_local, &t2).unwrap();
+        let recipients: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT email, type FROM thread_recipients WHERE thread_id = ?1")
+                .unwrap();
+            stmt.query_map(params![thread_local], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            recipients,
+            vec![("new-boss@example.com".to_string(), "cc".to_string())],
+            "the old recipients are replaced, not duplicated"
+        );
+        let (state, path): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, local_path FROM attachments WHERE remote_id = 61001",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state.as_deref(), Some("downloaded"), "download state kept");
+        assert_eq!(path.as_deref(), Some("/tmp/x"), "local path kept");
+    }
+
+    /// SY-05 (C8): the demo world's customers carry emails/phones/properties —
+    /// after the initial sync they must live in the mirror side tables (the
+    /// definitions resource syncs before customers).
+    #[tokio::test]
+    async fn initial_sync_mirrors_customer_contact_details_and_properties() {
+        let (conn, engine) = engine();
+        engine.initial_sync().await.unwrap();
+        let conn = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (local, flat_email): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT id, email FROM customers WHERE remote_id = 3001",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let emails: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT value FROM customer_emails WHERE customer_id = ?1 ORDER BY value")
+                .unwrap();
+            stmt.query_map(params![local], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(
+            emails.len() >= 2,
+            "the demo world's email list lands: {emails:?}"
+        );
+        assert!(
+            flat_email
+                .as_deref()
+                .is_some_and(|e| emails.contains(&e.to_string())),
+            "the flat email is one of the stored ones: {flat_email:?} vs {emails:?}"
+        );
+        // Property values (the world's customers carry Plan/Seats/Region).
+        let props: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT d.name, p.value FROM customer_properties p
+                       JOIN customer_property_definitions d ON d.id = p.definition_id
+                      WHERE p.customer_id = ?1 ORDER BY d.name",
+                )
+                .unwrap();
+            stmt.query_map(params![local], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(
+            props.iter().any(|(name, _)| name == "Plan"),
+            "property definitions resolved: {props:?}"
+        );
+        assert!(
+            props
+                .iter()
+                .any(|(name, value)| name == "Plan" && !value.is_empty()),
+            "Plan value present: {props:?}"
+        );
+        // And the whole customer set landed emails (not just customer 3001).
+        let with_emails: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT customer_id) FROM customer_emails",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(with_emails >= 5, "customers with emails: {with_emails}");
     }
 }
