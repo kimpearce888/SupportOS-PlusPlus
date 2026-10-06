@@ -30,15 +30,14 @@ pub fn open(path: &Path) -> Result<Connection> {
 ///
 /// Convenience wrapper for the common boot path: open + ensure_migrations_table +
 /// migrations::run_all. Idempotent — safe to call on every boot.
+///
+/// BK-04: no fabricated `schema_migrations` rows are seeded here — the
+/// .sosync guard uses the real canonical DDL fingerprint and the app's
+/// real migration history lives in `_migrations`.
 pub fn open_with_migrations(path: &Path) -> Result<Connection> {
     let mut conn = open(path)?;
     ensure_migrations_table(&conn)?;
     crate::migrations::run_all(&mut conn)?;
-    // Record the reference-equivalent migration set (the port implements
-    // reference migrations 001..016 via its boot-time batches; the record
-    // makes `migrations_applied` and the .sosync schema guard compare like
-    // with like). Idempotent.
-    let _ = crate::encrypted_sync::ensure_schema_migrations_record(&conn);
     Ok(conn)
 }
 

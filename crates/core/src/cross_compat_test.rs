@@ -1,10 +1,18 @@
-//! Cross-compat execution test: decrypt a REFERENCE-created .sosync bundle
-//! with the port's encrypted_sync module, and create a port bundle for the
-//! reference to decrypt. Run with:
+//! Cross-compat execution test for the .sosync schema guard (BK-04).
+//!
+//! Audit C1: the old guard compared fabricated migration numbers, so a
+//! REFERENCE-created bundle (MAIN's 123-table DDL, migration 16) verified and
+//! imported into the port — swapping in an incompatible schema. The new
+//! guard compares the REAL canonical DDL fingerprint, so a reference bundle
+//! must now be REJECTED with the incompatibility message, while port bundles
+//! must still decrypt on the reference side (JSON parsers ignore the extra
+//! `schema_fingerprint` header field).
+//!
+//! Run with:
 //!   cargo test -p supportos-plusplus-core --lib cross_compat -- --ignored --nocapture
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
@@ -15,32 +23,39 @@ const PASS: &str = "cross-compat-passphrase";
 
 #[test]
 #[ignore]
-fn decrypt_reference_created_bundle() {
+fn reference_bundle_is_rejected_by_the_real_schema_guard() {
+    // A minimal PORT-shaped local schema — the guard compares real DDL, not
+    // fabricated migration numbers.
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
-        "CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, name TEXT);
-         INSERT INTO schema_migrations VALUES (16, '016_m6_graph_coaching_memory');",
+        "CREATE TABLE conversations (
+             id INTEGER PRIMARY KEY, number INTEGER, subject TEXT,
+             status TEXT, mailbox_id INTEGER, customer_id INTEGER,
+             created_at TEXT, closed_at TEXT
+         );
+         CREATE TABLE customers (id INTEGER PRIMARY KEY, email TEXT);",
     )
     .unwrap();
-    encrypted_sync::ensure_schema_migrations_record(&conn).unwrap();
 
     let bundles = Path::new(DIR);
     let bundle = bundles.join("ref-created.sosync");
     assert!(bundle.exists(), "run scripts/sosync_cross_test.js first");
 
-    // Verify (decrypts + reports counts) — must succeed on the reference format.
+    // Verify with the right passphrase: decryption succeeds, but the schema
+    // guard must refuse the reference's divergent DDL (BK-04 / audit C1).
     let v = encrypted_sync::verify_bundle(&conn, bundles, &bundle, PASS);
     assert!(
-        v["ok"].as_bool().unwrap(),
-        "reference bundle failed port verify: {v}"
+        !v["ok"].as_bool().unwrap(),
+        "reference bundle must NOT verify against the port schema: {v}"
     );
     let msg = v["message"].as_str().unwrap();
-    assert!(msg.contains("5 conversations"), "unexpected message: {msg}");
-    assert!(msg.contains("2 customers"), "unexpected message: {msg}");
-    assert!(msg.contains("schema 16"), "unexpected message: {msg}");
-    println!("REFERENCE->PORT VERIFY: {msg}");
+    assert!(
+        msg.contains("incompatible"),
+        "expected the incompatibility message, got: {msg}"
+    );
+    println!("REFERENCE->PORT VERIFY (rejected): {msg}");
 
-    // Wrong passphrase must fail with the reference's exact message.
+    // Wrong passphrase still fails with the reference's exact message.
     let bad = encrypted_sync::verify_bundle(&conn, bundles, &bundle, "wrong-wrong-wrong");
     assert!(!bad["ok"].as_bool().unwrap());
     assert!(bad["message"]
@@ -53,10 +68,14 @@ fn decrypt_reference_created_bundle() {
     let port_conn = Connection::open(&db_path).unwrap();
     port_conn
         .execute_batch(
-            "CREATE TABLE conversations (id INTEGER PRIMARY KEY);
-             CREATE TABLE customers (id INTEGER PRIMARY KEY);
-             INSERT INTO conversations VALUES (1),(2),(3),(4),(5),(6),(7);
-             INSERT INTO customers VALUES (1),(2),(3);",
+            "CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY, number INTEGER, subject TEXT,
+                 status TEXT, mailbox_id INTEGER, customer_id INTEGER,
+                 created_at TEXT, closed_at TEXT
+             );
+             CREATE TABLE customers (id INTEGER PRIMARY KEY, email TEXT);
+             INSERT INTO conversations VALUES (1, 101, 'a', 'active', 1, 1, '2026-01-01', NULL);
+             INSERT INTO customers VALUES (1, 'a@example.com');",
         )
         .unwrap();
     let res = encrypted_sync::export_bundle(&port_conn, bundles, PASS);
@@ -71,4 +90,3 @@ fn decrypt_reference_created_bundle() {
         res.size_bytes.unwrap()
     );
 }
-use std::path::PathBuf;

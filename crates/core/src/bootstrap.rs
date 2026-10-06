@@ -101,10 +101,9 @@ pub fn apply_all(conn: &mut Connection) -> Result<()> {
     // QA computed_at stamp.
     crate::quality::ensure_quality_tables(conn)?;
 
-    // Record the reference-equivalent migration set so `migrations_applied`
-    // and the .sosync schema guard compare like with like (the reference's
-    // migrator writes these rows as it applies 001–016).
-    crate::encrypted_sync::ensure_schema_migrations_record(conn)?;
+    // BK-04: no fabricated `schema_migrations` rows are seeded at boot —
+    // the .sosync guard compares the real canonical DDL fingerprint, and
+    // the app's real migration history lives in `_migrations`.
 
     Ok(())
 }

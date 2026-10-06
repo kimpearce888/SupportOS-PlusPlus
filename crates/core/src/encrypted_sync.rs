@@ -15,7 +15,8 @@
 //!   "app_version": <string|null>,
 //!   "conversations": <count>,
 //!   "customers": <count>,
-//!   "sha256": <hex of plaintext snapshot>
+//!   "sha256": <hex of plaintext snapshot>,
+//!   "schema_fingerprint": <hex sha256 of the canonical DDL>  (BK-04)
 //! }
 //! ciphertext (AES-256-GCM over the SQLite VACUUM INTO snapshot)
 //! GCM tag (16 bytes, appended after the ciphertext)
@@ -26,10 +27,18 @@
 //! - Content: a `VACUUM INTO` snapshot of the SQLite mirror (the port's
 //!   mirror carries the same conversation/customer data model).
 //! - Import is safe-by-default: decrypt to temp, `PRAGMA integrity_check`,
-//!   schema-version guard (never import a newer schema), automatic safety
-//!   backup of the current DB, then atomic swap + WAL/SHM removal.
+//!   then the **real schema guard** (BK-04): the decrypted snapshot's
+//!   canonical DDL fingerprint must match the local schema exactly, or be
+//!   a compatible *ancestor* (older same-lineage schema the boot batches
+//!   can migrate). Fabricated migration numbers are never trusted — the
+//!   fingerprint is recomputed from the decrypted bytes, not read from the
+//!   (unauthenticated) header. A divergent schema (e.g. a bundle created
+//!   by the reference app) is refused before anything is changed;
+//!   afterwards: automatic safety backup of the current DB, atomic swap,
+//!   WAL/SHM removal.
 //! - Bundles are pruned to the newest 5.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -103,6 +112,11 @@ struct BundleHeader {
     customers: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
+    /// Canonical DDL fingerprint of the snapshot (BK-04). Informational in
+    /// the header — the import guard always recomputes it from the decrypted
+    /// bytes (the header is not authenticated).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,33 +196,20 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Local schema version (reference: `MAX(id) FROM schema_migrations`, 0 when
-/// unmigrated). The port records applied reference-equivalent migrations in
-/// `schema_migrations`; `_migrations` is the legacy port-only table.
-fn schema_version(conn: &Connection) -> i64 {
-    if let Ok(v) = conn.query_row(
-        "SELECT COALESCE(MAX(id), 0) FROM schema_migrations",
-        [],
-        |r| r.get(0),
-    ) {
-        return v;
-    }
-    if let Ok(v) = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM _migrations", [], |r| {
-        r.get(0)
-    }) {
-        return v;
-    }
-    0
-}
-
-/// Schema version of a snapshot file (reference `schemaVersionOfFile`):
-/// looks for `schema_migrations` then `migrations`; 0 when absent.
+/// Schema version of a snapshot file: looks for `schema_migrations` then
+/// `migrations` (the reference's tables) then `_migrations` (the port's
+/// real history); 0 when absent. Informational only — the import decision
+/// is made by the DDL fingerprint guard below (BK-04).
 fn schema_version_of_file(path: &Path) -> i64 {
     let Ok(test) = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return 0;
     };
-    for table in ["schema_migrations", "migrations"] {
+    for (table, col) in [
+        ("schema_migrations", "id"),
+        ("migrations", "id"),
+        ("_migrations", "version"),
+    ] {
         let exists: bool = test
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
@@ -219,7 +220,7 @@ fn schema_version_of_file(path: &Path) -> i64 {
             .unwrap_or(false);
         if exists {
             if let Ok(v) = test.query_row(
-                &format!("SELECT COALESCE(MAX(id), 0) FROM {table}"),
+                &format!("SELECT COALESCE(MAX({col}), 0) FROM {table}"),
                 [],
                 |r| r.get(0),
             ) {
@@ -230,42 +231,182 @@ fn schema_version_of_file(path: &Path) -> i64 {
     0
 }
 
-/// Ensure the port's DB records its reference-equivalent schema level so the
-/// import guard compares like with like. The port implements the reference
-/// migration set 001..016 via its boot-time batch migrations; this seeds
-/// `schema_migrations` with those ids exactly once (idempotent).
-pub fn ensure_schema_migrations_record(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );",
+// ---------------- Real schema guard (BK-04) ----------------
+
+/// fts5 shadow-table suffixes — the generated DDL of these companion tables
+/// depends on the bundled SQLite build, so they are excluded from the
+/// canonical fingerprint (the virtual table itself is still included).
+const FTS_SHADOW_SUFFIXES: [&str; 5] = ["_data", "_idx", "_docsize", "_content", "_config"];
+
+/// Names of the virtual tables (e.g. fts5) in this database.
+fn virtual_tables(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND sql LIKE 'CREATE VIRTUAL%'",
     )?;
-    for (id, name) in [
-        (1i64, "001_core"),
-        (2, "002_sync_jobs"),
-        (3, "003_ai_knowledge"),
-        (4, "004_fts"),
-        (5, "005_interaction_intelligence"),
-        (6, "006_interaction_integrity"),
-        (7, "007_channels_docs"),
-        (8, "008_semantic_docs_sla"),
-        (9, "009_outreach_semantic_sync"),
-        (10, "010_audit_hardening"),
-        (11, "011_activity_engine"),
-        (12, "012_m2_collaboration"),
-        (13, "013_m3_copilot_attributes"),
-        (14, "014_m4_intelligence_workspace"),
-        (15, "015_m5_quality_translation_reports"),
-        (16, "016_m6_graph_coaching_memory"),
-    ] {
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (id, name) VALUES (?1, ?2)",
-            rusqlite::params![id, name],
-        )?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// True when a sqlite_master object is excluded from the canonical schema
+/// fingerprint: SQLite internals, migration bookkeeping (whose presence
+/// depends on the database's lineage — fabricated or real — not on the app
+/// schema), and fts5 shadow tables (SQLite-version-dependent DDL).
+fn fingerprint_excluded(name: &str, virtual_tables: &[String]) -> bool {
+    if name.starts_with("sqlite_") {
+        return true;
     }
-    Ok(())
+    if name == "_migrations" || name == "schema_migrations" || name == "migrations" {
+        return true;
+    }
+    for vt in virtual_tables {
+        for suffix in FTS_SHADOW_SUFFIXES {
+            if name == format!("{vt}{suffix}") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Canonical DDL fingerprint (BK-04): SHA-256 over every schema object in
+/// `sqlite_master` (tables, indexes, views, triggers) with the object's SQL
+/// whitespace-normalized, sorted by (type, name). Two databases share a
+/// fingerprint **iff** their application schema is identical — regardless of
+/// any migration-number claims in bookkeeping tables.
+pub fn schema_fingerprint(conn: &Connection) -> Result<String> {
+    let vtabs = virtual_tables(conn)?;
+    let mut objects: Vec<(String, String, String)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (typ, name, sql) in rows {
+            if fingerprint_excluded(&name, &vtabs) {
+                continue;
+            }
+            objects.push((typ, name, sql));
+        }
+    }
+    objects.sort();
+    let mut canonical = String::new();
+    for (typ, name, sql) in &objects {
+        let normalized: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        canonical.push_str(&format!("{typ}\u{1f}{name}\u{1f}{normalized}\n"));
+    }
+    Ok(hex(&Sha256::digest(canonical.as_bytes())))
+}
+
+/// Canonical DDL fingerprint of a database file (opened read-only).
+fn fingerprint_of_file(path: &Path) -> Result<String> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    schema_fingerprint(&conn)
+}
+
+/// Columns of a table as (name, normalized type, notnull, pk) tuples.
+fn table_columns(conn: &Connection, table: &str) -> Option<Vec<(String, String, i64, i64)>> {
+    let escaped = table.replace('"', "\"\"");
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info(\"{escaped}\")"))
+        .ok()?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase(),
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })
+        .ok()?;
+    Some(rows.flatten().collect())
+}
+
+/// True when the snapshot's schema is a compatible **ancestor** of the local
+/// schema: every snapshot table exists locally with all of the snapshot's
+/// columns (same name, type, NOT NULL and primary-key flags). The local
+/// schema may have MORE tables/columns — that is ordinary additive evolution
+/// the idempotent boot batches migrate on restart. Any table or column the
+/// snapshot has that the local schema lacks means the bundle comes from a
+/// different (divergent or newer) lineage.
+fn snapshot_is_compatible_ancestor(local: &Connection, snapshot: &Connection) -> bool {
+    let vtabs = match virtual_tables(snapshot) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let names: Vec<String> = match snapshot
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect::<Vec<_>>())
+        }) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    for name in names {
+        if fingerprint_excluded(&name, &vtabs) {
+            continue;
+        }
+        let Some(snap_cols) = table_columns(snapshot, &name) else {
+            return false;
+        };
+        let Some(local_cols) = table_columns(local, &name) else {
+            return false; // table does not exist locally
+        };
+        let local_set: HashSet<(String, String, i64, i64)> = local_cols.into_iter().collect();
+        for col in snap_cols {
+            if !local_set.contains(&col) {
+                return false; // divergent or newer column
+            }
+        }
+    }
+    true
+}
+
+/// Outcome of the .sosync schema guard (BK-04).
+enum SchemaCheck {
+    /// Snapshot DDL is byte-identical to the local schema.
+    Identical,
+    /// Snapshot DDL is an older, compatible same-lineage schema (boot
+    /// batches migrate it on restart).
+    CompatibleAncestor,
+    /// Snapshot DDL is divergent — refuse the import.
+    Incompatible { bundle: String, local: String },
+}
+
+fn check_schema_compatibility(local: &Connection, snapshot: &Connection) -> Result<SchemaCheck> {
+    let local_fp = schema_fingerprint(local)?;
+    let bundle_fp = schema_fingerprint(snapshot)?;
+    if local_fp == bundle_fp {
+        return Ok(SchemaCheck::Identical);
+    }
+    if snapshot_is_compatible_ancestor(local, snapshot) {
+        Ok(SchemaCheck::CompatibleAncestor)
+    } else {
+        Ok(SchemaCheck::Incompatible {
+            bundle: bundle_fp,
+            local: local_fp,
+        })
+    }
+}
+
+/// Short display form of a fingerprint (first 12 hex chars).
+fn fp_short(fp: &str) -> &str {
+    &fp[..fp.len().min(12)]
 }
 
 // ---------------- Export ----------------
@@ -297,6 +438,11 @@ fn try_export_bundle(
         });
     }
     fs::create_dir_all(bundles_dir)?;
+    // BK-04: ensure the ledger table exists BEFORE the snapshot so the
+    // exported fingerprint matches the live schema (the first-ever export
+    // would otherwise ship a snapshot without `encrypted_sync_log` and
+    // force every later import through the ancestor path).
+    ensure_log_table(conn)?;
     let stamp = stamp();
     let snapshot_path = bundles_dir.join(format!(".snapshot-{stamp}.tmp"));
     let target = bundles_dir.join(format!("supportos-sync-{stamp}.sosync"));
@@ -305,8 +451,10 @@ fn try_export_bundle(
     let escaped = snapshot_path.to_string_lossy().replace('\'', "''");
     conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
 
-    // 2. Metadata from the snapshot.
+    // 2. Metadata from the snapshot — including the REAL canonical DDL
+    //    fingerprint of the bytes actually shipped (BK-04).
     let info = snapshot_info(&snapshot_path)?;
+    let fingerprint = fingerprint_of_file(&snapshot_path)?;
 
     // 3. Encrypt.
     let mut salt = [0u8; 16];
@@ -331,6 +479,7 @@ fn try_export_bundle(
         conversations: Some(info.conversations),
         customers: Some(info.customers),
         sha256: Some(info.sha256.clone()),
+        schema_fingerprint: Some(fingerprint.clone()),
     };
     let header_bytes = serde_json::to_vec(&header)?;
     let mut header_len = [0u8; 4];
@@ -464,7 +613,10 @@ fn integrity_check(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Two-phase import step 1 (reference `verifyBundle`).
+/// Two-phase import step 1 (reference `verifyBundle`). The schema guard is
+/// the REAL one (BK-04): the decrypted snapshot's canonical DDL must match
+/// the local schema, or be a compatible older schema — migration-number
+/// claims in the snapshot are not trusted (they can be fabricated).
 pub fn verify_bundle(
     conn: &Connection,
     bundles_dir: &Path,
@@ -476,28 +628,50 @@ pub fn verify_bundle(
         Err(msg) => return json!({ "ok": false, "message": format!("Verification failed: {msg}") }),
     };
     let result = (|| -> Result<Value> {
+        // The on-demand ledger table (idempotent) — every port DB carries it
+        // as soon as it syncs, so a fresh local DB must not fail the
+        // fingerprint guard for lacking it (BK-04).
+        ensure_log_table(conn)?;
         let info = snapshot_info(&temp)?;
-        let current = schema_version(conn);
-        let bundle = schema_version_of_file(&temp);
+        let schema = schema_version_of_file(&temp);
+        let snap = Connection::open_with_flags(&temp, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let check = check_schema_compatibility(conn, &snap)?;
         let _ = fs::remove_file(&temp);
-        if bundle > current {
-            return Ok(json!({
+        match check {
+            SchemaCheck::Incompatible { bundle, local } => Ok(json!({
                 "ok": false,
-                "message": format!("The bundle was created by a newer SupportOS (schema {bundle} > local {current}). Update SupportOS on this device first.")
-            }));
+                "message": format!(
+                    "The bundle was created by an incompatible database schema (bundle fingerprint {}, local {}). Importing it could corrupt your data - nothing was changed.",
+                    fp_short(&bundle),
+                    fp_short(&local)
+                )
+            })),
+            SchemaCheck::CompatibleAncestor => Ok(json!({
+                "ok": true,
+                "message": format!(
+                    "Bundle verified: {} conversations, {} customers, schema {} — an older compatible schema that will be brought up to date on restart.",
+                    info.conversations, info.customers, schema
+                ),
+                "info": info
+            })),
+            SchemaCheck::Identical => Ok(json!({
+                "ok": true,
+                "message": format!(
+                    "Bundle verified: {} conversations, {} customers, schema {}.",
+                    info.conversations, info.customers, schema
+                ),
+                "info": info
+            })),
         }
-        Ok(json!({
-            "ok": true,
-            "message": format!("Bundle verified: {} conversations, {} customers, schema {}.", info.conversations, info.customers, bundle),
-            "info": info
-        }))
     })();
     result
         .unwrap_or_else(|e| json!({ "ok": false, "message": format!("Verification failed: {e}") }))
 }
 
-/// Two-phase import step 2 (reference `importBundle`): decrypt, integrity +
-/// schema guard, safety backup, atomic swap, WAL/SHM removal.
+/// Two-phase import step 2 (reference `importBundle`): decrypt, integrity
+/// check, REAL schema-fingerprint guard (BK-04 — refuse divergent schemas
+/// before anything is touched), safety backup, atomic swap, WAL/SHM
+/// removal.
 pub fn import_bundle(
     conn: &Connection,
     db_path: &Path,
@@ -523,15 +697,38 @@ pub fn import_bundle(
             require_restart: None,
         };
     }
-    let current = schema_version(conn);
-    let bundle = schema_version_of_file(&temp);
-    if bundle > current {
-        let _ = fs::remove_file(&temp);
-        return ImportResult {
-            ok: false,
-            message: format!("The bundle was created by a newer SupportOS (schema {bundle} > local {current}). Update this device first."),
-            require_restart: None,
-        };
+    // The real schema guard (BK-04): compare the decrypted snapshot's actual
+    // DDL against the local schema. Migration-number claims inside the
+    // snapshot are not trusted — they can be fabricated (audit C1). The
+    // on-demand ledger table is ensured first (idempotent) so a fresh local
+    // DB is not penalized for not having logged a sync yet.
+    let schema_guard = (|| -> Result<SchemaCheck> {
+        ensure_log_table(conn)?;
+        let snap = Connection::open_with_flags(&temp, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        check_schema_compatibility(conn, &snap)
+    })();
+    match schema_guard {
+        Ok(SchemaCheck::Identical) | Ok(SchemaCheck::CompatibleAncestor) => {}
+        Ok(SchemaCheck::Incompatible { bundle, local }) => {
+            let _ = fs::remove_file(&temp);
+            return ImportResult {
+                ok: false,
+                message: format!(
+                    "The bundle's database schema is incompatible with this build (bundle fingerprint {}, local {}). Importing it could corrupt your data - nothing was changed.",
+                    fp_short(&bundle),
+                    fp_short(&local)
+                ),
+                require_restart: None,
+            };
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&temp);
+            return ImportResult {
+                ok: false,
+                message: format!("Import failed: schema check failed: {e}"),
+                require_restart: None,
+            };
+        }
     }
     let info = match snapshot_info(&temp) {
         Ok(i) => i,
@@ -733,6 +930,280 @@ mod tests {
         (conn, dir)
     }
 
+    // ---- BK-04: real schema fingerprint -------------------------------------
+
+    #[test]
+    fn fingerprint_is_stable_and_ordering_independent() {
+        let (conn, _dir) = setup();
+        let fp1 = schema_fingerprint(&conn).unwrap();
+        let fp2 = schema_fingerprint(&conn).unwrap();
+        assert_eq!(fp1, fp2, "same DDL must give the same fingerprint");
+        assert_eq!(fp1.len(), 64, "sha-256 hex");
+
+        // A database that creates the same tables in a DIFFERENT order must
+        // produce the same fingerprint (objects are sorted by name).
+        let conn2 = Connection::open_in_memory().unwrap();
+        conn2
+            .execute_batch(
+                "CREATE TABLE customers (id INTEGER PRIMARY KEY);
+                 CREATE TABLE conversations (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        assert_eq!(schema_fingerprint(&conn2).unwrap(), fp1);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_ddl_changes() {
+        let (conn, _dir) = setup();
+        let fp1 = schema_fingerprint(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE conversations ADD COLUMN subject TEXT")
+            .unwrap();
+        let fp2 = schema_fingerprint(&conn).unwrap();
+        assert_ne!(fp1, fp2, "adding a column must change the fingerprint");
+        conn.execute_batch("CREATE TABLE tags (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert_ne!(fp2, schema_fingerprint(&conn).unwrap());
+    }
+
+    #[test]
+    fn fingerprint_ignores_migration_bookkeeping_and_fts_shadows() {
+        let a = Connection::open_in_memory().unwrap();
+        a.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE VIRTUAL TABLE fts_threads USING fts5(body);",
+        )
+        .unwrap();
+        let fp_a = schema_fingerprint(&a).unwrap();
+
+        // Same app schema, but with fabricated migration bookkeeping rows and
+        // a differently-named migration table — the fingerprint must not care.
+        let b = Connection::open_in_memory().unwrap();
+        b.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, body TEXT);
+             CREATE VIRTUAL TABLE fts_threads USING fts5(body);
+             CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO schema_migrations VALUES (16, '016_m6_graph_coaching_memory');
+             CREATE TABLE _migrations (version INTEGER PRIMARY KEY, applied_at TEXT, label TEXT);
+             INSERT INTO _migrations (version) VALUES (1),(2);",
+        )
+        .unwrap();
+        assert_eq!(fp_a, schema_fingerprint(&b).unwrap());
+    }
+
+    #[test]
+    fn fingerprint_sees_through_fabricated_migration_numbers() {
+        // Audit C1's trap: a DB claiming "migration 16" via fabricated
+        // schema_migrations rows while shipping the port's DDL. The
+        // fingerprint reflects the DDL only — a MAIN-shaped schema claiming
+        // migration 16 must NOT fingerprint like a port schema, no matter
+        // what its migration numbers say.
+        let port_like = Connection::open_in_memory().unwrap();
+        port_like
+            .execute_batch(
+                "CREATE TABLE conversations (id INTEGER PRIMARY KEY, number INTEGER, mailbox_id INTEGER);
+                 CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO schema_migrations VALUES (16, '016_m6_graph_coaching_memory');",
+            )
+            .unwrap();
+        let main_like = Connection::open_in_memory().unwrap();
+        main_like
+            .execute_batch(
+                "CREATE TABLE conversations (id INTEGER PRIMARY KEY, number INTEGER, subject TEXT, mailboxId INTEGER, createdAt TEXT);
+                 CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO schema_migrations VALUES (16, '016_m6_graph_coaching_memory');",
+            )
+            .unwrap();
+        assert_ne!(
+            schema_fingerprint(&port_like).unwrap(),
+            schema_fingerprint(&main_like).unwrap(),
+            "same claimed migration number, different real DDL — the fingerprint must differ"
+        );
+    }
+
+    #[test]
+    fn compatible_ancestor_allows_additive_local_evolution() {
+        let older = Connection::open_in_memory().unwrap();
+        older
+            .execute_batch(
+                "CREATE TABLE conversations (id INTEGER PRIMARY KEY, subject TEXT);
+                 CREATE TABLE customers (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        let newer = Connection::open_in_memory().unwrap();
+        newer
+            .execute_batch(
+                "CREATE TABLE conversations (id INTEGER PRIMARY KEY, subject TEXT, status TEXT);
+                 CREATE TABLE customers (id INTEGER PRIMARY KEY);
+                 CREATE TABLE tags (id INTEGER PRIMARY KEY);",
+            )
+            .unwrap();
+        assert!(snapshot_is_compatible_ancestor(&newer, &older));
+        // The reverse is NOT compatible: the newer schema has columns/tables
+        // the older one lacks.
+        assert!(!snapshot_is_compatible_ancestor(&older, &newer));
+    }
+
+    #[test]
+    fn divergent_schema_is_not_an_ancestor() {
+        let port = Connection::open_in_memory().unwrap();
+        port.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, number INTEGER, mailbox_id INTEGER);",
+        )
+        .unwrap();
+        let reference = Connection::open_in_memory().unwrap();
+        // MAIN-shaped conversations: many columns with divergent names.
+        reference.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, number INTEGER UNIQUE, subject TEXT, status TEXT, mailboxId INTEGER, createdAt TEXT, closedAt TEXT, closedByUserId INTEGER, closedByUserEmail TEXT, preview TEXT, ccEmails TEXT, bccEmails TEXT, assignedTo INTEGER, assignedForSeconds INTEGER, tags TEXT, customerWaitingSince TEXT, firstResponseTimeSeconds INTEGER, supportHoursSupportedSeconds INTEGER, createdAtDays INTEGER, modifiedAt TEXT, sourceType TEXT, sourceVia TEXT, overrideCustomFields TEXT, spamCount INTEGER, hasAttachments INTEGER, embedUrl TEXT, reviewScore INTEGER, reviewComment TEXT, reviewLink TEXT);
+             CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO schema_migrations VALUES (16, '016_m6_graph_coaching_memory');",
+        )
+        .unwrap();
+        assert!(!snapshot_is_compatible_ancestor(&port, &reference));
+        assert!(!snapshot_is_compatible_ancestor(&reference, &port));
+    }
+
+    #[test]
+    fn export_bundle_writes_real_schema_fingerprint_header() {
+        let (conn, dir) = setup();
+        let bundles = dir.path().join("bundles");
+        let res = export_bundle(&conn, &bundles, "long-enough-pass");
+        assert!(res.ok, "{}", res.message);
+        let raw = fs::read(res.path.clone().unwrap()).unwrap();
+        let hl = u32::from_be_bytes([raw[6], raw[7], raw[8], raw[9]]);
+        let header: BundleHeader = serde_json::from_slice(&raw[10..10 + hl as usize]).unwrap();
+        let fp = header.schema_fingerprint.expect("fingerprint in header");
+        assert_eq!(
+            fp,
+            schema_fingerprint(&conn).unwrap(),
+            "header fingerprint matches the real DDL"
+        );
+        assert_eq!(fp.len(), 64);
+    }
+
+    #[test]
+    fn import_refuses_divergent_schema_and_leaves_db_untouched() {
+        // Local: port-shaped schema.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("local.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, number INTEGER, mailbox_id INTEGER);
+             INSERT INTO conversations VALUES (1, 101, 1);",
+        )
+        .unwrap();
+
+        // Bundle exported from a MAIN-shaped schema claiming migration 16 —
+        // exactly the fabricated-numbers trap of audit C1.
+        let other = Connection::open_in_memory().unwrap();
+        other.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, number INTEGER, subject TEXT, mailboxId INTEGER, createdAt TEXT);
+             CREATE TABLE customers (id INTEGER PRIMARY KEY, email TEXT);
+             CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO schema_migrations VALUES (16, '016_m6_graph_coaching_memory');",
+        )
+        .unwrap();
+        let bundles = dir.path().join("bundles");
+        let res = export_bundle(&other, &bundles, "long-enough-pass");
+        assert!(res.ok, "{}", res.message);
+        let bundle = PathBuf::from(res.path.unwrap());
+
+        // Verify must fail with the incompatibility message.
+        let v = verify_bundle(&conn, &bundles, &bundle, "long-enough-pass");
+        assert!(!v["ok"].as_bool().unwrap(), "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("incompatible"),
+            "{}",
+            v
+        );
+
+        // Snapshot AFTER verify (which ensures the on-demand ledger table —
+        // an expected, idempotent write). What follows must change nothing.
+        let before = fs::read(&db_path).unwrap();
+
+        // Import must refuse AND leave the database bytes untouched.
+        let r = import_bundle(&conn, &db_path, &bundles, &bundle, "long-enough-pass");
+        assert!(!r.ok, "{}", r.message);
+        assert!(r.message.contains("incompatible"), "{}", r.message);
+        // No safety backup was written (nothing was changed).
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("local.db.pre-import-"))
+            .collect();
+        assert!(
+            backups.is_empty(),
+            "no safety backup for a refused import: {backups:?}"
+        );
+        let after = fs::read(&db_path).unwrap();
+        assert_eq!(
+            before, after,
+            "the local DB must be byte-identical after a refused import"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "local data untouched");
+    }
+
+    #[test]
+    fn import_accepts_older_compatible_schema() {
+        // Local: newer port schema (extra table + column).
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("local.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, subject TEXT, status TEXT);
+             CREATE TABLE customers (id INTEGER PRIMARY KEY);
+             CREATE TABLE tags (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+
+        // Bundle from an OLDER same-lineage schema (subset of local).
+        let older = Connection::open_in_memory().unwrap();
+        older
+            .execute_batch(
+                "CREATE TABLE conversations (id INTEGER PRIMARY KEY, subject TEXT);
+             CREATE TABLE customers (id INTEGER PRIMARY KEY);
+             INSERT INTO conversations VALUES (1, 'old');
+             INSERT INTO customers VALUES (1);",
+            )
+            .unwrap();
+        let bundles = dir.path().join("bundles");
+        let res = export_bundle(&older, &bundles, "long-enough-pass");
+        assert!(res.ok, "{}", res.message);
+        let bundle = PathBuf::from(res.path.unwrap());
+
+        let v = verify_bundle(&conn, &bundles, &bundle, "long-enough-pass");
+        assert!(v["ok"].as_bool().unwrap(), "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("older compatible schema"),
+            "{}",
+            v
+        );
+
+        let r = import_bundle(&conn, &db_path, &bundles, &bundle, "long-enough-pass");
+        assert!(r.ok, "{}", r.message);
+        let restored = Connection::open(&db_path).unwrap();
+        let subject: String = restored
+            .query_row("SELECT subject FROM conversations WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(subject, "old", "older bundle data is swapped in");
+        // A safety backup of the previous data was written.
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("local.db.pre-import-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "one safety backup: {backups:?}");
+    }
+
     #[test]
     fn export_verify_roundtrip() {
         let (conn, dir) = setup();
@@ -758,6 +1229,10 @@ mod tests {
         // verify with the right passphrase
         let v = verify_bundle(&conn, &bundles, &path, "long-enough-pass");
         assert!(v["ok"].as_bool().unwrap(), "{v}");
+        // same-schema round-trip: identical fingerprint, plain verified message
+        let msg = v["message"].as_str().unwrap();
+        assert!(msg.contains("3 conversations"), "{msg}");
+        assert!(msg.contains("schema"), "{msg}");
         // wrong passphrase
         let v = verify_bundle(&conn, &bundles, &path, "wrong-passphrase");
         assert!(!v["ok"].as_bool().unwrap());

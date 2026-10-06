@@ -208,7 +208,9 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
                 .map(|m| m.len())
                 .unwrap_or(0),
             conn.query_row(
-                "SELECT COALESCE(MAX(id), 0) FROM schema_migrations",
+                // BK-04: the port's REAL applied migration history (not
+                // fabricated reference rows).
+                "SELECT COALESCE(MAX(version), 0) FROM _migrations",
                 [],
                 |r| r.get::<_, i64>(0),
             )
@@ -314,7 +316,8 @@ pub async fn db_stats(State(state): State<AppState>) -> impl IntoResponse {
     }
     let migrations: i64 = conn
         .query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM schema_migrations",
+            // BK-04: the port's REAL applied migration history.
+            "SELECT COALESCE(MAX(version), 0) FROM _migrations",
             [],
             |r| r.get(0),
         )

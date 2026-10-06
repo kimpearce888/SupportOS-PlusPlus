@@ -6,11 +6,7 @@
 use rusqlite::{params, Connection};
 
 use crate::error::Result;
-use crate::helpscout::{
-    HsConversation, HsCustomer, HsCustomerAddress, HsCustomerEmail, HsCustomerPhone,
-    HsCustomerPropertyValue, HsCustomerSocialProfile, HsCustomerWebsite, HsMailbox, HsTag, HsTeam,
-    HsUser,
-};
+use crate::helpscout::{HsConversation, HsCustomer, HsMailbox, HsTag, HsTeam, HsUser};
 
 // ---------------------------------------------------------------------------
 // Write helpers (upsert data into SQLite)
