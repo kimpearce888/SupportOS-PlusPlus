@@ -923,7 +923,7 @@ pub fn op_bulk_action(
             }
         }
         let payload_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
-        let _ = crate::jobs::enqueue_on(conn, "api", &format!("bulk_{action}"), &payload_str, 1);
+        let _ = crate::jobs::enqueue_on(conn, "api", &format!("bulk_{action}"), &payload_str, 1, 3);
         queued += 1;
     }
     let _ = crate::jobs::audit(

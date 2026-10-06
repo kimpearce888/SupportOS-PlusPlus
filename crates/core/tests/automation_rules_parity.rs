@@ -555,15 +555,20 @@ async fn automation_rule_crud_matches_the_reference_contract() {
         "add_tag executed locally: {tags:?}"
     );
 
+    // AU-04: gated actions park as `automation_action_awaiting_approval`
+    // JOBS (MAIN parity — visible in the Queue panel, approve via retry
+    // with {approved:true}, reject via cancel), not automation_approvals
+    // rows.
     let approvals: Vec<String> = {
         let mut stmt = db2
             .prepare(
-                "SELECT proposed_action_json FROM automation_approvals WHERE status = 'pending'",
+                "SELECT COALESCE(payload, '') FROM jobs
+                  WHERE type = 'automation_action_awaiting_approval' AND queue = 'ai'",
             )
-            .expect("prepare approvals");
+            .expect("prepare parked jobs");
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))
-            .expect("query approvals")
+            .expect("query parked jobs")
             .filter_map(|r| r.ok())
             .collect();
         rows
@@ -581,6 +586,23 @@ async fn automation_rule_crud_matches_the_reference_contract() {
         approvals.iter().any(|a| a.contains("create_ai_note")),
         "{approvals:?}"
     );
+    // Each parked job carries the reference retry budget (maxAttempts 1).
+    let parked_max: i64 = db2
+        .query_row(
+            "SELECT COALESCE(MIN(max_attempts), 0) FROM jobs
+              WHERE type = 'automation_action_awaiting_approval'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("parked max_attempts");
+    assert_eq!(parked_max, 1);
+    // The legacy approval table is no longer written by the fire path.
+    let legacy: i64 = db2
+        .query_row("SELECT COUNT(*) FROM automation_approvals", [], |r| {
+            r.get(0)
+        })
+        .expect("count legacy approvals");
+    assert_eq!(legacy, 0, "the fire path parks jobs, not approvals");
 
     // ── 12. Unknown conversation → 0 runs ──────────────────────────────────
     let r = client

@@ -1309,6 +1309,7 @@ impl HttpServer {
                             "embed_knowledge_chunks",
                             "{}",
                             4,
+                            2,
                         );
                         let seeded = crate::demo::seed_demo_data(&c, demo_mode);
                         if seeded {

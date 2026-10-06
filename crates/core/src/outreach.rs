@@ -877,6 +877,7 @@ pub fn campaign_queue(conn: &Connection, campaign_id: i64) -> serde_json::Value 
         "outreach_send_batch",
         &serde_json::json!({ "campaignId": campaign_id }).to_string(),
         1,
+        3,
     );
     serde_json::json!({ "ok": true, "message": format!("Campaign queued: {ready} conversations will be created (one per customer).") })
 }
@@ -910,6 +911,7 @@ pub fn campaign_resume(conn: &Connection, campaign_id: i64) -> serde_json::Value
         "outreach_send_batch",
         &serde_json::json!({ "campaignId": campaign_id }).to_string(),
         1,
+        3,
     );
     serde_json::json!({ "ok": true, "message": "Campaign resumed." })
 }
@@ -966,6 +968,7 @@ pub fn campaign_retry_failed(conn: &Connection, campaign_id: i64) -> serde_json:
             "outreach_send_batch",
             &serde_json::json!({ "campaignId": campaign_id }).to_string(),
             1,
+            3,
         );
     }
     serde_json::json!({ "ok": true, "message": if reset > 0 {
@@ -1082,6 +1085,7 @@ pub fn campaign_reconcile(conn: &Connection, campaign_id: i64) -> serde_json::Va
             "outreach_send_batch",
             &serde_json::json!({ "campaignId": campaign_id }).to_string(),
             1,
+            3,
         );
     } else {
         // v2.2.1 semantics: nothing left to send/reconcile -> terminal.
@@ -1992,7 +1996,8 @@ pub async fn send_batch(
                 "sync",
                 "sync_conversation",
                 &serde_json::json!({ "remoteId": rid }).to_string(),
-                3,
+                2,
+                2,
             );
         }
         log_event(
@@ -2075,6 +2080,7 @@ fn finalize_if_drained(conn: &Arc<Mutex<Connection>>, campaign_id: i64) -> serde
             "outreach_send_batch",
             &serde_json::json!({ "campaignId": campaign_id }).to_string(),
             1,
+            3,
         );
         return serde_json::json!({
             "ok": true,

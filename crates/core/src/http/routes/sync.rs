@@ -697,14 +697,14 @@ pub async fn clear_completed(State(state): State<AppState>) -> impl IntoResponse
 /// POST /api/sync/rebuild-search-index — enqueues maintenance job.
 pub async fn rebuild_search_index(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn_lock();
-    let _ = crate::jobs::enqueue_on(&conn, "maintenance", "rebuild_search_index", "{}", 4);
+    let _ = crate::jobs::enqueue_on(&conn, "maintenance", "rebuild_search_index", "{}", 4, 1);
     Json(json!({ "ok": true, "message": "Search index rebuild queued." }))
 }
 
 /// POST /api/sync/rebuild-embeddings — enqueues embeddings rebuild.
 pub async fn rebuild_embeddings(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn_lock();
-    let _ = crate::jobs::enqueue_on(&conn, "maintenance", "rebuild_embeddings", "{}", 4);
+    let _ = crate::jobs::enqueue_on(&conn, "maintenance", "rebuild_embeddings", "{}", 4, 1);
     Json(json!({
         "ok": true,
         "message": "Embedding rebuild queued (requires LM Studio embedding model).",

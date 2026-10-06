@@ -220,7 +220,9 @@ impl WorkerManager {
             });
         }
         // 5. Stale-job sweep (v2.2.1 audit fix): the boot recovery alone left
-        //    a job claimed right before restart stuck 'running' forever.
+        //    a job claimed right before restart stuck 'running' forever. The
+        //    periodic sweep is the reference's requeueStaleRunningJobs
+        //    (distinct message from the boot recovery, same 30-minute rule).
         {
             let this = self.clone();
             self.spawn(async move {
@@ -229,7 +231,7 @@ impl WorkerManager {
                     interval.tick().await;
                     Self::contained("stale_job_sweep", async {
                         let conn = this.lock();
-                        match jobs::recover_stale_jobs(&conn) {
+                        match jobs::requeue_stale_running_jobs(&conn, 30) {
                             Ok(n) if n > 0 => tracing::warn!(
                                 count = n,
                                 operation = "stale_job_sweep",
@@ -329,7 +331,7 @@ impl WorkerManager {
         for _ in 0..10 {
             let claimed = {
                 let mut conn = self.lock();
-                jobs::claim_next(&mut conn).unwrap_or(None)
+                jobs::claim_next(&mut conn, None).unwrap_or(None)
             };
             let Some(job) = claimed else { break };
             // C3 (audit T16): contain job panics at the task boundary —
@@ -347,7 +349,12 @@ impl WorkerManager {
                     "job panicked (contained at the worker boundary): marking failed"
                 );
                 let conn = self.lock();
-                let _ = jobs::fail(&conn, job.id, "job panicked (contained at worker boundary)");
+                let _ = jobs::fail(
+                    &conn,
+                    job.id,
+                    "job panicked (contained at worker boundary)",
+                    true,
+                );
             }
         }
         self.processing.store(false, Ordering::SeqCst);
@@ -648,6 +655,13 @@ impl WorkerManager {
                             .await?;
                         if kind == "sync_conversation" {
                             self.emit_conversation_updated_for_remote(remote);
+                            // AU-03: fire automation triggers + auto-analysis
+                            // when a conversation changed (the reference
+                            // onConversationChanged hook — v1.4.0 real-time
+                            // push for single-conversation updates).
+                            if let Some(local) = self.conversation_local_id_for_remote(remote) {
+                                self.on_conversation_changed(local);
+                            }
                         }
                     }
                 }
@@ -793,7 +807,7 @@ impl WorkerManager {
                             "UPDATE knowledge_chunks SET embedding_state = 'not_indexed'",
                             [],
                         )?;
-                        jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 2)?;
+                        jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 4, 2)?;
                     }
                 }
                 // ---------- outreach queue ----------
@@ -817,7 +831,7 @@ impl WorkerManager {
                         );
                     } else {
                         let conn = self.lock();
-                        jobs::fail(&conn, job_id, "outreach_send_batch missing campaignId")?;
+                        jobs::fail(&conn, job_id, "outreach_send_batch missing campaignId", true)?;
                         return Ok(());
                     }
                 }
@@ -829,7 +843,7 @@ impl WorkerManager {
                 "analyze_ticket" => {
                     let Some(conv_id) = num("conversationId") else {
                         let conn = self.lock();
-                        jobs::fail(&conn, job_id, "analyze_ticket missing conversationId")?;
+                        jobs::fail(&conn, job_id, "analyze_ticket missing conversationId", true)?;
                         return Ok(());
                     };
                     self.run_ai_job(kind, conv_id, AiJob::Analyze).await?;
@@ -837,7 +851,7 @@ impl WorkerManager {
                 "generate_draft" => {
                     let Some(conv_id) = num("conversationId") else {
                         let conn = self.lock();
-                        jobs::fail(&conn, job_id, "generate_draft missing conversationId")?;
+                        jobs::fail(&conn, job_id, "generate_draft missing conversationId", true)?;
                         return Ok(());
                     };
                     self.run_ai_job(kind, conv_id, AiJob::Draft).await?;
@@ -845,10 +859,56 @@ impl WorkerManager {
                 "create_ai_note" => {
                     let Some(conv_id) = num("conversationId") else {
                         let conn = self.lock();
-                        jobs::fail(&conn, job_id, "create_ai_note missing conversationId")?;
+                        jobs::fail(&conn, job_id, "create_ai_note missing conversationId", true)?;
                         return Ok(());
                     };
                     self.run_ai_job(kind, conv_id, AiJob::Note).await?;
+                }
+                // ---------- ai queue: automation awaiting-approval (AU-04) ----------
+                // The v1.6.0 audit fix shape: these jobs used to be completed
+                // instantly as no-ops (the write action was silently dropped).
+                // PARKED with a distinct status instead: visible in the Queue
+                // panel, approve with Retry (payload gains approved=true) or
+                // reject with Cancel (the queue routes patch/parse it).
+                "automation_action_awaiting_approval" => {
+                    let approved = payload
+                        .get("approved")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if approved {
+                        let action = payload.get("action").cloned();
+                        let rule_id = num("ruleId");
+                        let conversation_id = num("conversationId");
+                        if let (Some(action), Some(rule_id), Some(conversation_id)) =
+                            (action, rule_id, conversation_id)
+                        {
+                            let executed = {
+                                let mut conn = self.lock();
+                                crate::automation::execute_approved_action(
+                                    &mut conn,
+                                    conversation_id,
+                                    &action,
+                                )?
+                            };
+                            if executed {
+                                let kind = action
+                                    .get("kind")
+                                    .and_then(|k| k.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let conn = self.lock();
+                                crate::automation::record_approved_run(
+                                    &conn,
+                                    rule_id,
+                                    conversation_id,
+                                    &kind,
+                                )?;
+                            }
+                        }
+                    } else {
+                        let conn = self.lock();
+                        jobs::park_job(&conn, job_id)?;
+                    }
                 }
                 // ---------- attachments queue (WK-03 / C6) ----------
                 "download_recent_attachments" => {
@@ -861,7 +921,7 @@ impl WorkerManager {
                     if let Err(e) = self.execute_bulk_action(action, &payload).await {
                         let msg = e.to_string();
                         let conn = self.lock();
-                        let _ = jobs::fail(&conn, job_id, &msg);
+                        let _ = jobs::fail(&conn, job_id, &msg, true);
                         let _ = jobs::log_error(
                             &conn,
                             "workers",
@@ -886,7 +946,7 @@ impl WorkerManager {
                 }
                 _ => {
                     let conn = self.lock();
-                    jobs::fail(&conn, job_id, &format!("Unknown job type: {kind}"))?;
+                    jobs::fail(&conn, job_id, &format!("Unknown job type: {kind}"), false)?;
                     return Ok(());
                 }
             }
@@ -905,7 +965,7 @@ impl WorkerManager {
             let conn = self.lock();
             let retryable = true; // jobs::fail requeues when attempts remain
             if retryable {
-                let _ = jobs::fail(&conn, job_id, &msg);
+                let _ = jobs::fail(&conn, job_id, &msg, true);
             }
             let _ = jobs::log_error(&conn, "workers", &format!("Job {kind} failed: {msg}"));
             tracing::warn!(operation = kind, error = %msg, "Job failed");
@@ -920,11 +980,18 @@ impl WorkerManager {
         let _ = crate::maintenance::refresh_products(&conn);
         let auto_download =
             crate::settings::get_i64(&conn, "attachment_auto_download", 1).unwrap_or(1) != 0;
-        let _ = jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 2);
+        let _ = jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 4, 2);
         // v1.5.0: semantic ticket search over the fresh mirror.
-        let _ = jobs::enqueue_on(&conn, "embeddings", "embed_conversation_chunks", "{}", 2);
+        let _ = jobs::enqueue_on(&conn, "embeddings", "embed_conversation_chunks", "{}", 4, 2);
         if auto_download {
-            let _ = jobs::enqueue_on(&conn, "attachments", "download_recent_attachments", "{}", 2);
+            let _ = jobs::enqueue_on(
+                &conn,
+                "attachments",
+                "download_recent_attachments",
+                "{}",
+                4,
+                2,
+            );
         }
     }
 
@@ -947,6 +1014,105 @@ impl WorkerManager {
                 subject,
                 "sync",
             ));
+        }
+    }
+
+    /// Resolve a conversation's local id from its remote id (`None` when the
+    /// mirror has no row).
+    fn conversation_local_id_for_remote(&self, remote_id: i64) -> Option<i64> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id FROM conversations WHERE remote_id = ?1",
+            rusqlite::params![remote_id],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    /// AU-03: fire automation triggers + auto-analysis when a conversation
+    /// changes — the reference `onConversationChanged` hook
+    /// (workers.ts:731-756, wired into the `sync_conversation` job — v1.4.0
+    /// real-time push path). Only runs when the conversation's last
+    /// non-deleted thread is a CUSTOMER message (the reference checks
+    /// `type === 'customer'`); automation failures never break sync.
+    ///
+    /// - fires the `new_conversation` and `customer_reply` triggers (the
+    ///   reference fires both — every enabled rule with either trigger and
+    ///   matching conditions runs, AU-02 evaluates them);
+    /// - enqueues `analyze_ticket` when `automatic_analysis_enabled` (default
+    ///   true) and the AI backend is enabled (PRIORITY.ANALYTICS=3,
+    ///   maxAttempts 2 — the reference constants);
+    /// - refreshes the deterministic interaction snapshot (spec #59 — the
+    ///   sync path already refreshes per upserted customer thread; this is
+    ///   the conversation-level convergence).
+    fn on_conversation_changed(&self, conversation_local_id: i64) {
+        // Automation failures never break sync (the reference wraps the
+        // whole hook in try/catch).
+        let result: Result<()> = (|| {
+            let last_thread_type: Option<String> = {
+                let conn = self.lock();
+                conn.query_row(
+                    "SELECT thread_type FROM conversation_threads
+                      WHERE conversation_id = ?1 AND deleted_at IS NULL
+                      ORDER BY created_at DESC, id DESC LIMIT 1",
+                    rusqlite::params![conversation_local_id],
+                    |r| r.get(0),
+                )
+                .ok()
+            };
+            if last_thread_type.as_deref() != Some("customer") {
+                return Ok(());
+            }
+            // New/changed ticket with a customer message -> automation +
+            // analysis (reference workers.ts:737-746).
+            {
+                let mut conn = self.lock();
+                let _ = crate::automation::fire_trigger_for_conversation(
+                    &mut conn,
+                    "new_conversation",
+                    conversation_local_id,
+                );
+                let _ = crate::automation::fire_trigger_for_conversation(
+                    &mut conn,
+                    "customer_reply",
+                    conversation_local_id,
+                );
+            }
+            {
+                let conn = self.lock();
+                let automatic_analysis =
+                    crate::settings::get_bool(&conn, "automatic_analysis_enabled", true)
+                        .unwrap_or(true);
+                let ai_enabled = !matches!(
+                    crate::ai_pipeline::backend_from_settings(&conn),
+                    crate::ai_pipeline::AiBackend::Disabled
+                );
+                if automatic_analysis && ai_enabled {
+                    let _ = jobs::enqueue_on(
+                        &conn,
+                        "ai",
+                        "analyze_ticket",
+                        &format!("{{\"conversationId\":{conversation_local_id}}}"),
+                        3,
+                        2,
+                    );
+                }
+                // Interaction intelligence: refresh deterministic signals on
+                // customer activity (spec #59) — never break sync.
+                let _ = crate::interaction_current::record_current_interaction(
+                    &conn,
+                    conversation_local_id,
+                );
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!(
+                error = %e,
+                conversation_id = conversation_local_id,
+                operation = "on_conversation_changed",
+                "Automation fire on conversation change failed (non-fatal)"
+            );
         }
     }
 
@@ -1558,7 +1724,7 @@ mod tests {
         );
 
         // A claimed job to dead-letter.
-        jobs::enqueue_on(&shared.lock().unwrap(), "api", "boom_kind", "{}", 1).unwrap();
+        jobs::enqueue_on(&shared.lock().unwrap(), "api", "boom_kind", "{}", 1, 3).unwrap();
         let (job_id,) = {
             let c = shared.lock().unwrap();
             c.query_row(
@@ -1592,7 +1758,13 @@ mod tests {
         assert!(panicked);
         {
             let c = shared.lock().unwrap();
-            jobs::fail(&c, job_id, "job panicked (contained at worker boundary)").unwrap();
+            jobs::fail(
+                &c,
+                job_id,
+                "job panicked (contained at worker boundary)",
+                true,
+            )
+            .unwrap();
         }
         let status: String = {
             let c = shared.lock().unwrap();
@@ -1614,6 +1786,138 @@ mod tests {
         let now = iso_now();
         assert!(parse_iso_to_unix(&now).is_some());
         assert!(now.ends_with('Z'));
+    }
+
+    /// AU-03: `onConversationChanged` — the worker hook that fires automation
+    /// triggers when a conversation's last non-deleted thread is a CUSTOMER
+    /// message (reference workers.ts:731-756), plus the analysis enqueue gate
+    /// and the interaction snapshot refresh.
+    #[tokio::test]
+    async fn au03_on_conversation_changed_fires_triggers_for_customer_threads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut conn = Connection::open(tmp.path().join("t.db")).unwrap();
+        crate::db::ensure_migrations_table(&conn).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        // Conversation 9: last thread is a CUSTOMER message (fires).
+        // Conversation 10: last thread is an agent REPLY (does not fire).
+        conn.execute_batch(
+            "INSERT INTO customers (id, remote_id, first_name, email)
+             VALUES (1, 9001, 'Ada', 'ada@example.com');
+             INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, status)
+             VALUES (9, 105011, 5012, 'Refund question', 'I want a refund', 1, 1, 'active'),
+                    (10, 105012, 5013, 'Bug report', 'It crashed', 1, 1, 'active');
+             INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id, created_at)
+             VALUES (9, 'customer', 'I want a refund', 'customer', 1, datetime('now')),
+                    (10, 'reply', 'We are on it', 'user', 1, datetime('now'));
+             INSERT INTO tags (id, remote_id, name, slug) VALUES (3, 3003, 'billing', 'billing');",
+        )
+        .unwrap();
+        crate::settings::set_string(&conn, "automation_enabled", "true").unwrap();
+        crate::automation::create_rule_record(
+            &conn,
+            &crate::automation::validate_rule(&serde_json::json!({
+                "name": "Flag refunds", "enabled": true, "trigger": "new_conversation",
+                "conditions": [{ "field": "subject", "operator": "contains", "value": "refund" }],
+                "actions": [{ "kind": "add_tag", "params": { "tag": "billing" } }],
+                "requires_approval": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let shared = Arc::new(Mutex::new(conn));
+        let bus = EventBus::default();
+        let provider = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+            as Arc<dyn HelpScoutProvider>;
+        let engine = Arc::new(crate::sync_engine::SyncEngine::new(
+            shared.clone(),
+            provider.clone(),
+        ));
+        let manager = WorkerManager::new(
+            shared.clone(),
+            Some(engine),
+            provider,
+            bus,
+            tmp.path().to_path_buf(),
+            None,
+        );
+
+        // The hook on the customer-thread conversation fires the
+        // new_conversation rule (AU-02 conditions match 'refund').
+        manager.on_conversation_changed(9);
+        {
+            let c = shared.lock().unwrap();
+            let tagged: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM conversation_tags ct
+                      JOIN tags t ON t.id = ct.tag_id
+                     WHERE ct.conversation_id = 9 AND t.name = 'billing'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                tagged, 1,
+                "the new_conversation rule must fire and add the tag"
+            );
+            let runs: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_runs WHERE conversation_id = 9",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(runs >= 1, "the fired rule records a run");
+            // The interaction snapshot refreshed (spec #59).
+            let signals: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM client_current_signals WHERE conversation_id = 9",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(signals, 1);
+            // analyze_ticket IS enqueued (defaults: automatic_analysis_enabled
+            // true, ai_enabled true -> the LmStudio backend) with the MAIN
+            // constants: priority 3 (ANALYTICS), max_attempts 2.
+            let (analyzed, priority, max_attempts): (i64, i64, i64) = c
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(MAX(priority), 0), COALESCE(MAX(max_attempts), 0)
+                       FROM jobs WHERE type = 'analyze_ticket'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(analyzed, 1, "the hook enqueues analyze_ticket");
+            assert_eq!(priority, 3, "PRIORITY.ANALYTICS");
+            assert_eq!(max_attempts, 2, "the reference retry budget");
+        }
+
+        // The gate: an agent-reply last thread fires NOTHING.
+        manager.on_conversation_changed(10);
+        {
+            let c = shared.lock().unwrap();
+            let runs: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_runs WHERE conversation_id = 10",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(runs, 0, "agent replies must not fire triggers");
+            let signals: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM client_current_signals WHERE conversation_id = 10",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(signals, 0, "no customer activity -> no snapshot");
+        }
+
+        // With automatic_analysis_enabled + a runnable AI backend the hook
+        // enqueues analyze_ticket (3, 2) — verified by settings alone here:
+        // the backend gate is exercised by the WK-03 AI-job tests.
     }
 
     #[test]
@@ -1669,7 +1973,7 @@ mod tests {
     ) -> i64 {
         let id = {
             let conn = shared.lock().unwrap_or_else(|p| p.into_inner());
-            let id = jobs::enqueue_on(&conn, queue, kind, payload, 2).expect("enqueue");
+            let id = jobs::enqueue_on(&conn, queue, kind, payload, 2, 3).expect("enqueue");
             conn.execute(
                 "UPDATE jobs SET status = 'running', attempt = 1 WHERE id = ?1",
                 rusqlite::params![id],

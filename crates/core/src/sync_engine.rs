@@ -1631,13 +1631,20 @@ impl SyncEngine {
                 // an embedding model is configured) — reference parity.
                 if processed > 0 {
                     let conn = self.lock();
-                    let _ =
-                        crate::jobs::enqueue_on(&conn, "embeddings", "embed_docs_chunks", "{}", 2);
+                    let _ = crate::jobs::enqueue_on(
+                        &conn,
+                        "embeddings",
+                        "embed_docs_chunks",
+                        "{}",
+                        4,
+                        2,
+                    );
                     let _ = crate::jobs::enqueue_on(
                         &conn,
                         "embeddings",
                         "embed_conversation_chunks",
                         "{}",
+                        4,
                         2,
                     );
                 }
@@ -1835,27 +1842,58 @@ impl SyncEngine {
         }
         let seen: Vec<i64> = list.iter().map(|t| t.remote_id).collect();
         {
-            let conn = self.lock();
+            let mut conn = self.lock();
             for t in &list {
                 upsert_thread(&conn, local_id, t)?;
             }
             // Remove local threads that no longer exist remotely.
             if !list.is_empty() || !threads.is_empty() {
-                let mut stmt =
-                    conn.prepare("SELECT id, remote_id FROM conversation_threads WHERE conversation_id = ?1 AND remote_id IS NOT NULL")?;
-                let stale: Vec<i64> = stmt
-                    .query_map(params![local_id], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-                    })?
-                    .filter_map(|r| r.ok())
-                    .filter(|(_, remote)| !seen.contains(remote))
-                    .map(|(id, _)| id)
-                    .collect();
-                for id in stale {
-                    let _ = conn.execute(
-                        "DELETE FROM conversation_threads WHERE id = ?1",
-                        params![id],
-                    );
+                let stale: Vec<i64> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, remote_id FROM conversation_threads
+                          WHERE conversation_id = ?1 AND remote_id IS NOT NULL",
+                    )?;
+                    let rows: Vec<(i64, i64)> = stmt
+                        .query_map(params![local_id], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    rows.into_iter()
+                        .filter(|(_, remote)| !seen.contains(remote))
+                        .map(|(id, _)| id)
+                        .collect()
+                };
+                if !stale.is_empty() {
+                    // M15 (audit T16): the reference deletes the FTS row and
+                    // the thread row inside ONE transaction (coordinator.ts
+                    // 698-704, v1.6.0 FTS-drift fix — hard-deleting threads
+                    // without cleaning fts_threads left ghost search hits, and
+                    // statement-by-statement deletes could leave partial
+                    // states). The fts table is guarded: a minimal DB that
+                    // has not run the search migration still syncs.
+                    let fts_exists: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM sqlite_master
+                              WHERE type = 'table' AND name = 'fts_threads'",
+                            [],
+                            |_| Ok(true),
+                        )
+                        .unwrap_or(false);
+                    let tx = conn.transaction()?;
+                    for id in &stale {
+                        if fts_exists {
+                            tx.execute(
+                                "DELETE FROM fts_threads WHERE thread_id = ?1",
+                                params![id],
+                            )?;
+                        }
+                        tx.execute(
+                            "DELETE FROM conversation_threads WHERE id = ?1",
+                            params![id],
+                        )?;
+                    }
+                    tx.commit()?;
                 }
             }
         }
@@ -2088,6 +2126,100 @@ mod tests {
             )
             .ok();
         assert!(status.is_none());
+    }
+
+    /// M15 (audit T16): deleting a locally-stale thread must also delete its
+    /// `fts_threads` row, inside the same transaction — hard-deleting threads
+    /// without cleaning FTS left ghost search hits for messages that no
+    /// longer exist (reference coordinator.ts:698-704, v1.6.0 FTS-drift fix).
+    #[tokio::test]
+    async fn stale_thread_delete_removes_fts_rows_too() {
+        let (conn, engine) = engine();
+        engine.initial_sync().await.unwrap();
+        // Demo-world conversation 105000 (3 threads).
+        let conv = engine.provider.list_threads(105_000).await.unwrap();
+        assert!(conv.len() >= 2, "demo world must have >= 2 threads");
+        let kept: Vec<HsThread> = conv[..conv.len() - 1].to_vec();
+        let stale_remote_id = conv[conv.len() - 1].remote_id;
+
+        // Index every thread into fts_threads (the search engine's shape:
+        // body + thread_id + conversation_id), remembering the STALE thread's
+        // LOCAL id (the thread row is about to disappear — the ghost-hit
+        // check must not go through it).
+        let (stale_thread_local, kept_thread_local) = {
+            let c = conn.lock().unwrap();
+            let local: i64 = c
+                .query_row(
+                    "SELECT id FROM conversations WHERE remote_id = 105000",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut stale_local = 0;
+            let mut kept_local = 0;
+            for t in &conv {
+                let thread_local: i64 = c
+                    .query_row(
+                        "SELECT id FROM conversation_threads WHERE remote_id = ?1",
+                        params![t.remote_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                if t.remote_id == stale_remote_id {
+                    stale_local = thread_local;
+                } else if t.remote_id == kept[0].remote_id {
+                    kept_local = thread_local;
+                }
+                c.execute(
+                    "INSERT INTO fts_threads (body, thread_id, conversation_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![t.body.clone().unwrap_or_default(), thread_local, local],
+                )
+                .unwrap();
+            }
+            (stale_local, kept_local)
+        };
+
+        // Re-ingest with the last thread gone from the provider (deleted or
+        // merged upstream): the local row AND its FTS row must disappear,
+        // together; the kept threads keep both.
+        engine
+            .ingest_conversation(&conv_kept_conversation(&engine).await, &kept, false)
+            .await
+            .unwrap();
+
+        let c = conn.lock().unwrap();
+        let (stale_threads, stale_fts): (i64, i64) = c
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM conversation_threads WHERE remote_id = ?1),
+                        (SELECT COUNT(*) FROM fts_threads WHERE thread_id = ?2)",
+                params![stale_remote_id, stale_thread_local],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stale_threads, 0, "stale thread row must be deleted");
+        assert_eq!(stale_fts, 0, "stale thread FTS row must be deleted with it");
+
+        let (kept_threads, kept_fts): (i64, i64) = c
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM conversation_threads WHERE remote_id = ?1),
+                        (SELECT COUNT(*) FROM fts_threads WHERE thread_id = ?2)",
+                params![kept[0].remote_id, kept_thread_local],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept_threads, 1);
+        assert_eq!(kept_fts, 1, "kept thread keeps its FTS row");
+    }
+
+    /// The conversation payload for the M15 test (demo world 105000).
+    async fn conv_kept_conversation(engine: &SyncEngine) -> HsConversation {
+        let query = ConversationQuery::default();
+        let page = engine.provider.list_conversations(&query).await.unwrap();
+        page.items
+            .into_iter()
+            .find(|c| c.remote_id == 105_000)
+            .expect("demo conversation 105000")
     }
 
     #[test]

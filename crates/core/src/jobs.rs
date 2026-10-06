@@ -57,57 +57,87 @@ pub fn ensure_jobs_table(conn: &Connection) -> Result<()> {
 }
 
 /// Enqueue a job of `kind` with `payload` (JSON) on the `sync` queue
-/// (reference default priority 2). Available immediately.
+/// (reference default priority 2, default max_attempts 3). Available
+/// immediately.
 pub fn enqueue(conn: &Connection, kind: &str, payload: &str) -> Result<i64> {
-    enqueue_on(conn, "sync", kind, payload, 2)
+    enqueue_on(conn, "sync", kind, payload, 2, 3)
 }
 
-/// Enqueue a job on a specific queue with a priority (reference
-/// `enqueue(queue, type, payload, priority, delayMinutes)` shape).
+/// Enqueue a job on a specific queue with a priority and a retry budget
+/// (reference `enqueue(queue, type, payload, priority = 2, maxAttempts = 3)`
+/// shape, jobRepo.ts:9). `run_at` is stored in SQLite's own
+/// `datetime('now')` format so `claim_next` compares it lexically (the
+/// reference's ISO-8601 pitfall never applies here).
 pub fn enqueue_on(
     conn: &Connection,
     queue: &str,
     kind: &str,
     payload: &str,
     priority: i64,
+    max_attempts: i64,
 ) -> Result<i64> {
     ensure_jobs_table(conn)?;
     conn.execute(
-        "INSERT INTO jobs (queue, type, priority, payload, run_at)
-         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-        params![queue, kind, priority, payload],
+        "INSERT INTO jobs (queue, type, priority, payload, max_attempts, run_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+        params![queue, kind, priority, payload, max_attempts],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-/// Claim the next available job for `worker_id` (recorded in `locked_*`).
-/// Returns `None` if no job is available.
+/// Claim the next available job — optionally scoped to one queue (the
+/// reference `claimNext(queue?)` filter, jobRepo.ts:22). Returns `None` if
+/// no job is available.
 ///
-/// KNOWN PITFALL: never compare ISO-8601 timestamps lexically against SQLite
-/// `datetime('now')` strings — compare via `julianday()` instead.
-pub fn claim_next(conn: &mut Connection) -> Result<Option<ClaimedJob>> {
+/// Ordering is the reference's `priority ASC, id ASC`; a job is runnable
+/// when `run_at IS NULL OR run_at <= datetime('now')` (SQLite's own format,
+/// never ISO-8601 — see the reference's run_at pitfall comment).
+pub fn claim_next(conn: &mut Connection, queue: Option<&str>) -> Result<Option<ClaimedJob>> {
     let tx = conn.transaction()?;
-    // Atomic claim: highest priority first, then oldest run_at, never a
-    // parked awaiting_approval job (mirror of the reference worker claim).
-    let row: Option<(i64, String, String, i64, i64)> = tx
-        .prepare(
-            "SELECT id, type, payload, attempt, max_attempts
-               FROM jobs
-              WHERE status = 'queued'
-                AND julianday(COALESCE(run_at, datetime('now'))) <= julianday('now')
-              ORDER BY priority ASC, run_at ASC, id ASC
-              LIMIT 1;",
-        )?
-        .query_row([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        })
-        .ok();
+    // Atomic claim: highest priority first, then FIFO by id, never a parked
+    // awaiting_approval job (status filter). The queue filter scopes the
+    // claim to one worker's lane (reference claimNext(queue)).
+    type ClaimRow = (i64, String, String, i64, i64);
+    let select_row = |stmt: &mut rusqlite::Statement<'_>,
+                      params: &[&dyn rusqlite::ToSql]|
+     -> rusqlite::Result<Option<ClaimRow>> {
+        let mut rows = stmt.query(params)?;
+        match rows.next()? {
+            Some(r) => Ok(Some((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))),
+            None => Ok(None),
+        }
+    };
+    let row: Option<ClaimRow> = match queue {
+        Some(q) => {
+            let mut stmt = tx.prepare(
+                "SELECT id, type, payload, attempt, max_attempts
+                   FROM jobs
+                  WHERE status = 'queued'
+                    AND (run_at IS NULL OR run_at <= datetime('now'))
+                    AND queue = ?
+                  ORDER BY priority ASC, id ASC
+                  LIMIT 1;",
+            )?;
+            select_row(&mut stmt, &[&q])?
+        }
+        None => {
+            let mut stmt = tx.prepare(
+                "SELECT id, type, payload, attempt, max_attempts
+                   FROM jobs
+                  WHERE status = 'queued'
+                    AND (run_at IS NULL OR run_at <= datetime('now'))
+                  ORDER BY priority ASC, id ASC
+                  LIMIT 1;",
+            )?;
+            select_row(&mut stmt, &[])?
+        }
+    };
 
     let Some((id, kind, payload, attempt, max_attempts)) = row else {
         return Ok(None);
@@ -116,8 +146,6 @@ pub fn claim_next(conn: &mut Connection) -> Result<Option<ClaimedJob>> {
     tx.execute(
         "UPDATE jobs
             SET status = 'running',
-                locked_by = 'worker',
-                locked_at = datetime('now'),
                 started_at = datetime('now'),
                 attempt = ?1
           WHERE id = ?2",
@@ -144,10 +172,11 @@ pub struct ClaimedJob {
     pub max_attempts: i64,
 }
 
-/// Mark a claimed job as completed.
+/// Mark a claimed job as completed (clears any carried-over error, the
+/// reference `completeJob` sets `error = NULL`).
 pub fn complete(conn: &Connection, id: i64) -> Result<()> {
     let rows = conn.execute(
-        "UPDATE jobs SET status = 'completed', completed_at = datetime('now')
+        "UPDATE jobs SET status = 'completed', completed_at = datetime('now'), error = NULL
           WHERE id = ?1 AND status = 'running'",
         params![id],
     )?;
@@ -159,11 +188,14 @@ pub fn complete(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Mark a claimed job as failed. If attempt < max_attempts, requeue with
-/// exponential backoff. Otherwise, dead-letter (`failed`).
-pub fn fail(conn: &Connection, id: i64, error: &str) -> Result<()> {
-    let now = chrono::Utc::now();
-
+/// Mark a claimed job as failed (reference `failJob(id, error, retryable)`,
+/// jobRepo.ts:53). If `retryable` and attempt < max_attempts, requeue with
+/// the reference's exact exponential backoff — `min(300, 5 * 2^attempt)`
+/// SECONDS (5, 10, 20, 40, 80, 160, 300 capped), stored via SQLite
+/// `datetime('now', '+N seconds')` so it stays in the claim-comparable
+/// format. Otherwise, dead-letter (`failed`). The error text is capped at
+/// 1000 characters like the reference's `error.slice(0, 1000)`.
+pub fn fail(conn: &Connection, id: i64, error: &str, retryable: bool) -> Result<()> {
     let row: Option<(i64, i64)> = conn
         .prepare("SELECT attempt, max_attempts FROM jobs WHERE id = ?1 AND status = 'running'")?
         .query_row(params![id], |r| {
@@ -177,28 +209,40 @@ pub fn fail(conn: &Connection, id: i64, error: &str) -> Result<()> {
         ));
     };
 
-    if attempt >= max_attempts {
+    let error: String = error.chars().take(1000).collect();
+    let can_retry = retryable && attempt < max_attempts;
+    if !can_retry {
         conn.execute(
             "UPDATE jobs SET status = 'failed', completed_at = datetime('now'), error = ?1 WHERE id = ?2",
             params![error, id],
         )?;
     } else {
-        // Requeue with exponential backoff: 2^attempt minutes (1, 2, 4, 8, 16).
-        let shift = ((attempt - 1).max(0) as u32).min(10);
-        let delay_secs = 60u64 << shift;
-        let next = now + chrono::Duration::seconds(delay_secs as i64);
-        let next_str = format!("{}", next.format("%Y-%m-%dT%H:%M:%S"));
+        // Reference backoff (jobRepo.ts:58): Math.min(300, 2 ** attempt * 5).
+        let shift = u32::try_from(attempt).unwrap_or(0).min(20);
+        let delay_secs = (5i64 << shift).min(300);
         conn.execute(
             "UPDATE jobs
                 SET status = 'queued',
                     locked_by = NULL,
                     locked_at = NULL,
-                    run_at = ?1,
+                    run_at = datetime('now', '+' || ?1 || ' seconds'),
                     error = ?2
               WHERE id = ?3",
-            params![next_str, error, id],
+            params![delay_secs, error, id],
         )?;
     }
+    Ok(())
+}
+
+/// `parkJob(id)` (jobRepo.ts:98, v1.6.0 audit fix): park a job in the
+/// `awaiting_approval` state — visible in the Queue panel, never claimed
+/// again, approved via `retry_job(id, {"approved":true})` / rejected via
+/// `cancel_job(id)`.
+pub fn park_job(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE jobs SET status = 'awaiting_approval', completed_at = NULL WHERE id = ?1",
+        params![id],
+    )?;
     Ok(())
 }
 
@@ -394,12 +438,29 @@ pub fn clear_completed(conn: &Connection) -> Result<usize> {
     Ok(rows)
 }
 
-/// `recoverStaleJobs()` — release jobs stuck in `running` for 30+ minutes.
+/// `recoverStaleJobs()` — release jobs stuck in `running` for 30+ minutes
+/// (the boot recovery, message matches the reference).
 pub fn recover_stale_jobs(conn: &Connection) -> Result<usize> {
     let rows = conn.execute(
         "UPDATE jobs SET status = 'queued', error = 'Recovered after restart'
           WHERE status = 'running' AND started_at < datetime('now', '-30 minutes')",
         [],
+    )?;
+    Ok(rows)
+}
+
+/// `requeueStaleRunningJobs(thresholdMinutes = 30)` (jobRepo.ts:159, v2.2.1
+/// audit fix): the periodic sweep companion to the boot recovery — the same
+/// conservative 30-minute rule, with the sweep's distinct error message, so
+/// a job claimed moments before a restart does not stay `running` for the
+/// whole process lifetime.
+pub fn requeue_stale_running_jobs(conn: &Connection, threshold_minutes: i64) -> Result<usize> {
+    let rows = conn.execute(
+        "UPDATE jobs SET status = 'queued',
+             error = 'Re-queued by maintenance sweep: running longer than threshold'
+          WHERE status = 'running'
+            AND started_at < datetime('now', ?1)",
+        params![format!("-{threshold_minutes} minutes")],
     )?;
     Ok(rows)
 }
@@ -573,12 +634,14 @@ mod tests {
         let id = enqueue(&conn, "test.echo", r#"{"msg":"hi"}"#).unwrap();
         assert!(id > 0);
 
-        let claimed = claim_next(&mut conn).unwrap().expect("a job is available");
+        let claimed = claim_next(&mut conn, None)
+            .unwrap()
+            .expect("a job is available");
         assert_eq!(claimed.kind, "test.echo");
         assert_eq!(claimed.attempts, 1);
 
         // No more jobs available.
-        assert!(claim_next(&mut conn).unwrap().is_none());
+        assert!(claim_next(&mut conn, None).unwrap().is_none());
 
         complete(&conn, claimed.id).unwrap();
         let state: String = conn
@@ -597,9 +660,9 @@ mod tests {
         let id = enqueue(&conn, "test.failing", "{}").unwrap();
 
         // Attempt 1: fail -> requeue with backoff (run_at in the future).
-        let claimed = claim_next(&mut conn).unwrap().unwrap();
+        let claimed = claim_next(&mut conn, None).unwrap().unwrap();
         assert_eq!(claimed.attempts, 1);
-        fail(&conn, claimed.id, "boom").unwrap();
+        fail(&conn, claimed.id, "boom", true).unwrap();
         let state: String = conn
             .query_row("SELECT status FROM jobs WHERE id=?1", params![id], |r| {
                 r.get(0)
@@ -615,9 +678,9 @@ mod tests {
         .unwrap();
 
         // Attempt 2: claim again, fail -> still requeued (attempt < max_attempts=3).
-        let claimed = claim_next(&mut conn).unwrap().unwrap();
+        let claimed = claim_next(&mut conn, None).unwrap().unwrap();
         assert_eq!(claimed.attempts, 2);
-        fail(&conn, claimed.id, "boom").unwrap();
+        fail(&conn, claimed.id, "boom", true).unwrap();
         let state: String = conn
             .query_row("SELECT status FROM jobs WHERE id=?1", params![id], |r| {
                 r.get(0)
@@ -631,15 +694,174 @@ mod tests {
             params![id],
         )
         .unwrap();
-        let claimed = claim_next(&mut conn).unwrap().unwrap();
+        let claimed = claim_next(&mut conn, None).unwrap().unwrap();
         assert_eq!(claimed.attempts, 3);
-        fail(&conn, claimed.id, "boom").unwrap();
+        fail(&conn, claimed.id, "boom", true).unwrap();
         let state: String = conn
             .query_row("SELECT status FROM jobs WHERE id=?1", params![id], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    /// DB-09: the exact reference backoff seconds — min(300, 5 * 2^attempt)
+    /// (jobRepo.ts:58), stored in SQLite datetime format so it is comparable.
+    #[test]
+    fn fail_backoff_is_exact_reference_seconds() {
+        let conn = fresh_db();
+        // attempt 0 -> 5s, 1 -> 10s, 2 -> 20s, 4 -> 80s, 6 -> min(320,300) = 300 capped.
+        for (attempt, expect_secs) in [(0i64, 5i64), (1, 10), (2, 20), (4, 80), (6, 300)] {
+            conn.execute(
+                "INSERT INTO jobs (queue, type, status, attempt, max_attempts, run_at)
+                 VALUES ('sync', 'b', 'running', ?1, 99, datetime('now'))",
+                params![attempt],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            fail(&conn, id, "boom", true).unwrap();
+            let run_at: String = conn
+                .query_row("SELECT run_at FROM jobs WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            // REAL seconds since now (SQLite's datetime() truncates to whole
+            // seconds at generation, so the observable delay is expect-1..expect+1).
+            let delay: f64 = conn
+                .query_row(
+                    "SELECT julianday(?1) - julianday('now')",
+                    params![run_at],
+                    |r| r.get::<_, f64>(0),
+                )
+                .unwrap()
+                * 86400.0;
+            assert!(
+                (expect_secs as f64 - 1.1..=expect_secs as f64 + 1.1).contains(&delay),
+                "attempt {attempt}: backoff {delay:.2}s not within [{}, {}]",
+                expect_secs - 1,
+                expect_secs + 1
+            );
+            // SQLite format (space separator), never ISO-8601 ('T').
+            assert!(
+                !run_at.contains('T'),
+                "run_at must stay in SQLite datetime format, got {run_at}"
+            );
+        }
+    }
+
+    /// DB-09: `failJob(id, error, retryable=false)` dead-letters immediately
+    /// (the reference's unknown-job-type path never retries).
+    #[test]
+    fn fail_non_retryable_dead_letters_immediately() {
+        let mut conn = fresh_db();
+        let id = enqueue(&conn, "test.permanent", "{}").unwrap();
+        let claimed = claim_next(&mut conn, None).unwrap().unwrap();
+        assert_eq!(claimed.attempts, 1);
+        fail(&conn, claimed.id, "Unknown job type", false).unwrap();
+        let state: String = conn
+            .query_row("SELECT status FROM jobs WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "failed");
+    }
+
+    /// DB-09: `claimNext(queue?)` — the queue filter scopes the claim.
+    #[test]
+    fn claim_next_filters_by_queue() {
+        let mut conn = fresh_db();
+        enqueue_on(&conn, "sync", "sync.job", "{}", 2, 3).unwrap();
+        enqueue_on(&conn, "ai", "ai.job", "{}", 4, 3).unwrap();
+        // Unscoped claim follows priority: the ai job (priority 4 vs 2)? No —
+        // lower number = higher priority, so sync (2) wins unscoped.
+        let claimed = claim_next(&mut conn, None).unwrap().unwrap();
+        assert_eq!(claimed.kind, "sync.job");
+        // Scoped claim on the ai lane finds its own job.
+        let claimed = claim_next(&mut conn, Some("ai")).unwrap().unwrap();
+        assert_eq!(claimed.kind, "ai.job");
+        // The ai lane is now empty even though the sync job is mid-flight.
+        assert!(claim_next(&mut conn, Some("ai")).unwrap().is_none());
+    }
+
+    /// DB-09: `parkJob(id)` — the awaiting-approval park (jobRepo.ts:98).
+    #[test]
+    fn park_job_awaiting_approval_never_claimed_until_approved() {
+        let mut conn = fresh_db();
+        let id = enqueue(&conn, "automation.parked", "{}").unwrap();
+        let claimed = claim_next(&mut conn, None).unwrap().unwrap();
+        park_job(&conn, claimed.id).unwrap();
+        let (state, completed_at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, completed_at FROM jobs WHERE id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "awaiting_approval");
+        assert!(completed_at.is_none());
+        // Never claimed while parked (any lane).
+        assert!(claim_next(&mut conn, None).unwrap().is_none());
+        // Approve = retry with the approved patch -> queued again.
+        let ok = retry_job(&conn, id, Some(r#"{"approved":true}"#)).unwrap();
+        assert_eq!(ok, Some(true));
+        let reclaimed = claim_next(&mut conn, Some("sync")).unwrap().unwrap();
+        assert_eq!(reclaimed.id, id);
+    }
+
+    /// DB-09: the periodic sweep (v2.2.1) uses the reference's distinct
+    /// message and honors its threshold parameter.
+    #[test]
+    fn requeue_stale_running_jobs_uses_sweep_message_and_threshold() {
+        let conn = fresh_db();
+        conn.execute_batch(
+            "INSERT INTO jobs (queue, type, status, started_at)
+             VALUES ('sync', 'a', 'running', datetime('now', '-45 minutes'));
+             INSERT INTO jobs (queue, type, status, started_at)
+             VALUES ('sync', 'b', 'running', datetime('now', '-5 minutes'));",
+        )
+        .unwrap();
+        // Threshold 30: only the 45-minute-old row is requeued.
+        let n = requeue_stale_running_jobs(&conn, 30).unwrap();
+        assert_eq!(n, 1);
+        let (status, error): (String, Option<String>) = conn
+            .query_row("SELECT status, error FROM jobs WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(status, "queued");
+        assert_eq!(
+            error.as_deref(),
+            Some("Re-queued by maintenance sweep: running longer than threshold")
+        );
+        let status_b: String = conn
+            .query_row("SELECT status FROM jobs WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status_b, "running");
+    }
+
+    /// DB-09: enqueue stores the caller's max_attempts (jobRepo.ts:9).
+    #[test]
+    fn enqueue_records_max_attempts() {
+        let conn = fresh_db();
+        let id = enqueue_on(&conn, "ai", "analyze_ticket", "{}", 3, 2).unwrap();
+        let max_attempts: i64 = conn
+            .query_row(
+                "SELECT max_attempts FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_attempts, 2);
+        // Default enqueue keeps the reference default of 3.
+        let id = enqueue(&conn, "plain", "{}").unwrap();
+        let max_attempts: i64 = conn
+            .query_row(
+                "SELECT max_attempts FROM jobs WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(max_attempts, 3);
     }
 
     #[test]
@@ -756,9 +978,9 @@ mod tests {
     #[test]
     fn priority_ordering_in_claim() {
         let mut conn = fresh_db();
-        enqueue_on(&conn, "sync", "low", "{}", 4).unwrap();
-        enqueue_on(&conn, "sync", "high", "{}", 0).unwrap();
-        let claimed = claim_next(&mut conn).unwrap().unwrap();
+        enqueue_on(&conn, "sync", "low", "{}", 4, 3).unwrap();
+        enqueue_on(&conn, "sync", "high", "{}", 0, 3).unwrap();
+        let claimed = claim_next(&mut conn, None).unwrap().unwrap();
         assert_eq!(claimed.kind, "high");
     }
 
@@ -770,7 +992,7 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(claim_next(&mut conn).unwrap().is_none());
+        assert!(claim_next(&mut conn, None).unwrap().is_none());
     }
 
     #[test]

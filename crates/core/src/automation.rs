@@ -1633,22 +1633,470 @@ pub fn js_truthy(v: &serde_json::Value) -> i64 {
     }
 }
 
-/// Park a higher-risk / gated action as a pending approval (the port's
-/// approval tier — the awaiting-approval mechanism AU-04 wires routes for).
-fn park_approval(
+/// Park a gated/higher-risk action as an `automation_action_awaiting_approval`
+/// JOB (AU-04, MAIN parity — engine.ts:151/159: `enqueue('ai',
+/// 'automation_action_awaiting_approval', { ruleId, conversationId, action },
+/// 2, 1)`). The job is `queued` until a worker claims it and parks it in
+/// `awaiting_approval` (visible in the Queue panel); approve via the queue
+/// retry route (payload gains `approved:true`), reject via cancel.
+fn enqueue_awaiting_approval(
     conn: &Connection,
     rule_id: i64,
     conversation_id: i64,
     action: &serde_json::Value,
 ) -> Result<()> {
-    let action_json = serde_json::to_string(action)
-        .map_err(|e| crate::error::Error::Config(format!("action serialization failed: {e}")))?;
-    conn.execute(
-        "INSERT INTO automation_approvals (rule_id, conversation_id, proposed_action_json, status)
-         VALUES (?1, ?2, ?3, 'pending')",
-        params![rule_id, conversation_id, action_json],
+    let payload = serde_json::json!({
+        "ruleId": rule_id,
+        "conversationId": conversation_id,
+        "action": action,
+    });
+    crate::jobs::enqueue_on(
+        conn,
+        "ai",
+        "automation_action_awaiting_approval",
+        &payload.to_string(),
+        2,
+        1,
     )?;
     Ok(())
+}
+
+/// The reference `executeNonDestructive` dispatch (engine.ts:315-325) — the
+/// shared execution path for the fire-time non-destructive arm and APPROVED
+/// awaiting-approval jobs. Returns `Ok(false)` when an AI-dependent action
+/// was skipped because the AI backend is disabled (WK-03 C6 gate — the
+/// reference enqueues unconditionally; a queued job with no runnable
+/// backend failed permanently in the port before).
+fn execute_non_destructive(
+    conn: &Connection,
+    kind: &str,
+    params: &serde_json::Value,
+    conversation_id: i64,
+    ai_enabled: bool,
+) -> Result<bool> {
+    match kind {
+        "create_ai_note" => {
+            if !ai_enabled {
+                return Ok(false);
+            }
+            crate::jobs::enqueue_on(
+                conn,
+                "ai",
+                "create_ai_note",
+                &format!("{{\"conversationId\":{conversation_id}}}"),
+                2,
+                1,
+            )?;
+            Ok(true)
+        }
+        "create_ai_draft" => {
+            if !ai_enabled {
+                return Ok(false);
+            }
+            crate::jobs::enqueue_on(
+                conn,
+                "ai",
+                "generate_draft",
+                &format!("{{\"conversationId\":{conversation_id}}}"),
+                2,
+                1,
+            )?;
+            Ok(true)
+        }
+        "add_tag" => {
+            // The reference routes add_tag through the API queue (a Help
+            // Scout write); the port applies the local tag (the remote
+            // write path is the SY-10 provider gap).
+            if let Some(tag) = params.get("tag").and_then(|t| t.as_str()) {
+                let mut tags =
+                    crate::conversation_ops::read_conversation_tags(conn, conversation_id);
+                if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                    tags.push(tag.to_string());
+                    crate::conversation_ops::write_conversation_tags(conn, conversation_id, &tags);
+                }
+            }
+            Ok(true)
+        }
+        "manual_review_queue" => {
+            conn.execute(
+                "UPDATE conversations SET is_unread = 1 WHERE id = ?1",
+                params![conversation_id],
+            )?;
+            Ok(true)
+        }
+        // Parity: unknown/non-executing kinds are a no-op (the reference
+        // falls through the if-chain silently).
+        _ => Ok(true),
+    }
+}
+
+/// Execute an APPROVED awaiting-approval action (the reference
+/// `executeApprovedAction`, engine.ts:307-309 — the worker calls this after
+/// a human approves the parked job in the Queue panel). Non-destructive
+/// kinds share the fire-time dispatch; the port also executes the
+/// higher-risk `set_status` / `assign` kinds through `ticket_ops` (the
+/// single source of truth for state mutations — the reference's dispatch
+/// no-ops them, which would silently drop the approved write).
+///
+/// Returns `Ok(false)` when the action could not run (AI disabled, unknown
+/// conversation, rejected write) — the caller then skips the approved-run
+/// record instead of fabricating a `completed` run.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite`/`Error::Config` on DB failures.
+pub fn execute_approved_action(
+    conn: &mut Connection,
+    conversation_id: i64,
+    action: &serde_json::Value,
+) -> Result<bool> {
+    let kind = action
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or_default();
+    let params = action
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let ai_enabled = !matches!(
+        crate::ai_pipeline::backend_from_settings(conn),
+        crate::ai_pipeline::AiBackend::Disabled
+    );
+    match kind {
+        "set_status" | "assign" => {
+            let remote: Option<i64> = conn
+                .query_row(
+                    "SELECT remote_id FROM conversations WHERE id = ?1",
+                    params![conversation_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            let Some(conversation_remote_id) = remote else {
+                return Ok(false);
+            };
+            let op = if kind == "set_status" {
+                let new_status = params
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("closed")
+                    .to_string();
+                crate::ticket_ops::TicketOperation::ChangeStatus {
+                    conversation_remote_id,
+                    new_status,
+                    actor_type: "automation".to_string(),
+                    actor_id: None,
+                }
+            } else {
+                let assignee_local_id: Option<i64> = params
+                    .get("userId")
+                    .and_then(|u| u.as_i64())
+                    .and_then(|id| {
+                        conn.query_row(
+                            "SELECT id FROM users WHERE id = ?1 OR remote_id = ?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .ok()
+                    });
+                crate::ticket_ops::TicketOperation::Assign {
+                    conversation_remote_id,
+                    assignee_local_id,
+                    actor_type: "automation".to_string(),
+                    actor_id: None,
+                }
+            };
+            match crate::ticket_ops::execute(conn, &op) {
+                Ok(crate::ticket_ops::OperationResult::Success { .. }) => Ok(true),
+                Ok(crate::ticket_ops::OperationResult::Rejected { .. }) => Ok(false),
+                Err(_) => Ok(false),
+            }
+        }
+        _ => execute_non_destructive(conn, kind, &params, conversation_id, ai_enabled),
+    }
+}
+
+/// `recordApprovedRun` (engine.ts:311-313): the run row the worker records
+/// after an approved action executed.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the insert fails.
+pub fn record_approved_run(
+    conn: &Connection,
+    rule_id: i64,
+    conversation_id: i64,
+    kind: &str,
+) -> Result<()> {
+    record_run(
+        conn,
+        rule_id,
+        Some(conversation_id),
+        "completed",
+        &format!("Approved by human: executed {kind}"),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AU-02: the reference condition model (engine.ts matches:192-294 +
+// matchesAttribute:233-294). Conditions decide whether a rule MATCHES; the
+// AI never performs a write (attribute conditions only gate matching).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The conversation fields the reference `fireTrigger` query loads
+/// (engine.ts:119-128) — the surface the 8 condition fields test against.
+#[derive(Debug, Clone, Default)]
+struct FireContext {
+    subject: Option<String>,
+    preview: Option<String>,
+    /// `GROUP_CONCAT(t.name)` over the conversation's tags.
+    tags: Option<String>,
+    mailbox_name: Option<String>,
+}
+
+/// Load the fire context for one conversation (`None` when unknown — the
+/// reference returns no runs for a missing conversation).
+fn load_fire_context(conn: &Connection, conversation_id: i64) -> Result<Option<FireContext>> {
+    let row = conn
+        .query_row(
+            "SELECT c.subject, c.preview,
+                    (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct
+                      JOIN tags t ON t.id = ct.tag_id
+                     WHERE ct.conversation_id = c.id),
+                    (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_id)
+               FROM conversations c WHERE c.id = ?1",
+            params![conversation_id],
+            |r| {
+                Ok(FireContext {
+                    subject: r.get(0)?,
+                    preview: r.get(1)?,
+                    tags: r.get(2)?,
+                    mailbox_name: r.get(3)?,
+                })
+            },
+        )
+        .ok();
+    Ok(row)
+}
+
+/// Current attribute values keyed by catalog attribute — the reference
+/// `currentAttributes` (engine.ts:171-176): `superseded_at IS NULL` rows
+/// only; a missing key IS the honest 'unknown'.
+fn current_attributes(
+    conn: &Connection,
+    conversation_id: i64,
+) -> std::collections::HashMap<String, (String, String)> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT attribute, value, value_type FROM ai_attributes
+          WHERE conversation_id = ?1 AND superseded_at IS NULL",
+    ) else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map(params![conversation_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    }) else {
+        return map;
+    };
+    for (k, v, t) in rows.flatten() {
+        map.insert(k, (v, t));
+    }
+    map
+}
+
+/// Latest AI draft verification outcome: 'failed' | 'passed' | 'none'
+/// (reference `latestVerification`, engine.ts:179-190 — no row or an
+/// unparsable payload reads 'none'; `verified === true` reads 'passed').
+fn latest_verification(conn: &Connection, conversation_id: i64) -> &'static str {
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT verification FROM ai_drafts
+              WHERE conversation_id = ?1 AND verification IS NOT NULL
+              ORDER BY id DESC LIMIT 1",
+            params![conversation_id],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(payload) = row else {
+        return "none";
+    };
+    match serde_json::from_str::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|v| v.get("verified").and_then(|x| x.as_bool()))
+    {
+        Some(true) => "passed",
+        Some(false) => "failed",
+        None => "none",
+    }
+}
+
+/// The reference condition matcher (engine.ts `matches`:192-226). Operator
+/// semantics per field; unknown fields never match.
+fn condition_matches(
+    ctx: &FireContext,
+    analysis: Option<&crate::ai_pipeline::LatestAnalysis>,
+    cond: &serde_json::Value,
+    attributes: &std::collections::HashMap<String, (String, String)>,
+    verification: &str,
+) -> bool {
+    let field = cond
+        .get("field")
+        .and_then(|f| f.as_str())
+        .unwrap_or_default();
+    let operator = cond
+        .get("operator")
+        .and_then(|o| o.as_str())
+        .unwrap_or_default();
+    let raw_value = cond
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let value = raw_value.to_lowercase();
+    match field {
+        "subject" => {
+            let subject = ctx.subject.as_deref().unwrap_or_default().to_lowercase();
+            if operator == "contains" {
+                subject.contains(&value)
+            } else {
+                subject == value
+            }
+        }
+        // body ignores the operator in the reference (includes only).
+        "body" => ctx
+            .preview
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(&value),
+        "tag" => ctx
+            .tags
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .split(',')
+            .any(|t| {
+                if operator == "contains" {
+                    t.contains(&value)
+                } else {
+                    t.trim() == value
+                }
+            }),
+        "mailbox" => ctx
+            .mailbox_name
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(&value),
+        "confidence" => {
+            const LEVELS: [&str; 4] = ["unknown", "low", "medium", "high"];
+            let current = analysis
+                .and_then(|a| a.analysis.confidence.as_deref())
+                .unwrap_or("unknown");
+            let idx = LEVELS.iter().position(|l| *l == current);
+            let target = LEVELS.iter().position(|l| *l == value);
+            match (idx, target) {
+                (Some(i), Some(t)) => match operator {
+                    "lt" => i < t,
+                    "gt" => i > t,
+                    _ => i == t,
+                },
+                _ => false,
+            }
+        }
+        "known_issue_match" => analysis
+            .and_then(|a| a.analysis.known_issue_candidate.as_deref())
+            .map(|k| k.to_lowercase().contains(&value))
+            .unwrap_or(false),
+        "ai_attribute" => attribute_matches(cond, raw_value, attributes),
+        "ai_verification" => verification == value,
+        _ => false,
+    }
+}
+
+/// AI-attribute condition matching (engine.ts `matchesAttribute`:233-294):
+/// operator semantics follow the attribute's value_type, and a missing
+/// attribute is 'unknown' — it matches value 'unknown' (equals) and nothing
+/// else (honest unknown: never a fabricated concrete value).
+fn attribute_matches(
+    cond: &serde_json::Value,
+    wanted: &str,
+    attributes: &std::collections::HashMap<String, (String, String)>,
+) -> bool {
+    use crate::catalog::AiAttributeKey;
+    let key = cond
+        .get("attribute")
+        .and_then(|a| a.as_str())
+        .unwrap_or_default();
+    // Closed catalog: an unknown key never matches (engine.ts:235).
+    let Some(def) = AiAttributeKey::parse(key) else {
+        return false;
+    };
+    let operator = cond
+        .get("operator")
+        .and_then(|o| o.as_str())
+        .unwrap_or_default();
+    let current = attributes.get(key);
+    let actual = current.map(|(v, _)| v.as_str()).unwrap_or("unknown");
+    if wanted.to_lowercase() == "unknown" {
+        // Only 'equals unknown' matches a missing attribute.
+        return operator == "equals" && actual == "unknown";
+    }
+    if actual == "unknown" {
+        return false; // honest unknown never matches a concrete value
+    }
+    match def.value_type() {
+        crate::catalog::AttributeValueType::Number => {
+            let (Some(a), Some(b)) = (actual.parse::<f64>().ok(), wanted.parse::<f64>().ok())
+            else {
+                return false;
+            };
+            match operator {
+                "gt" => a > b,
+                "gte" => a >= b,
+                "lt" => a < b,
+                "lte" => a <= b,
+                "equals" => a == b,
+                "not_equals" => a != b,
+                _ => false,
+            }
+        }
+        crate::catalog::AttributeValueType::Boolean => {
+            if wanted != "true" && wanted != "false" {
+                return false;
+            }
+            match operator {
+                "equals" => actual == wanted,
+                "not_equals" => actual != wanted,
+                _ => false,
+            }
+        }
+        crate::catalog::AttributeValueType::Enum => {
+            // Ordered vocabularies (urgency, frustration, risk...) support gt/lt.
+            let vocab = def.values();
+            let ai = vocab.iter().position(|v| v.eq_ignore_ascii_case(actual));
+            let bi = vocab.iter().position(|v| v.eq_ignore_ascii_case(wanted));
+            match operator {
+                "equals" => actual.eq_ignore_ascii_case(wanted),
+                "not_equals" => !actual.eq_ignore_ascii_case(wanted),
+                "contains" => actual.to_lowercase().contains(&wanted.to_lowercase()),
+                "gt" => matches!((ai, bi), (Some(x), Some(y)) if x > y),
+                "gte" => matches!((ai, bi), (Some(x), Some(y)) if x >= y),
+                "lt" => matches!((ai, bi), (Some(x), Some(y)) if x < y),
+                "lte" => matches!((ai, bi), (Some(x), Some(y)) if x <= y),
+                _ => false,
+            }
+        }
+        _ => match operator {
+            // text
+            "equals" => actual.eq_ignore_ascii_case(wanted),
+            "not_equals" => !actual.eq_ignore_ascii_case(wanted),
+            "contains" => actual.to_lowercase().contains(&wanted.to_lowercase()),
+            _ => false,
+        },
+    }
 }
 
 /// Fire a trigger for a conversation — the reference manual-trigger path
@@ -1658,15 +2106,15 @@ fn park_approval(
 /// - unknown conversation (local id, like the reference `WHERE c.id = ?`)
 ///   ⇒ no runs;
 /// - every ENABLED rule with the fired trigger runs, in `priority, id`
-///   order: read actions enqueue + record `completed`, non-destructive
-///   actions execute (or park when `requires_approval` and write actions
-///   are disabled), higher-risk actions always park an approval;
+///   order, when ALL of its conditions match (AU-02: the reference
+///   condition model above — unmatched rules record a `skipped` run and
+///   do NOT bump run_count); read actions enqueue + record `completed`,
+///   non-destructive actions execute (or park when `requires_approval`
+///   and write actions are disabled), higher-risk actions always park an
+///   approval;
 /// - each fired rule records one run per action, bumps `run_count` /
 ///   `last_run_at`, and the LAST recorded run row is returned (the
 ///   reference pushes the last run per rule).
-///
-/// Conditions are stored and validated (AU-01) but evaluated by the AU-02
-/// condition-model port — until then rules fire as matched.
 ///
 /// # Errors
 ///
@@ -1680,17 +2128,18 @@ pub fn fire_trigger_for_conversation(
     if !crate::settings::get_bool(conn, "automation_enabled", false)? {
         return Ok(Vec::new());
     }
-    let conversation_exists = conn
-        .query_row(
-            "SELECT 1 FROM conversations WHERE id = ?1",
-            params![conversation_id],
-            |_| Ok(()),
-        )
-        .is_ok();
-    if !conversation_exists {
+    let Some(ctx) = load_fire_context(conn, conversation_id)? else {
         return Ok(Vec::new());
-    }
+    };
     ensure_main_rule_columns(conn)?;
+    // AU-02: load the condition inputs once per fire (the reference loads
+    // the conversation, latest analysis, attribute snapshot and draft
+    // verification before looping rules).
+    let analysis = crate::ai_pipeline::get_latest_analysis(conn, conversation_id)
+        .ok()
+        .flatten();
+    let attributes = current_attributes(conn, conversation_id);
+    let verification = latest_verification(conn, conversation_id);
     let write_enabled = crate::settings::get_bool(conn, "automation_write_actions_enabled", false)?;
     // WK-03 (C6): AI actions only enqueue when the AI backend can run
     // them (the reference gates on aiEnabled) — a queued job with no
@@ -1702,6 +2151,28 @@ pub fn fire_trigger_for_conversation(
     let mut runs = Vec::new();
     for rule in list_rule_records(conn)? {
         if !rule.enabled || rule.trigger != fired {
+            continue;
+        }
+        // AU-02: ALL conditions must match (`conditions.every(...)` — an
+        // empty array matches). Unmatched rules record a `skipped` run and
+        // do NOT bump run_count (the reference `continue`).
+        let matched = rule
+            .conditions
+            .as_array()
+            .map(|conds| {
+                conds.iter().all(|c| {
+                    condition_matches(&ctx, analysis.as_ref(), c, &attributes, verification)
+                })
+            })
+            .unwrap_or(true);
+        if !matched {
+            record_run(
+                conn,
+                rule.id,
+                Some(conversation_id),
+                "skipped",
+                "Conditions not matched",
+            )?;
             continue;
         }
         if let Some(actions) = rule.actions.as_array() {
@@ -1727,6 +2198,7 @@ pub fn fire_trigger_for_conversation(
                                     "analyze_ticket",
                                     &format!("{{\"conversationId\":{conversation_id}}}"),
                                     3,
+                                    2,
                                 );
                                 record_run(
                                     conn,
@@ -1756,7 +2228,10 @@ pub fn fire_trigger_for_conversation(
                     }
                     "non_destructive" => {
                         if rule.requires_approval && !write_enabled {
-                            park_approval(conn, rule.id, conversation_id, action)?;
+                            // AU-04: park via jobs (MAIN parity — the parked
+                            // job is visible in the Queue panel; approve via
+                            // retry, reject via cancel).
+                            enqueue_awaiting_approval(conn, rule.id, conversation_id, action)?;
                             record_run(
                                 conn,
                                 rule.id,
@@ -1765,86 +2240,36 @@ pub fn fire_trigger_for_conversation(
                                 &format!("Action {kind} requires approval (non-destructive)"),
                             )?;
                         } else {
-                            match kind {
-                                "create_ai_note" => {
-                                    if ai_enabled {
-                                        let _ = crate::jobs::enqueue_on(
-                                            conn,
-                                            "ai",
-                                            "create_ai_note",
-                                            &format!("{{\"conversationId\":{conversation_id}}}"),
-                                            2,
-                                        );
-                                    } else {
-                                        record_run(
-                                            conn,
-                                            rule.id,
-                                            Some(conversation_id),
-                                            "skipped",
-                                            "AI action create_ai_note skipped: AI is disabled",
-                                        )?;
-                                    }
-                                }
-                                "create_ai_draft" => {
-                                    if ai_enabled {
-                                        let _ = crate::jobs::enqueue_on(
-                                            conn,
-                                            "ai",
-                                            "generate_draft",
-                                            &format!("{{\"conversationId\":{conversation_id}}}"),
-                                            2,
-                                        );
-                                    } else {
-                                        record_run(
-                                            conn,
-                                            rule.id,
-                                            Some(conversation_id),
-                                            "skipped",
-                                            "AI action create_ai_draft skipped: AI is disabled",
-                                        )?;
-                                    }
-                                }
-                                "add_tag" => {
-                                    // The reference routes add_tag through the
-                                    // API queue (a Help Scout write); the port
-                                    // applies the local tag (the remote write
-                                    // path is the SY-10 provider gap).
-                                    if let Some(tag) = params.get("tag").and_then(|t| t.as_str()) {
-                                        let mut tags =
-                                            crate::conversation_ops::read_conversation_tags(
-                                                conn,
-                                                conversation_id,
-                                            );
-                                        if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
-                                            tags.push(tag.to_string());
-                                            crate::conversation_ops::write_conversation_tags(
-                                                conn,
-                                                conversation_id,
-                                                &tags,
-                                            );
-                                        }
-                                    }
-                                }
-                                "manual_review_queue" => {
-                                    let _ = conn.execute(
-                                        "UPDATE conversations SET is_unread = 1 WHERE id = ?1",
-                                        params![conversation_id],
-                                    );
-                                }
-                                _ => {}
-                            }
-                            record_run(
+                            let executed = execute_non_destructive(
                                 conn,
-                                rule.id,
-                                Some(conversation_id),
-                                "completed",
-                                &format!("Executed {kind}"),
+                                kind,
+                                &params,
+                                conversation_id,
+                                ai_enabled,
                             )?;
+                            if !executed {
+                                record_run(
+                                    conn,
+                                    rule.id,
+                                    Some(conversation_id),
+                                    "skipped",
+                                    &format!("AI action {kind} skipped: AI is disabled"),
+                                )?;
+                            }
+                            if executed {
+                                record_run(
+                                    conn,
+                                    rule.id,
+                                    Some(conversation_id),
+                                    "completed",
+                                    &format!("Executed {kind}"),
+                                )?;
+                            }
                         }
                     }
                     _ => {
                         // higher_risk: always requires explicit approval.
-                        park_approval(conn, rule.id, conversation_id, action)?;
+                        enqueue_awaiting_approval(conn, rule.id, conversation_id, action)?;
                         record_run(
                             conn,
                             rule.id,
@@ -2771,5 +3196,600 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert!(runs_cols.contains(&"detail".to_string()), "{runs_cols:?}");
+    }
+
+    // ---- AU-02: the condition model ----------------------------------------
+
+    /// A full-boot fixture (the AI tables the condition model reads need the
+    /// canonical chain).
+    fn boot_db() -> Connection {
+        let f = NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::db::ensure_migrations_table(&conn).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        conn
+    }
+
+    /// One conversation with subject/preview/tags/mailbox + AI attribute +
+    /// verification fixtures, ready for condition-matching tests.
+    fn seeded_boot_db() -> Connection {
+        let conn = boot_db();
+        conn.execute_batch(
+            "INSERT INTO customers (id, remote_id, first_name, email)
+             VALUES (1, 9001, 'Ada', 'ada@example.com');
+             INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, status)
+             VALUES (9, 105011, 5012, 'Refund question', 'I want a refund for the export feature', 1, 1, 'active');
+             INSERT INTO tags (id, remote_id, name, slug) VALUES (3, 3003, 'billing', 'billing');
+             INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (9, 3);
+             INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
+             INSERT INTO ai_attributes (conversation_id, attribute, value, value_type, confidence, source, schema_version)
+             VALUES (9, 'urgency', 'high', 'enum', 'high', 'deterministic', 'attributes_v1'),
+                    (9, 'question_count', '3', 'number', 'high', 'deterministic', 'attributes_v1'),
+                    (9, 'known_issue', 'true', 'boolean', 'high', 'deterministic', 'attributes_v1'),
+                    (9, 'product', 'Data Exporter', 'text', 'medium', 'ai', 'attributes_v1');
+             INSERT INTO ai_drafts (conversation_id, content, verification)
+             VALUES (9, 'draft', '{\"verified\":true}');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn cond(field: &str, operator: &str, value: &str) -> serde_json::Value {
+        serde_json::json!({ "field": field, "operator": operator, "value": value })
+    }
+
+    fn attr_cond(attribute: &str, operator: &str, value: &str) -> serde_json::Value {
+        serde_json::json!({
+            "field": "ai_attribute", "operator": operator, "value": value,
+            "attribute": attribute
+        })
+    }
+
+    #[test]
+    fn au02_condition_model_matches_reference_semantics() {
+        let conn = seeded_boot_db();
+        let ctx = load_fire_context(&conn, 9).unwrap().expect("context");
+        let attributes = current_attributes(&conn, 9);
+        let verification = latest_verification(&conn, 9);
+        assert_eq!(verification, "passed");
+
+        // subject: contains / equals (case-insensitive)
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("subject", "contains", "refund"),
+            &attributes,
+            verification
+        ));
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("subject", "contains", "REFUND"),
+            &attributes,
+            verification
+        ));
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("subject", "equals", "refund question"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &cond("subject", "equals", "refund"),
+            &attributes,
+            verification
+        ));
+
+        // body: contains only (operator ignored, like the reference)
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("body", "contains", "export feature"),
+            &attributes,
+            verification
+        ));
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("body", "equals", "export"),
+            &attributes,
+            verification
+        ));
+
+        // tag: contains / equals on the comma-split GROUP_CONCAT
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("tag", "contains", "bill"),
+            &attributes,
+            verification
+        ));
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("tag", "equals", "billing"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &cond("tag", "equals", "bill"),
+            &attributes,
+            verification
+        ));
+
+        // mailbox: contains
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("mailbox", "contains", "sup"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &cond("mailbox", "contains", "billing"),
+            &attributes,
+            verification
+        ));
+
+        // confidence: unknown (no analysis) compares against the ladder.
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("confidence", "equals", "unknown"),
+            &attributes,
+            verification
+        ));
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("confidence", "lt", "low"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &cond("confidence", "gt", "unknown"),
+            &attributes,
+            verification
+        ));
+
+        // known_issue_match: no analysis -> never matches
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &cond("known_issue_match", "contains", "export"),
+            &attributes,
+            verification
+        ));
+
+        // ai_attribute: number operators
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &attr_cond("question_count", "gt", "2"),
+            &attributes,
+            verification
+        ));
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &attr_cond("question_count", "lte", "3"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &attr_cond("question_count", "lt", "3"),
+            &attributes,
+            verification
+        ));
+
+        // ai_attribute: boolean
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &attr_cond("known_issue", "equals", "true"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &attr_cond("known_issue", "not_equals", "true"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &attr_cond("known_issue", "equals", "True"),
+            &attributes,
+            verification
+        ));
+
+        // ai_attribute: ordered enum vocabulary (urgency high > low)
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &attr_cond("urgency", "gt", "low"),
+            &attributes,
+            verification
+        ));
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &attr_cond("urgency", "equals", "HIGH"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &attr_cond("urgency", "lt", "low"),
+            &attributes,
+            verification
+        ));
+
+        // ai_attribute: text contains (case-insensitive)
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &attr_cond("product", "contains", "exporter"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &attr_cond("product", "equals", "exporter"),
+            &attributes,
+            verification
+        ));
+
+        // ai_attribute: honest unknown — equals 'unknown' matches a missing
+        // attribute; contains/other operators never do; a present attribute
+        // never matches 'unknown'.
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &attr_cond("intent", "equals", "unknown"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &attr_cond("intent", "contains", "unknown"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &attr_cond("urgency", "equals", "unknown"),
+            &attributes,
+            verification
+        ));
+        // Closed catalog: a key outside the 14 never matches.
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &attr_cond("mood", "equals", "high"),
+            &attributes,
+            verification
+        ));
+
+        // ai_verification: exact vocabulary match
+        assert!(condition_matches(
+            &ctx,
+            None,
+            &cond("ai_verification", "equals", "passed"),
+            &attributes,
+            verification
+        ));
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &cond("ai_verification", "equals", "failed"),
+            &attributes,
+            verification
+        ));
+
+        // unknown field: never matches
+        assert!(!condition_matches(
+            &ctx,
+            None,
+            &cond("mood", "equals", "high"),
+            &attributes,
+            verification
+        ));
+    }
+
+    #[test]
+    fn au02_latest_verification_reads_draft_outcomes() {
+        let conn = seeded_boot_db();
+        // No drafts at all -> none.
+        conn.execute("DELETE FROM ai_drafts", []).unwrap();
+        assert_eq!(latest_verification(&conn, 9), "none");
+        // Unparsable payload -> none.
+        conn.execute(
+            "INSERT INTO ai_drafts (conversation_id, content, verification) VALUES (9, 'd', 'not-json')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(latest_verification(&conn, 9), "none");
+        // verified:false -> failed (newest row wins).
+        conn.execute(
+            "INSERT INTO ai_drafts (conversation_id, content, verification) VALUES (9, 'd', '{\"verified\":false}')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(latest_verification(&conn, 9), "failed");
+    }
+
+    #[test]
+    fn au02_fire_evaluates_conditions_and_skips_unmatched() {
+        let mut conn = seeded_boot_db();
+        crate::settings::set_string(&conn, "automation_enabled", "true").unwrap();
+        let matching = create_rule_record(
+            &conn,
+            &validate_rule(&serde_json::json!({
+                "name": "Refund tag", "enabled": true, "trigger": "manual",
+                "conditions": [{ "field": "subject", "operator": "contains", "value": "refund" }],
+                "actions": [{ "kind": "add_tag", "params": { "tag": "flagged" } }],
+                "requires_approval": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let unmatching = create_rule_record(
+            &conn,
+            &validate_rule(&serde_json::json!({
+                "name": "Never matches", "enabled": true, "trigger": "manual",
+                "conditions": [{ "field": "subject", "operator": "contains", "value": "invoice" }],
+                "actions": [{ "kind": "add_tag", "params": { "tag": "wrong" } }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let runs = fire_trigger_for_conversation(&mut conn, "manual", 9).unwrap();
+        // Only the matching rule ran.
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].rule_id, matching);
+        assert_eq!(runs[0].status, "completed");
+        // The unmatched rule recorded a skipped run and did NOT bump
+        // run_count (the reference `continue`).
+        let (status, detail): (String, String) = conn
+            .query_row(
+                "SELECT outcome, COALESCE(detail, '') FROM automation_runs
+                  WHERE rule_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![unmatching],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "skipped");
+        assert_eq!(detail, "Conditions not matched");
+        let run_count: i64 = conn
+            .query_row(
+                "SELECT COALESCE(run_count, 0) FROM automation_rules WHERE id = ?1",
+                params![unmatching],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 0, "unmatched rules must not bump run_count");
+        let run_count: i64 = conn
+            .query_row(
+                "SELECT COALESCE(run_count, 0) FROM automation_rules WHERE id = ?1",
+                params![matching],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 1);
+        // The matching rule's action actually ran (add_tag is local).
+        let flagged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_tags ct JOIN tags t ON t.id = ct.tag_id
+                  WHERE ct.conversation_id = 9 AND t.name = 'flagged'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 1);
+    }
+
+    #[test]
+    fn au02_fire_reads_analysis_confidence_and_attributes() {
+        let mut conn = seeded_boot_db();
+        crate::settings::set_string(&conn, "automation_enabled", "true").unwrap();
+        create_rule_record(
+            &conn,
+            &validate_rule(&serde_json::json!({
+                "name": "Urgent escalation", "enabled": true, "trigger": "customer_reply",
+                "conditions": [
+                    { "field": "ai_attribute", "operator": "equals", "value": "high",
+                      "attribute": "urgency" }
+                ],
+                "actions": [{ "kind": "manual_review_queue" }],
+                "requires_approval": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let runs = fire_trigger_for_conversation(&mut conn, "customer_reply", 9).unwrap();
+        assert_eq!(runs.len(), 1, "urgency=high attribute must match");
+        assert_eq!(runs[0].status, "completed");
+        let unread: i64 = conn
+            .query_row(
+                "SELECT is_unread FROM conversations WHERE id = 9",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        assert_eq!(
+            unread, 1,
+            "manual_review_queue marks the conversation unread"
+        );
+    }
+
+    // ---- AU-04: awaiting-approval gating via parked jobs --------------------
+
+    #[test]
+    fn au04_fire_parks_jobs_not_approvals() {
+        let mut conn = seeded_boot_db();
+        crate::settings::set_string(&conn, "automation_enabled", "true").unwrap();
+        let rule = create_rule_record(
+            &conn,
+            &validate_rule(&serde_json::json!({
+                "name": "Close refunds", "enabled": true, "trigger": "manual",
+                "actions": [{ "kind": "set_status", "params": { "status": "pending" } }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let runs = fire_trigger_for_conversation(&mut conn, "manual", 9).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "awaiting_approval");
+
+        // The parked action is a JOB (ai queue, max_attempts 1, MAIN shape),
+        // not an automation_approvals row.
+        let (queue, kind, max_attempts, status, payload): (String, String, i64, String, String) =
+            conn.query_row(
+                "SELECT queue, type, max_attempts, status, COALESCE(payload, '')
+                   FROM jobs ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(queue, "ai");
+        assert_eq!(kind, "automation_action_awaiting_approval");
+        assert_eq!(max_attempts, 1);
+        assert_eq!(status, "queued");
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["ruleId"], rule);
+        assert_eq!(v["conversationId"], 9);
+        assert_eq!(v["action"]["kind"], "set_status");
+        assert_eq!(v["action"]["params"]["status"], "pending");
+
+        let approvals: i64 = conn
+            .query_row("SELECT COUNT(*) FROM automation_approvals", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(approvals, 0, "the fire path parks jobs, not approvals");
+    }
+
+    #[test]
+    fn au04_park_approve_execute_via_queue_panel_flow() {
+        let mut conn = seeded_boot_db();
+        crate::settings::set_string(&conn, "automation_enabled", "true").unwrap();
+        let rule = create_rule_record(
+            &conn,
+            &validate_rule(&serde_json::json!({
+                "name": "Tag VIPs", "enabled": true, "trigger": "manual",
+                "actions": [{ "kind": "add_tag", "params": { "tag": "vip" } }],
+                "requires_approval": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // automation_write_actions_enabled defaults OFF -> parks the job.
+        fire_trigger_for_conversation(&mut conn, "manual", 9).unwrap();
+        let job_id: i64 = conn
+            .query_row(
+                "SELECT id FROM jobs WHERE type = 'automation_action_awaiting_approval'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Worker claims it and parks it (the AU-04 worker handler's shape).
+        let claimed = crate::jobs::claim_next(&mut conn, Some("ai"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, job_id);
+        crate::jobs::park_job(&conn, job_id).unwrap();
+        // Parked jobs are never claimed.
+        assert!(crate::jobs::claim_next(&mut conn, Some("ai"))
+            .unwrap()
+            .is_none());
+
+        // Approve = queue retry with the approved:true patch.
+        let ok = crate::jobs::retry_job(&conn, job_id, Some(r#"{"approved":true}"#)).unwrap();
+        assert_eq!(ok, Some(true));
+        let action: serde_json::Value = conn
+            .query_row(
+                "SELECT payload FROM jobs WHERE id = ?1",
+                params![job_id],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|p| serde_json::from_str(&p).unwrap())
+            .unwrap();
+
+        // The worker's approved path: execute + record the approved run.
+        let executed = execute_approved_action(&mut conn, 9, &action["action"]).unwrap();
+        assert!(executed);
+        record_approved_run(&conn, rule, 9, "add_tag").unwrap();
+
+        // The tag landed locally.
+        let vip: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_tags ct JOIN tags t ON t.id = ct.tag_id
+                  WHERE ct.conversation_id = 9 AND t.name = 'vip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vip, 1);
+        // The approved run is recorded with the reference detail string.
+        let (status, detail): (String, String) = conn
+            .query_row(
+                "SELECT outcome, COALESCE(detail, '') FROM automation_runs
+                  WHERE rule_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![rule],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(detail, "Approved by human: executed add_tag");
+    }
+
+    #[test]
+    fn au04_execute_approved_set_status_through_ticket_ops() {
+        let mut conn = seeded_boot_db();
+        let executed = execute_approved_action(
+            &mut conn,
+            9,
+            &serde_json::json!({ "kind": "set_status", "params": { "status": "pending" } }),
+        )
+        .unwrap();
+        assert!(executed);
+        let status: String = conn
+            .query_row("SELECT status FROM conversations WHERE id = 9", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "pending");
+        // Unknown conversation: not executed, no fabrication.
+        let executed = execute_approved_action(
+            &mut conn,
+            999,
+            &serde_json::json!({ "kind": "set_status", "params": { "status": "closed" } }),
+        )
+        .unwrap();
+        assert!(!executed);
     }
 }

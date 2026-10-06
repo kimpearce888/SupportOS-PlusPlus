@@ -143,7 +143,8 @@ pub async fn import(State(state): State<AppState>, Json(body): Json<Value>) -> R
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match knowledge_store::import_manual(&conn, &source_name, documents, &visibility) {
         Ok(results) => {
-            let _ = crate::jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 4);
+            let _ =
+                crate::jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 4, 2);
             let _ = crate::audit::audit(
                 &conn,
                 &crate::audit::AuditEntry::user("knowledge_imported").with_after_state(json!({
@@ -200,7 +201,8 @@ pub async fn import_file(State(state): State<AppState>, Json(body): Json<Value>)
         &visibility,
     ) {
         Ok(results) => {
-            let _ = crate::jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 4);
+            let _ =
+                crate::jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 4, 2);
             Json(json!({
                 "ok": true,
                 "imported": results.len(),
@@ -289,7 +291,8 @@ pub async fn reindex(State(state): State<AppState>) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match crate::search::rebuild_indexes(&conn) {
         Ok(_) => {
-            let _ = crate::jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 4);
+            let _ =
+                crate::jobs::enqueue_on(&conn, "embeddings", "embed_knowledge_chunks", "{}", 4, 2);
             Json(json!({"ok": true, "message": "Reindexing queued."})).into_response()
         }
         Err(e) => (

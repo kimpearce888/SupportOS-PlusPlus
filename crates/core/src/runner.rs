@@ -172,7 +172,7 @@ impl<'a> Runner<'a> {
         };
 
         for _ in 0..max_iterations {
-            let Some(job) = jobs::claim_next(self.conn)? else {
+            let Some(job) = jobs::claim_next(self.conn, None)? else {
                 break; // No more pending jobs.
             };
             summary.processed += 1;
@@ -185,7 +185,7 @@ impl<'a> Runner<'a> {
                 }
                 HandlerOutcome::Failure { message } => {
                     let dead_before = count_dead(self.conn)?;
-                    jobs::fail(self.conn, job.id, &message)?;
+                    jobs::fail(self.conn, job.id, &message, true)?;
                     let dead_after = count_dead(self.conn)?;
                     summary.failed += 1;
                     if dead_after > dead_before {

@@ -1924,6 +1924,7 @@ pub async fn process_new_ticket(
             }))
             .unwrap_or_default(),
             2,
+            1,
         );
         note_created = true;
     }
