@@ -993,6 +993,52 @@ impl WorkerManager {
                 2,
             );
         }
+        // WK-05 (audit M11) / reference workers.ts:640-651: background
+        // automatic AI after the initial sync — enqueue `analyze_ticket` for
+        // conversations that have NO completed ticket_analysis run yet
+        // (LIMIT 50, PRIORITY.ANALYTICS = 3, maxAttempts 2), gated on
+        // `ai_enabled` + `automatic_analysis_enabled` (both default true).
+        // The per-conversation new/reply hook is AU-03's
+        // `on_conversation_changed`; the worker-side execution is WK-03's
+        // ai-queue handler (process_new_ticket).
+        let automatic_analysis =
+            crate::settings::get_bool(&conn, "automatic_analysis_enabled", true).unwrap_or(true);
+        let ai_enabled = !matches!(
+            crate::ai_pipeline::backend_from_settings(&conn),
+            crate::ai_pipeline::AiBackend::Disabled
+        );
+        if automatic_analysis && ai_enabled {
+            let fresh: Vec<i64> = {
+                let mut stmt = match conn.prepare(
+                    "SELECT c.id FROM conversations c
+                      WHERE NOT EXISTS (
+                            SELECT 1 FROM ai_runs a
+                             WHERE a.conversation_id = c.id
+                               AND a.type = 'ticket_analysis'
+                               AND a.status = 'completed')
+                        AND c.deleted_at IS NULL
+                      ORDER BY c.id LIMIT 50",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let ids: Vec<i64> = match stmt.query_map([], |r| r.get::<_, i64>(0)) {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(_) => Vec::new(),
+                };
+                ids
+            };
+            for id in fresh {
+                let _ = jobs::enqueue_on(
+                    &conn,
+                    "ai",
+                    "analyze_ticket",
+                    &format!("{{\"conversationId\":{id}}}"),
+                    3,
+                    2,
+                );
+            }
+        }
     }
 
     /// Emit `conversation-updated` for a remote id (write-behind convergence).
@@ -1918,6 +1964,220 @@ mod tests {
         // With automatic_analysis_enabled + a runnable AI backend the hook
         // enqueues analyze_ticket (3, 2) — verified by settings alone here:
         // the backend gate is exercised by the WK-03 AI-job tests.
+    }
+
+    /// WK-05 (audit M11) / reference workers.ts:640-651: after the initial
+    /// sync, `analyze_ticket` is enqueued for every conversation that has NO
+    /// completed ticket_analysis run yet (LIMIT 50, priority 3, maxAttempts
+    /// 2), gated on `ai_enabled` + `automatic_analysis_enabled`.
+    #[tokio::test]
+    async fn wk05_on_after_initial_sync_enqueues_analysis_for_unanalyzed_conversations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut conn = Connection::open(tmp.path().join("t.db")).unwrap();
+        crate::db::ensure_migrations_table(&conn).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        // Three conversations; #2 already has a completed ticket_analysis.
+        conn.execute_batch(
+            "INSERT INTO customers (id, remote_id, first_name, email)
+             VALUES (1, 9001, 'Ada', 'ada@example.com');
+             INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+             VALUES (11, 105021, 5011, 'A', 1, 1, 'active'),
+                    (12, 105022, 5012, 'B', 1, 1, 'active'),
+                    (13, 105023, 5013, 'C', 1, 1, 'active');
+             INSERT INTO ai_runs (input_hash, prompt_version, model, response_json, type,
+                                  conversation_id, status, provenance)
+             VALUES ('h2', 'ticket_analysis_v1', 'demo_seed', '{}', 'ticket_analysis', 12,
+                     'completed', 'ai_generated');",
+        )
+        .unwrap();
+
+        let shared = Arc::new(Mutex::new(conn));
+        let bus = EventBus::default();
+        let provider = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+            as Arc<dyn HelpScoutProvider>;
+        let engine = Arc::new(crate::sync_engine::SyncEngine::new(
+            shared.clone(),
+            provider.clone(),
+        ));
+        let manager = WorkerManager::new(
+            shared.clone(),
+            Some(engine),
+            provider,
+            bus,
+            tmp.path().to_path_buf(),
+            None,
+        );
+
+        manager.on_after_initial_sync();
+
+        {
+            let c = shared.lock().unwrap();
+            let rows: Vec<(String, i64, i64, i64)> = {
+                let mut stmt = c
+                    .prepare(
+                        "SELECT payload, priority, max_attempts, id FROM jobs
+                          WHERE type = 'analyze_ticket' ORDER BY id",
+                    )
+                    .unwrap();
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+            assert_eq!(rows.len(), 2, "only the two UNANALYZED conversations");
+            let payloads: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+            assert!(
+                payloads.contains(&"{\"conversationId\":11}".to_string()),
+                "conversation 11 enqueued: {payloads:?}"
+            );
+            assert!(
+                payloads.contains(&"{\"conversationId\":13}".to_string()),
+                "conversation 13 enqueued: {payloads:?}"
+            );
+            for (_, priority, max_attempts, _) in &rows {
+                assert_eq!(*priority, 3, "PRIORITY.ANALYTICS = 3");
+                assert_eq!(*max_attempts, 2, "the reference retry budget");
+            }
+        }
+    }
+
+    /// WK-05: the batch respects the reference LIMIT 50, and the two gates
+    /// (`ai_enabled`, `automatic_analysis_enabled`) suppress it entirely.
+    #[tokio::test]
+    async fn wk05_initial_analysis_respects_limit_50_and_both_gates() {
+        // ── 60 fresh conversations -> at most 50 jobs (the LIMIT). ──────────
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut conn = Connection::open(tmp.path().join("t.db")).unwrap();
+        crate::db::ensure_migrations_table(&conn).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        let mut seed = String::from(
+            "INSERT INTO customers (id, remote_id, first_name, email)
+             VALUES (1, 9001, 'Ada', 'ada@example.com');",
+        );
+        for i in 0..60i64 {
+            let remote = 100000 + i;
+            let number = 6000 + i;
+            seed.push_str(&format!(
+                "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+                 VALUES ({i}, {remote}, {number}, 'S{i}', 1, 1, 'active');"
+            ));
+        }
+        conn.execute_batch(&seed).unwrap();
+        let shared = Arc::new(Mutex::new(conn));
+        let bus = EventBus::default();
+        let provider = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+            as Arc<dyn HelpScoutProvider>;
+        let engine = Arc::new(crate::sync_engine::SyncEngine::new(
+            shared.clone(),
+            provider.clone(),
+        ));
+        let manager = WorkerManager::new(
+            shared.clone(),
+            Some(engine),
+            provider,
+            bus,
+            tmp.path().to_path_buf(),
+            None,
+        );
+        manager.on_after_initial_sync();
+        {
+            let c = shared.lock().unwrap();
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE type = 'analyze_ticket'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 50, "the reference LIMIT 50");
+        }
+
+        // ── Gate 1: ai_enabled = false -> nothing enqueued. ─────────────────
+        let tmp2 = tempfile::tempdir().expect("tempdir");
+        let mut conn2 = Connection::open(tmp2.path().join("t.db")).unwrap();
+        crate::db::ensure_migrations_table(&conn2).unwrap();
+        crate::bootstrap::apply_all(&mut conn2).unwrap();
+        conn2.execute_batch(
+            "INSERT INTO customers (id, remote_id, first_name, email)
+             VALUES (1, 9001, 'Ada', 'ada@example.com');
+             INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+             VALUES (21, 105121, 5021, 'A', 1, 1, 'active');",
+        )
+        .unwrap();
+        crate::settings::set_bool(&conn2, "ai_enabled", false).unwrap();
+        let shared2 = Arc::new(Mutex::new(conn2));
+        let bus2 = EventBus::default();
+        let provider2 = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+            as Arc<dyn HelpScoutProvider>;
+        let engine2 = Arc::new(crate::sync_engine::SyncEngine::new(
+            shared2.clone(),
+            provider2.clone(),
+        ));
+        let manager2 = WorkerManager::new(
+            shared2.clone(),
+            Some(engine2),
+            provider2,
+            bus2,
+            tmp2.path().to_path_buf(),
+            None,
+        );
+        manager2.on_after_initial_sync();
+        {
+            let c = shared2.lock().unwrap();
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE type = 'analyze_ticket'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "ai_enabled=false suppresses the batch");
+        }
+
+        // ── Gate 2: automatic_analysis_enabled = false -> nothing enqueued. ─
+        let tmp3 = tempfile::tempdir().expect("tempdir");
+        let mut conn3 = Connection::open(tmp3.path().join("t.db")).unwrap();
+        crate::db::ensure_migrations_table(&conn3).unwrap();
+        crate::bootstrap::apply_all(&mut conn3).unwrap();
+        conn3.execute_batch(
+            "INSERT INTO customers (id, remote_id, first_name, email)
+             VALUES (1, 9001, 'Ada', 'ada@example.com');
+             INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+             VALUES (31, 105131, 5031, 'A', 1, 1, 'active');",
+        )
+        .unwrap();
+        crate::settings::set_bool(&conn3, "automatic_analysis_enabled", false).unwrap();
+        let shared3 = Arc::new(Mutex::new(conn3));
+        let bus3 = EventBus::default();
+        let provider3 = Arc::new(crate::helpscout::FakeHelpScoutProvider::new_demo())
+            as Arc<dyn HelpScoutProvider>;
+        let engine3 = Arc::new(crate::sync_engine::SyncEngine::new(
+            shared3.clone(),
+            provider3.clone(),
+        ));
+        let manager3 = WorkerManager::new(
+            shared3.clone(),
+            Some(engine3),
+            provider3,
+            bus3,
+            tmp3.path().to_path_buf(),
+            None,
+        );
+        manager3.on_after_initial_sync();
+        {
+            let c = shared3.lock().unwrap();
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs WHERE type = 'analyze_ticket'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "automatic_analysis_enabled=false suppresses the batch"
+            );
+        }
     }
 
     #[test]

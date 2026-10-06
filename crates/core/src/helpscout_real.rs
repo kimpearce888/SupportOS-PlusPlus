@@ -582,6 +582,11 @@ impl RealHelpScoutProvider {
         let expires_iso = expires_at.to_rfc3339();
         let keep_refresh: Option<String> = refresh_token.map(|s| s.to_string());
         let conn = self.conn_lock();
+        // SY-07 (audit M21): the account/revoked columns are added lazily by
+        // `ensure_account_row`; the save path must ensure them too or the
+        // FIRST connect on a fresh database fails with "no column named
+        // account" before any token is ever stored.
+        ensure_account_row(&conn);
         conn.execute(
             "INSERT INTO oauth_tokens (account, access_token, refresh_token, token_type, expires_at, obtained_at, scope, revoked)
              VALUES ('default', ?1, ?2, 'bearer', ?3, datetime('now'), ?4, 0)
@@ -647,8 +652,14 @@ impl RealHelpScoutProvider {
     /// Revoke (disconnect): tokens cleared, `revoked = 1`.
     pub fn revoke(&self) -> Result<()> {
         let conn = self.conn_lock();
+        // SY-07: same lazy-column guard as save_tokens (fresh DBs would
+        // otherwise fail the revoke UPDATE).
+        ensure_account_row(&conn);
         conn.execute(
-            "UPDATE oauth_tokens SET revoked = 1, access_token = NULL, refresh_token = NULL
+            // access_token is NOT NULL in the port's base table, so the
+            // disconnect clears it to '' (the reference sets NULL; the
+            // authenticated check treats both identically).
+            "UPDATE oauth_tokens SET revoked = 1, access_token = '', refresh_token = NULL
               WHERE account = 'default'",
             [],
         )?;
@@ -1867,6 +1878,14 @@ fn ensure_account_row(conn: &Connection) {
              UPDATE oauth_tokens SET account = 'default' WHERE account IS NULL;",
         );
     }
+    // SY-07: `save_tokens` upserts with ON CONFLICT(account) — the reference's
+    // oauth_tokens has `account TEXT PRIMARY KEY` (migration 002), but a lazy
+    // ALTER cannot add a constraint, so a UNIQUE INDEX provides the conflict
+    // target (idempotent; the base table's CHECK(id = 1) guarantees at most
+    // one legacy row to backfill).
+    let _ = conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_tokens_account ON oauth_tokens(account);",
+    );
 }
 
 #[cfg(test)]

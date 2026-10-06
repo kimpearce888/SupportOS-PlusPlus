@@ -1331,13 +1331,40 @@ impl HttpServer {
         tracing::info!(addr = %self.addr, "HTTP API server bound");
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                let _ = tokio::signal::ctrl_c().await;
+                wait_for_shutdown_signal().await;
                 // v2.2.1 audit fix: stop the workers so in-flight ticks end
                 // on the process's own terms.
                 workers_handle.stop();
             })
             .await?;
         Ok(())
+    }
+}
+
+/// Wait for the process's shutdown signal: SIGINT (Ctrl-C) OR SIGTERM
+/// (service stop / `kill`), whichever arrives first.
+///
+/// M20 (audit T16): the reference registers BOTH handlers —
+/// `process.on('SIGINT')` and `process.on('SIGTERM')` (index.ts:88-89). The
+/// port previously listened for `ctrl_c` only, so a SIGTERM (Docker stop,
+/// systemd, plain `kill`) terminated the process with NO graceful shutdown:
+/// worker timers were cut mid-tick and in-flight jobs were left 'running'
+/// until the NEXT restart's boot recovery swept them. With both handlers the
+/// graceful-shutdown path (workers stopped, server drained) runs for either
+/// signal, mirroring the reference's single `shutdown(signal)` closure.
+pub async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -1409,4 +1436,33 @@ fn is_loopback_host(host: &str) -> bool {
     }
     h = h.trim_start_matches('[').trim_end_matches(']').to_string();
     h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "::ffff:127.0.0.1"
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_signal_tests {
+    use super::*;
+
+    /// M20 (audit T16): a SIGTERM must resolve the graceful-shutdown wait.
+    /// Previously only `ctrl_c` (SIGINT) was handled — a service stop
+    /// (`kill`, `docker stop`, systemd) killed the process with no graceful
+    /// shutdown at all. The test installs the handler by STARTING the wait
+    /// first, then raises SIGTERM to this (test) process: with the handler
+    /// installed the signal is delivered to the runtime instead of taking
+    /// the default lethal disposition, and the wait resolves.
+    #[tokio::test]
+    async fn sigterm_resolves_the_shutdown_wait() {
+        let handle = tokio::spawn(wait_for_shutdown_signal());
+        // Give the runtime a moment to poll the task and install the
+        // signal handlers before raising the signal.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let out = std::process::Command::new("kill")
+            .args(["-s", "TERM", &std::process::id().to_string()])
+            .status()
+            .expect("kill -TERM <self> must run");
+        assert!(out.success(), "kill -TERM must succeed");
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("wait_for_shutdown_signal resolved after SIGTERM")
+            .expect("shutdown-wait task joined cleanly");
+    }
 }

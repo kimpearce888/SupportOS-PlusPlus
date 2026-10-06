@@ -1119,6 +1119,71 @@ pub fn campaign_reconcile(conn: &Connection, campaign_id: i64) -> serde_json::Va
     serde_json::json!({ "resolvedSent": resolved_sent, "returnedToQueue": returned, "stillUnknown": still_unknown })
 }
 
+/// `campaignService.refreshReplies` (spec #51, OR-03 / audit M23): update
+/// `replied_at` for sent recipients from the LOCAL mirror — a customer
+/// thread arriving after our `sent_at` = a reply. Honest note: this reflects
+/// the local mirror (sync-dependent), not a delivery-read receipt.
+///
+/// Port column mapping (documented renames): `threads` → `conversation_threads`
+/// with `type` → `thread_type` and the remote creation time stored in
+/// `created_at` (MAIN reads `threads.remote_created_at`).
+pub fn refresh_replies(conn: &Connection, campaign_id: i64) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    let sent: Vec<(i64, Option<i64>, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT r.id, r.hs_conversation_remote_id, r.sent_at
+               FROM outreach_recipients r
+              WHERE r.campaign_id = ?1 AND r.state = 'sent'
+                AND r.replied_at IS NULL
+                AND r.hs_conversation_remote_id IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([campaign_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    let mut replied = 0i64;
+    for (id, remote_id, sent_at) in sent {
+        let Some(remote) = remote_id else { continue };
+        let Some(conv_local): Option<i64> = tx
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = ?1",
+                [remote],
+                |r| r.get(0),
+            )
+            .ok()
+        else {
+            continue;
+        };
+        // The first customer thread strictly AFTER our send (1970 fallback
+        // for rows whose sent_at never landed).
+        let customer_thread: Option<String> = tx
+            .query_row(
+                "SELECT created_at FROM conversation_threads
+                  WHERE conversation_id = ?1 AND thread_type = 'customer'
+                    AND deleted_at IS NULL
+                    AND julianday(created_at) > julianday(COALESCE(?2, '1970-01-01'))
+                  ORDER BY created_at ASC LIMIT 1",
+                rusqlite::params![conv_local, sent_at],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(thread_at) = customer_thread {
+            // `outreachRepo.setReplied` — stamp the THREAD's timestamp (not
+            // now()) so the report reflects when the customer actually replied.
+            tx.execute(
+                "UPDATE outreach_recipients SET replied_at = ?1 WHERE id = ?2",
+                rusqlite::params![thread_at, id],
+            )?;
+            log_event(&tx, campaign_id, Some(id), "recipient_replied", None);
+            replied += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(replied)
+}
+
 /// The not-found report shape (reference report() early return).
 pub fn campaign_report_not_found() -> serde_json::Value {
     serde_json::json!({
@@ -1132,7 +1197,11 @@ pub fn campaign_report_not_found() -> serde_json::Value {
 
 /// `campaignService.report` (spec #52).
 pub fn campaign_report(conn: &Connection, campaign_id: i64) -> serde_json::Value {
-    let Some(c) = get_outreach_campaign(conn, campaign_id).ok().flatten() else {
+    if get_outreach_campaign(conn, campaign_id)
+        .ok()
+        .flatten()
+        .is_none()
+    {
         return serde_json::json!({
             "campaign": serde_json::Value::Null,
             "totals": { "recipients": 0, "sent": 0, "failed": 0, "skipped": 0,
@@ -1140,6 +1209,13 @@ pub fn campaign_report(conn: &Connection, campaign_id: i64) -> serde_json::Value
             "replies": [],
             "note": "Campaign not found."
         });
+    }
+    // OR-03 (audit M23): the report CALLS the reply scan first (the reference
+    // `this.refreshReplies(campaignId)`), then re-reads the campaign so the
+    // served `replied` totals + reply list reflect the fresh scan.
+    let _ = refresh_replies(conn, campaign_id);
+    let Some(c) = get_outreach_campaign(conn, campaign_id).ok().flatten() else {
+        return campaign_report_not_found();
     };
     let cancelled: i64 = conn
         .query_row(
@@ -2442,6 +2518,181 @@ mod tests {
             !mark_recipient_replied(&conn, rid).unwrap(),
             "second call returns false"
         );
+    }
+
+    // ---- OR-03: refreshReplies (campaign reply tracking) ---------------------
+
+    /// fresh_db + the M031 outreach tables (campaigns/recipients/events) +
+    /// the M028 conversation_threads table (with the production state/
+    /// deleted_at columns) the reply scan reads.
+    fn or03_db() -> Connection {
+        let conn = fresh_db();
+        crate::inbox::apply_m028(&conn).expect("apply M028");
+        crate::conversation_ops::apply_m030(&conn).expect("apply M030");
+        crate::sla::ensure_sla_schema(&conn).expect("ensure SLA schema");
+        apply_m031(&conn).expect("apply M031");
+        conn
+    }
+
+    /// A sent recipient of `campaign` mirrored as conversation `remote`.
+    fn seed_sent_recipient_with_conversation(conn: &Connection, campaign: i64, remote: i64) -> i64 {
+        // A customer + conversation in the mirror for the remote id.
+        conn.execute(
+            "INSERT INTO customers (id, remote_id, first_name, last_name)
+             VALUES (10, 1001, 'Ada', 'Lovelace')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+             VALUES (9, ?1, 1001, 'Reply tracking', 1, 10)",
+            params![remote],
+        )
+        .unwrap();
+        // A sent recipient pointing at that conversation.
+        conn.execute(
+            "INSERT INTO outreach_recipients
+                 (campaign_id, customer_local_id, customer_remote_id, email, snapshot, state,
+                  attempts, hs_conversation_remote_id, hs_conversation_number, sent_at, replied_at)
+             VALUES (?1, 10, 1001, 'ada@b.co', '{}', 'sent', 1, ?2, 1001,
+                     '2026-01-02T10:00:00.000Z', NULL)",
+            params![campaign, remote],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT id FROM outreach_recipients WHERE campaign_id = ?1",
+            params![campaign],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn add_thread(conn: &Connection, conversation: i64, kind: &str, at: &str) {
+        conn.execute(
+            "INSERT INTO conversation_threads
+                 (conversation_id, thread_type, state, body, actor_type, actor_id, created_at)
+             VALUES (?1, ?2, 'published', 'text', 'user', 1, ?3)",
+            params![conversation, kind, at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn or03_refresh_replies_marks_replied_from_customer_thread_after_send() {
+        let conn = or03_db();
+        let cid = seed_campaign(&conn, 1, &[]);
+        let rid = seed_sent_recipient_with_conversation(&conn, cid, 5001);
+        // Our own agent reply (before the send) + the customer reply after.
+        add_thread(&conn, 9, "user", "2026-01-02T09:00:00.000Z");
+        add_thread(&conn, 9, "customer", "2026-01-03T12:30:00.000Z");
+
+        let n = refresh_replies(&conn, cid).unwrap();
+        assert_eq!(n, 1, "one recipient marked replied");
+        let replied_at: String = conn
+            .query_row(
+                "SELECT replied_at FROM outreach_recipients WHERE id = ?1",
+                params![rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            replied_at, "2026-01-03T12:30:00.000Z",
+            "replied_at is the THREAD's timestamp (setReplied semantics), not now()"
+        );
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outreach_events
+                  WHERE campaign_id = ?1 AND recipient_id = ?2 AND event = 'recipient_replied'",
+                params![cid, rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "recipient_replied event logged");
+    }
+
+    #[test]
+    fn or03_refresh_replies_ignores_agent_threads_older_threads_and_unknown_conversations() {
+        let conn = or03_db();
+        let cid = seed_campaign(&conn, 1, &[]);
+        // Recipient 1: conversation with only an AGENT thread after the send.
+        let r1 = seed_sent_recipient_with_conversation(&conn, cid, 5001);
+        add_thread(&conn, 9, "user", "2026-01-04T10:00:00.000Z");
+        // Recipient 2: customer thread but BEFORE our send (old conversation).
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+             VALUES (10, 5002, 1002, 'Old', 1, 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outreach_recipients
+                 (campaign_id, customer_local_id, customer_remote_id, email, snapshot, state,
+                  attempts, hs_conversation_remote_id, hs_conversation_number, sent_at, replied_at)
+             VALUES (?1, 11, 1001, 'ada2@b.co', '{}', 'sent', 1, 5002, 1002,
+                     '2026-01-05T10:00:00.000Z', NULL)",
+            params![cid],
+        )
+        .unwrap();
+        add_thread(&conn, 10, "customer", "2026-01-01T08:00:00.000Z");
+        // Recipient 3: sent with NO mirrored conversation at all.
+        conn.execute(
+            "INSERT INTO outreach_recipients
+                 (campaign_id, customer_local_id, customer_remote_id, email, snapshot, state,
+                  attempts, hs_conversation_remote_id, hs_conversation_number, sent_at, replied_at)
+             VALUES (?1, 12, 1001, 'ada3@b.co', '{}', 'sent', 1, 9999, 1003,
+                     '2026-01-05T10:00:00.000Z', NULL)",
+            params![cid],
+        )
+        .unwrap();
+        let _ = r1;
+
+        let n = refresh_replies(&conn, cid).unwrap();
+        assert_eq!(n, 0, "no reply detected for any of the three");
+        let unreplied: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outreach_recipients
+                  WHERE campaign_id = ?1 AND replied_at IS NOT NULL",
+                params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unreplied, 0);
+    }
+
+    #[test]
+    fn or03_refresh_replies_idempotent_and_report_serves_fresh_reply_totals() {
+        let conn = or03_db();
+        let cid = seed_campaign(&conn, 1, &[]);
+        let rid = seed_sent_recipient_with_conversation(&conn, cid, 5001);
+        add_thread(&conn, 9, "customer", "2026-01-03T12:30:00.000Z");
+
+        // The report itself runs the scan (reference report() calls
+        // refreshReplies first) and serves the fresh totals.
+        let report = campaign_report(&conn, cid);
+        assert_eq!(report["campaign"]["id"], cid);
+        assert_eq!(report["totals"]["sent"], 1, "one sent recipient");
+        assert_eq!(report["totals"]["replied"], 1, "reply reflected in totals");
+        assert_eq!(report["totals"]["reply_rate"], 1.0, "1/1 = 1.0");
+        let replies = report["replies"].as_array().expect("replies list");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["customer"], "Ada Lovelace");
+        assert_eq!(replies[0]["conversation_number"], 1001);
+        assert_eq!(replies[0]["conversation_local_id"], 9);
+        assert_eq!(replies[0]["replied_at"], "2026-01-03T12:30:00.000Z");
+
+        // Second scan finds nothing new (replied rows are not re-scanned).
+        let n2 = refresh_replies(&conn, cid).unwrap();
+        assert_eq!(n2, 0, "already-replied recipients are skipped");
+        let _ = rid;
+    }
+
+    #[test]
+    fn or03_report_for_unknown_campaign_keeps_reference_not_found_shape() {
+        let conn = or03_db();
+        let report = campaign_report(&conn, 424242);
+        assert!(report["campaign"].is_null());
+        assert_eq!(report["note"], "Campaign not found.");
+        assert_eq!(report["totals"]["reply_rate"], serde_json::Value::Null);
     }
 
     // ---- serde --------------------------------------------------------------
