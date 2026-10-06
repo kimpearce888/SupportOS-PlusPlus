@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 19 | M20 | SIGTERM not handled (ctrl_c only) | Defect | Major | S | T16 M20 | Handle SIGTERM alongside ctrl_c for graceful shutdown (crates/core/src/http/server.rs:1307-1312 vs MAIN index.ts:88-89). |
-| 20 | SY-07 | OAuth (authorize-url, callback, refresh, client-credentials, disconnect, status) | Partial | Major | M | M21 | Implement or remove the Tauri loopback OAuth/webhook receiver (loopback.rs binds then drops; handlers are {ok:true,todo:M2} stubs); delete the dead exchange_code legacy path (oauth.rs:200-247). |
-| 21 | TH-09 | bodyLimit 20MB (attachments) | Missing | Major | Add tower_http DefaultBodyLimit(20MB) to router | M19 | DefaultBodyLimit' crates/core/src (0 hits) |
-| 22 | OR-03 | Campaign reply tracking (refreshReplies, reply_rate) | Missing | Major | S | M23 | Call reply scan in campaign report (refreshReplies port) |
-| 23 | WK-05 | Background automatic AI (process_new_ticket on new/reply) | Missing | Major | M | M11 | Enqueue analyze_ticket on new/reply (sync hook + automation engine) and handle in worker loop |
 | 24 | SY-10 | Provider write methods (createConversation, updateTags/Fields, snooze/schedule, runWorkflow, getAttachmentData, ping, routing) | Partial | Major | run_workflow\\ | - | snooze\\ |
 | 25 | AI-18 | Interaction forbidden-claim text safety scan | Missing | Major | S | - | Port FORBIDDEN_PATTERNS text scan used on interaction free text |
 | 26 | AI-17 | Interaction 2-stage AI enrichment (observe/recommend prompts + safety gates) | Missing | Major | Add 2-stage AI enrichment with enum filter + evidence whitelist + forbidden-claim gates | - | recommendInteraction' crates/core (absent); read ai_prompts.rs:399,420 (unused) |
