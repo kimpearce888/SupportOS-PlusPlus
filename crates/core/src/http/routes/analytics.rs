@@ -317,6 +317,22 @@ pub async fn top_questions(
 /// `analyticsService.topQuestions(days)` — latest completed analysis per
 /// conversation, grouped by primary question, top 20.
 fn top_questions_impl(conn: &rusqlite::Connection, days: i64) -> Vec<Value> {
+    let mut out: Vec<Value> = grouped_questions(conn, days)
+        .into_iter()
+        .map(|(question, ids)| {
+            json!({ "question": question, "count": ids.len(), "conversation_ids": ids })
+        })
+        .collect();
+    out.truncate(20);
+    out
+}
+
+/// The shared question grouping behind top-questions / doc-gaps /
+/// answer-reuse (reference `analyticsService` latest-completed-run query):
+/// the latest completed `ticket_analysis` per conversation within the day
+/// window, grouped by the lowercased + trimmed `primary_question`, sorted
+/// by conversation count desc (uncapped — callers cap).
+fn grouped_questions(conn: &rusqlite::Connection, days: i64) -> Vec<(String, Vec<i64>)> {
     let Ok(mut stmt) = conn.prepare(
         "SELECT LOWER(TRIM(json_extract(a.response_json, '$.primary_question'))) AS question,
                 a.conversation_id
@@ -345,64 +361,1128 @@ fn top_questions_impl(conn: &rusqlite::Connection, days: i64) -> Vec<Value> {
             .or_default()
             .push(conversation_id);
     }
-    let mut out: Vec<Value> = by_question
-        .into_iter()
-        .map(|(question, ids)| {
-            json!({ "question": question, "count": ids.len(), "conversation_ids": ids })
-        })
-        .collect();
-    out.sort_by(|a, b| {
-        b["count"]
-            .as_i64()
-            .unwrap_or(0)
-            .cmp(&a["count"].as_i64().unwrap_or(0))
-    });
-    out.truncate(20);
+    let mut out: Vec<(String, Vec<i64>)> = by_question.into_iter().collect();
+    out.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
     out
 }
 
-pub async fn doc_gaps(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"gaps": []})))
+/// Reference `analyticsService.ftsTokens`: 3+-char tokens, capped at 6,
+/// joined as quoted prefix terms (`"tok"*`); `""` when nothing survives.
+fn fts_tokens(q: &str) -> String {
+    let tokens = crate::search::tokenize(q, 3, 6);
+    if tokens.is_empty() {
+        return "\"\"".to_string();
+    }
+    tokens
+        .iter()
+        .map(|t| format!("\"{t}\"*"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
-pub async fn answer_reuse(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"reuse": []})))
+
+/// Char-boundary truncation (the reference `String.slice(0, n)`).
+fn truncate_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
 }
+
+/// The reference `occurredAt` regex
+/// `/^\d{4}-\d{2}-\d{2}(T[\d:.]+Z?)?$/`: a date, optionally followed by a
+/// time of digits/dots/colons with an optional trailing Z.
+fn is_reference_date_time(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let date_ok = bytes.len() >= 10
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit);
+    if !date_ok {
+        return false;
+    }
+    if s.len() == 10 {
+        return true;
+    }
+    let rest = &s[10..];
+    let Some(time) = rest.strip_prefix('T') else {
+        return false;
+    };
+    let (time, z) = match time.strip_suffix('Z') {
+        Some(t) => (t, true),
+        None => (time, false),
+    };
+    if time.is_empty()
+        || !time
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.' || b == b':')
+    {
+        return false;
+    }
+    // At most one Z, and only as the final character.
+    !time.contains('Z') && (!z || !time.is_empty())
+}
+
+/// The reference zod-422 envelope for the release-events route
+/// (app.ts setErrorHandler: first issue as the message + the issue list).
+fn release_event_422(path: &str, message: &str) -> axum::response::Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "statusCode": 422,
+            "error": "ValidationError",
+            "message": format!("Invalid request ({path}): {message}"),
+            "issues": [{ "path": path, "message": message }]
+        })),
+    )
+        .into_response()
+}
+
+// ---------------- Issue Radar (AN-08, analyticsService.issueRadar) ----------------
+
+/// A cluster with the read-time facts the radar needs (reference
+/// `IssueCluster & { conversation_ids }` — the port derives trend and
+/// customer count from the mirror instead of storing them).
+struct RadarCluster {
+    id: i64,
+    title: String,
+    conversation_ids: Vec<i64>,
+    customer_count: usize,
+    summary: String,
+    trend: &'static str,
+}
+
+/// Per-conversation facts for the radar extensions (reference
+/// `radarExtensions` convStmt: one bounded pass, julian days in SQL).
+struct ConvFacts {
+    id: i64,
+    customer_id: Option<i64>,
+    mailbox_id: Option<i64>,
+    created_at: Option<String>,
+    jd: Option<f64>,
+}
+
+fn radar_alert(
+    kind: &str,
+    title: String,
+    detail: String,
+    conversation_ids: Vec<i64>,
+    cluster_id: Option<i64>,
+    severity: &str,
+) -> Value {
+    let capped: Vec<i64> = conversation_ids.into_iter().take(10).collect();
+    json!({
+        "kind": kind,
+        "title": title,
+        "detail": detail,
+        "conversation_ids": capped,
+        "cluster_id": cluster_id,
+        "severity": severity,
+    })
+}
+
+/// `analyticsService.issueRadar()` — ten association-only alert kinds over
+/// the issue clusters, top questions, escalated tickets, ratings and
+/// per-cluster conversation facts. Every alert carries supporting
+/// conversation links; the wording never claims causation.
+///
+/// Stack adaptations: the port's `conversations` mirror has no
+/// `deleted_at` (fresh-install mirror), `created_at` is the remote
+/// timestamp, and cluster trend/customer count are derived at read time
+/// (the reference refreshes them into `issue_clusters` on sync).
+fn issue_radar_impl(conn: &rusqlite::Connection) -> Vec<Value> {
+    let mut alerts: Vec<Value> = Vec::new();
+    let clusters = radar_clusters(conn);
+
+    // ── Cluster-trend alerts (issueRadar first loop) ─────────────────────
+    for c in &clusters {
+        if c.trend == "new" && c.conversation_ids.len() >= 2 {
+            alerts.push(radar_alert(
+                "new_cluster",
+                format!("New issue cluster: {}", c.title),
+                format!(
+                    "{} conversations from {} customers first seen recently. {}",
+                    c.conversation_ids.len(),
+                    c.customer_count,
+                    c.summary
+                ),
+                c.conversation_ids.clone(),
+                Some(c.id),
+                if c.conversation_ids.len() >= 5 {
+                    "critical"
+                } else {
+                    "warning"
+                },
+            ));
+        }
+        if c.trend == "rising" && c.conversation_ids.len() >= 3 {
+            alerts.push(radar_alert(
+                "volume_spike",
+                format!("Rising volume: {}", c.title),
+                format!(
+                    "Conversation volume in this cluster increased vs the previous 14 days. {}",
+                    c.summary
+                ),
+                c.conversation_ids.clone(),
+                Some(c.id),
+                "warning",
+            ));
+        }
+        if c.trend == "stable" && c.conversation_ids.len() >= 5 {
+            alerts.push(radar_alert(
+                "recurring_issue",
+                format!("Recurring issue: {}", c.title),
+                format!(
+                    "{} conversations over time. Consider a knowledge article or known issue entry. {}",
+                    c.conversation_ids.len(),
+                    c.summary
+                ),
+                c.conversation_ids.clone(),
+                Some(c.id),
+                "info",
+            ));
+        }
+    }
+
+    // ── High-volume questions (top 3 of topQuestions(30)) ───────────────
+    for q in top_questions_impl(conn, 30).into_iter().take(3) {
+        let count = q["count"].as_i64().unwrap_or(0);
+        if count >= 3 {
+            alerts.push(radar_alert(
+                "high_volume_question",
+                format!("High-volume question ({count} tickets)"),
+                q["question"].as_str().unwrap_or_default().to_string(),
+                q["conversation_ids"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>())
+                    .unwrap_or_default(),
+                None,
+                "info",
+            ));
+        }
+    }
+
+    // ── Escalation-heavy (bounded to 1000 rows) ─────────────────────────
+    let escalated: Vec<i64> = conn
+        .prepare(
+            "SELECT c.id FROM conversations c
+               JOIN conversation_tags ct ON ct.conversation_id = c.id
+               JOIN tags t ON t.id = ct.tag_id
+              WHERE t.name = 'escalated'
+                AND julianday(c.created_at) >= julianday('now', '-30 days')
+              LIMIT 1000",
+        )
+        .map(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, i64>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    if escalated.len() >= 2 {
+        alerts.push(radar_alert(
+            "escalation_heavy",
+            format!(
+                "{} escalated tickets in the last 30 days",
+                escalated.len()
+            ),
+            "Multiple tickets required escalation. Review the underlying causes - this is a correlation, not a causal claim.".to_string(),
+            escalated,
+            None,
+            "warning",
+        ));
+    }
+
+    // ── Rating-correlated clusters (most recent 2000 not-good ratings) ──
+    let bad_ids: std::collections::HashSet<i64> = conn
+        .prepare(
+            "SELECT r.conversation_id FROM ratings r
+              WHERE r.rating = 'not-good' AND r.conversation_id IS NOT NULL
+              ORDER BY r.id DESC LIMIT 2000",
+        )
+        .map(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, i64>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    if !bad_ids.is_empty() {
+        for c in &clusters {
+            let overlap: Vec<i64> = c
+                .conversation_ids
+                .iter()
+                .copied()
+                .filter(|id| bad_ids.contains(id))
+                .collect();
+            if overlap.len() >= 2 {
+                alerts.push(radar_alert(
+                    "rating_correlated",
+                    format!("Cluster \"{}\" is associated with poor ratings", c.title),
+                    format!(
+                        "{} conversations in this cluster received \"not-good\" ratings. This is an association, not proof of causation.",
+                        overlap.len()
+                    ),
+                    overlap,
+                    Some(c.id),
+                    "warning",
+                ));
+            }
+        }
+    }
+
+    // ── Radar extensions (v2.0.0 M4, plan Phase 20) ────────────────────
+    alerts.extend(radar_extensions(conn, &clusters));
+    alerts
+}
+
+/// Load the clusters with derived trend + facts (reference `listClusters`
+/// + `computeTrends` read-time equivalent).
+fn radar_clusters(conn: &rusqlite::Connection) -> Vec<RadarCluster> {
+    let cluster_rows: Vec<(i64, String)> = conn
+        .prepare("SELECT id, name FROM issue_clusters ORDER BY conversation_count DESC")
+        .map(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    if cluster_rows.is_empty() {
+        return Vec::new();
+    }
+
+    // Member conversation ids per cluster (bounded set for the facts query).
+    let members: Vec<(i64, String, Vec<i64>)> = cluster_rows
+        .into_iter()
+        .filter_map(|(id, title)| {
+            let member_ids: Vec<i64> = conn
+                .prepare("SELECT conversation_id FROM issue_cluster_members WHERE cluster_id = ?1")
+                .and_then(|mut stmt| {
+                    Ok(stmt
+                        .query_map(rusqlite::params![id], |r| r.get::<_, i64>(0))?
+                        .filter_map(|r| r.ok())
+                        .collect())
+                })
+                .unwrap_or_default();
+            Some((id, title, member_ids))
+        })
+        .collect();
+    let all_conv_ids: Vec<i64> = members
+        .iter()
+        .flat_map(|(_, _, ids)| ids.iter().copied())
+        .collect::<std::collections::HashSet<i64>>()
+        .into_iter()
+        .collect();
+    if all_conv_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let placeholders = all_conv_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT c.id, c.customer_id, c.mailbox_id, c.created_at, julianday(c.created_at) AS jd
+           FROM conversations c WHERE c.id IN ({placeholders})"
+    );
+    let facts: Vec<ConvFacts> = conn
+        .prepare(&sql)
+        .and_then(|mut stmt| {
+            let params: Vec<&dyn rusqlite::ToSql> = all_conv_ids
+                .iter()
+                .map(|i| i as &dyn rusqlite::ToSql)
+                .collect();
+            Ok(stmt
+                .query_map(params.as_slice(), |r| {
+                    Ok(ConvFacts {
+                        id: r.get(0)?,
+                        customer_id: r.get(1)?,
+                        mailbox_id: r.get(2)?,
+                        created_at: r.get(3)?,
+                        jd: r.get(4)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect())
+        })
+        .unwrap_or_default();
+    let now_jd: f64 = conn
+        .query_row("SELECT julianday('now')", [], |r| r.get(0))
+        .unwrap_or(0.0);
+
+    let mut clusters = Vec::new();
+    for (id, title, member_ids) in members {
+        let convs: Vec<&ConvFacts> = facts
+            .iter()
+            .filter(|f| member_ids.contains(&f.id))
+            .collect();
+        if convs.is_empty() {
+            continue;
+        }
+
+        // Trend (reference computeTrends second pass — deterministic).
+        let recent = convs
+            .iter()
+            .filter(|f| f.jd.is_some_and(|d| now_jd - d <= 14.0))
+            .count();
+        let previous = convs
+            .iter()
+            .filter(|f| {
+                f.jd.is_some_and(|d| now_jd - d > 14.0 && now_jd - d <= 28.0)
+            })
+            .count();
+        let trend = if (recent as f64) > previous as f64 * 1.3 && recent >= 3 {
+            "rising"
+        } else if previous > 0 && (recent as f64) < previous as f64 * 0.7 {
+            "falling"
+        } else if previous == 0 && recent > 0 {
+            "new"
+        } else {
+            "stable"
+        };
+
+        let customer_count = convs
+            .iter()
+            .filter_map(|f| f.customer_id)
+            .collect::<std::collections::HashSet<i64>>()
+            .len();
+        let summary = format!(
+            "{} conversations from {} customers.",
+            convs.len(),
+            customer_count
+        );
+        clusters.push(RadarCluster {
+            id,
+            title,
+            conversation_ids: convs.iter().map(|f| f.id).collect(),
+            customer_count,
+            summary,
+            trend,
+        });
+    }
+    clusters
+}
+
+/// The v2.0.0 radar extensions (reference `radarExtensions`): per-cluster
+/// association alerts plus the global unusual-volume check. Early-returns
+/// when there are no clusters (reference behavior).
+fn radar_extensions(conn: &rusqlite::Connection, clusters: &[RadarCluster]) -> Vec<Value> {
+    let mut alerts: Vec<Value> = Vec::new();
+    if clusters.is_empty() {
+        return alerts;
+    }
+    let ids: Vec<i64> = clusters
+        .iter()
+        .flat_map(|c| c.conversation_ids.clone())
+        .collect();
+    if ids.is_empty() {
+        return alerts;
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT c.id, c.customer_id, c.mailbox_id, c.created_at, julianday(c.created_at) AS jd
+           FROM conversations c WHERE c.id IN ({placeholders})"
+    );
+    let facts: Vec<ConvFacts> = conn
+        .prepare(&sql)
+        .and_then(|mut stmt| {
+            let params: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+            Ok(stmt
+                .query_map(params.as_slice(), |r| {
+                    Ok(ConvFacts {
+                        id: r.get(0)?,
+                        customer_id: r.get(1)?,
+                        mailbox_id: r.get(2)?,
+                        created_at: r.get(3)?,
+                        jd: r.get(4)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect())
+        })
+        .unwrap_or_default();
+    let now_jd: f64 = conn
+        .query_row("SELECT julianday('now')", [], |r| r.get(0))
+        .unwrap_or(0.0);
+
+    for c in clusters {
+        let convs: Vec<&ConvFacts> = facts
+            .iter()
+            .filter(|f| c.conversation_ids.contains(&f.id))
+            .collect();
+        if convs.len() < 2 {
+            continue;
+        }
+        let conv_ids: Vec<i64> = convs.iter().map(|f| f.id).collect();
+
+        // Reappearing: activity in both the recent 30d and the 60-30d window.
+        let recent_count = convs
+            .iter()
+            .filter(|f| f.jd.is_some_and(|d| now_jd - d <= 30.0))
+            .count();
+        let older_count = convs
+            .iter()
+            .filter(|f| {
+                f.jd.is_some_and(|d| now_jd - d > 30.0 && now_jd - d <= 60.0)
+            })
+            .count();
+        if recent_count >= 2 && older_count >= 2 {
+            alerts.push(radar_alert(
+                "reappearing_issue",
+                format!("Reappearing issue: {}", c.title),
+                format!(
+                    "{} conversations 30-60 days ago and {} in the last 30 days - the topic went quiet and came back. {}",
+                    older_count, recent_count, c.summary
+                ),
+                conv_ids.clone(),
+                Some(c.id),
+                "warning",
+            ));
+        }
+
+        // Customer concentration: few customers, many tickets.
+        let customers: std::collections::HashSet<i64> =
+            convs.iter().filter_map(|f| f.customer_id).collect();
+        if convs.len() >= 4 && !customers.is_empty() && customers.len() <= convs.len() / 2 {
+            alerts.push(radar_alert(
+                "customer_concentration",
+                format!("Customer concentration: {}", c.title),
+                format!(
+                    "{} conversations from only {} distinct customers - a small group hitting the same problem repeatedly (an association, not a causal claim). {}",
+                    convs.len(),
+                    customers.len(),
+                    c.summary
+                ),
+                conv_ids.clone(),
+                Some(c.id),
+                "info",
+            ));
+        }
+
+        // Inbox concentration: one mailbox dominates the cluster.
+        let mut mailbox_counts: std::collections::HashMap<i64, usize> =
+            std::collections::HashMap::new();
+        for f in &convs {
+            if let Some(m) = f.mailbox_id {
+                *mailbox_counts.entry(m).or_insert(0) += 1;
+            }
+        }
+        let dominant = mailbox_counts
+            .iter()
+            .max_by_key(|(_, n)| **n)
+            .map(|(m, n)| (*m, *n));
+        if let Some((mailbox_id, n)) = dominant {
+            if convs.len() >= 4 && n as f64 / convs.len() as f64 >= 0.7 {
+                let mailbox_name: String = conn
+                    .query_row(
+                        "SELECT name FROM mailboxes WHERE id = ?1",
+                        rusqlite::params![mailbox_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| format!("mailbox #{mailbox_id}"));
+                alerts.push(radar_alert(
+                    "inbox_concentration",
+                    format!("Inbox concentration: {}", c.title),
+                    format!(
+                        "{} of {} conversations arrived in \"{}\" - the issue is concentrated in one channel. {}",
+                        n,
+                        convs.len(),
+                        mailbox_name,
+                        c.summary
+                    ),
+                    conv_ids.clone(),
+                    Some(c.id),
+                    "info",
+                ));
+            }
+        }
+
+        // Release correlation: a 7-day burst window containing >= 60% of the
+        // cluster; releases recorded inside the window are associations.
+        let mut jds: Vec<f64> = convs.iter().filter_map(|f| f.jd).collect();
+        jds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let date_by_jd: Vec<(f64, &str)> = convs
+            .iter()
+            .filter_map(|f| f.jd.map(|d| (d, f.created_at.as_deref().unwrap_or(""))))
+            .collect();
+        if jds.len() >= 4 {
+            let (mut best_start, mut best_count) = (None, 0usize);
+            for &start in &jds {
+                let in_window = jds
+                    .iter()
+                    .filter(|&&d| d >= start && d < start + 7.0)
+                    .count();
+                if in_window > best_count {
+                    best_count = in_window;
+                    best_start = Some(start);
+                }
+            }
+            if let Some(best) = best_start {
+                if best_count as f64 / jds.len() as f64 >= 0.6 {
+                    let start_date = date_by_jd
+                        .iter()
+                        .find(|(d, _)| *d == best)
+                        .map(|(_, s)| *s)
+                        .unwrap_or("");
+                    let releases: Vec<String> = conn
+                        .prepare(
+                            "SELECT version_label FROM incident_releases
+                              WHERE released_at IS NOT NULL
+                                AND julianday(released_at) >= ?1
+                                AND julianday(released_at) < ?2
+                              LIMIT 3",
+                        )
+                        .and_then(|mut stmt| {
+                            Ok(stmt
+                                .query_map(rusqlite::params![best, best + 7.0], |r| {
+                                    r.get::<_, String>(0)
+                                })?
+                                .filter_map(|r| r.ok())
+                                .collect())
+                        })
+                        .unwrap_or_default();
+                    let release_note = if releases.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " Releases recorded in this window: {} (association only).",
+                            releases.join(", ")
+                        )
+                    };
+                    alerts.push(radar_alert(
+                        "release_correlation",
+                        format!("Temporal burst: {}", c.title),
+                        format!(
+                            "{} of {} conversations started within one 7-day window starting {}. Temporal clustering suggests something changed - possibly a release - but this is an association, not a causal claim.{} {}",
+                            best_count,
+                            jds.len(),
+                            truncate_chars(start_date, 10),
+                            release_note,
+                            c.summary
+                        ),
+                        conv_ids.clone(),
+                        Some(c.id),
+                        "warning",
+                    ));
+                }
+            }
+        }
+
+        // Repeated unresolved pattern: one customer hitting the same cluster
+        // repeatedly over a >= 14 day span.
+        let mut by_customer: std::collections::HashMap<i64, (usize, f64, f64, Vec<i64>)> =
+            std::collections::HashMap::new();
+        for f in &convs {
+            let (cid, jd) = match (f.customer_id, f.jd) {
+                (Some(cid), Some(jd)) => (cid, jd),
+                _ => continue,
+            };
+            let entry = by_customer.entry(cid).or_insert((0, jd, jd, Vec::new()));
+            entry.0 += 1;
+            entry.1 = entry.1.min(jd);
+            entry.2 = entry.2.max(jd);
+            entry.3.push(f.id);
+        }
+        let repeated: Vec<&(usize, f64, f64, Vec<i64>)> = by_customer
+            .values()
+            .filter(|e| e.0 >= 2 && e.2 - e.1 >= 14.0)
+            .collect();
+        if !repeated.is_empty() {
+            alerts.push(radar_alert(
+                "repeated_unresolved",
+                format!("Repeated unresolved pattern: {}", c.title),
+                format!(
+                    "{} customer(s) wrote in {} times about this cluster across 14+ day spans - the underlying problem may not be resolved. {}",
+                    repeated.len(),
+                    repeated.iter().map(|e| e.0.to_string()).collect::<Vec<_>>().join(", "),
+                    c.summary
+                ),
+                repeated.iter().flat_map(|e| e.3.clone()).collect(),
+                Some(c.id),
+                "warning",
+            ));
+        }
+    }
+
+    // Unusual support volume (global): last 7d vs previous 7d.
+    let recent7: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversations
+              WHERE julianday(created_at) >= julianday('now', '-7 days')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let prev7: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conversations
+              WHERE julianday(created_at) >= julianday('now', '-14 days')
+                AND julianday(created_at) < julianday('now', '-7 days')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if recent7 >= 10 && prev7 > 0 && recent7 as f64 / prev7 as f64 >= 1.4 {
+        let sample: Vec<i64> = conn
+            .prepare(
+                "SELECT id FROM conversations
+                  WHERE julianday(created_at) >= julianday('now', '-7 days')
+                  ORDER BY created_at DESC LIMIT 10",
+            )
+            .map(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, i64>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        alerts.push(radar_alert(
+            "volume_spike",
+            format!("Unusual support volume: {recent7} conversations in the last 7 days"),
+            format!(
+                "{} conversations in the last 7 days vs {} in the previous 7 (a {}% increase). An association with a change somewhere - not a causal claim.",
+                recent7,
+                prev7,
+                ((recent7 as f64 / prev7 as f64 - 1.0) * 100.0).round() as i64
+            ),
+            sample,
+            None,
+            if recent7 as f64 / prev7 as f64 >= 2.0 {
+                "critical"
+            } else {
+                "warning"
+            },
+        ));
+    }
+
+    alerts
+}
+
+/// GET /api/reports/doc-gaps?days=90 — documentation gap detection
+/// (audit M3 / AN-06, spec #43; reference `analyticsService.docGaps(days)`):
+/// repeated customer questions (count >= 2 within the top-20 questions) whose
+/// knowledge coverage is weak, each with the first published reply as the
+/// known answer and a suggested doc title.
+///
+/// Route shape (reference analytics.ts:75-78): `{ gaps: [...] }`.
+pub async fn doc_gaps(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let days = clamp_days_param(params.get("days"), 90, 1, 3650);
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut gaps: Vec<Value> = grouped_questions(&conn, days)
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= 2)
+        .map(|(question, ids)| {
+            // Knowledge coverage: FTS hits with the reference's token
+            // building (3+ char tokens, capped at 6, quoted prefix terms).
+            let knowledge_hits: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM fts_knowledge WHERE fts_knowledge MATCH ?1",
+                    rusqlite::params![fts_tokens(&question)],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            // The first published reply to the question's first
+            // conversation is the "known answer" (reference reads
+            // threads WHERE type='reply' AND state='published').
+            let known_answer: Option<String> = conn
+                .query_row(
+                    "SELECT body FROM conversation_threads
+                      WHERE conversation_id = ?1 AND thread_type = 'reply' AND state = 'published'
+                      ORDER BY created_at ASC LIMIT 1",
+                    rusqlite::params![ids[0]],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap_or(None);
+            let coverage = if knowledge_hits == 0 {
+                "missing"
+            } else if knowledge_hits < 2 {
+                "partial"
+            } else {
+                "ambiguous"
+            };
+            json!({
+                "question": question,
+                "conversation_count": ids.len(),
+                "known_answer": known_answer.map(|b| truncate_chars(&b, 300)),
+                "coverage": coverage,
+                "suggested_doc_title": format!("Documentation: {}", truncate_chars(&question, 80)),
+            })
+        })
+        .collect();
+    gaps.truncate(15);
+    (StatusCode::OK, Json(json!({ "gaps": gaps })))
+}
+
+/// GET /api/reports/answer-reuse?days=90 — answer reuse detection (audit M3 /
+/// AN-07, spec #44; reference `analyticsService.answerReuse(days)`):
+/// recommendation only, never automatic modification. Repeated questions
+/// (2+ conversations) with the first conversation's published resolution,
+/// a matching saved reply and a matching knowledge document.
+///
+/// Route shape (reference analytics.ts:80-82): `{ candidates: [...] }`.
+pub async fn answer_reuse(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let days = clamp_days_param(params.get("days"), 90, 1, 3650);
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut candidates: Vec<Value> = grouped_questions(&conn, days)
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= 2)
+        .map(|(question, ids)| {
+            // The first conversation's published reply is the common
+            // resolution (reference: threads type='reply' state='published'
+            // ORDER BY remote_created_at ASC LIMIT 1).
+            let common_resolution: Option<String> = conn
+                .query_row(
+                    "SELECT body FROM conversation_threads
+                      WHERE conversation_id = ?1 AND thread_type = 'reply' AND state = 'published'
+                      ORDER BY created_at ASC LIMIT 1",
+                    rusqlite::params![ids[0]],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap_or(None);
+            // A saved reply whose name or preview matches the question
+            // (first 40 chars, LIKE).
+            let like = format!("%{}%", truncate_chars(&question, 40));
+            let saved_reply_name: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM saved_replies
+                      WHERE deleted_at IS NULL AND (name LIKE ?1 OR preview LIKE ?1) LIMIT 1",
+                    rusqlite::params![like],
+                    |r| r.get(0),
+                )
+                .unwrap_or(None);
+            // A knowledge document whose title or content matches.
+            let knowledge_doc_title: Option<String> = conn
+                .query_row(
+                    "SELECT title FROM knowledge_documents
+                      WHERE title LIKE ?1 OR content LIKE ?1 LIMIT 1",
+                    rusqlite::params![like],
+                    |r| r.get(0),
+                )
+                .unwrap_or(None);
+            json!({
+                "question": question,
+                "conversation_count": ids.len(),
+                "common_resolution": common_resolution.map(|b| truncate_chars(&b, 300)),
+                "saved_reply_name": saved_reply_name,
+                "knowledge_doc_title": knowledge_doc_title,
+            })
+        })
+        .collect();
+    candidates.truncate(15);
+    (StatusCode::OK, Json(json!({ "candidates": candidates })))
+}
+
+/// GET /api/reports/issue-radar — the Issue Radar (audit M3 / AN-08, spec
+/// #42; reference `analyticsService.issueRadar()`): association-only
+/// alerts, each carrying supporting conversation links and never claiming
+/// causation. Ten alert kinds over the issue clusters, the top questions,
+/// escalated tickets, ratings and per-cluster conversation facts.
+///
+/// Route shape (reference analytics.ts:85): `{ alerts: [...] }`.
 pub async fn issue_radar(State(state): State<AppState>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::intelligence_features::get_radar_snapshot(&conn) {
-        Ok(snapshot) => {
-            let alerts = vec![json!({
-                "type": "radar_snapshot",
-                "active_known_issues": snapshot.active_known_issues,
-                "active_clusters": snapshot.active_clusters,
-                "active_incidents": snapshot.active_incidents,
-            })];
-            (StatusCode::OK, Json(json!({"alerts": alerts})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": e.to_string()})),
-        ),
-    }
+    (
+        StatusCode::OK,
+        Json(json!({ "alerts": issue_radar_impl(&conn) })),
+    )
 }
+
+/// GET /api/reports/metric-definitions — the seeded metric dictionary
+/// (audit M3 / AN-08; reference `analyticsService.metricDefinitions()`):
+/// every local metric defined with its formula, source and limitations
+/// (reference migration 003 seeds exactly 11 rows, ordered by key).
+///
+/// Route shape (reference analytics.ts:87): `{ definitions: [...] }`.
 pub async fn metric_definitions(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"definitions": []})))
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let definitions: Vec<Value> = conn
+        .prepare(
+            "SELECT key, name, description, formula, source, limitations
+             FROM metric_definitions ORDER BY key",
+        )
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok(json!({
+                    "key": r.get::<_, String>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "description": r.get::<_, Option<String>>(2)?,
+                    "formula": r.get::<_, Option<String>>(3)?,
+                    "source": r.get::<_, String>(4)?,
+                    "limitations": r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    (StatusCode::OK, Json(json!({ "definitions": definitions })))
 }
+
+/// GET /api/reports/release-correlation — conversation counts 7 days
+/// before/after each recorded release event (audit M3 / AN-10, section 51;
+/// reference `analyticsRepo.releaseCorrelation()`). Wording stays
+/// "potentially related" — never proven causation.
+///
+/// Route shape (reference analytics.ts:89-96): `{ releases, note, source }`.
 pub async fn release_correlation(State(state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"correlations": []})))
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let releases: Vec<Value> = conn
+        .prepare("SELECT name, version, occurred_at FROM release_events ORDER BY occurred_at DESC")
+        .map(|mut stmt| {
+            stmt.query_map([], |r| {
+                let name: String = r.get(0)?;
+                let version: Option<String> = r.get(1)?;
+                let occurred_at: String = r.get(2)?;
+                // julian-day arithmetic keeps both RFC3339 and SQLite
+                // datetime strings comparable (stack adaptation: the
+                // reference compares remote_created_at strings directly).
+                let before_7d: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM conversations
+                          WHERE created_at IS NOT NULL
+                            AND julianday(created_at) >= julianday(?1, '-7 days')
+                            AND julianday(created_at) < julianday(?1)",
+                        rusqlite::params![occurred_at],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let after_7d: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM conversations
+                          WHERE created_at IS NOT NULL
+                            AND julianday(created_at) >= julianday(?1)
+                            AND julianday(created_at) < julianday(?1, '+7 days')",
+                        rusqlite::params![occurred_at],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                Ok(json!({
+                    "release": name,
+                    "version": version,
+                    "occurred_at": occurred_at,
+                    "before_7d": before_7d,
+                    "after_7d": after_7d,
+                }))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "releases": releases,
+            "note": "Conversations before/after each release window. Timing overlap is described as \"potentially related\" - never as proven causation.",
+            "source": "local"
+        })),
+    )
 }
+
+/// POST /api/reports/release-events — record a release event (audit M3 /
+/// AN-10; reference analytics.ts:98-111 + `analyticsRepo.addReleaseEvent`).
+///
+/// Body (zod `z.object`): `{ name: string 1..=200, version?: string <= 100,
+/// occurredAt: /^\d{4}-\d{2}-\d{2}(T[\d:.]+Z?)?$/, notes?: string <= 2000 }`.
+/// A zod failure surfaces as the reference 422 ValidationError envelope
+/// (app.ts setErrorHandler: first issue as the message).
+///
+/// Route shape: `{ ok: true, message: "Release event recorded." }`.
 pub async fn release_events(
     State(state): State<AppState>,
-    Json(_body): Json<Value>,
-) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"ok": true})))
+    body: Option<Json<Value>>,
+) -> axum::response::Response {
+    let body = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
+
+    // --- zod equivalent ---
+    let name = match body.get("name") {
+        Some(Value::String(s)) => {
+            let n = s.chars().count();
+            if n == 0 {
+                return release_event_422("name", "String must contain at least 1 character(s)");
+            }
+            if n > 200 {
+                return release_event_422("name", "String must contain at most 200 character(s)");
+            }
+            s.clone()
+        }
+        None => return release_event_422("name", "Required"),
+        Some(other) => {
+            return release_event_422(
+                "name",
+                &format!("Expected string, received {}", zod_type_of(other)),
+            )
+        }
+    };
+    let version = match body.get("version") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => {
+            if s.chars().count() > 100 {
+                return release_event_422(
+                    "version",
+                    "String must contain at most 100 character(s)",
+                );
+            }
+            s.clone()
+        }
+        Some(other) => {
+            return release_event_422(
+                "version",
+                &format!("Expected string, received {}", zod_type_of(other)),
+            )
+        }
+    };
+    let occurred_at = match body.get("occurredAt") {
+        Some(Value::String(s)) => {
+            if !is_reference_date_time(s) {
+                return release_event_422("occurredAt", "Invalid");
+            }
+            s.clone()
+        }
+        None => return release_event_422("occurredAt", "Required"),
+        Some(other) => {
+            return release_event_422(
+                "occurredAt",
+                &format!("Expected string, received {}", zod_type_of(other)),
+            )
+        }
+    };
+    let notes = match body.get("notes") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            if s.chars().count() > 2000 {
+                return release_event_422("notes", "String must contain at most 2000 character(s)");
+            }
+            Some(s.clone())
+        }
+        Some(other) => {
+            return release_event_422(
+                "notes",
+                &format!("Expected string, received {}", zod_type_of(other)),
+            )
+        }
+    };
+
+    // --- write (reference `addReleaseEvent`) ---
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match conn.execute(
+        "INSERT INTO release_events (name, version, occurred_at, notes) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![name, version, occurred_at, notes],
+    ) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "message": "Release event recorded." })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "message": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
+
+/// GET /api/reports/helpscout/:reportKey — Help Scout native report import
+/// (audit M3 / AN-11, spec #46; reference analytics.ts:114-143): four
+/// report keys proxied through the provider, clearly labeled with their
+/// Help Scout origin; unknown keys are a 404.
+///
+/// Route shape: `{ ok: true, report, source: "helpscout", note }`; a
+/// provider failure is `{ ok: false, message: "Help Scout report request
+/// failed: ..." }` (HTTP 200, reference catch); an unknown key is the
+/// reference 404 envelope.
 pub async fn helpscout_report(
     State(state): State<AppState>,
-    axum::extract::Path(_key): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"data": []})))
+    axum::extract::Path(report_key): axum::extract::Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let days = clamp_days_param(params.get("days"), 30, 1, 3650);
+    let now_iso = chrono::Utc::now().to_rfc3339();
+    let days_ago_iso = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let start: String = params
+        .get("from")
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&days_ago_iso)
+        .chars()
+        .take(10)
+        .collect();
+    let end: String = params
+        .get("to")
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&now_iso)
+        .chars()
+        .take(10)
+        .collect();
+
+    // The effective provider (reference `ctx.provider`): the engine's
+    // provider when the app is wired, else the real provider.
+    let provider: Option<std::sync::Arc<dyn crate::helpscout::HelpScoutProvider>> =
+        if let Some(sync) = state.sync.as_ref() {
+            Some(sync.provider().clone())
+        } else if let Some(real) = state.real.clone() {
+            let coerced: std::sync::Arc<dyn crate::helpscout::HelpScoutProvider> = real;
+            Some(coerced)
+        } else {
+            None
+        };
+
+    let Some(provider) = provider else {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "ok": false,
+                "message": "Help Scout report request failed: no provider configured"
+            })),
+        )
+            .into_response();
+    };
+
+    let fetched = match report_key.as_str() {
+        "company" => provider.get_company_overall_report(&start, &end).await,
+        "conversations" => {
+            provider
+                .get_conversations_overall_report(&start, &end)
+                .await
+        }
+        "happiness" => provider.get_happiness_ratings_report(&start, &end).await,
+        "productivity" => provider.get_productivity_overall_report(&start, &end).await,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "statusCode": 404,
+                    "error": "NotFound",
+                    "message": "Unknown report. Available: company, conversations, happiness, productivity."
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match fetched {
+        Ok(row) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "report": row,
+                "source": "helpscout",
+                "note": "Numbers come from Help Scout native reporting and use Help Scout definitions."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": false,
+                "message": format!("Help Scout report request failed: {e}")
+            })),
+        )
+            .into_response(),
+    }
 }
+
 /// AI-written report narrative (audit AI-14; spec #105, reference
 /// analytics.ts:146-160 + `AiPipeline.reportNarrative`). Clearly labeled
 /// AI-generated: the route runs the existing `ai_pipeline::report_narrative`

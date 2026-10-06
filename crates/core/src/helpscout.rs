@@ -304,6 +304,18 @@ pub struct HsRating {
     pub created_at: Option<String>,
 }
 
+/// A Help Scout native report row (reference `HsReportRow`,
+/// provider.ts:326-330): the raw report payload labeled with its origin.
+/// `data` is the untouched provider JSON — Help Scout definitions apply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HsReportRow {
+    pub key: String,
+    pub name: String,
+    /// Always "helpscout" — labels the numbers' origin.
+    pub source: String,
+    pub data: serde_json::Value,
+}
+
 /// A Help Scout folder (per-mailbox view: Unassigned / Mine / Drafts).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HsFolder {
@@ -548,6 +560,45 @@ pub trait HelpScoutProvider: Send + Sync {
     /// its seeded ratings by remote id. A default keeps bounded implementors
     /// compiling.
     async fn get_rating(&self, _rating_id: i64) -> Result<Option<HsRating>> {
+        Ok(None)
+    }
+
+    // ---------------- Help Scout native reports (AN-11, provider.ts:401-404) ----------------
+
+    /// `GET /v2/reports/company` over a date range. Errors surface as
+    /// `Ok(None)` (the reference `rangeReport` catch → null).
+    async fn get_company_overall_report(
+        &self,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        Ok(None)
+    }
+
+    /// `GET /v2/reports/conversations` over a date range.
+    async fn get_conversations_overall_report(
+        &self,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        Ok(None)
+    }
+
+    /// `GET /v2/reports/happiness` over a date range.
+    async fn get_happiness_ratings_report(
+        &self,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        Ok(None)
+    }
+
+    /// `GET /v2/reports/productivity` over a date range.
+    async fn get_productivity_overall_report(
+        &self,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Option<HsReportRow>> {
         Ok(None)
     }
 
@@ -2501,6 +2552,123 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             .iter()
             .find(|r| r.remote_id == rating_id)
             .cloned())
+    }
+
+    // ---------------- Help Scout native reports (AN-11, fakeProvider.ts:225-250) ----------------
+
+    async fn get_company_overall_report(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        let world = self.lock_world();
+        let in_range = world
+            .conversations
+            .iter()
+            .filter(|c| {
+                c.created_at
+                    .as_deref()
+                    .is_some_and(|t| t >= start && t <= end)
+            })
+            .count();
+        Ok(Some(HsReportRow {
+            key: "hs_company_overall".into(),
+            name: "Help Scout Company Overall".into(),
+            source: "helpscout".into(),
+            data: serde_json::json!({
+                "totalConversations": in_range,
+                "startDate": start,
+                "endDate": end
+            }),
+        }))
+    }
+
+    async fn get_conversations_overall_report(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        let world = self.lock_world();
+        let in_range: Vec<&HsConversation> = world
+            .conversations
+            .iter()
+            .filter(|c| {
+                c.created_at
+                    .as_deref()
+                    .is_some_and(|t| t >= start && t <= end)
+            })
+            .collect();
+        let by_status = |s: &str| in_range.iter().filter(|c| c.status == s).count();
+        Ok(Some(HsReportRow {
+            key: "hs_conversations_overall".into(),
+            name: "Help Scout Conversations Overall".into(),
+            source: "helpscout".into(),
+            data: serde_json::json!({
+                "totalConversations": in_range.len(),
+                "byStatus": {
+                    "active": by_status("active"),
+                    "closed": by_status("closed"),
+                    "pending": by_status("pending")
+                }
+            }),
+        }))
+    }
+
+    async fn get_happiness_ratings_report(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        let world = self.lock_world();
+        let in_range: Vec<&HsRating> = world
+            .ratings
+            .iter()
+            .filter(|r| {
+                r.created_at
+                    .as_deref()
+                    .is_some_and(|t| t >= start && t <= end)
+            })
+            .collect();
+        let count = |v: &str| {
+            in_range
+                .iter()
+                .filter(|r| r.rating.as_deref() == Some(v))
+                .count()
+        };
+        Ok(Some(HsReportRow {
+            key: "hs_happiness_ratings".into(),
+            name: "Help Scout Happiness Ratings".into(),
+            source: "helpscout".into(),
+            data: serde_json::json!({
+                "great": count("great"),
+                "okay": count("okay"),
+                "notGood": count("not-good")
+            }),
+        }))
+    }
+
+    async fn get_productivity_overall_report(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        let world = self.lock_world();
+        let replies = world
+            .threads
+            .iter()
+            .filter(|t| {
+                t.kind == "reply"
+                    && t.created_at
+                        .as_deref()
+                        .is_some_and(|c| c >= start && c <= end)
+            })
+            .count();
+        Ok(Some(HsReportRow {
+            key: "hs_productivity_overall".into(),
+            name: "Help Scout Productivity Overall".into(),
+            source: "helpscout".into(),
+            data: serde_json::json!({ "repliesSent": replies }),
+        }))
     }
 
     fn reset(&self) {

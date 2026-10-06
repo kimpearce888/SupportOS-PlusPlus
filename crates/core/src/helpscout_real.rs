@@ -30,8 +30,8 @@ use crate::helpscout::{
     ConversationCreated, ConversationPatch, ConversationQuery, CreateConversationInput,
     CreateThreadInput, CustomerQuery, HelpScoutProvider, HsBeaconChat, HsConversation, HsCustomer,
     HsDocArticle, HsDocCategory, HsDocCollection, HsField, HsFieldOption, HsFolder, HsMailbox,
-    HsOrganization, HsPropertyDef, HsRating, HsSavedReply, HsTag, HsTeam, HsThread, HsUser,
-    HsUserStatus, HsWebhookConfig, HsWorkflow, Page, ThreadCreated,
+    HsOrganization, HsPropertyDef, HsRating, HsReportRow, HsSavedReply, HsTag, HsTeam, HsThread,
+    HsUser, HsUserStatus, HsWebhookConfig, HsWorkflow, Page, ThreadCreated,
 };
 
 /// Default Help Scout API base.
@@ -722,6 +722,36 @@ impl RealHelpScoutProvider {
         self.queue.enqueue(priority, is_write, fut).await
     }
 
+    /// Reference `HelpScoutReportService.rangeReport` (services.ts):
+    /// `GET {path}?start=&end=` riding PRIORITY.ANALYTICS; any failure
+    /// maps to `Ok(None)` (the reference's catch → null).
+    async fn hs_range_report(
+        &self,
+        key: &str,
+        name: &str,
+        path: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        match self
+            .request_pri(
+                &format!("{path}?start={start}&end={end}"),
+                "GET",
+                None,
+                PRIORITY_ANALYTICS,
+            )
+            .await
+        {
+            Ok(data) => Ok(Some(HsReportRow {
+                key: key.to_string(),
+                name: name.to_string(),
+                source: "helpscout".to_string(),
+                data,
+            })),
+            Err(_) => Ok(None),
+        }
+    }
+
     async fn request_inner(
         &self,
         path: &str,
@@ -1356,6 +1386,68 @@ impl HelpScoutProvider for RealHelpScoutProvider {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         }))
+    }
+
+    // ---------------- Help Scout native reports (AN-11, services.ts HelpScoutReportService) ----------------
+
+    async fn get_company_overall_report(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        self.hs_range_report(
+            "hs_company_overall",
+            "Help Scout Company Overall",
+            "/v2/reports/company",
+            start,
+            end,
+        )
+        .await
+    }
+
+    async fn get_conversations_overall_report(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        self.hs_range_report(
+            "hs_conversations_overall",
+            "Help Scout Conversations Overall",
+            "/v2/reports/conversations",
+            start,
+            end,
+        )
+        .await
+    }
+
+    async fn get_happiness_ratings_report(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        self.hs_range_report(
+            "hs_happiness_ratings",
+            "Help Scout Happiness Ratings",
+            "/v2/reports/happiness",
+            start,
+            end,
+        )
+        .await
+    }
+
+    async fn get_productivity_overall_report(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<Option<HsReportRow>> {
+        self.hs_range_report(
+            "hs_productivity_overall",
+            "Help Scout Productivity Overall",
+            "/v2/reports/productivity",
+            start,
+            end,
+        )
+        .await
     }
 
     // ---------------- Extended surface ----------------

@@ -444,7 +444,7 @@ pub fn fts_query_or(q: &str, max_tokens: usize) -> String {
 
 /// Reference tokenization: replace `["*()]` with spaces, split on whitespace,
 /// keep tokens whose char count is at least `min_chars`, cap at `max_tokens`.
-fn tokenize(q: &str, min_chars: usize, max_tokens: usize) -> Vec<String> {
+pub(crate) fn tokenize(q: &str, min_chars: usize, max_tokens: usize) -> Vec<String> {
     let cleaned: String = q
         .chars()
         .map(|c| {
