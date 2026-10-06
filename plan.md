@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **108 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **103 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
 |---|---|---|---|---|---|---|---|
-| 9 | BK-04 | .sosync schema guard (prevent incompatible import) | Divergent | Critical | M | C1 | Real schema fingerprint in header (e.g. canonical DDL hash) checked on import; stop fabricating history |
-| 10 | C3 | panic=abort profile + unrecovered panics kill the packaged app | Defect | Critical | M | T16 C3 | Switch release profile to unwind and add catch_unwind containment at handler/task boundary (Cargo.toml:85 panic=abort; operations.rs:276-278 tile panic; rate_limit.rs:69 poisoned-mutex expects). |
-| 11 | AI-22 | LM Studio client (models/chat/embeddings, timeout, /v1 normalization) | Partial | Major | S | M10 | Add timeout from lmstudio_timeout_ms; normalize base URL /v1 on all paths |
-| 12 | CL-01 | Side threads create (title/team/participants/first_message + 422s) | Partial | Major | S | M14 | Parse full schema; 422 on unknown participants/teams; store title/team/participants/first_message |
-| 13 | CL-04 | Side thread participants add | Stub | Major | S | M14 | Insert participants with existence checks (sideThreadRepo.ts:173-186) |
 | 14 | AU-03 | Auto-fire on conversation update (workers hook) | Missing | Major | M | - | Hook conversation-updated events to fire triggers (worker side) |
 | 15 | AU-04 | Awaiting-approval gating (parked jobs + approve/reject) | Divergent | Major | M | - | Expose approve/reject routes; park via jobs (parity) or rewire tile+sweep to approvals |
 | 16 | AU-02 | Trigger vocabulary (new_conversation/customer_reply/ai_low_confidence/manual) | Divergent | Major | L | M27 | Port MAIN trigger/condition/action vocabulary and risk tiers |
