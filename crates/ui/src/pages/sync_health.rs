@@ -1,20 +1,39 @@
-//! Sync Health page — the `/sync-health` route.
+//! Sync Health page — the `/sync-health` route (UI-19).
 //!
 //! Per spec A9: "The 'Webhook push' screen (in Sync Health) must explain in
-//! plain language what address Help Scout needs, show the state
-//! (not configured, registered, receiving, error), support register and
-//! delete as Tauri commands, and never claim real-time updates are active
-//! when they are not."
+//! plain language what address Help Scout needs, show the state (not
+//! configured, registered, receiving, error), support register and delete
+//! as Tauri commands, and never claim real-time updates are active when
+//! they are not."
 //!
-//! This page is the UI for the webhook push feature. The actual register/
-//! delete Tauri commands call the Help Scout Webhooks API; the state machine
-//! is driven by the `webhook_state` Tauri IPC command (which reads the
-//! `webhook_configs` table + the last-received event timestamp).
+//! The page is wired to the reference API:
+//! - GET /api/sync/status — state, current run, checkpoints, last success,
+//!   recent runs, webhook stats/config, rate limit, API queue.
+//! - POST /api/sync/initial | incremental | reconcile | cancel — the sync
+//!   actions (with the `{wait:true}` inline option for visible feedback).
+//! - POST /api/webhooks/register, DELETE /api/webhooks/:remoteId.
 
 use leptos::*;
 
 use crate::components::button::{Button, ButtonStyle};
 use crate::components::state_view::EmptyState;
+
+/// The 12 supported Help Scout webhook events (reference
+/// webhookRegisterSchema — mirrored in routes/sync.rs).
+pub const SUPPORTED_WEBHOOK_EVENTS: [&str; 12] = [
+    "convo.created",
+    "convo.updated",
+    "convo.assigned",
+    "convo.status",
+    "convo.customer.reply.created",
+    "convo.agent.reply.created",
+    "convo.note.created",
+    "satisfaction.ratings",
+    "customer.created",
+    "customer.updated",
+    "conversation.merged",
+    "team.updated",
+];
 
 /// The webhook push state machine (A9).
 /// Matches the spec's four states: not configured → registered → receiving → error.
@@ -60,81 +79,351 @@ impl WebhookPushState {
     }
 }
 
-/// The Sync Health page component.
-///
-/// Shows:
-/// - Plain-language explanation of what address Help Scout needs.
-/// - The current webhook push state (badge).
-/// - The registered URL (or "not configured").
-/// - Last event received timestamp.
-/// - Register and Delete buttons.
-/// - A note about incremental polling being the baseline.
+/// Derive the push state from a `/api/sync/status` payload (the same
+/// derivation the page used before, now shared with the tests): events
+/// received -> receiving; a configured webhook -> registered; else not
+/// configured.
+#[must_use]
+pub fn derive_push_state(status: &serde_json::Value) -> WebhookPushState {
+    let events = status
+        .pointer("/webhook/events/total")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let configured = status
+        .pointer("/webhook/configured")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if events > 0 {
+        WebhookPushState::Receiving
+    } else if configured {
+        WebhookPushState::Registered
+    } else {
+        WebhookPushState::NotConfigured
+    }
+}
+
+/// The Sync Health page component: health cards, sync actions,
+/// checkpoints, recent runs, the webhook register + event queue.
 #[component]
 pub fn SyncHealthPage() -> impl IntoView {
-    // Wired to the `sync_health_state` Tauri IPC command on mount.
-    let state = create_rw_signal(WebhookPushState::NotConfigured);
-    let webhook_url = create_rw_signal(String::new());
-    let last_event = create_rw_signal(None::<String>);
+    let status = create_rw_signal(serde_json::Value::Null);
+    let push_state = create_rw_signal(WebhookPushState::NotConfigured);
     let loading = create_rw_signal(true);
+    let error_msg = create_rw_signal(None::<String>);
+    let action_msg = create_rw_signal(None::<String>);
+    let running = create_rw_signal(false);
+    // The webhook registration form.
+    let webhook_url_input = create_rw_signal(String::new());
+    let selected_events = create_rw_signal(
+        SUPPORTED_WEBHOOK_EVENTS
+            .iter()
+            .map(|e| (*e, true))
+            .collect::<Vec<(&'static str, bool)>>(),
+    );
+    // Bumped after every action so the whole status refetches.
+    let reload = create_rw_signal(0u32);
 
     create_effect(move |_| {
-        let state = state;
+        let _ = reload.get();
+        let status = status;
+        let push_state = push_state;
+        let running = running;
         let loading = loading;
+        let error_msg = error_msg;
         wasm_bindgen_futures::spawn_local(async move {
             match crate::api::get_json::<serde_json::Value>("/api/sync/status").await {
                 Ok(data) => {
-                    // Derive the push state from the webhook stats block the
-                    // same way the reference SyncHealth banner does: events
-                    // received -> receiving; else sync runs -> registered.
-                    let events = data
-                        .pointer("/webhook/events/total")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let runs = data
-                        .pointer("/last_success/id")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let push_state = if events > 0 {
-                        "receiving"
-                    } else if runs > 0 {
-                        "registered"
-                    } else {
-                        "not_configured"
-                    };
-                    let new_state = match push_state {
-                        "receiving" => WebhookPushState::Receiving,
-                        "registered" => WebhookPushState::Registered,
-                        "error" => WebhookPushState::Error,
-                        _ => WebhookPushState::NotConfigured,
-                    };
-                    state.set(new_state);
+                    running.set(
+                        data.get("running")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                    );
+                    push_state.set(derive_push_state(&data));
+                    status.set(data);
                     loading.set(false);
                 }
-                Err(_) => {
+                Err(e) => {
+                    error_msg.set(Some(e));
                     // If the API is unreachable, show NotConfigured.
-                    state.set(WebhookPushState::NotConfigured);
+                    push_state.set(WebhookPushState::NotConfigured);
                     loading.set(false);
                 }
             }
         });
     });
 
-    let on_register = move || {
-        // M2: invoke `webhook_register` Tauri command.
-        // For now, just flip the state to demonstrate the UI.
-        state.set(WebhookPushState::Registered);
+    // Run a sync action (POST /api/sync/:action with {wait:true} so the
+    // result is visible inline), then refetch the status.
+    let run_action = move |action: &'static str| {
+        let reload = reload;
+        let action_msg = action_msg;
+        let running = running;
+        let action = action.to_string();
+        wasm_bindgen_futures::spawn_local(async move {
+            running.set(true);
+            let result = crate::api::post_json::<serde_json::Value>(
+                &format!("/api/sync/{action}"),
+                Some(&serde_json::json!({ "wait": true })),
+            )
+            .await;
+            match result {
+                Ok(body) => {
+                    let message = body
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("{action} completed."));
+                    action_msg.set(Some(message));
+                }
+                Err(e) => action_msg.set(Some(e)),
+            }
+            running.set(false);
+            reload.set(reload.get_untracked() + 1);
+        });
     };
 
-    let on_delete = move || {
-        // M2: invoke `webhook_delete` Tauri command.
-        state.set(WebhookPushState::NotConfigured);
-        webhook_url.set(String::new());
-        last_event.set(None);
+    // POST /api/webhooks/register with the form's URL + selected events.
+    let on_register = move || {
+        let url = webhook_url_input.get_untracked();
+        let events: Vec<String> = selected_events
+            .get_untracked()
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(e, _)| e.to_string())
+            .collect();
+        let reload = reload;
+        let action_msg = action_msg;
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = crate::api::post_json::<serde_json::Value>(
+                "/api/webhooks/register",
+                Some(&serde_json::json!({ "url": url, "events": events })),
+            )
+            .await;
+            let message = match result {
+                Ok(body) => {
+                    let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let text = body
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Registered.")
+                        .to_string();
+                    if ok {
+                        format!("Webhook registered. {text}")
+                    } else {
+                        text
+                    }
+                }
+                Err(e) => e,
+            };
+            action_msg.set(Some(message));
+            reload.set(reload.get_untracked() + 1);
+        });
+    };
+
+    // DELETE /api/webhooks/:remoteId (per configured webhook).
+    let on_delete = move |remote_id: i64| {
+        let reload = reload;
+        let action_msg = action_msg;
+        wasm_bindgen_futures::spawn_local(async move {
+            let result =
+                crate::api::delete_json::<serde_json::Value>(&format!("/api/webhooks/{remote_id}"))
+                    .await;
+            let message = match result {
+                Ok(body) => body
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Deleted.")
+                    .to_string(),
+                Err(e) => e,
+            };
+            action_msg.set(Some(message));
+            reload.set(reload.get_untracked() + 1);
+        });
     };
 
     view! {
         <div class="spp-page spp-page--sync-health">
             <h2 class="spp-page__title">"Sync Health"</h2>
+
+            <Show when=move || error_msg.get().is_some() fallback=|| ().into_view()>
+                <div class="spp-state spp-state--error">
+                    <p class="spp-state__body">{move || error_msg.get().unwrap_or_default()}</p>
+                </div>
+            </Show>
+
+            // ── Health cards ──
+            <section class="spp-sync-health-cards">
+                {move || {
+                    let s = status.get();
+                    let cards = if s.is_null() {
+                        vec![]
+                    } else {
+                        let state = s
+                            .get("state")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("never")
+                            .to_string();
+                        let last = s
+                            .pointer("/last_success/finished_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("never")
+                            .to_string();
+                        let records = s
+                            .pointer("/last_success/records_processed")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        let pending = s
+                            .pointer("/webhook/events/pending")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        vec![
+                            ("Sync state", state, "state"),
+                            ("Running", if running.get() { "yes".into() } else { "no".into() }, "running"),
+                            ("Last successful sync", format!("{last} ({records} records)"), "last-success"),
+                            ("Webhook events pending", pending.to_string(), "webhook-pending"),
+                        ]
+                    };
+                    cards
+                        .into_iter()
+                        .map(|(title, value, key)| {
+                            view! {
+                                <div class=format!("spp-sync-health-card spp-sync-health-card--{key}")>
+                                    <span class="spp-sync-health-card__title">{title}</span>
+                                    <span class="spp-sync-health-card__value">{value}</span>
+                                </div>
+                            }
+                        })
+                        .collect_view()
+                }}
+            </section>
+
+            // ── Sync actions ──
+            <section class="spp-sync-actions">
+                <h3 class="spp-sync-actions__title">"Sync actions"</h3>
+                <div class="spp-sync-actions__row">
+                    <Button on_click=move || run_action("initial") style=ButtonStyle::Primary>
+                        "Full sync"
+                    </Button>
+                    <Button on_click=move || run_action("incremental") style=ButtonStyle::Ghost>
+                        "Incremental sync"
+                    </Button>
+                    <Button on_click=move || run_action("reconcile") style=ButtonStyle::Ghost>
+                        "Reconcile"
+                    </Button>
+                    <Button on_click=move || run_action("cancel") style=ButtonStyle::Ghost>
+                        "Cancel"
+                    </Button>
+                </div>
+                <Show when=move || action_msg.get().is_some() fallback=|| ().into_view()>
+                    <div class="spp-state spp-state--info">
+                        <p class="spp-state__body">{move || action_msg.get().unwrap_or_default()}</p>
+                    </div>
+                </Show>
+                <p class="spp-muted spp-text-xs">
+                    "Actions run against the connected Help Scout mailbox; the fake provider in demo mode serves seeded data."
+                </p>
+            </section>
+
+            // ── Checkpoints ──
+            <section class="spp-sync-checkpoints">
+                <h3 class="spp-sync-checkpoints__title">"Checkpoints"</h3>
+                <Show
+                    when=move || !loading.get() && status.get().get("checkpoints").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+                    fallback=move || {
+                        view! {
+                            <EmptyState message="No checkpoints yet — they appear after the first sync." />
+                        }
+                    }
+                >
+                    <table class="spp-table">
+                        <thead>
+                            <tr>
+                                <th>"Resource"</th>
+                                <th>"Status"</th>
+                                <th>"Last success"</th>
+                                <th>"Processed"</th>
+                                <th>"Failed"</th>
+                                <th>"Retries"</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {move || {
+                                status.get()
+                                    .get("checkpoints")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .map(|c| {
+                                        view! {
+                                            <tr>
+                                                <td>{c.get("resource").and_then(|v| v.as_str()).unwrap_or_default().to_string()}</td>
+                                                <td>{c.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string()}</td>
+                                                <td>{c.get("last_success_at").and_then(|v| v.as_str()).unwrap_or("—").to_string()}</td>
+                                                <td>{c.get("records_processed").and_then(|v| v.as_i64()).unwrap_or(0).to_string()}</td>
+                                                <td>{c.get("records_failed").and_then(|v| v.as_i64()).unwrap_or(0).to_string()}</td>
+                                                <td>{c.get("retry_count").and_then(|v| v.as_i64()).unwrap_or(0).to_string()}</td>
+                                            </tr>
+                                        }
+                                    })
+                                    .collect_view()
+                            }}
+                        </tbody>
+                    </table>
+                </Show>
+            </section>
+
+            // ── Recent runs ──
+            <section class="spp-sync-runs">
+                <h3 class="spp-sync-runs__title">"Recent runs"</h3>
+                <Show
+                    when=move || !loading.get() && status.get().get("recent_runs").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+                    fallback=move || {
+                        view! {
+                            <EmptyState message="No sync runs recorded yet." />
+                        }
+                    }
+                >
+                    <table class="spp-table">
+                        <thead>
+                            <tr>
+                                <th>"#"</th>
+                                <th>"Kind"</th>
+                                <th>"State"</th>
+                                <th>"Started"</th>
+                                <th>"Finished"</th>
+                                <th>"Records"</th>
+                                <th>"Errors"</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {move || {
+                                status.get()
+                                    .get("recent_runs")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .map(|r| {
+                                        view! {
+                                            <tr>
+                                                <td>{r.get("id").and_then(|v| v.as_i64()).unwrap_or(0).to_string()}</td>
+                                                <td>{r.get("kind").and_then(|v| v.as_str()).unwrap_or_default().to_string()}</td>
+                                                <td>{r.get("state").and_then(|v| v.as_str()).unwrap_or_default().to_string()}</td>
+                                                <td>{r.get("started_at").and_then(|v| v.as_str()).unwrap_or("—").to_string()}</td>
+                                                <td>{r.get("finished_at").and_then(|v| v.as_str()).unwrap_or("running…").to_string()}</td>
+                                                <td>{r.get("records_processed").and_then(|v| v.as_i64()).unwrap_or(0).to_string()}</td>
+                                                <td>{r.get("errors").and_then(|v| v.as_i64()).unwrap_or(0).to_string()}</td>
+                                            </tr>
+                                        }
+                                    })
+                                    .collect_view()
+                            }}
+                        </tbody>
+                    </table>
+                </Show>
+            </section>
 
             // ── Webhook push section ──
             <section class="spp-webhook-push">
@@ -150,61 +439,145 @@ pub fn SyncHealthPage() -> impl IntoView {
 
                 // State badge.
                 <div class="spp-webhook-push__state">
-                    <span class="spp-webhook-state-badge" class=move || state.get().css_class()>
-                        {move || state.get().label()}
+                    <span class="spp-webhook-state-badge" class=move || push_state.get().css_class()>
+                        {move || push_state.get().label()}
                     </span>
-                    <Show when=move || state.get().is_realtime() fallback=|| ()>
+                    <Show when=move || push_state.get().is_realtime() fallback=|| ()>
                         <span class="spp-webhook-realtime-indicator">"● Real-time"</span>
                     </Show>
                 </div>
 
-                // Registered URL (if any).
-                <Show when=move || !webhook_url.get().is_empty() fallback=|| ()>
-                    <div class="spp-webhook-push__url">
-                        <span class="spp-webhook-push__label">"Registered URL:"</span>
-                        <code>{move || webhook_url.get()}</code>
-                    </div>
-                </Show>
-
-                // Last event timestamp (if any).
-                <Show when=move || last_event.get().is_some() fallback=|| ()>
-                    <div class="spp-webhook-push__last-event">
-                        <span class="spp-webhook-push__label">"Last event received:"</span>
-                        <span>{move || last_event.get().unwrap_or_default()}</span>
-                    </div>
-                </Show>
-
-                // Actions.
-                <div class="spp-webhook-push__actions">
-                    <Show
-                        when=move || state.get() == WebhookPushState::NotConfigured || state.get() == WebhookPushState::Error
-                        fallback=|| ().into_view()
-                    >
-                        <Button on_click=move || on_register() style=ButtonStyle::Primary>
-                            "Register webhook"
-                        </Button>
-                    </Show>
-                    <Show
-                        when=move || state.get() != WebhookPushState::NotConfigured
-                        fallback=|| ().into_view()
-                    >
-                        <Button on_click=move || on_delete() style=ButtonStyle::Ghost>
-                            "Delete webhook"
-                        </Button>
-                    </Show>
+                // The registration form: URL + event checkboxes + register.
+                <div class="spp-webhook-push__form">
+                    <label class="spp-webhook-push__label" for="webhook-url-input">
+                        "Public https URL"
+                        <input
+                            id="webhook-url-input"
+                            class="spp-input"
+                            type="url"
+                            placeholder="https://your-public-host/api/webhooks/helpscout"
+                            prop:value=move || webhook_url_input.get()
+                            on:input=move |ev| webhook_url_input.set(event_target_value(&ev))
+                        />
+                    </label>
+                    <fieldset class="spp-webhook-push__events">
+                        <legend>"Events"</legend>
+                        {selected_events.get_untracked().iter().map(|(event, _)| {
+                            let event = *event;
+                            view! {
+                                <label class="spp-webhook-push__event">
+                                    <input
+                                        type="checkbox"
+                                        prop:checked=move || {
+                                            selected_events.get()
+                                                .iter()
+                                                .find(|(e, _)| *e == event)
+                                                .map(|(_, on)| *on)
+                                                .unwrap_or(false)
+                                        }
+                                        on:change=move |_| {
+                                            selected_events.update(|list| {
+                                                if let Some(entry) =
+                                                    list.iter_mut().find(|(e, _)| *e == event)
+                                                {
+                                                    entry.1 = !entry.1;
+                                                }
+                                            });
+                                        }
+                                    />
+                                    {event}
+                                </label>
+                            }
+                        }).collect_view()}
+                    </fieldset>
+                    <Button on_click=on_register style=ButtonStyle::Primary>
+                        "Register webhook"
+                    </Button>
                 </div>
 
-                // Note about polling baseline (A9: "incremental polling is always the baseline").
+                // The configured webhooks with their delete buttons.
+                <Show
+                    when=move || status.get().pointer("/webhook/configured").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+                    fallback=|| ().into_view()
+                >
+                    <div class="spp-webhook-push__configured">
+                        <span class="spp-webhook-push__label">"Registered webhooks:"</span>
+                        {move || {
+                            status.get()
+                                .pointer("/webhook/configured")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|w| {
+                                    let remote_id = w.get("remote_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                                    let url = w.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                                    view! {
+                                        <div class="spp-webhook-push__url">
+                                            <code>{url}</code>
+                                            <Button on_click=move || on_delete(remote_id) style=ButtonStyle::Ghost>
+                                "Delete"
+                            </Button>
+                                        </div>
+                                    }
+                                })
+                                .collect_view()
+                        }}
+                    </div>
+                </Show>
+
+                // Note about polling baseline (A9).
                 <p class="spp-webhook-push__polling-note">
                     "Incremental polling runs every 5 minutes regardless of webhook configuration. "
                     "Webhook push is optional and provides real-time updates when configured."
                 </p>
             </section>
 
-            // ── Sync status section ──
-            <section class="spp-sync-status">
-                <h3 class="spp-sync-status__title">"Sync status"</h3>
-                <EmptyState message="Sync status details will appear here once the first sync completes." />
+            // ── Webhook event queue ──
+            <section class="spp-sync-webhook-queue">
+                <h3 class="spp-sync-webhook-queue__title">"Webhook events"</h3>
+                <Show
+                    when=move || status.get().pointer("/webhook/recent").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+                    fallback=move || {
+                        view! {
+                            <EmptyState message="No webhook events received yet." />
+                        }
+                    }
+                >
+                    <table class="spp-table">
+                        <thead>
+                            <tr>
+                                <th>"Event"</th>
+                                <th>"Received"</th>
+                                <th>"State"</th>
+                                <th>"Attempts"</th>
+                                <th>"Error"</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {move || {
+                                status.get()
+                                    .pointer("/webhook/recent")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .map(|e| {
+                                        view! {
+                                            <tr>
+                                                <td>{e.get("event_type").and_then(|v| v.as_str()).unwrap_or_default().to_string()}</td>
+                                                <td>{e.get("received_at").and_then(|v| v.as_str()).unwrap_or("—").to_string()}</td>
+                                                <td>{e.get("processing_state").and_then(|v| v.as_str()).unwrap_or_default().to_string()}</td>
+                                                <td>{e.get("attempts").and_then(|v| v.as_i64()).unwrap_or(0).to_string()}</td>
+                                                <td>{e.get("processing_error").and_then(|v| v.as_str()).unwrap_or("—").to_string()}</td>
+                                            </tr>
+                                        }
+                                    })
+                                    .collect_view()
+                            }}
+                        </tbody>
+                    </table>
+                </Show>
             </section>
         </div>
     }
@@ -240,5 +613,31 @@ mod tests {
         assert!(!WebhookPushState::Registered.is_realtime());
         assert!(WebhookPushState::Receiving.is_realtime());
         assert!(!WebhookPushState::Error.is_realtime());
+    }
+
+    #[test]
+    fn supported_events_match_the_reference_set() {
+        assert_eq!(SUPPORTED_WEBHOOK_EVENTS.len(), 12);
+        assert!(SUPPORTED_WEBHOOK_EVENTS.contains(&"convo.created"));
+        assert!(SUPPORTED_WEBHOOK_EVENTS.contains(&"satisfaction.ratings"));
+    }
+
+    #[test]
+    fn derive_push_state_from_status_payload() {
+        // No webhook at all.
+        let s = serde_json::json!({
+            "webhook": { "events": { "total": 0 }, "configured": [] }
+        });
+        assert_eq!(derive_push_state(&s), WebhookPushState::NotConfigured);
+        // Configured but no events yet.
+        let s = serde_json::json!({
+            "webhook": { "events": { "total": 0 }, "configured": [ { "remote_id": 1 } ] }
+        });
+        assert_eq!(derive_push_state(&s), WebhookPushState::Registered);
+        // Events received.
+        let s = serde_json::json!({
+            "webhook": { "events": { "total": 5 }, "configured": [ { "remote_id": 1 } ] }
+        });
+        assert_eq!(derive_push_state(&s), WebhookPushState::Receiving);
     }
 }

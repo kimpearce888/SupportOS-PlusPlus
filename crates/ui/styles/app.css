@@ -2527,6 +2527,79 @@ body {
 .spp-incidents__card { padding: 0; overflow-x: auto; }
 .spp-incidents__card .spp-table { margin: 0; }
 
+/* UI-19: Sync Health — health cards, actions, webhook form. */
+.spp-sync-health-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--spp-space-3);
+  margin-bottom: var(--spp-space-4);
+}
+
+.spp-sync-health-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-1);
+  padding: var(--spp-space-3);
+  background: var(--spp-bg-elevated);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius);
+}
+
+.spp-sync-health-card__title {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.spp-sync-health-card__value {
+  font-size: var(--spp-text-md);
+  font-weight: 600;
+}
+
+.spp-sync-actions__row {
+  display: flex;
+  gap: var(--spp-space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--spp-space-2);
+}
+
+.spp-webhook-push__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-3);
+  margin: var(--spp-space-3) 0;
+}
+
+.spp-webhook-push__events {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spp-space-2) var(--spp-space-4);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius);
+  padding: var(--spp-space-2) var(--spp-space-3);
+}
+
+.spp-webhook-push__event {
+  font-size: var(--spp-text-xs);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spp-space-1);
+}
+
+.spp-webhook-push__configured {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-2);
+  margin: var(--spp-space-2) 0;
+}
+
+.spp-webhook-push__url {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+}
+
 .spp-incidents__title { font-size: var(--spp-text-sm); }
 
 /* The header selects (status / severity) on the detail page. */
