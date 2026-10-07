@@ -305,7 +305,9 @@ async fn graph_read_layer_parity() {
     assert_eq!(body["node"]["kind"], json!("customer"));
     assert_eq!(body["node"]["local_id"], json!(11));
     assert_eq!(body["node"]["label"], json!("Ada Lovelace"));
-    assert_eq!(body["edge_count"], json!(2));
+    // 4 edges touching Ada: belongs_to (org), involves (conversation),
+    // mentions (human), related_to (human).
+    assert_eq!(body["edge_count"], json!(4));
     // The 422s and the 404.
     let r = client
         .get(format!("{base}/api/graph/node/banana/11"))
@@ -348,25 +350,43 @@ async fn graph_read_layer_parity() {
         .await
         .expect("body");
     assert_eq!(body["node"]["label"], json!("Ada Lovelace"));
-    assert_eq!(body["total_edges"], json!(2));
+    // Derived + human: belongs_to (out, org), involves (in, conversation),
+    // mentions (out, human) and related_to (out, human).
+    assert_eq!(body["total_edges"], json!(4));
     assert_eq!(body["truncated"], json!(false));
     assert_eq!(body["notes"].as_array().unwrap().len(), 3);
     let edges = body["edges"].as_array().expect("edges");
-    assert_eq!(edges.len(), 2);
-    // Sorted by relation, then target label: mentions < related_to.
-    assert_eq!(edges[0]["relation"], json!("mentions"));
+    assert_eq!(edges.len(), 4);
+    // Sorted by relation, then target label:
+    // belongs_to < involves < mentions < related_to.
+    assert_eq!(edges[0]["relation"], json!("belongs_to"));
+    assert_eq!(edges[0]["origin"], json!("helpscout_mirror"));
     assert_eq!(edges[0]["source"]["label"], json!("Ada Lovelace"));
-    assert_eq!(edges[0]["target"]["kind"], json!("known_issue"));
+    assert_eq!(edges[0]["target"]["kind"], json!("organization"));
+    assert_eq!(edges[0]["target"]["label"], json!("Acme"));
+    assert_eq!(edges[0]["note"], json!(null));
+    assert_eq!(edges[1]["relation"], json!("involves"));
+    assert_eq!(edges[1]["origin"], json!("helpscout_mirror"));
+    // Inbound edge: the conversation is the source, Ada the target.
     assert_eq!(
-        edges[0]["target"]["label"],
+        edges[1]["source"]["label"],
+        json!("#101 Export stuck at night")
+    );
+    assert_eq!(edges[1]["target"]["label"], json!("Ada Lovelace"));
+    assert_eq!(edges[2]["relation"], json!("mentions"));
+    assert_eq!(edges[2]["source"]["label"], json!("Ada Lovelace"));
+    assert_eq!(edges[2]["target"]["kind"], json!("known_issue"));
+    assert_eq!(
+        edges[2]["target"]["label"],
         json!("Login loop after password reset")
     );
-    assert_eq!(edges[0]["origin"], json!("human_local"));
-    assert_eq!(edges[0]["note"], json!("likely cause"));
-    assert!(edges[0]["at"].is_string());
-    assert_eq!(edges[1]["relation"], json!("related_to"));
+    assert_eq!(edges[2]["origin"], json!("human_local"));
+    assert_eq!(edges[2]["note"], json!("likely cause"));
+    assert!(edges[2]["at"].is_string());
+    assert_eq!(edges[3]["relation"], json!("related_to"));
 
-    // direction=in on customer 11: no inbound edges.
+    // direction=in on customer 11: the derived involves edge from the
+    // conversation.
     let body: Value = client
         .get(format!(
             "{base}/api/graph/neighbors/customer/11?direction=in"
@@ -377,8 +397,14 @@ async fn graph_read_layer_parity() {
         .json()
         .await
         .expect("body");
-    assert_eq!(body["total_edges"], json!(0));
-    assert_eq!(body["edges"].as_array().unwrap().len(), 0);
+    assert_eq!(body["total_edges"], json!(1));
+    assert_eq!(body["edges"].as_array().unwrap().len(), 1);
+    assert_eq!(body["edges"][0]["relation"], json!("involves"));
+    assert_eq!(
+        body["edges"][0]["source"]["label"],
+        json!("#101 Export stuck at night")
+    );
+    assert_eq!(body["edges"][0]["origin"], json!("helpscout_mirror"));
 
     // The known issue has one of each direction.
     let body: Value = client
@@ -425,7 +451,7 @@ async fn graph_read_layer_parity() {
         .json()
         .await
         .expect("body");
-    assert_eq!(body["total_edges"], json!(2));
+    assert_eq!(body["total_edges"], json!(4));
     assert_eq!(body["edges"].as_array().unwrap().len(), 1);
     assert_eq!(body["truncated"], json!(true));
     assert_eq!(body["notes"].as_array().unwrap().len(), 4);
@@ -483,10 +509,13 @@ async fn graph_read_layer_parity() {
     assert_eq!(body["depth_reached"], json!(1));
     assert_eq!(body["truncated"], json!(false));
     let nodes = body["nodes"].as_array().expect("nodes");
-    assert_eq!(nodes.len(), 3);
+    // Seed + organization (belongs_to) + conversation (involves/related_to)
+    // + known issue (mentions).
+    assert_eq!(nodes.len(), 4);
     assert!(nodes.iter().any(|n| n["kind"] == json!("conversation")));
     assert!(nodes.iter().any(|n| n["kind"] == json!("known_issue")));
-    assert_eq!(body["edges"].as_array().unwrap().len(), 2);
+    assert!(nodes.iter().any(|n| n["kind"] == json!("organization")));
+    assert_eq!(body["edges"].as_array().unwrap().len(), 4);
 
     // depth=2 reaches Belle through the known issue's depends_on edge.
     let body: Value = client
@@ -499,12 +528,20 @@ async fn graph_read_layer_parity() {
         .expect("body");
     assert_eq!(body["depth_reached"], json!(2));
     let nodes = body["nodes"].as_array().expect("nodes");
-    assert_eq!(nodes.len(), 4);
+    // Depth 2 adds Belle (org belongs_to / known-issue depends_on) and the
+    // assigned agent (conversation assigned_to).
+    assert_eq!(nodes.len(), 6);
     assert!(
         nodes
             .iter()
             .any(|n| n["kind"] == json!("customer") && n["local_id"] == json!(12)),
         "Belle should be reached at depth 2"
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n["kind"] == json!("agent") && n["local_id"] == json!(7)),
+        "Dana (assignee) should be reached at depth 2"
     );
     assert_eq!(
         body["notes"][0],

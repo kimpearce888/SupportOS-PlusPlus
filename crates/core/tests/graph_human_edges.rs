@@ -367,17 +367,29 @@ async fn graph_human_edges_parity() {
     assert_eq!(resp.status().as_u16(), 200);
     let body: Value = resp.json().await.expect("neighbors body");
     assert_eq!(body["node"]["kind"], "customer");
-    // Both stored edges touch customer 9 (related_to + depends_on to the
-    // same conversation — the reference serves EDGES, not unique nodes).
-    assert_eq!(body["total_edges"], 2);
+    // Four edges touch customer 9: the two stored human edges (related_to +
+    // depends_on to the same conversation — the reference serves EDGES, not
+    // unique nodes) PLUS the derived belongs_to (organization) and involves
+    // (the conversation) edges from the GR-01 layer.
+    assert_eq!(body["total_edges"], 4);
     let edges = body["edges"].as_array().expect("edges array");
-    assert_eq!(edges.len(), 2);
-    assert_eq!(edges[0]["relation"], "depends_on");
-    assert_eq!(edges[0]["target"]["kind"], "conversation");
-    assert_eq!(edges[0]["target"]["label"], "#33 Refund please");
-    assert_eq!(edges[1]["relation"], "related_to");
-    assert_eq!(edges[1]["source"]["kind"], "customer");
-    assert_eq!(edges[0]["origin"], "human_local");
+    assert_eq!(edges.len(), 4);
+    // Sorted by (relation, target label): belongs_to < depends_on <
+    // involves < related_to.
+    assert_eq!(edges[0]["relation"], "belongs_to");
+    assert_eq!(edges[0]["origin"], "helpscout_mirror");
+    assert_eq!(edges[0]["target"]["kind"], "organization");
+    assert_eq!(edges[0]["target"]["label"], "Acme");
+    assert_eq!(edges[1]["relation"], "depends_on");
+    assert_eq!(edges[1]["target"]["kind"], "conversation");
+    assert_eq!(edges[1]["target"]["label"], "#33 Refund please");
+    assert_eq!(edges[1]["origin"], "human_local");
+    assert_eq!(edges[2]["relation"], "involves");
+    assert_eq!(edges[2]["origin"], "helpscout_mirror");
+    assert_eq!(edges[2]["source"]["kind"], "conversation");
+    assert_eq!(edges[2]["target"]["kind"], "customer");
+    assert_eq!(edges[3]["relation"], "related_to");
+    assert_eq!(edges[3]["source"]["kind"], "customer");
 
     // The target side serves the incoming edge too.
     let resp = client
@@ -403,8 +415,17 @@ async fn graph_human_edges_parity() {
     let nodes = body["nodes"].as_array().expect("nodes array");
     assert_eq!(nodes[0]["label"], "Ada Lovelace", "center first");
     let edges = body["edges"].as_array().expect("edges array");
-    assert_eq!(edges.len(), 2, "both outgoing human edges");
-    assert_eq!(edges[0]["origin"], "human_local");
+    // Two human edges + the derived belongs_to and involves.
+    assert_eq!(edges.len(), 4, "human + derived edges");
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|e| e["origin"] == "human_local")
+            .count(),
+        2,
+        "both outgoing human edges"
+    );
+    assert_eq!(edges[0]["origin"], "helpscout_mirror");
 
     // stats counts the human-edge store (the reference per-kind shape).
     let resp = client
@@ -467,19 +488,31 @@ async fn graph_human_edges_parity() {
     let body: Value = resp.json().await.expect("body");
     assert_eq!(body["total"], 2);
 
-    // The neighbors view reflects the removal.
+    // The neighbors view reflects the removal: the depends_on edge remains,
+    // alongside the derived belongs_to + involves edges.
     let resp = client
         .get(format!("{base}/api/graph/neighbors/customer/9"))
         .send()
         .await
         .expect("neighbors after delete");
     let body: Value = resp.json().await.expect("body");
-    // The depends_on edge still links the pair.
-    assert_eq!(body["total_edges"], 1);
+    let edges = body["edges"].as_array().expect("edges array");
     assert_eq!(
-        body["edges"].as_array().map(Vec::len),
-        Some(1),
+        edges
+            .iter()
+            .filter(|e| e["relation"] == "depends_on")
+            .count(),
+        1,
         "the depends_on edge remains"
     );
-    assert_eq!(body["edges"][0]["relation"], "depends_on");
+    assert_eq!(
+        edges
+            .iter()
+            .filter(|e| e["relation"] == "related_to")
+            .count(),
+        0,
+        "the removed edge is gone"
+    );
+    assert_eq!(edges.len(), 3);
+    assert_eq!(body["total_edges"], 3);
 }
