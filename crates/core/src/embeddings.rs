@@ -482,7 +482,10 @@ pub fn chunk_conversation(conn: &Connection, conversation_id: i64) -> Result<()>
     Ok(())
 }
 
-/// Chunk-table stats — reference `conversationChunkStats()`.
+/// Chunk-table stats (reference `conversationChunkStats` /
+/// `docsEmbeddingStats`): total chunks, embedded (`indexed`), waiting
+/// (`not_indexed`/`queued`) and `failed`. The hybrid search routes gate
+/// their semantic layer on `indexed > 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConversationChunkStats {
     pub chunks: usize,
@@ -541,6 +544,88 @@ pub struct ConversationChunkWithEmbedding {
     pub content: String,
     /// Decoded Float32 little-endian embedding.
     pub embedding: Vec<f32>,
+}
+
+/// A docs chunk with its stored local embedding — the no-Qdrant fallback
+/// scan input (reference `listDocChunksWithEmbedding` row).
+#[derive(Debug, Clone)]
+pub struct DocChunkWithEmbedding {
+    pub article_id: i64,
+    pub content: String,
+    /// Decoded Float32 little-endian embedding.
+    pub embedding: Vec<f32>,
+}
+
+/// All docs chunks with a stored local embedding (the no-Qdrant fallback
+/// scan, reference `listDocChunksWithEmbedding`), bounded to 2000 rows like
+/// the reference.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the query fails.
+pub fn list_doc_chunks_with_embedding(conn: &Connection) -> Result<Vec<DocChunkWithEmbedding>> {
+    let mut stmt = conn.prepare(
+        "SELECT article_id, content, embedding FROM docs_chunks
+          WHERE embedding IS NOT NULL AND embedding_state = 'indexed'
+          LIMIT 2000",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .map(|(article_id, content, blob)| DocChunkWithEmbedding {
+            article_id,
+            content,
+            embedding: decode_f32_le(&blob),
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// Stats over `docs_chunks` (reference `docsEmbeddingStats`): total chunks,
+/// embedded (`indexed`), waiting (`not_indexed`/`queued`) and `failed`. The
+/// docs search route gates its semantic layer on `indexed > 0`.
+///
+/// # Errors
+///
+/// Returns `Error::Sqlite` if the query fails (e.g. the table is missing).
+pub fn docs_chunk_stats(conn: &Connection) -> Result<ConversationChunkStats> {
+    let row = conn.query_row(
+        "SELECT COUNT(*) AS chunks,
+           SUM(CASE WHEN embedding_state = 'indexed' THEN 1 ELSE 0 END) AS indexed,
+           SUM(CASE WHEN embedding_state IN ('not_indexed', 'queued') THEN 1 ELSE 0 END) AS pending,
+           SUM(CASE WHEN embedding_state = 'failed' THEN 1 ELSE 0 END) AS failed
+         FROM docs_chunks",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<i64>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        },
+    );
+    let (chunks, indexed, pending, failed) = match row {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => (0, None, None, None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(ConversationChunkStats {
+        chunks: usize::try_from(chunks).unwrap_or(0),
+        indexed: indexed
+            .map(|n| usize::try_from(n).unwrap_or(0))
+            .unwrap_or(0),
+        pending: pending
+            .map(|n| usize::try_from(n).unwrap_or(0))
+            .unwrap_or(0),
+        failed: failed.map(|n| usize::try_from(n).unwrap_or(0)).unwrap_or(0),
+    })
 }
 
 /// All ticket chunks with a stored local embedding (the no-Qdrant fallback

@@ -390,12 +390,22 @@ fn upsert_user_status(
 }
 
 fn upsert_doc_collection(conn: &Connection, c: &crate::helpscout::HsDocCollection) -> Result<i64> {
+    // Reference upsertCollection: the full column set (visibility +
+    // article_count come with the Docs API key's mirror).
     conn.execute(
-        "INSERT INTO docs_collections (remote_id, slug, name, last_synced_at)
-         VALUES (?1, ?2, ?3, datetime('now'))
+        "INSERT INTO docs_collections (remote_id, slug, name, description, visibility, article_count, last_synced_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
          ON CONFLICT(remote_id) DO UPDATE SET slug = excluded.slug, name = excluded.name,
-           last_synced_at = datetime('now')",
-        params![c.remote_id, c.slug, c.name],
+           description = excluded.description, visibility = excluded.visibility,
+           article_count = excluded.article_count, last_synced_at = datetime('now')",
+        params![
+            c.remote_id,
+            c.slug,
+            c.name,
+            c.description,
+            c.visibility,
+            c.article_count
+        ],
     )?;
     local_id(conn, "docs_collections", c.remote_id)
         .ok_or_else(|| Error::Other("docs_collections upsert lost its row".into()))
@@ -418,20 +428,143 @@ fn upsert_doc_categories(
     Ok(())
 }
 
+/// Reference `upsertArticle` (docsRepo.ts:52-87), adapted to the port's
+/// `docs` table (renamed from `docs_articles`, DB-04): category remote ->
+/// local resolution, preview/words derived from the text, and the v1.6.0
+/// audit fix — re-chunking + FTS reindex gated on a content hash so
+/// byte-identical incremental syncs never destroy stored embeddings.
+/// Metadata columns (number, status, views, collection, category) still
+/// update every pass.
 fn upsert_doc_article(
-    conn: &Connection,
+    conn: &mut Connection,
     a: &crate::helpscout::HsDocArticle,
     collection_local: i64,
 ) -> Result<()> {
+    // Reference: `a.categoryId ? SELECT id FROM docs_categories WHERE
+    // remote_id = ? : null`.
+    let category_local = a
+        .category_id
+        .and_then(|cid| local_id(conn, "docs_categories", cid));
+    // Reference: `preview = a.preview ?? (a.text ? text.replace(/\s+/g, ' ')
+    // .slice(0, 220) : null)` — the provider carries no preview field, so it
+    // is always derived from the text here (UTF-16 slice, like JS).
+    let preview = a.text.as_deref().filter(|t| !t.is_empty()).map(|t| {
+        let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        crate::embeddings::utf16_slice(&collapsed, 0, 220)
+    });
+    // Reference: `words = a.text ? text.split(/\s+/).filter(Boolean).length
+    // : null` (null only when the text is absent/empty).
+    let words = a
+        .text
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| i64::try_from(t.split_whitespace().count()).unwrap_or(0));
+    // Reference chunk source: `a.text ? `${a.name}\n\n${a.text}` : a.name`;
+    // the content hash gates re-chunking + FTS reindex.
+    let chunk_source = match a.text.as_deref().filter(|t| !t.is_empty()) {
+        Some(t) => format!("{}\n\n{}", a.name, t),
+        None => a.name.clone(),
+    };
+    let content_hash = crate::embeddings::content_hash(&chunk_source);
+    let existing: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT id, content_hash FROM docs WHERE remote_id = ?1",
+            params![a.remote_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let content_changed = match &existing {
+        Some((_, Some(prev_hash))) => *prev_hash != content_hash,
+        _ => true,
+    };
     conn.execute(
-        "INSERT INTO docs (remote_id, collection_local_id, slug, name, text, remote_created_at, remote_updated_at, last_synced_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+        "INSERT INTO docs (remote_id, collection_local_id, category_local_id, number, slug, name, status, preview, text, views, words, remote_created_at, remote_updated_at, last_synced_at, content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now'), ?14)
          ON CONFLICT(remote_id) DO UPDATE SET collection_local_id = excluded.collection_local_id,
-           slug = excluded.slug, name = excluded.name, text = excluded.text,
-           remote_created_at = excluded.remote_created_at, remote_updated_at = excluded.remote_updated_at,
-           last_synced_at = datetime('now')",
-        params![a.remote_id, collection_local, a.slug, a.name, a.text, a.created_at, a.updated_at],
+           category_local_id = excluded.category_local_id, number = excluded.number,
+           slug = excluded.slug, name = excluded.name, status = excluded.status,
+           preview = excluded.preview, text = excluded.text, views = excluded.views,
+           words = excluded.words, remote_created_at = excluded.remote_created_at,
+           remote_updated_at = excluded.remote_updated_at, last_synced_at = datetime('now'),
+           content_hash = excluded.content_hash",
+        params![
+            a.remote_id,
+            collection_local,
+            category_local,
+            a.number,
+            a.slug,
+            a.name,
+            a.status,
+            preview,
+            a.text,
+            a.views,
+            words,
+            a.created_at,
+            a.updated_at,
+            content_hash
+        ],
     )?;
+    if content_changed {
+        let id = match existing {
+            Some((id, _)) => id,
+            None => local_id(conn, "docs", a.remote_id)
+                .ok_or_else(|| Error::Other("docs article upsert lost its row".into()))?,
+        };
+        reindex_doc_fts(conn, id, &a.name, a.text.as_deref())?;
+        rechunk_doc_article(conn, id, &a.name, a.text.as_deref())?;
+    }
+    Ok(())
+}
+
+/// Reference `reindexArticleFts`: delete+insert into `docs_fts`
+/// (`text ?? ''` for the null case).
+fn reindex_doc_fts(
+    conn: &mut Connection,
+    article_id: i64,
+    name: &str,
+    text: Option<&str>,
+) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM docs_fts WHERE article_id = ?1",
+        params![article_id],
+    )?;
+    tx.execute(
+        "INSERT INTO docs_fts (name, text, article_id) VALUES (?1, ?2, ?3)",
+        params![name, text.unwrap_or(""), article_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Reference `rechunkArticle` (v1.4.0): (re)chunk an article for semantic
+/// search — delete+insert in a transaction, resetting the embedding state
+/// (content changes invalidate previous embeddings). No text, no chunks.
+fn rechunk_doc_article(
+    conn: &mut Connection,
+    article_id: i64,
+    name: &str,
+    text: Option<&str>,
+) -> Result<()> {
+    // Reference: chunkText(`${title}\n\n${text}`, 1200, 150) — only when a
+    // non-empty text exists.
+    let chunks = match text.filter(|t| !t.is_empty()) {
+        Some(t) => crate::embeddings::chunk_text(&format!("{name}\n\n{t}"), 1200, 150),
+        None => Vec::new(),
+    };
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM docs_chunks WHERE article_id = ?1",
+        params![article_id],
+    )?;
+    for (i, content) in chunks.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO docs_chunks (article_id, chunk_index, content, chunk_version)
+             VALUES (?1, ?2, ?3, 2)",
+            params![article_id, i64::try_from(i).unwrap_or(0), content],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1624,10 +1757,10 @@ impl SyncEngine {
                 };
                 for col_remote in collections {
                     let articles = self.provider.list_doc_articles(col_remote).await?;
-                    let conn = self.lock();
+                    let mut conn = self.lock();
                     if let Some(col_local) = local_id(&conn, "docs_collections", col_remote) {
                         for a in &articles {
-                            upsert_doc_article(&conn, a, col_local)?;
+                            upsert_doc_article(&mut conn, a, col_local)?;
                             processed += 1;
                         }
                     }
@@ -2520,5 +2653,248 @@ mod tests {
             )
             .unwrap();
         assert!(with_emails >= 5, "customers with emails: {with_emails}");
+    }
+
+    // ---- DC-01: docs mirror upserts (reference docsRepo.ts) ---------------
+
+    use crate::helpscout::{HsDocArticle, HsDocCategory, HsDocCollection};
+
+    fn seed_docs_mirror(conn: &mut Connection) -> i64 {
+        let collection = upsert_doc_collection(
+            conn,
+            &HsDocCollection {
+                remote_id: 901,
+                slug: Some("kb".into()),
+                name: "Knowledge Base".into(),
+                description: Some("Everything users ask".into()),
+                visibility: Some("public".into()),
+                article_count: Some(2),
+            },
+        )
+        .unwrap();
+        upsert_doc_categories(
+            conn,
+            collection,
+            &[HsDocCategory {
+                remote_id: 951,
+                collection_id: 901,
+                slug: Some("basics".into()),
+                name: "Basics".into(),
+                sort_order: Some(1),
+            }],
+        )
+        .unwrap();
+        collection
+    }
+
+    fn article(remote_id: i64, name: &str, text: &str) -> HsDocArticle {
+        HsDocArticle {
+            remote_id,
+            collection_id: 901,
+            category_id: Some(951),
+            number: Some(42),
+            slug: Some("kb-article".into()),
+            name: name.into(),
+            status: Some("published".into()),
+            text: Some(text.into()),
+            views: Some(7),
+            created_at: Some("2026-10-01T10:00:00Z".into()),
+            updated_at: Some("2026-10-02T10:00:00Z".into()),
+        }
+    }
+
+    #[test]
+    fn doc_collection_upsert_writes_the_full_reference_column_set() {
+        let mut conn = fresh_conn();
+        let id = seed_docs_mirror(&mut conn);
+        let (slug, description, visibility, article_count): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT slug, description, visibility, article_count
+                   FROM docs_collections WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(slug.as_deref(), Some("kb"));
+        assert_eq!(description.as_deref(), Some("Everything users ask"));
+        assert_eq!(visibility.as_deref(), Some("public"));
+        assert_eq!(article_count, Some(2));
+        // Re-upsert with changed metadata updates it (no duplicate row).
+        upsert_doc_collection(
+            &conn,
+            &HsDocCollection {
+                remote_id: 901,
+                slug: Some("kb2".into()),
+                name: "Knowledge Base".into(),
+                description: None,
+                visibility: Some("private".into()),
+                article_count: Some(3),
+            },
+        )
+        .unwrap();
+        let (count, visibility): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(visibility) FROM docs_collections",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(visibility.as_deref(), Some("private"));
+    }
+
+    #[test]
+    fn doc_article_upsert_writes_derived_fields_and_chunks_and_fts() {
+        let mut conn = fresh_conn();
+        let collection = seed_docs_mirror(&mut conn);
+        let text = "To invite teammates, open Settings and click Team.  Roles decide access.";
+        upsert_doc_article(
+            &mut conn,
+            &article(9101, "Inviting teammates", text),
+            collection,
+        )
+        .unwrap();
+        let scalar = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+        let text_of =
+            |sql: &str| -> Option<String> { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(None) };
+        let id: i64 = conn
+            .query_row("SELECT id FROM docs WHERE remote_id = 9101", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Category remote -> local resolution: the article points at the
+        // LOCAL id of the category with remote_id 951.
+        assert_eq!(
+            scalar("SELECT COALESCE(category_local_id, 0) FROM docs WHERE remote_id = 9101"),
+            scalar("SELECT id FROM docs_categories WHERE remote_id = 951"),
+            "category remote id must resolve to its local id"
+        );
+        assert_eq!(scalar("SELECT number FROM docs WHERE remote_id = 9101"), 42);
+        assert_eq!(
+            scalar("SELECT COALESCE(views, 0) FROM docs WHERE remote_id = 9101"),
+            7
+        );
+        assert_eq!(
+            text_of("SELECT status FROM docs WHERE remote_id = 9101").as_deref(),
+            Some("published")
+        );
+        // words: whitespace-split token count of the text.
+        assert_eq!(
+            scalar("SELECT COALESCE(words, 0) FROM docs WHERE remote_id = 9101"),
+            11
+        );
+        // preview: whitespace-collapsed text, UTF-16-capped at 220.
+        assert_eq!(
+            text_of("SELECT preview FROM docs WHERE remote_id = 9101").as_deref(),
+            Some("To invite teammates, open Settings and click Team. Roles decide access.")
+        );
+        // The text is short enough for one chunk; the FTS mirror has one row.
+        assert_eq!(
+            scalar("SELECT COUNT(*) FROM docs_chunks WHERE article_id = (SELECT id FROM docs WHERE remote_id = 9101)"),
+            1
+        );
+        assert_eq!(
+            scalar("SELECT COUNT(*) FROM docs_fts WHERE article_id = (SELECT id FROM docs WHERE remote_id = 9101)"),
+            1
+        );
+        // The chunk content is the reference `title\n\ntext` source with
+        // whitespace runs collapsed (chunkText's /\s+/g -> ' ').
+        let chunk_content: String = conn
+            .query_row(
+                "SELECT content FROM docs_chunks WHERE article_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            chunk_content.starts_with("Inviting teammates To invite teammates"),
+            "chunk content: {chunk_content:?}"
+        );
+    }
+
+    #[test]
+    fn doc_article_rechunk_is_gated_on_the_content_hash() {
+        let mut conn = fresh_conn();
+        let collection = seed_docs_mirror(&mut conn);
+        upsert_doc_article(
+            &mut conn,
+            &article(9102, "VAT numbers", "Add your VAT number under Billing."),
+            collection,
+        )
+        .unwrap();
+        let id: i64 = conn
+            .query_row("SELECT id FROM docs WHERE remote_id = 9102", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Simulate the embedding job having indexed the chunk.
+        conn.execute(
+            "UPDATE docs_chunks SET embedding_state = 'indexed', embedding_model = 'm',
+                    embedding = X'0000803F' WHERE article_id = ?1",
+            params![id],
+        )
+        .unwrap();
+        // Byte-identical re-sync: metadata updates, chunks stay untouched
+        // (the v1.6.0 audit fix — stored embeddings survive).
+        let mut same = article(9102, "VAT numbers", "Add your VAT number under Billing.");
+        same.views = Some(99);
+        upsert_doc_article(&mut conn, &same, collection).unwrap();
+        let (state, views, count): (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT (SELECT embedding_state FROM docs_chunks WHERE article_id = ?1),
+                        (SELECT views FROM docs WHERE id = ?1),
+                        (SELECT COUNT(*) FROM docs_chunks WHERE article_id = ?1)",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "indexed", "identical content must not rechunk");
+        assert_eq!(views, Some(99), "metadata columns still update");
+        assert_eq!(count, 1);
+        // Content change: chunks are rebuilt and reset to not_indexed.
+        upsert_doc_article(
+            &mut conn,
+            &article(9102, "VAT numbers", "UPDATED body — content changed."),
+            collection,
+        )
+        .unwrap();
+        let (state, count): (String, i64) = conn
+            .query_row(
+                "SELECT embedding_state, COUNT(*) FROM docs_chunks WHERE article_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "not_indexed", "content change must rechunk");
+        assert!(count >= 1);
+    }
+
+    #[test]
+    fn doc_article_without_text_lands_no_chunks() {
+        let mut conn = fresh_conn();
+        let collection = seed_docs_mirror(&mut conn);
+        let mut no_text = article(9103, "Title only", "");
+        no_text.text = None;
+        upsert_doc_article(&mut conn, &no_text, collection).unwrap();
+        let (chunks, fts_rows, words, preview): (i64, i64, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM docs_chunks WHERE article_id = d.id),
+                        (SELECT COUNT(*) FROM docs_fts WHERE article_id = d.id),
+                        d.words, d.preview
+                   FROM docs d WHERE d.remote_id = 9103",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        // Reference rechunkArticle: no text -> no chunks; preview/words null.
+        assert_eq!(chunks, 0);
+        assert_eq!(fts_rows, 1, "FTS still indexes the name (text ?? '')");
+        assert!(words.is_none());
+        assert!(preview.is_none());
     }
 }

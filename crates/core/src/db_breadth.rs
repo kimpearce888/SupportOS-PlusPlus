@@ -705,6 +705,11 @@ fn add_missing_reference_columns(conn: &Connection) -> Result<()> {
     add(conn, "docs", "words", "INTEGER")?;
     add(conn, "docs", "content_hash", "TEXT")?;
 
+    // ---- docs_collections (007; the reference upserts visibility +
+    // article_count, which the port's reduced mirror lacked) ----
+    add(conn, "docs_collections", "visibility", "TEXT")?;
+    add(conn, "docs_collections", "article_count", "INTEGER")?;
+
     // ---- docs_chunks / conversation_chunks (010 embedding retry cap) ----
     add(
         conn,
