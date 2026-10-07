@@ -49,7 +49,7 @@ pub fn SupportGraphPage() -> impl IntoView {
                 match crate::api::get_json::<serde_json::Value>(&path).await {
                     Ok(data) => {
                         neighbors.set(
-                            data.get("neighbors")
+                            data.get("edges")
                                 .and_then(|v| v.as_array())
                                 .cloned()
                                 .unwrap_or_default(),
@@ -102,7 +102,7 @@ pub fn SupportGraphPage() -> impl IntoView {
                             <ul class="spp-graph__node-list">
                                 {move || nodes.with(|items| {
                                     items.iter().map(|n| {
-                                        let id = n.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                                        let id = n.get("local_id").and_then(|v| v.as_i64()).unwrap_or(0);
                                         let kind = n.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                         let label = n.get("label").and_then(|v| v.as_str()).unwrap_or("(no label)").to_string();
                                         let kind_for_click = kind.clone();
@@ -149,13 +149,18 @@ pub fn SupportGraphPage() -> impl IntoView {
                                 <ul class="spp-graph__neighbor-list">
                                     {move || neighbors.with(|items| {
                                         items.iter().map(|n| {
-                                            let id = n.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                                            let kind = n.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                            let label = n.get("label").and_then(|v| v.as_str()).unwrap_or("(no label)").to_string();
+                                            // The neighbor is the far endpoint of each edge
+                                            // (the center node is one of source/target).
+                                            let far = n.get("target").unwrap_or(n);
+                                            let id = far.get("local_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                                            let kind = far.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let label = far.get("label").and_then(|v| v.as_str()).unwrap_or("(no label)").to_string();
+                                            let relation = n.get("relation").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                             view! {
                                                 <li class="spp-graph__neighbor">
                                                     <span class="spp-badge">{kind}</span>
                                                     <span class="spp-graph__neighbor-label">{label}</span>
+                                                    <span class="spp-badge spp-badge--status">{relation}</span>
                                                     <span class="spp-graph__neighbor-id">{"#"}{id.to_string()}</span>
                                                 </li>
                                             }

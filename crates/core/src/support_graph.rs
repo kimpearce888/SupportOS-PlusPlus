@@ -691,6 +691,531 @@ pub fn validate_link_body(
 }
 
 // ---------------------------------------------------------------------------
+// GR-03: the read layer (reference graphService stats / search /
+// neighbors / subgraph, ported to the port's documented renames)
+
+/// Bounded neighbor serving (reference shared/graph.ts:154).
+pub const GRAPH_MAX_NEIGHBOR_EDGES: usize = 200;
+/// BFS node cap (shared/graph.ts:155).
+pub const GRAPH_MAX_SUBGRAPH_NODES: usize = 250;
+/// BFS depth cap (shared/graph.ts:156).
+pub const GRAPH_MAX_SUBGRAPH_DEPTH: u32 = 2;
+/// Per-kind search cap (shared/graph.ts:157).
+pub const GRAPH_MAX_SEARCH_PER_KIND: usize = 10;
+/// Total search cap (graphService.ts:803).
+pub const GRAPH_MAX_SEARCH_TOTAL: usize = 80;
+
+/// The reference kind labels (shared/graph.ts GRAPH_NODE_KIND_LABELS).
+fn kind_label(kind: GraphNodeKind) -> &'static str {
+    match kind {
+        GraphNodeKind::Customer => "Customer",
+        GraphNodeKind::Organization => "Organization",
+        GraphNodeKind::Conversation => "Conversation",
+        GraphNodeKind::KnownIssue => "Known issue",
+        GraphNodeKind::IssueCluster => "Issue cluster",
+        GraphNodeKind::Incident => "Incident",
+        GraphNodeKind::KnowledgeDocument => "Knowledge document",
+        GraphNodeKind::Agent => "Agent",
+        GraphNodeKind::Campaign => "Campaign",
+        GraphNodeKind::Product => "Product",
+        GraphNodeKind::CustomObject => "Custom object",
+        GraphNodeKind::ConnectorData => "Connector row",
+    }
+}
+
+/// `stats()` — live counts over the local mirror (reference
+/// graphService.ts:672-724): per-kind node counts and per-relation edge
+/// counts (origin labeled), plus the human-edge total. Port renames:
+/// known_issue_conversations→known_issue_links,
+/// issue_cluster_conversations→issue_cluster_members,
+/// knowledge_candidates→knowledge_gap_candidates,
+/// support_graph_edges→graph_edges, customer_local_id→customer_id,
+/// assignee_local_id→assignee_id (DB-04).
+pub fn graph_stats(conn: &Connection) -> Result<Value> {
+    let count = |sql: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) AS n FROM ({sql})"), [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0)
+    };
+    let node_specs: [(&str, &str); 12] = [
+        (
+            "customer",
+            "SELECT id FROM customers WHERE deleted_at IS NULL",
+        ),
+        (
+            "organization",
+            "SELECT id FROM organizations WHERE deleted_at IS NULL",
+        ),
+        (
+            "conversation",
+            "SELECT id FROM conversations WHERE deleted_at IS NULL",
+        ),
+        ("known_issue", "SELECT id FROM known_issues"),
+        ("issue_cluster", "SELECT id FROM issue_clusters"),
+        ("incident", "SELECT id FROM incidents"),
+        ("knowledge_document", "SELECT id FROM knowledge_documents"),
+        ("agent", "SELECT id FROM users WHERE deleted_at IS NULL"),
+        ("campaign", "SELECT id FROM outreach_campaigns"),
+        ("product", "SELECT id FROM products"),
+        (
+            "custom_object",
+            "SELECT id FROM custom_objects WHERE deleted_at IS NULL",
+        ),
+        ("connector_data", "SELECT id FROM connector_rows"),
+    ];
+    let nodes: Vec<Value> = node_specs
+        .iter()
+        .map(|(kind, sql)| {
+            let kind = GraphNodeKind::ALL
+                .into_iter()
+                .find(|k| k.as_str() == *kind)
+                .expect("12 kinds");
+            json!({"kind": kind.as_str(), "label": kind_label(kind), "count": count(sql)})
+        })
+        .collect();
+    let edge_specs: [(&str, &str, &str); 18] = [
+        ("belongs_to", "helpscout_mirror", "SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id"),
+        ("involves", "helpscout_mirror", "SELECT 1 FROM conversations c WHERE c.customer_id IS NOT NULL AND c.deleted_at IS NULL"),
+        ("assigned_to", "helpscout_mirror", "SELECT 1 FROM conversations c WHERE c.assignee_id IS NOT NULL AND c.deleted_at IS NULL"),
+        ("owns", "helpscout_mirror", "SELECT 1 FROM incidents i WHERE i.owner_user_local_id IS NOT NULL"),
+        ("linked_to_issue", "ai_derived", "SELECT 1 FROM known_issue_links"),
+        ("clustered_into", "deterministic_local", "SELECT 1 FROM issue_cluster_members"),
+        ("promoted_to_issue", "helpscout_mirror", "SELECT 1 FROM issue_clusters WHERE known_issue_id IS NOT NULL"),
+        ("affected_by", "deterministic_local", "SELECT 1 FROM incident_conversations"),
+        ("related_to", "human_local", "SELECT 1 FROM incident_related"),
+        ("linked_to", "human_local", "SELECT 1 FROM custom_object_links"),
+        ("sent_to", "helpscout_mirror", "SELECT 1 FROM outreach_recipients"),
+        ("generated_conversation", "helpscout_mirror", "SELECT 1 FROM outreach_recipients WHERE hs_conversation_remote_id IS NOT NULL"),
+        ("cites", "ai_derived", "SELECT 1 FROM ai_sources s JOIN ai_runs r ON r.id = s.run_id WHERE s.source_type = 'knowledge_document' AND r.conversation_id IS NOT NULL"),
+        ("collaborated_on", "human_local", "SELECT 1 FROM side_thread_participants stp JOIN side_threads st ON st.id = stp.side_thread_id"),
+        ("about_product", "deterministic_local", "SELECT 1 FROM (SELECT 1 FROM incidents WHERE product IS NOT NULL AND TRIM(product) != '' UNION ALL SELECT 1 FROM known_issues WHERE product IS NOT NULL AND TRIM(product) != '' UNION ALL SELECT 1 FROM issue_clusters WHERE product IS NOT NULL AND TRIM(product) != '')"),
+        ("about_product", "ai_derived", "SELECT 1 FROM ai_attributes WHERE attribute = 'product' AND superseded_at IS NULL AND value_type = 'text'"),
+        ("gap_evidence", "deterministic_local", "SELECT 1 FROM knowledge_gap_candidates WHERE related_document_ids NOT IN ('[]', '')"),
+        ("human_edge", "human_local", "SELECT 1 FROM graph_edges"),
+    ];
+    let edges: Vec<Value> = edge_specs
+        .iter()
+        .map(|(relation, origin, sql)| {
+            json!({"relation": relation, "origin": origin, "count": count(sql)})
+        })
+        .collect();
+    Ok(json!({
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "nodes": nodes,
+        "edges": edges,
+        "human_edges": count("SELECT 1 FROM graph_edges"),
+        "notes": [
+            "Counts are live counts over the local mirror - no denormalized totals that could go stale.",
+            "Connector rows carry no derived edges by design (rows are keyed only by row_key); humans can link them explicitly.",
+            "linked_to_issue edges aggregate the human and AI link provenance stored per row."
+        ]
+    }))
+}
+
+/// Escape LIKE metacharacters (the reference's `escapeLike`).
+fn escape_like(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for ch in v.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// `search(query, kinds)` — LIKE-escaped bounded search across node labels
+/// (reference graphService.ts:727-812): per-kind capped at 10, 80 total,
+/// every branch a constant SQL string with the value as the only bound
+/// parameter. Port adaptations: known-issue/cluster labels read
+/// COALESCE(title, name) (the M015/M016 tables), and the incident label
+/// tolerates the guarded NULL code/title columns.
+pub fn graph_search(
+    conn: &Connection,
+    query: &str,
+    kinds: Option<&[GraphNodeKind]>,
+) -> Result<Vec<Value>> {
+    let q: String = query.trim().chars().take(120).collect();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let like = format!("%{}%", escape_like(&q));
+    // The conversation branch also matches the exact number (JS:
+    // `Number.isInteger(Number(q)) ? Number(q) : -1`).
+    let number: i64 = q.parse::<i64>().unwrap_or(-1);
+    let wanted: Vec<GraphNodeKind> = match kinds {
+        Some(list) => list.to_vec(),
+        None => GraphNodeKind::ALL.to_vec(),
+    };
+    let per_kind = GRAPH_MAX_SEARCH_PER_KIND;
+    let customer_label =
+        "COALESCE(NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), ''), 'Customer #' || cu.id)";
+    let user_label =
+        "COALESCE(NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), ''), 'User #' || u.id)";
+    let conversation_label =
+        "'#' || c.number || ' ' || COALESCE(SUBSTR(c.subject, 1, 100), '(no subject)')";
+    let incident_label =
+        "COALESCE(i.code, 'INC') || ' ' || COALESCE(i.title, 'Incident #' || i.id)";
+    let mut results: Vec<Value> = Vec::new();
+    for kind in wanted {
+        if results.len() >= GRAPH_MAX_SEARCH_TOTAL {
+            break;
+        }
+        let (sql, number_bound) = match kind {
+            GraphNodeKind::Conversation => (
+                format!(
+                    "SELECT c.id, {conversation_label} label, c.status sublabel, (c.deleted_at IS NOT NULL) deleted
+                       FROM conversations c
+                      WHERE (c.number = ?1 OR c.subject LIKE ?2 ESCAPE '\\') AND c.deleted_at IS NULL
+                      LIMIT {per_kind}"
+                ),
+                true,
+            ),
+            GraphNodeKind::Customer => (
+                format!(
+                    "SELECT cu.id, {customer_label} label, NULL sublabel, (cu.deleted_at IS NOT NULL) deleted
+                       FROM customers cu
+                      WHERE ({customer_label} LIKE ?1 ESCAPE '\\' OR cu.last_name LIKE ?1 ESCAPE '\\')
+                        AND cu.deleted_at IS NULL
+                      LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::Organization => (
+                format!(
+                    "SELECT o.id, o.name label, o.domains sublabel, (o.deleted_at IS NOT NULL) deleted
+                       FROM organizations o WHERE o.name LIKE ?1 ESCAPE '\\' LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::KnownIssue => (
+                format!(
+                    "SELECT ki.id, COALESCE(ki.title, ki.name) label, ki.status sublabel, 0 deleted
+                       FROM known_issues ki WHERE COALESCE(ki.title, ki.name) LIKE ?1 ESCAPE '\\' LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::IssueCluster => (
+                format!(
+                    "SELECT ic.id, COALESCE(ic.title, ic.name) label, 'cluster' sublabel, 0 deleted
+                       FROM issue_clusters ic WHERE COALESCE(ic.title, ic.name) LIKE ?1 ESCAPE '\\' LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::Incident => (
+                format!(
+                    "SELECT i.id, {incident_label} label, i.status sublabel, 0 deleted
+                       FROM incidents i WHERE (i.title LIKE ?1 ESCAPE '\\' OR i.code LIKE ?1 ESCAPE '\\') LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::KnowledgeDocument => (
+                format!(
+                    "SELECT kd.id, kd.title label, kd.visibility sublabel, 0 deleted
+                       FROM knowledge_documents kd WHERE kd.title LIKE ?1 ESCAPE '\\' LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::Agent => (
+                format!(
+                    "SELECT u.id, {user_label} label, u.email sublabel, (u.deleted_at IS NOT NULL) deleted
+                       FROM users u WHERE ({user_label} LIKE ?1 ESCAPE '\\' OR u.email LIKE ?1 ESCAPE '\\') LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::Campaign => (
+                format!(
+                    "SELECT oc.id, oc.name label, oc.status sublabel, 0 deleted
+                       FROM outreach_campaigns oc WHERE oc.name LIKE ?1 ESCAPE '\\' LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::Product => (
+                format!(
+                    "SELECT p.id, p.name label, p.description sublabel, 0 deleted
+                       FROM products p WHERE p.name LIKE ?1 ESCAPE '\\' LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::CustomObject => (
+                format!(
+                    "SELECT co.id, co.title label, cot.name sublabel, (co.deleted_at IS NOT NULL) deleted
+                       FROM custom_objects co JOIN custom_object_types cot ON cot.id = co.type_id
+                      WHERE co.title LIKE ?1 ESCAPE '\\' AND co.deleted_at IS NULL LIMIT {per_kind}"
+                ),
+                false,
+            ),
+            GraphNodeKind::ConnectorData => (
+                format!(
+                    "SELECT cr.id, 'row ' || cr.row_key label, cn.name sublabel, 0 deleted
+                       FROM connector_rows cr JOIN connectors cn ON cn.id = cr.connector_id
+                      WHERE cr.row_key LIKE ?1 ESCAPE '\\' LIMIT {per_kind}"
+                ),
+                false,
+            ),
+        };
+        let rows: Vec<Value> = conn
+            .prepare(&sql)
+            .and_then(|mut stmt| {
+                let rows: Vec<rusqlite::Result<Value>> = if number_bound {
+                    stmt.query_map(params![number, like], map_search_row(kind))?
+                        .collect()
+                } else {
+                    stmt.query_map(params![like], map_search_row(kind))?
+                        .collect()
+                };
+                Ok(rows.into_iter().filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+        results.extend(rows);
+    }
+    Ok(results)
+}
+
+/// One served search row (the reference GraphSearchResult).
+fn map_search_row(kind: GraphNodeKind) -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    move |r| {
+        Ok(json!({
+            "kind": kind.as_str(),
+            "local_id": r.get::<_, i64>(0)?,
+            "label": r.get::<_, String>(1)?,
+            "sublabel": r.get::<_, Option<String>>(2)?,
+            "deleted": r.get::<_, i64>(3)? != 0,
+        }))
+    }
+}
+
+/// `neighbors(kind, id, {direction, limit})` — the reference envelope
+/// `{node, edges, total_edges, truncated, notes}` (graphService.ts:522-622).
+/// The edge set is the human-asserted store, both directions; the ~24
+/// read-time derived branches are plan item GR-01 and land separately
+/// (the reference's notes keep saying so honestly). Edges are sorted by
+/// (relation, target label) before the limit slice, exactly like the
+/// reference.
+pub fn neighbors_json(
+    conn: &Connection,
+    kind: GraphNodeKind,
+    id: i64,
+    direction: &str,
+    limit: i64,
+) -> Result<Option<Value>> {
+    let Some(center) = node_ref(conn, kind, id)? else {
+        return Ok(None);
+    };
+    let center_json = serde_json::to_value(&center).unwrap_or(Value::Null);
+    let limit = limit.clamp(1, GRAPH_MAX_NEIGHBOR_EDGES as i64) as usize;
+    let mut raw: usize = 0;
+    // (relation, target label, edge json) — the sort keys travel with the row.
+    let mut edges: Vec<(String, String, Value)> = Vec::new();
+    let human_ref = |kind: GraphNodeKind, id: i64| -> Value {
+        node_ref(conn, kind, id)
+            .ok()
+            .flatten()
+            .and_then(|r| serde_json::to_value(r).ok())
+            .unwrap_or_else(|| {
+                json!({
+                    "kind": kind.as_str(),
+                    "local_id": id,
+                    "label": format!("#{id} (removed)"),
+                    "sublabel": Value::Null,
+                    "deleted": true,
+                })
+            })
+    };
+    if direction != "in" {
+        let mut stmt = conn.prepare(
+            "SELECT relation, note, created_at, target_kind, target_local_id
+               FROM graph_edges WHERE source_kind = ?1 AND source_local_id = ?2
+               LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![kind.as_str(), id, GRAPH_MAX_NEIGHBOR_EDGES], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (relation, note, at, target_kind, target_local_id) = row?;
+            let Some(tk) = GraphNodeKind::ALL
+                .into_iter()
+                .find(|k| k.as_str() == target_kind)
+            else {
+                continue;
+            };
+            raw += 1;
+            let target = human_ref(tk, target_local_id);
+            let label = target["label"].as_str().unwrap_or("").to_string();
+            edges.push((
+                relation.clone(),
+                label,
+                json!({
+                    "relation": relation,
+                    "origin": "human_local",
+                    "source": center_json,
+                    "target": target,
+                    "note": note,
+                    "at": at,
+                }),
+            ));
+        }
+    }
+    if direction != "out" {
+        let mut stmt = conn.prepare(
+            "SELECT relation, note, created_at, source_kind, source_local_id
+               FROM graph_edges WHERE target_kind = ?1 AND target_local_id = ?2
+               LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![kind.as_str(), id, GRAPH_MAX_NEIGHBOR_EDGES], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (relation, note, at, source_kind, source_local_id) = row?;
+            let Some(sk) = GraphNodeKind::ALL
+                .into_iter()
+                .find(|k| k.as_str() == source_kind)
+            else {
+                continue;
+            };
+            raw += 1;
+            let source = human_ref(sk, source_local_id);
+            edges.push((
+                relation.clone(),
+                // The reference sorts by edge.target.label — for inbound
+                // edges that is the center's label.
+                center_json["label"].as_str().unwrap_or("").to_string(),
+                json!({
+                    "relation": relation,
+                    "origin": "human_local",
+                    "source": source,
+                    "target": center_json,
+                    "note": note,
+                    "at": at,
+                }),
+            ));
+        }
+    }
+    edges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let truncated = raw > limit;
+    let mut notes: Vec<String> = vec![
+        "Derived edges are computed live from the local mirror - they can never drift from the data they describe.".to_string(),
+        "about_product edges from conversations carry AI-attribute provenance; everything deterministic is labeled as such.".to_string(),
+        "Connector rows have no derived links by design - only human-asserted edges can connect them.".to_string(),
+    ];
+    if truncated {
+        notes.push(format!(
+            "Bounded to the first {limit} of {raw} edges (deep hubs: expand from a specific neighbor)."
+        ));
+    }
+    Ok(Some(json!({
+        "node": center_json,
+        "edges": edges.into_iter().take(limit).map(|(_, _, e)| e).collect::<Vec<_>>(),
+        "total_edges": raw,
+        "truncated": truncated,
+        "notes": notes,
+    })))
+}
+
+/// `subgraph(kind, id, {depth})` — the bounded BFS expansion
+/// (reference graphService.ts:625-670): depth clamped to 1..2, nodes
+/// capped at 250 (minimum 10), 40 edges per frontier node, the node cap
+/// reported honestly through `truncated`.
+pub fn subgraph_json(
+    conn: &Connection,
+    kind: GraphNodeKind,
+    id: i64,
+    depth: u32,
+    max_nodes: u32,
+) -> Result<Option<Value>> {
+    let Some(seed) = node_ref(conn, kind, id)? else {
+        return Ok(None);
+    };
+    let depth = depth.clamp(1, GRAPH_MAX_SUBGRAPH_DEPTH);
+    let max_nodes = max_nodes.clamp(10, GRAPH_MAX_SUBGRAPH_NODES as u32) as usize;
+    let seed_json = serde_json::to_value(&seed).unwrap_or(Value::Null);
+    let node_key = |v: &Value| {
+        format!(
+            "{}:{}",
+            v["kind"].as_str().unwrap_or(""),
+            v["local_id"].as_i64().unwrap_or(-1)
+        )
+    };
+    let mut nodes: Vec<Value> = vec![seed_json.clone()];
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::from([node_key(&seed_json)]);
+    let mut edges: Vec<Value> = Vec::new();
+    let mut frontier: Vec<Value> = vec![seed_json.clone()];
+    let mut depth_reached: u32 = 0;
+    for d in 0..depth {
+        if nodes.len() >= max_nodes {
+            break;
+        }
+        let mut next: Vec<Value> = Vec::new();
+        for f in &frontier {
+            if nodes.len() >= max_nodes {
+                break;
+            }
+            let (Some(fk), Some(fi)) = (
+                f["kind"].as_str().and_then(GraphNodeKind::parse),
+                f["local_id"].as_i64(),
+            ) else {
+                continue;
+            };
+            let Some(nb) = neighbors_json(conn, fk, fi, "both", 40)? else {
+                continue;
+            };
+            for edge in nb["edges"].as_array().cloned().unwrap_or_default() {
+                edges.push(edge.clone());
+                let far = if node_key(&edge["source"]) == node_key(f) {
+                    edge["target"].clone()
+                } else {
+                    edge["source"].clone()
+                };
+                if !seen.contains(&node_key(&far)) {
+                    if nodes.len() >= max_nodes {
+                        break;
+                    }
+                    seen.insert(node_key(&far));
+                    nodes.push(far.clone());
+                    next.push(far);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+        depth_reached = d + 1;
+    }
+    let truncated = nodes.len() >= max_nodes;
+    let edge_cap = (max_nodes * 3).min(edges.len());
+    Ok(Some(json!({
+        "seeds": [seed_json],
+        "nodes": nodes,
+        "edges": edges[..edge_cap],
+        "truncated": truncated,
+        "depth_reached": depth_reached,
+        "notes": [
+            format!("Bounded exploration: at most {depth} hop(s) and {max_nodes} nodes."),
+            if truncated {
+                "Node cap reached - expand from a specific neighbor instead of deepening blindly."
+            } else {
+                "Full expansion within bounds."
+            }
+        ]
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]

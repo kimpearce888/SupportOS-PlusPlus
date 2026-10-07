@@ -18,27 +18,23 @@ use std::collections::HashMap;
 use super::super::server::AppState;
 use crate::catalog::{GraphHumanRelation, GraphNodeKind};
 
-/// GET /api/graph/stats
-///
-/// Interim shape (flat counts); the reference per-kind/per-relation
-/// breakdown lands with GR-03. `human_edges` now counts the human-edge
-/// store (the reference's `support_graph_edges` row count) — every stored
-/// edge is human-asserted until the derived read-time layer exists.
-pub async fn stats(State(state): State<AppState>) -> Json<Value> {
+/// GET /api/graph/stats — the reference contract (graph.ts:22 +
+/// graphService.ts:672-724): live per-kind node counts, per-relation edge
+/// counts with origins, the human-edge total and the reference notes.
+pub async fn stats(State(state): State<AppState>) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let nodes: i64 = conn
-        .query_row("SELECT COUNT(*) FROM graph_nodes", [], |r| r.get(0))
-        .unwrap_or(0);
-    let edges: i64 = conn
-        .query_row("SELECT COUNT(*) FROM graph_edges", [], |r| r.get(0))
-        .unwrap_or(0);
-    Json(json!({
-        "nodes": nodes,
-        "edges": edges,
-        "human_edges": edges,
-        "generated_at": chrono::Utc::now().to_rfc3339(),
-        "notes": "Graph stats generated from local SQLite graph_nodes/graph_edges tables. Stored edges are human-asserted (reference support_graph_edges contract); the derived read-time layer lands with GR-01/GR-03."
-    }))
+    match crate::support_graph::graph_stats(&conn) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /api/graph/meta — the reference contract: the 12-kind union, the
@@ -56,100 +52,293 @@ pub async fn meta(State(_state): State<AppState>) -> Json<Value> {
     }))
 }
 
-/// GET /api/graph/search
+/// GET /api/graph/search — the reference contract (graph.ts:28-43 +
+/// graphService.search): the query capped at 200 chars, the kinds filter a
+/// comma list over the closed union, results per-kind capped at 10 / 80
+/// total, serving `{results: GraphSearchResult[]}`.
 pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
     let query = params.get("q").cloned().unwrap_or_default();
+    if query.chars().count() > 200 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Search query too long (max 200 chars)."
+            })),
+        )
+            .into_response();
+    }
+    let mut kinds: Option<Vec<GraphNodeKind>> = None;
+    if let Some(raw) = params.get("kinds").filter(|k| !k.trim().is_empty()) {
+        let mut parsed: Vec<GraphNodeKind> = Vec::new();
+        let mut ok = true;
+        for k in raw.split(',').map(|k| k.trim()).filter(|k| !k.is_empty()) {
+            match GraphNodeKind::parse(k) {
+                Some(kind) => parsed.push(kind),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "Unknown node kind in kinds filter."
+                })),
+            )
+                .into_response();
+        }
+        kinds = Some(parsed);
+    }
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let nodes: Vec<Value> = conn
-        .prepare("SELECT id, kind, label, properties_json FROM graph_nodes WHERE label LIKE ?1 ORDER BY id LIMIT 20")
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![format!("%{query}%")], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "kind": r.get::<_, String>(1)?,
-                    "label": r.get::<_, Option<String>>(2)?,
-                    "properties": r.get::<_, Option<String>>(3)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    Json(json!({"results": nodes}))
+    match crate::support_graph::graph_search(&conn, &query, kinds.as_deref()) {
+        Ok(results) => Json(json!({ "results": results })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
 }
 
-/// GET /api/graph/node/:kind/:id
+/// `parseId` (reference graph.ts:16-19): an integer > 0 or null.
+fn parse_positive_int(raw: &str) -> Option<i64> {
+    let n: f64 = raw.trim().parse().ok()?;
+    if n.fract() == 0.0 && n > 0.0 && n <= i64::MAX as f64 {
+        Some(n as i64)
+    } else {
+        None
+    }
+}
+
+/// GET /api/graph/node/:kind/:id — the reference contract (graph.ts:58-72):
+/// kind validation, positive-integer id validation, the 404 envelope, and
+/// `{node, edge_count}` with the edge count from a 5-edge neighbor probe.
 pub async fn node(
     State(state): State<AppState>,
-    Path((kind, id)): Path<(String, i64)>,
-) -> Json<Value> {
+    Path((kind, id)): Path<(String, String)>,
+) -> Response {
+    let Some(kind) = GraphNodeKind::parse(&kind) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Unknown node kind."
+            })),
+        )
+            .into_response();
+    };
+    let Some(id) = parse_positive_int(&id) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Node id must be a positive integer."
+            })),
+        )
+            .into_response();
+    };
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let row = conn.query_row(
-        "SELECT id, kind, label, properties_json FROM graph_nodes WHERE id = ?1",
-        rusqlite::params![id],
-        |r| {
-            Ok(json!({
-                "id": r.get::<_, i64>(0)?,
-                "kind": r.get::<_, String>(1)?,
-                "label": r.get::<_, Option<String>>(2)?,
-                "properties": r.get::<_, Option<String>>(3)?,
-            }))
-        },
-    );
-    match row {
-        Ok(v) => Json(v),
-        Err(_) => Json(json!({"error": "Node not found"})),
+    match crate::support_graph::neighbors_json(&conn, kind, id, "both", 5) {
+        Ok(Some(nb)) => Json(json!({
+            "node": nb["node"],
+            "edge_count": nb["total_edges"],
+        }))
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Node not found."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
-/// GET /api/graph/neighbors/:kind/:id — interim envelope ({neighbors}).
-///
-/// Addresses the node by (kind, local mirror id) like the reference; the
-/// items are reference-shaped `GraphNodeRef`s of the opposite endpoints of
-/// the stored human edges (both directions). The reference's direction /
-/// limit params, derived branches and 404 envelope land with GR-01/GR-03.
+/// GET /api/graph/neighbors/:kind/:id — the reference contract
+/// (graph.ts:78-101): direction must be out/in/both, limit 1..200, unknown
+/// nodes 404; serves the `{node, edges, total_edges, truncated, notes}`
+/// envelope.
 pub async fn neighbors(
     State(state): State<AppState>,
-    Path((kind, id)): Path<(String, i64)>,
-) -> Json<Value> {
+    Path((kind, id)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(kind) = GraphNodeKind::parse(&kind) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Unknown node kind."
+            })),
+        )
+            .into_response();
+    };
+    let Some(id) = parse_positive_int(&id) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Node id must be a positive integer."
+            })),
+        )
+            .into_response();
+    };
+    let direction = params
+        .get("direction")
+        .map(|s| s.as_str())
+        .unwrap_or("both");
+    if !matches!(direction, "out" | "in" | "both") {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "direction must be out, in or both."
+            })),
+        )
+            .into_response();
+    }
+    let limit = match params
+        .get("limit")
+        .map(|l| l.trim().parse::<f64>())
+        .unwrap_or(Ok(200.0))
+    {
+        Ok(n) if n.is_finite() && n >= 1.0 && n <= 200.0 => n as i64,
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "limit must be between 1 and 200."
+                })),
+            )
+                .into_response();
+        }
+    };
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::reports::get_graph_neighbors(&conn, &kind, id) {
-        Ok(refs) => Json(json!({ "neighbors": refs })),
-        Err(e) => Json(json!({"error": e.to_string(), "neighbors": []})),
+    match crate::support_graph::neighbors_json(&conn, kind, id, direction, limit) {
+        Ok(Some(v)) => Json(v).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Node not found."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
-/// GET /api/graph/subgraph/:kind/:id — interim envelope ({nodes, edges})
-/// over the center ref plus the stored human edges (both directions). The
-/// reference's bounded BFS (depth <= 2, node cap) lands with GR-03.
+/// GET /api/graph/subgraph/:kind/:id — the reference contract
+/// (graph.ts:103-127): depth must be 1 or 2, unknown nodes 404; serves the
+/// bounded-BFS `{seeds, nodes, edges, truncated, depth_reached, notes}`
+/// envelope.
 pub async fn subgraph(
     State(state): State<AppState>,
-    Path((kind, id)): Path<(String, i64)>,
-) -> Json<Value> {
+    Path((kind, id)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(kind) = GraphNodeKind::parse(&kind) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Unknown node kind."
+            })),
+        )
+            .into_response();
+    };
+    let Some(id) = parse_positive_int(&id) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "statusCode": 422,
+                "error": "ValidationError",
+                "message": "Node id must be a positive integer."
+            })),
+        )
+            .into_response();
+    };
+    let depth = match params
+        .get("depth")
+        .map(|d| d.trim().parse::<f64>())
+        .unwrap_or(Ok(1.0))
+    {
+        Ok(n) if n.is_finite() && n.fract() == 0.0 && (1.0..=2.0).contains(&n) => n as u32,
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "depth must be 1 or 2."
+                })),
+            )
+                .into_response();
+        }
+    };
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let kind_enum = crate::reports::validate_graph_node_kind(&kind).ok();
-    let center: Option<Value> = kind_enum
-        .and_then(|k| crate::support_graph::node_ref(&conn, k, id).ok().flatten())
-        .and_then(|r| serde_json::to_value(r).ok());
-    let neighbors: Vec<Value> = crate::reports::get_graph_neighbors(&conn, &kind, id)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|n| serde_json::to_value(n).ok())
-        .collect();
-    let edges = kind_enum
-        .map(|k| crate::support_graph::human_edges_touching(&conn, k, id).unwrap_or_default())
-        .unwrap_or_default();
-    let mut nodes = Vec::with_capacity(1 + neighbors.len());
-    if let Some(c) = center {
-        nodes.push(c);
+    match crate::support_graph::subgraph_json(&conn, kind, id, depth, 120) {
+        Ok(Some(v)) => Json(v).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Node not found."
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "statusCode": 500,
+                "error": "InternalError",
+                "message": e.to_string()
+            })),
+        )
+            .into_response(),
     }
-    nodes.extend(neighbors);
-    Json(json!({"nodes": nodes, "edges": edges}))
 }
 
 /// GET /api/graph/edges — the reference contract (graph.ts:129-134):

@@ -53,6 +53,12 @@ impl GraphNodeKind {
             Self::ConnectorData => "connector_data",
         }
     }
+
+    /// Parse the wire vocabulary (the 12-kind union the routes accept).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|k| k.as_str() == s)
+    }
 }
 
 #[cfg(test)]
