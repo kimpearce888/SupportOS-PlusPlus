@@ -358,7 +358,7 @@ async fn graph_human_edges_parity() {
     assert_eq!(body["edges"].as_array().map(Vec::len), Some(1));
     assert_eq!(body["edges"][0]["relation"], "depends_on");
 
-    // ── neighbors / subgraph read the same store (interim envelopes) ───
+    // ── neighbors / subgraph read the same store (reference envelopes) ───
     let resp = client
         .get(format!("{base}/api/graph/neighbors/customer/9"))
         .send()
@@ -366,10 +366,18 @@ async fn graph_human_edges_parity() {
         .expect("neighbors");
     assert_eq!(resp.status().as_u16(), 200);
     let body: Value = resp.json().await.expect("neighbors body");
-    let neighbors = body["neighbors"].as_array().expect("neighbors array");
-    assert_eq!(neighbors.len(), 1);
-    assert_eq!(neighbors[0]["kind"], "conversation");
-    assert_eq!(neighbors[0]["label"], "#33 Refund please");
+    assert_eq!(body["node"]["kind"], "customer");
+    // Both stored edges touch customer 9 (related_to + depends_on to the
+    // same conversation — the reference serves EDGES, not unique nodes).
+    assert_eq!(body["total_edges"], 2);
+    let edges = body["edges"].as_array().expect("edges array");
+    assert_eq!(edges.len(), 2);
+    assert_eq!(edges[0]["relation"], "depends_on");
+    assert_eq!(edges[0]["target"]["kind"], "conversation");
+    assert_eq!(edges[0]["target"]["label"], "#33 Refund please");
+    assert_eq!(edges[1]["relation"], "related_to");
+    assert_eq!(edges[1]["source"]["kind"], "customer");
+    assert_eq!(edges[0]["origin"], "human_local");
 
     // The target side serves the incoming edge too.
     let resp = client
@@ -378,9 +386,11 @@ async fn graph_human_edges_parity() {
         .await
         .expect("neighbors incoming");
     let body: Value = resp.json().await.expect("body");
-    let neighbors = body["neighbors"].as_array().expect("neighbors array");
-    assert_eq!(neighbors.len(), 1);
-    assert_eq!(neighbors[0]["kind"], "known_issue");
+    assert_eq!(body["total_edges"], 1);
+    let edges = body["edges"].as_array().expect("edges array");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["source"]["kind"], "known_issue");
+    assert_eq!(edges[0]["target"]["kind"], "incident");
 
     let resp = client
         .get(format!("{base}/api/graph/subgraph/customer/9"))
@@ -389,13 +399,14 @@ async fn graph_human_edges_parity() {
         .expect("subgraph");
     assert_eq!(resp.status().as_u16(), 200);
     let body: Value = resp.json().await.expect("subgraph body");
+    assert_eq!(body["seeds"][0]["label"], "Ada Lovelace", "seed first");
     let nodes = body["nodes"].as_array().expect("nodes array");
     assert_eq!(nodes[0]["label"], "Ada Lovelace", "center first");
     let edges = body["edges"].as_array().expect("edges array");
     assert_eq!(edges.len(), 2, "both outgoing human edges");
     assert_eq!(edges[0]["origin"], "human_local");
 
-    // stats counts the human-edge store.
+    // stats counts the human-edge store (the reference per-kind shape).
     let resp = client
         .get(format!("{base}/api/graph/stats"))
         .send()
@@ -403,7 +414,14 @@ async fn graph_human_edges_parity() {
         .expect("stats");
     let body: Value = resp.json().await.expect("stats body");
     assert_eq!(body["human_edges"], 3);
-    assert_eq!(body["edges"], 3);
+    let human_edge_row = body["edges"]
+        .as_array()
+        .expect("edge rows")
+        .iter()
+        .find(|e| e["relation"] == "human_edge")
+        .expect("human_edge stat");
+    assert_eq!(human_edge_row["count"], 3);
+    assert_eq!(human_edge_row["origin"], "human_local");
 
     // ── DELETE: 422 / 404 / ok, in the reference's words ───────────────
     let resp = client
@@ -457,5 +475,11 @@ async fn graph_human_edges_parity() {
         .expect("neighbors after delete");
     let body: Value = resp.json().await.expect("body");
     // The depends_on edge still links the pair.
-    assert_eq!(body["neighbors"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["total_edges"], 1);
+    assert_eq!(
+        body["edges"].as_array().map(Vec::len),
+        Some(1),
+        "the depends_on edge remains"
+    );
+    assert_eq!(body["edges"][0]["relation"], "depends_on");
 }
