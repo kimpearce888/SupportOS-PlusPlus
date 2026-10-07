@@ -217,7 +217,7 @@ pub fn OrganizationDetailPage(organization_id: i64) -> impl IntoView {
                         health.set(Some(h));
                     }
                     timeline.set(
-                        tl.get("timeline")
+                        tl.get("events")
                             .and_then(|v| v.as_array())
                             .cloned()
                             .unwrap_or_default(),

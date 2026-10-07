@@ -1153,25 +1153,20 @@ pub fn update_organization(
 /// POST /api/timeline/rebuild — run the real customer-events rebuild (the
 /// sweep that derives `signup`/`support_conversation`/`rating`/`incident_
 /// exposure` events from the mirror data) and re-resolve the organization
-/// FK backfill, then report both counts. Returns (events_written,
-/// org_links_resolved).
-pub fn timeline_rebuild(conn: &Connection) -> Result<(usize, usize)> {
+/// FK backfill (a port-side nicety that keeps org timelines resolvable; it
+/// stays off the wire). Returns the count of NEW events derived — the
+/// reference's `created`. The `customer_events_rebuilt` audit row is
+/// written by the route, exactly like the reference (one row, one shape).
+pub fn timeline_rebuild(conn: &Connection) -> Result<usize> {
     let events = crate::customer_events::rebuild(conn)?;
-    let links = conn.execute(
+    conn.execute(
         "UPDATE customers SET organization_id = (
             SELECT o.id FROM organizations o
              WHERE o.name = customers.organization AND o.deleted_at IS NULL LIMIT 1)
          WHERE organization_id IS NULL AND organization IS NOT NULL AND organization != ''",
         [],
     )?;
-    let _ = crate::audit::audit(
-        conn,
-        &crate::audit::AuditEntry::user("timeline_rebuilt").with_after_state(json!({
-            "events_written": events,
-            "org_links_resolved": links,
-        })),
-    );
-    Ok((events, links))
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -1640,9 +1635,8 @@ mod tests {
             params![cid],
         )
         .unwrap();
-        let (events, links) = timeline_rebuild(&conn).unwrap();
-        assert!(events > 0, "the sweep should derive at least one event");
-        assert!(links <= events, "links are a subset of events");
+        let created = timeline_rebuild(&conn).unwrap();
+        assert!(created > 0, "the sweep should derive at least one event");
         // The org timeline now has member events.
         let (org_events, total) =
             crate::customer_events::list_for_organization(&conn, org_id, None, 50, 0).unwrap();

@@ -756,6 +756,190 @@ fn parse_ts(raw: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
         .map(|naive| naive.and_utc().fixed_offset())
 }
 
+// ─── TS-03: per-conversation state serving (reference ticketStateRepo
+// getConversationState / listTransitions / stateLifecycle) ─────────────
+
+/// `getConversationState(conversationLocalId)` — the conversation's
+/// current state row through `conversations.supportos_state_id`
+/// (reference ticketStateRepo.ts:69-77), or `None`.
+pub fn get_conversation_state(
+    conn: &Connection,
+    conversation_local_id: i64,
+) -> Option<TicketStateDef> {
+    conn.query_row(
+        "SELECT ts.id, ts.key, ts.name, ts.color, ts.sort_order, ts.is_resolved,
+                ts.built_in, ts.created_at, ts.updated_at
+         FROM conversations c JOIN ticket_states ts ON ts.id = c.supportos_state_id
+         WHERE c.id = ?1",
+        [conversation_local_id],
+        row_to_def,
+    )
+    .ok()
+}
+
+/// `listTransitions(conversationLocalId, limit = 100)` — the full
+/// transition history, newest first (`occurred_at DESC, id DESC`),
+/// with the joined state names and the user actor name
+/// (reference ticketStateRepo.ts:136-152). `new_state_id` NULL means the
+/// state was cleared (served as `'(no state)'`, exactly like the
+/// reference's COALESCE).
+pub fn list_transitions(
+    conn: &Connection,
+    conversation_local_id: i64,
+    limit: i64,
+) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.conversation_id, t.previous_state_id, t.new_state_id,
+                t.actor_type, t.actor_local_id, t.reason, t.occurred_at, t.source,
+                p.name AS previous_state_name,
+                COALESCE(n.name, '(no state)') AS new_state_name,
+                CASE WHEN t.actor_type = 'user' THEN
+                    (SELECT TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, ''))
+                       FROM users u WHERE u.id = t.actor_local_id)
+                END AS actor_name
+         FROM state_transitions t
+         LEFT JOIN ticket_states p ON p.id = t.previous_state_id
+         LEFT JOIN ticket_states n ON n.id = t.new_state_id
+         WHERE t.conversation_id = ?1
+         ORDER BY t.occurred_at DESC, t.id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![conversation_local_id, limit], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, i64>(0)?,
+                "conversation_id": r.get::<_, i64>(1)?,
+                "previous_state_id": r.get::<_, Option<i64>>(2)?,
+                "new_state_id": r.get::<_, Option<i64>>(3)?,
+                "previous_state_name": r.get::<_, Option<String>>(9)?,
+                "new_state_name": r.get::<_, String>(10)?,
+                "actor_type": r.get::<_, String>(4)?,
+                "actor_local_id": r.get::<_, Option<i64>>(5)?,
+                "actor_name": r.get::<_, Option<String>>(11)?,
+                "reason": r.get::<_, Option<String>>(6)?,
+                "occurred_at": r.get::<_, String>(7)?,
+                "source": r.get::<_, String>(8)?,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// `stateLifecycle(conversationLocalId)` — per-state lifecycle metrics
+/// (reference ticketStateRepo.ts:159-203): total/average minutes in state
+/// (spans run from each transition to the next, or to now for the current
+/// state), time since entering the current state, re-entry counts and the
+/// current state row. Cleared entries aggregate under id 0 /
+/// '(no state)', exactly like the reference's `new_state_id ?? 0`.
+pub fn state_lifecycle(conn: &Connection, conversation_local_id: i64) -> Result<serde_json::Value> {
+    // Oldest first (the reference reverses the newest-first list).
+    let mut transitions = list_transitions(conn, conversation_local_id, 1000)?;
+    transitions.reverse();
+    let current = get_conversation_state(conn, conversation_local_id);
+    let now: chrono::DateTime<chrono::FixedOffset> = chrono::Utc::now().into();
+    struct PerState {
+        state_id: i64,
+        state_name: String,
+        entries: i64,
+        total_minutes: Vec<f64>,
+        last_entered: Option<String>,
+    }
+    let mut per_state: Vec<PerState> = Vec::new();
+    for (i, t) in transitions.iter().enumerate() {
+        let new_state_id = t["new_state_id"].as_i64().unwrap_or(0);
+        let idx = per_state
+            .iter()
+            .position(|p| p.state_id == new_state_id)
+            .unwrap_or_else(|| {
+                per_state.push(PerState {
+                    state_id: new_state_id,
+                    state_name: t["new_state_name"].as_str().unwrap_or("").to_string(),
+                    entries: 0,
+                    total_minutes: Vec::new(),
+                    last_entered: None,
+                });
+                per_state.len() - 1
+            });
+        let entry = &mut per_state[idx];
+        entry.entries += 1;
+        entry.last_entered = t["occurred_at"].as_str().map(String::from);
+        // The span end: the next transition, or now when this is the
+        // current state's latest entry.
+        let next_at = transitions
+            .get(i + 1)
+            .and_then(|n| n["occurred_at"].as_str());
+        let is_current = current
+            .as_ref()
+            .map(|c| c.id == new_state_id)
+            .unwrap_or(false);
+        let end = next_at.or_else(|| if is_current { Some("") } else { None });
+        if let (Some(occurred), Some(end_raw)) = (t["occurred_at"].as_str(), end) {
+            let end_ts = if end_raw.is_empty() {
+                Some(now)
+            } else {
+                parse_ts(end_raw)
+            };
+            if let (Some(start), Some(e)) = (parse_ts(occurred), end_ts) {
+                let mins = (e - start).num_milliseconds() as f64 / 60_000.0;
+                if mins.is_finite() && mins >= 0.0 {
+                    entry.total_minutes.push(mins);
+                }
+            }
+        }
+    }
+    // Time since entering the current state (the newest transition when it
+    // matches, rounded like the reference).
+    let mut time_in_current: Option<i64> = None;
+    if let (Some(current), Some(last)) = (current.as_ref(), transitions.last()) {
+        if last["new_state_id"].as_i64() == Some(current.id) {
+            if let Some(occurred) = last["occurred_at"].as_str() {
+                if let Some(start) = parse_ts(occurred) {
+                    let mins = (now - start).num_milliseconds() as f64 / 60_000.0;
+                    if mins.is_finite() && mins >= 0.0 {
+                        time_in_current = Some(mins.round() as i64);
+                    }
+                }
+            }
+        }
+    }
+    let current_json = current
+        .as_ref()
+        .and_then(|c| serde_json::to_value(c).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let per_state_json: Vec<serde_json::Value> = per_state
+        .into_iter()
+        .map(|e| {
+            let total = if e.total_minutes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(e.total_minutes.iter().sum::<f64>().round() as i64)
+            };
+            let avg = if e.total_minutes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!((e.total_minutes.iter().sum::<f64>()
+                    / e.total_minutes.len() as f64)
+                    .round() as i64)
+            };
+            serde_json::json!({
+                "state_id": e.state_id,
+                "state_name": e.state_name,
+                "entries": e.entries,
+                "total_minutes": total,
+                "avg_minutes": avg,
+                "last_entered": e.last_entered,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "current_state": current_json,
+        "time_in_current_state_min": time_in_current,
+        "transitions": transitions.len(),
+        "per_state": per_state_json,
+    }))
+}
+
 /// `stateBottlenecks()` — avg/max minutes spent per state from the
 /// FK-based transition log (reference computeBottlenecks).
 pub fn state_bottlenecks(conn: &Connection) -> Vec<serde_json::Value> {

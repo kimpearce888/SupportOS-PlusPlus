@@ -67,7 +67,7 @@ pub fn CustomerProfilePage(customer_id: i64) -> impl IntoView {
                     customer.set(Some(c));
                     conversations.set(cv);
                     timeline.set(
-                        tl.get("timeline")
+                        tl.get("events")
                             .and_then(|v| v.as_array())
                             .cloned()
                             .unwrap_or_default(),
@@ -209,22 +209,24 @@ pub fn CustomerProfilePage(customer_id: i64) -> impl IntoView {
                             <div class="spp-customer-profile__timeline">
                                 {move || timeline.with(|entries| {
                                     entries.iter().map(|e| {
-                                        let event_type = e.get("event_type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                        let body = e.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                        let actor = e.get("actor_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                        let kind = e.get("event_kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                        let title = e.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                         let time = e.get("occurred_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                        let conv_number = e.get("conversation_number").and_then(|v| v.as_i64()).unwrap_or(0);
+                                        let conv_id = e.get("detail")
+                                            .and_then(|d| d.get("conversation_id"))
+                                            .and_then(|v| v.as_i64());
                                         view! {
                                             <div class="spp-timeline-entry">
                                                 <div class="spp-timeline-entry__header">
-                                                    <span class="spp-timeline-entry__type">{event_type}</span>
-                                                    <span class="spp-timeline-entry__conv">{"#"}{conv_number.to_string()}</span>
-                                                    <span class="spp-timeline-entry__actor">{actor}</span>
+                                                    <span class="spp-timeline-entry__type">{kind}</span>
                                                     <span class="spp-timeline-entry__time">{time}</span>
                                                 </div>
-                                                {if !body.is_empty() {
+                                                <div class="spp-timeline-entry__body">{title.clone()}</div>
+                                                {if conv_id.is_some() {
                                                     view! {
-                                                        <div class="spp-timeline-entry__body">{body.clone()}</div>
+                                                        <div class="spp-timeline-entry__conv">
+                                                            {"conversation #"}{conv_id.unwrap().to_string()}
+                                                        </div>
                                                     }.into_view()
                                                 } else {
                                                     ().into_view()

@@ -133,6 +133,35 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<i64>) -> impl Int
                         }
                     }
                 }
+                // v1.7.0 (TS-03): the custom ticket-state serving on the
+                // detail payload (reference conversations.ts:229-231 +
+                // 257-259 + 268): the current state row, the newest-first
+                // transition history (capped at 50) and the per-state
+                // lifecycle metrics under `activity`, plus the full state
+                // list for pickers.
+                let ticket_state = crate::ticket_states::get_conversation_state(&conn, id)
+                    .and_then(|s| serde_json::to_value(s).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                let state_history =
+                    crate::ticket_states::list_transitions(&conn, id, 50).unwrap_or_default();
+                let state_lifecycle =
+                    crate::ticket_states::state_lifecycle(&conn, id).unwrap_or(serde_json::json!({
+                        "current_state": serde_json::Value::Null,
+                        "time_in_current_state_min": serde_json::Value::Null,
+                        "transitions": 0,
+                        "per_state": [],
+                    }));
+                let ticket_states: Vec<serde_json::Value> =
+                    crate::ticket_states::list_states(&conn)
+                        .iter()
+                        .filter_map(|s| serde_json::to_value(s).ok())
+                        .collect();
+                v["activity"] = serde_json::json!({
+                    "ticket_state": ticket_state,
+                    "state_history": state_history,
+                    "state_lifecycle": state_lifecycle,
+                });
+                v["ticket_states"] = serde_json::Value::Array(ticket_states);
                 (StatusCode::OK, Json(v))
             }
             Err(e) => (

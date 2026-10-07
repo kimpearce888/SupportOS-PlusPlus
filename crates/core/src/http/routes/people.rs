@@ -129,25 +129,72 @@ pub async fn get_customer(State(state): State<AppState>, Path(id): Path<i64>) ->
     }
 }
 
-/// GET /api/customers/:id/timeline — customer timeline.
+/// `clampListParam` (reference routes/helpers.ts:10-14): the fallback
+/// for absent/empty values, `Number()` semantics for the rest — garbage
+/// (NaN/Infinity) falls back, finite numbers truncate toward zero and
+/// clamp into `[min, max]`.
+fn clamp_list_param(raw: Option<&String>, fallback: i64, min: i64, max: i64) -> i64 {
+    match raw {
+        Some(s) if !s.is_empty() => s
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| (n.trunc() as i64).clamp(min, max))
+            .unwrap_or(fallback),
+        _ => fallback,
+    }
+}
+
+/// GET /api/customers/:id/timeline — reference people.ts:86-97: the
+/// event-kind timeline over `customer_events` with the kind filter
+/// (truncated to 40 chars, empty = unfiltered) and the page clamps
+/// (pageSize 1..200 default 100, page 1..100000 default 1, offset =
+/// (page-1) * pageSize), serving `{events, total, kind_counts}`; unknown
+/// customers answer the reference 404 envelope (existence is a plain
+/// `WHERE id = ?` like `getCustomerByLocalId`).
 pub async fn customer_timeline(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::customers::customer_timeline(&conn, id, Some(100)) {
-        Ok(entries) => {
-            let items: Vec<Value> = entries
-                .iter()
-                .filter_map(|e| serde_json::to_value(e).ok())
-                .collect();
-            (StatusCode::OK, Json(json!({"timeline": items})))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": e.to_string()})),
-        ),
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM customers WHERE id = ?1",
+            rusqlite::params![id],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !exists {
+        return not_found("Customer not found.");
     }
+    // `(q.kind ?? '').slice(0, 40) || null` — truncate first, then the
+    // empty string means "no filter".
+    let kind: Option<String> = params
+        .get("kind")
+        .map(|k| k.chars().take(40).collect::<String>())
+        .filter(|k| !k.is_empty());
+    let page_size = clamp_list_param(params.get("pageSize"), 100, 1, 200);
+    let offset = (clamp_list_param(params.get("page"), 1, 1, 100000) - 1) * page_size;
+    let (events, total) = match crate::customer_events::list_for_customer(
+        &conn,
+        id,
+        kind.as_deref(),
+        page_size,
+        offset,
+    ) {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    let kind_counts = match crate::customer_events::kind_counts(&conn, id) {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    (
+        StatusCode::OK,
+        Json(json!({"events": events, "total": total, "kind_counts": kind_counts})),
+    )
+        .into_response()
 }
 
 /// GET /api/customers/:id/support-health — the no-score support-health
@@ -206,51 +253,48 @@ pub async fn get_organization(State(state): State<AppState>, Path(id): Path<i64>
     }
 }
 
-/// GET /api/organizations/:id/timeline — the union of member customers'
-/// events (the reference peopleRepo.listForOrganization semantics the
-/// customer_events module already implemented; the route returned an empty
-/// array).
+/// GET /api/organizations/:id/timeline — reference people.ts:108-118:
+/// the union of member customers' events with the same kind/page clamps
+/// as the customer timeline, serving `{events, total}` where each event
+/// carries `customer_name`; unknown organizations (deleted included, like
+/// `getOrganizationDetail`'s `deleted_at IS NULL`) answer the reference
+/// 404 envelope.
 pub async fn organization_timeline(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let exists: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM organizations WHERE id = ?1 AND deleted_at IS NULL",
+            "SELECT 1 FROM organizations WHERE id = ?1 AND deleted_at IS NULL",
             rusqlite::params![id],
-            |r| r.get::<_, i64>(0),
+            |_| Ok(()),
         )
-        .map(|n| n > 0)
-        .unwrap_or(false);
+        .is_ok();
     if !exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"message": "Organization not found.", "timeline": []})),
-        );
+        return not_found("Organization not found.");
     }
-    let kind = params
+    // Same kind truncation/clamps as the customer timeline.
+    let kind: Option<String> = params
         .get("kind")
-        .map(|k| k.as_str())
+        .map(|k| k.chars().take(40).collect::<String>())
         .filter(|k| !k.is_empty());
-    let limit = params
-        .get("limit")
-        .and_then(|l| l.parse::<i64>().ok())
-        .unwrap_or(50);
-    let offset = params
-        .get("offset")
-        .and_then(|o| o.parse::<i64>().ok())
-        .unwrap_or(0);
-    match crate::customer_events::list_for_organization(&conn, id, kind, limit, offset) {
+    let page_size = clamp_list_param(params.get("pageSize"), 100, 1, 200);
+    let offset = (clamp_list_param(params.get("page"), 1, 1, 100000) - 1) * page_size;
+    match crate::customer_events::list_for_organization(
+        &conn,
+        id,
+        kind.as_deref(),
+        page_size,
+        offset,
+    ) {
         Ok((events, total)) => (
             StatusCode::OK,
-            Json(json!({"timeline": events, "total": total})),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": e.to_string(), "timeline": []})),
-        ),
+            Json(json!({"events": events, "total": total})),
+        )
+            .into_response(),
+        Err(e) => internal(e),
     }
 }
 
@@ -672,22 +716,33 @@ pub async fn update_organization(
     }
 }
 
-/// POST /api/timeline/rebuild — the real thing: the customer-events sweep
-/// (rebuild) plus the organization FK backfill, with both counts in the
-/// response (was a fake-success `{"ok": true}` that queued nothing).
+/// POST /api/timeline/rebuild — reference people.ts:131-135: the full
+/// idempotent re-derivation, answering `{ok, created, message}` and
+/// writing the `customer_events_rebuilt` audit row with
+/// `{created}`. (The port additionally resolves organization links on
+/// the way — an idempotent port-side nicety that keeps org timelines
+/// resolvable; it stays off the wire like in the reference.)
 pub async fn timeline_rebuild(State(state): State<AppState>) -> Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     match people_store::timeline_rebuild(&conn) {
-        Ok((events, links)) => (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "events_written": events,
-                "org_links_resolved": links,
-                "message": format!("Timeline rebuild complete: {events} events written, {links} organization links resolved.")
-            })),
-        )
-            .into_response(),
+        Ok(created) => {
+            if let Err(e) = crate::audit::audit(
+                &conn,
+                &crate::audit::AuditEntry::user("customer_events_rebuilt")
+                    .with_after_state(json!({"created": created})),
+            ) {
+                return internal(e);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "created": created,
+                    "message": format!("Timeline rebuilt; {created} new event(s) derived.")
+                })),
+            )
+                .into_response()
+        }
         Err(e) => internal(e),
     }
 }
@@ -938,9 +993,30 @@ mod tests {
         let (status, body) = body_json(timeline_rebuild(State(state_clone(&state))).await).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["ok"].as_bool().unwrap());
-        // events_written is a number (0 on an empty db is fine — the point
-        // is the route ran the real sweep, not a fake "queued" message).
-        assert!(body["events_written"].is_i64());
+        // `created` is a number (0 on an empty db is fine — the point is
+        // the route ran the real sweep, not a fake "queued" message), and
+        // the reference message shape.
+        assert!(body["created"].is_i64());
+        assert_eq!(
+            body["message"],
+            json!(format!(
+                "Timeline rebuilt; {} new event(s) derived.",
+                body["created"].as_i64().unwrap()
+            ))
+        );
+        // The reference audit row (one, with the created count).
+        {
+            let conn = state.conn.lock().unwrap();
+            let (action, after): (String, Value) = conn
+                .query_row(
+                    "SELECT action, after_state FROM audit_log WHERE action = 'customer_events_rebuilt'",
+                    [],
+                    |r| Ok((r.get(0)?, serde_json::from_str::<Value>(&r.get::<_, String>(1)?).unwrap_or_default())),
+                )
+                .unwrap();
+            assert_eq!(action, "customer_events_rebuilt");
+            assert_eq!(after["created"], body["created"]);
+        }
     }
 
     #[tokio::test]
