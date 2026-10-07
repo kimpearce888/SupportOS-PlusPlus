@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **69 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **68 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,7 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 48 | IS-02 | Known issues CRUD (rich fields) + link/unlink | Divergent | Major | M | M5 | Write/serve all MAIN fields |
 | 49 | IS-03 | Engineering refs + support cases (from-conversation capture) | Stub | Major | M | - | Implement refs CRUD + support-case capture from conversation |
 | 50 | TL-02 | Customer/organization timeline reads (kind counts, filters) | Divergent | Major | M | - | Serve event-kind timeline for customers with filters |
 | 51 | TS-03 | Transition history + per-state lifecycle serving | Missing | Major | M | - | Serve transition history + per-state lifecycle in conversation detail |
