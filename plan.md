@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **63 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **58 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 54 | ME-01 | Composed customer memory profile (9 sections + freshness) | Missing | Major | L | M6 | Compose profile at read time (issue history, outcomes, interaction, AI entries, freshness, quarantined) |
-| 55 | GR-01 | Derived edge layer (~24 read-time branches) | Missing | Major | XL | M4 | Port read-time derived-edge layer (or populate edges on sync) |
-| 56 | UI-17 | Notification center (tabs, filters, prefs, mention queue) | Partial | Major | M | M24 | Wire mark-read/read-all to API; persist prefs via PUT; parse MAIN field names; mention queue; filters |
-| 57 | UI-19 | Sync health page (sync actions, checkpoints, health cards, webhook register) | Stub | Major | M | M25 | Port sync actions, checkpoints, runs, health cards, webhook register via API |
-| 58 | UI-21 | Onboarding (6-step wizard + live checks) | Divergent | Major | M | - | 6-step wizard with live LM Studio/Qdrant checks |
 | 59 | UI-22 | Command palette (live search, 12 hits, keyboard nav) | Stub | Major | M | M9 | Live search via POST /api/search, 200ms debounce, keyboard nav, 12 hits |
 | 60 | UI-26 | SSE toasts + cross-page invalidation | Missing | Major | M | - | Toast center for rating/webhook/campaign/critical events; subscribe error |
 | 61 | UI-27 | URL-backed state / deep links (view=, days=, doc=, article=, tab=) | Missing | Major | M | - | URL-backed filter state + deep links on dashboard/inbox/knowledge/docs/issues |
