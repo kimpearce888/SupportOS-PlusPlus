@@ -1540,18 +1540,47 @@ pub async fn cluster_issues(
                 .map(|s| s.to_string()),
             conversation_ids: ids,
         };
-        let _ = upsert_cluster(conn, &cluster);
+        let _ = upsert_cluster(
+            conn,
+            &ClusterUpsert {
+                title: cluster.title.clone(),
+                summary: cluster.summary.clone(),
+                category: cluster.category.clone(),
+                product: cluster.product.clone(),
+                feature: cluster.feature.clone(),
+                known_issue_id: None,
+                ai_generated: true,
+                conversation_ids: cluster.conversation_ids.clone(),
+            },
+        );
         out.push(cluster);
     }
     let _ = compute_trends(conn);
     Ok(out)
 }
 
-/// Persist a cluster (reference `issues.upsertCluster`): find by title,
-/// update or insert, refresh members + counts/first/last-seen. The port's
-/// legacy `issue_clusters` table has a NOT NULL `name` column — the title
-/// doubles as the name (same convention as the demo seed).
-fn upsert_cluster(conn: &Connection, c: &ClusterOut) -> Result<i64> {
+/// Repo-level input for [`upsert_cluster`] (reference `issues.upsertCluster`,
+/// issueRepo.ts:56). `ClusterOut` is the /api/ai/cluster-issues wire shape;
+/// this struct carries the extra fields the reference's repo layer accepts:
+/// `known_issue_id` (the demo seed links a cluster to its known issue) and
+/// an explicit `ai_generated` flag (reference default: true).
+#[derive(Debug, Clone)]
+pub struct ClusterUpsert {
+    pub title: String,
+    pub summary: String,
+    pub category: Option<String>,
+    pub product: Option<String>,
+    pub feature: Option<String>,
+    pub known_issue_id: Option<i64>,
+    pub ai_generated: bool,
+    pub conversation_ids: Vec<i64>,
+}
+
+/// Persist a cluster (reference `issues.upsertCluster`, issueRepo.ts:56-86):
+/// find by title, update or insert, refresh members + counts/first/last-seen.
+/// The port's legacy `issue_clusters` table has a NOT NULL `name` column —
+/// the title doubles as the name (same convention as the demo seed).
+pub fn upsert_cluster(conn: &Connection, c: &ClusterUpsert) -> Result<i64> {
     let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM issue_clusters WHERE title = ?1",
@@ -1563,16 +1592,31 @@ fn upsert_cluster(conn: &Connection, c: &ClusterOut) -> Result<i64> {
         Some(id) => {
             conn.execute(
                 "UPDATE issue_clusters SET summary=?2, category=?3, product=?4, feature=?5,
-                        updated_at=datetime('now') WHERE id=?1",
-                params![id, c.summary, c.category, c.product, c.feature],
+                        known_issue_id=?6, updated_at=datetime('now') WHERE id=?1",
+                params![
+                    id,
+                    c.summary,
+                    c.category,
+                    c.product,
+                    c.feature,
+                    c.known_issue_id
+                ],
             )?;
             id
         }
         None => {
             conn.execute(
-                "INSERT INTO issue_clusters (name, title, summary, category, product, feature, ai_generated)
-                 VALUES (?1, ?1, ?2, ?3, ?4, ?5, 1)",
-                params![c.title, c.summary, c.category, c.product, c.feature],
+                "INSERT INTO issue_clusters (name, title, summary, category, product, feature, known_issue_id, ai_generated)
+                 VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    c.title,
+                    c.summary,
+                    c.category,
+                    c.product,
+                    c.feature,
+                    c.known_issue_id,
+                    i64::from(c.ai_generated)
+                ],
             )?;
             conn.last_insert_rowid()
         }
@@ -1584,16 +1628,20 @@ fn upsert_cluster(conn: &Connection, c: &ClusterOut) -> Result<i64> {
             params![cluster_id, id],
         )?;
     }
+    // Reference issueRepo.ts:73-82 maintenance UPDATE. Port adaptation:
+    // the port's legacy M016 table declares first_seen_at/last_seen_at NOT
+    // NULL (the reference's are nullable), so an empty member set falls
+    // back to the existing values via COALESCE instead of writing NULL.
     conn.execute(
         "UPDATE issue_clusters SET
             conversation_count = (SELECT COUNT(*) FROM issue_cluster_members WHERE cluster_id = ?1),
             customer_count = (SELECT COUNT(DISTINCT c.customer_id) FROM issue_cluster_members m
                                JOIN conversations c ON c.id = m.conversation_id
                               WHERE m.cluster_id = ?1 AND c.customer_id IS NOT NULL),
-            first_seen_at = (SELECT MIN(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_members m
-                               JOIN conversations c ON c.id = m.conversation_id WHERE m.cluster_id = ?1),
-            last_seen_at = (SELECT MAX(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_members m
-                              JOIN conversations c ON c.id = m.conversation_id WHERE m.cluster_id = ?1)
+            first_seen_at = COALESCE((SELECT MIN(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_members m
+                               JOIN conversations c ON c.id = m.conversation_id WHERE m.cluster_id = ?1), first_seen_at),
+            last_seen_at = COALESCE((SELECT MAX(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_members m
+                              JOIN conversations c ON c.id = m.conversation_id WHERE m.cluster_id = ?1), last_seen_at)
           WHERE id = ?1",
         params![cluster_id],
     )?;
@@ -1959,6 +2007,142 @@ pub async fn process_new_ticket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_db_with_conversations() -> rusqlite::Connection {
+        // Same pattern as maintenance.rs's fresh_db(): a kept temp file (the
+        // handle must outlive the test; WAL sidecars need the directory).
+        let f = tempfile::NamedTempFile::new()
+            .expect("tempfile")
+            .into_temp_path()
+            .keep()
+            .expect("keep");
+        let mut conn = crate::db::open(&f).expect("open DB");
+        crate::bootstrap::apply_all(&mut conn).expect("apply all migrations");
+        conn.execute_batch(
+            "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
+             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+                 VALUES (1, 101, 101, 'a', 'active', 1, 11, '2026-10-01 10:00:00');
+             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at, remote_created_at)
+                 VALUES (2, 102, 102, 'b', 'active', 1, 11, '2026-10-03 09:00:00', '2026-10-02 09:00:00');
+             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+                 VALUES (3, 103, 103, 'c', 'active', 1, 12, '2026-10-05 11:00:00');",
+        )
+        .expect("seed");
+        conn
+    }
+
+    fn upsert_input(
+        title: &str,
+        known_issue_id: Option<i64>,
+        ai_generated: bool,
+        ids: Vec<i64>,
+    ) -> ClusterUpsert {
+        ClusterUpsert {
+            title: title.to_string(),
+            summary: "s".to_string(),
+            category: None,
+            product: None,
+            feature: None,
+            known_issue_id,
+            ai_generated,
+            conversation_ids: ids,
+        }
+    }
+
+    /// IS-01: upsert_cluster — the reference issues.upsertCluster port.
+    /// Insert path: title doubles as the legacy NOT NULL name, ai_generated
+    /// flag lands, members land, and the maintenance UPDATE computes
+    /// conversation_count / customer_count / first_seen_at / last_seen_at.
+    #[test]
+    fn upsert_cluster_insert_computes_counts_and_bounds() {
+        let conn = test_db_with_conversations();
+        let id =
+            upsert_cluster(&conn, &upsert_input("login", Some(7), true, vec![1, 2, 3])).unwrap();
+        let row: (String, String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT name, title, known_issue_id, ai_generated FROM issue_clusters WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "login", "title doubles as the legacy name");
+        assert_eq!(row.1, "login");
+        assert_eq!(row.2, Some(7));
+        assert_eq!(row.3, Some(1));
+        let counts: (i64, i64) = conn
+            .query_row(
+                "SELECT conversation_count, customer_count FROM issue_clusters WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts.0, 3);
+        assert_eq!(counts.1, 2, "DISTINCT customers (11 twice + 12 once)");
+        let bounds: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT first_seen_at, last_seen_at FROM issue_clusters WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            bounds.0.as_deref(),
+            Some("2026-10-01 10:00:00"),
+            "MIN over COALESCE(remote,created)"
+        );
+        assert_eq!(
+            bounds.1.as_deref(),
+            Some("2026-10-05 11:00:00"),
+            "MAX over COALESCE(remote,created)"
+        );
+    }
+
+    /// IS-01: upsert_cluster — the update path is title-keyed (no duplicate
+    /// rows), known_issue_id/summary are written on update, and members are
+    /// never removed by a smaller re-upsert.
+    #[test]
+    fn upsert_cluster_update_is_title_keyed_and_keeps_members() {
+        let conn = test_db_with_conversations();
+        let first =
+            upsert_cluster(&conn, &upsert_input("login", Some(7), true, vec![1, 2, 3])).unwrap();
+        let again = upsert_cluster(&conn, &upsert_input("login", None, false, vec![1])).unwrap();
+        assert_eq!(first, again);
+        let (ki, count, rows): (Option<i64>, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT known_issue_id FROM issue_clusters WHERE id = ?1),
+                        (SELECT conversation_count FROM issue_clusters WHERE id = ?1),
+                        (SELECT COUNT(*) FROM issue_clusters)",
+                params![first],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ki, None, "update path writes known_issue_id");
+        assert_eq!(count, 3, "members persist across re-upserts");
+        assert_eq!(rows, 1, "title-keyed upsert never duplicates");
+    }
+
+    /// IS-01: upsert_cluster with no member ids keeps zero counts; the
+    /// NOT NULL first_seen_at/last_seen_at keep their insert defaults
+    /// (the reference's nullable columns get NULL — the port's M016 shape
+    /// cannot, so COALESCE keeps the defaults).
+    #[test]
+    fn upsert_cluster_with_no_members_serves_empty_bounds() {
+        let conn = test_db_with_conversations();
+        let id = upsert_cluster(&conn, &upsert_input("empty", None, false, vec![])).unwrap();
+        let (count, customers, first): (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT conversation_count, customer_count, first_seen_at FROM issue_clusters WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(customers, 0);
+        assert!(
+            first.is_some(),
+            "NOT NULL first_seen_at keeps its insert default on an empty member set"
+        );
+    }
 
     #[test]
     fn extract_json_strips_fences_and_recovers_brace_slice() {

@@ -13,6 +13,7 @@
 
 use rusqlite::Connection;
 
+use crate::ai_pipeline::{upsert_cluster, ClusterUpsert};
 use crate::jobs;
 use crate::quality::{is_closing_acknowledgment, published_threads, ThreadLite};
 use crate::settings;
@@ -793,28 +794,23 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
         .map(|c| c.id)
         .collect();
     if tz_convs.len() >= 2 {
-        conn.execute(
-            "INSERT INTO issue_clusters (name, title, summary, category, product, feature, known_issue_id, ai_generated)
-             VALUES ('timezone schedules after DST change', 'timezone schedules after DST change',
-                     'Customers in DST-observing regions report scheduled items firing one hour off after clock changes.',
-                     'Timezone / Scheduling', 'Reports', 'Schedules', ?1, 1)",
-            rusqlite::params![ki1],
-        )
-        .ok();
-        let cluster = conn.last_insert_rowid();
-        for conv in &tz_convs {
-            conn.execute(
-                "INSERT OR IGNORE INTO issue_cluster_members (cluster_id, conversation_id) VALUES (?1, ?2)",
-                rusqlite::params![cluster, conv],
-            )
-            .ok();
-        }
-        // upsertCluster maintains conversation_count/last_seen_at — the gap
-        // engine's new_issue_undocumented detection reads the count.
-        conn.execute(
-            "UPDATE issue_clusters SET conversation_count = (SELECT COUNT(*) FROM issue_cluster_members WHERE cluster_id = ?1),
-                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-            rusqlite::params![cluster],
+        // Reference demoSeed.ts:89-98 — clusters land through the SAME repo
+        // upsert (issues.upsertCluster) the AI clustering pipeline uses, so
+        // every count stays maintained: conversation_count, customer_count
+        // and first/last_seen_at (which the gap engine's
+        // new_issue_undocumented detection reads).
+        upsert_cluster(
+            conn,
+            &ClusterUpsert {
+                title: "timezone schedules after DST change".to_string(),
+                summary: "Customers in DST-observing regions report scheduled items firing one hour off after clock changes.".to_string(),
+                category: Some("Timezone / Scheduling".to_string()),
+                product: Some("Reports".to_string()),
+                feature: Some("Schedules".to_string()),
+                known_issue_id: Some(ki1),
+                ai_generated: true,
+                conversation_ids: tz_convs,
+            },
         )
         .ok();
     }
@@ -832,26 +828,20 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
         .map(|c| c.id)
         .collect();
     if billing_convs.len() >= 2 {
-        conn.execute(
-            "INSERT INTO issue_clusters (name, title, summary, category, product, feature, known_issue_id, ai_generated)
-             VALUES ('billing payment issues', 'billing payment issues',
-                     'Failed charges and invoice/VAT questions from finance contacts.',
-                     'Billing', 'Billing', 'Payments', NULL, 1)",
-            [],
-        )
-        .ok();
-        let cluster = conn.last_insert_rowid();
-        for conv in &billing_convs {
-            conn.execute(
-                "INSERT OR IGNORE INTO issue_cluster_members (cluster_id, conversation_id) VALUES (?1, ?2)",
-                rusqlite::params![cluster, conv],
-            )
-            .ok();
-        }
-        conn.execute(
-            "UPDATE issue_clusters SET conversation_count = (SELECT COUNT(*) FROM issue_cluster_members WHERE cluster_id = ?1),
-                 last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-            rusqlite::params![cluster],
+        // Reference demoSeed.ts:100-112.
+        upsert_cluster(
+            conn,
+            &ClusterUpsert {
+                title: "billing payment issues".to_string(),
+                summary: "Failed charges and invoice/VAT questions from finance contacts."
+                    .to_string(),
+                category: Some("Billing".to_string()),
+                product: Some("Billing".to_string()),
+                feature: Some("Payments".to_string()),
+                known_issue_id: None,
+                ai_generated: true,
+                conversation_ids: billing_convs,
+            },
         )
         .ok();
     }

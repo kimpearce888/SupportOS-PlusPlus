@@ -8,27 +8,71 @@ use serde_json::{json, Value};
 
 use super::super::server::AppState;
 
-/// GET /api/issues/clusters
+/// GET /api/issues/clusters — reference routes/issues.ts:6 +
+/// issueRepo.listClusters (issueRepo.ts:88-92): full cluster rows plus each
+/// cluster's `conversation_ids`, ordered by `conversation_count DESC`.
+///
+/// Wire shape (reference `IssueCluster`, shared/types.ts:340-354 + `SELECT *`):
+/// id, title, summary, category, product, feature, conversation_count,
+/// customer_count, first_seen_at, last_seen_at, trend, known_issue_id,
+/// ai_generated, created_at, updated_at, provenance, conversation_ids.
+/// The port's legacy `name`/`status` columns are NOT on the reference wire and
+/// stay unserved (the demo seed doubles title into `name` for the legacy
+/// readers).
 pub async fn list_clusters(State(state): State<AppState>) -> Json<Value> {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let clusters: Vec<Value> = conn
-        .prepare("SELECT id, name, status, created_at FROM issue_clusters ORDER BY id DESC")
+        .prepare(
+            "SELECT id, title, summary, category, product, feature,
+                    conversation_count, customer_count, first_seen_at, last_seen_at,
+                    trend, known_issue_id, ai_generated, created_at, updated_at, provenance
+             FROM issue_clusters ORDER BY conversation_count DESC",
+        )
         .ok()
-        .map(|mut stmt| {
-            stmt.query_map([], |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "name": r.get::<_, String>(1)?,
-                    "status": r.get::<_, String>(2)?,
-                    "created_at": r.get::<_, String>(3)?,
-                }))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+        .and_then(|mut stmt| {
+            let rows: Vec<std::result::Result<Value, _>> = stmt
+                .query_map([], |r| {
+                    Ok(json!({
+                        "id": r.get::<_, i64>(0)?,
+                        "title": r.get::<_, String>(1)?,
+                        "summary": r.get::<_, Option<String>>(2)?,
+                        "category": r.get::<_, Option<String>>(3)?,
+                        "product": r.get::<_, Option<String>>(4)?,
+                        "feature": r.get::<_, Option<String>>(5)?,
+                        "conversation_count": r.get::<_, i64>(6)?,
+                        "customer_count": r.get::<_, Option<i64>>(7)?,
+                        "first_seen_at": r.get::<_, Option<String>>(8)?,
+                        "last_seen_at": r.get::<_, Option<String>>(9)?,
+                        "trend": r.get::<_, Option<String>>(10)?,
+                        "known_issue_id": r.get::<_, Option<i64>>(11)?,
+                        "ai_generated": r.get::<_, Option<i64>>(12)?,
+                        "created_at": r.get::<_, Option<String>>(13)?,
+                        "updated_at": r.get::<_, Option<String>>(14)?,
+                        "provenance": r.get::<_, Option<String>>(15)?,
+                        "conversation_ids": cluster_conversation_ids(&conn, r.get::<_, i64>(0)?)?,
+                    }))
+                })
+                .map(|rows| rows.collect())
+                .unwrap_or_default();
+            Some(rows.into_iter().filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default();
     Json(json!({"clusters": clusters}))
+}
+
+/// The cluster's member conversation ids (reference listClusters/getCluster's
+/// `SELECT conversation_id FROM issue_cluster_conversations WHERE cluster_id = ?`
+/// — the port's documented rename is `issue_cluster_members`).
+fn cluster_conversation_ids(
+    conn: &rusqlite::Connection,
+    cluster_id: i64,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT conversation_id FROM issue_cluster_members WHERE cluster_id = ?1")?;
+    let ids = stmt
+        .query_map(rusqlite::params![cluster_id], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
 }
 
 /// GET /api/issues/sla-alerts
@@ -67,35 +111,110 @@ pub async fn sla_alerts(State(state): State<AppState>) -> axum::response::Respon
     }
 }
 
-/// GET /api/issues/clusters/:id
-pub async fn get_cluster(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+/// GET /api/issues/clusters/:id — reference routes/issues.ts:11-21: 404
+/// `{statusCode, error, message}` when the cluster is unknown, else
+/// `{cluster, conversations}` where conversations are the member rows
+/// `(id, number, subject, status, remote_created_at)`.
+///
+/// Port adaptation: the reference selects `remote_created_at`; the port's
+/// sync stores that value in `conversations.created_at` (remote_created_at
+/// stays NULL on synced rows), so the column is served as
+/// `COALESCE(remote_created_at, created_at)` under the reference's name.
+pub async fn get_cluster(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let row = conn.query_row(
-        "SELECT id, name, status, created_at FROM issue_clusters WHERE id = ?1",
+        "SELECT id, title, summary, category, product, feature,
+                conversation_count, customer_count, first_seen_at, last_seen_at,
+                trend, known_issue_id, ai_generated, created_at, updated_at, provenance
+         FROM issue_clusters WHERE id = ?1",
         rusqlite::params![id],
         |r| {
             Ok(json!({
                 "id": r.get::<_, i64>(0)?,
-                "name": r.get::<_, String>(1)?,
-                "status": r.get::<_, String>(2)?,
-                "created_at": r.get::<_, String>(3)?,
+                "title": r.get::<_, String>(1)?,
+                "summary": r.get::<_, Option<String>>(2)?,
+                "category": r.get::<_, Option<String>>(3)?,
+                "product": r.get::<_, Option<String>>(4)?,
+                "feature": r.get::<_, Option<String>>(5)?,
+                "conversation_count": r.get::<_, i64>(6)?,
+                "customer_count": r.get::<_, Option<i64>>(7)?,
+                "first_seen_at": r.get::<_, Option<String>>(8)?,
+                "last_seen_at": r.get::<_, Option<String>>(9)?,
+                "trend": r.get::<_, Option<String>>(10)?,
+                "known_issue_id": r.get::<_, Option<i64>>(11)?,
+                "ai_generated": r.get::<_, Option<i64>>(12)?,
+                "created_at": r.get::<_, Option<String>>(13)?,
+                "updated_at": r.get::<_, Option<String>>(14)?,
+                "provenance": r.get::<_, Option<String>>(15)?,
             }))
         },
     );
     match row {
-        Ok(v) => Json(v),
-        Err(_) => Json(json!({"error": "Cluster not found"})),
+        Ok(mut cluster) => {
+            // Reference issues.ts:17-19 — the member conversations in one
+            // IN-list query; an empty id list degrades to `IN (NULL)` and
+            // matches nothing (reference behavior).
+            let conversation_ids = cluster_conversation_ids(&conn, id).unwrap_or_default();
+            cluster["conversation_ids"] = json!(conversation_ids);
+            let placeholders = if conversation_ids.is_empty() {
+                "NULL".to_string()
+            } else {
+                vec!["?"; conversation_ids.len()].join(",")
+            };
+            let conversations: Vec<Value> = conn
+                .prepare(&format!(
+                    "SELECT id, number, subject, status,
+                            COALESCE(remote_created_at, created_at) AS remote_created_at
+                     FROM conversations WHERE id IN ({placeholders})"
+                ))
+                .and_then(|mut stmt| {
+                    let rows: Vec<std::result::Result<Value, _>> = stmt
+                        .query_map(rusqlite::params_from_iter(conversation_ids.iter()), |r| {
+                            Ok(json!({
+                                "id": r.get::<_, i64>(0)?,
+                                "number": r.get::<_, Option<i64>>(1)?,
+                                "subject": r.get::<_, Option<String>>(2)?,
+                                "status": r.get::<_, Option<String>>(3)?,
+                                "remote_created_at": r.get::<_, Option<String>>(4)?,
+                            }))
+                        })?
+                        .collect();
+                    Ok(rows.into_iter().filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(json!({"cluster": cluster, "conversations": conversations})),
+            )
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "statusCode": 404,
+                "error": "NotFound",
+                "message": "Cluster not found."
+            })),
+        )
+            .into_response(),
     }
 }
 
-/// DELETE /api/issues/clusters/:id
+/// DELETE /api/issues/clusters/:id — reference routes/issues.ts:23-26:
+/// removes the cluster row (members cascade; conversations are untouched —
+/// the reference's ON DELETE CASCADE on issue_cluster_conversations, which
+/// the port keeps on issue_cluster_members). Missing ids stay `{ok: true}`
+/// exactly like the reference (DELETE of zero rows is not an error).
 pub async fn delete_cluster(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
     let _ = conn.execute(
         "DELETE FROM issue_clusters WHERE id = ?1",
         rusqlite::params![id],
     );
-    Json(json!({"ok": true}))
+    Json(json!({"ok": true, "message": "Cluster deleted (conversations are untouched)."}))
 }
 
 /// GET /api/issues/known
