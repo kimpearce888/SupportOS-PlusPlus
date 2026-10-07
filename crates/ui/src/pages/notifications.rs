@@ -24,8 +24,10 @@ use crate::components::theming::Severity;
 /// `spp_core::notification_prefs::DEFAULT_RETENTION_TTL_DAYS` (30).
 pub const DEFAULT_TTL_DAYS_DISPLAY: i64 = 30;
 
-/// A UI-side notification row. Mirrors `spp_core::notifications::Notification`
-/// but with `'static` lifetimes so Leptos signals can hold it.
+/// A UI-side notification row. Mirrors the wire shape of
+/// `spp_core::notifications::NotificationRecord` (the reference
+/// `GET /api/notifications` payload) with `'static` lifetimes so Leptos
+/// signals can hold it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotificationView {
     /// The row id (used by the "Mark as read" action).
@@ -34,16 +36,81 @@ pub struct NotificationView {
     pub notification_type: NotificationType,
     /// The severity bucket (copied from `NotificationType::severity()`).
     pub severity: Severity,
-    /// The agent who should see this notification. `None` for "all agents".
+    /// The headline (reference field `title`).
+    pub title: String,
+    /// The detail body, when present.
+    pub body: Option<String>,
+    /// The agent who should see this notification. `None` for "all agents"
+    /// (reference field `target_user_local_id`).
     pub target_user_id: Option<i64>,
     /// The conversation the notification is about. `None` for system-wide.
     pub conversation_id: Option<i64>,
+    /// The conversation number, when linked (reference field).
+    pub conversation_number: Option<i64>,
     /// The JSON payload (triggering event details), as a raw string.
     pub payload: Option<String>,
-    /// Whether the notification has been read.
+    /// Whether the notification has been read (`read_at` set).
     pub read: bool,
     /// When the notification was created (ISO-8601 UTC).
     pub created_at: String,
+}
+
+/// Parse one wire row (the reference field names: `type`, `title`, `body`,
+/// `target_user_local_id`, `read_at`).
+pub fn parse_notification_row(n: &serde_json::Value) -> Option<NotificationView> {
+    let id = n.get("id")?.as_i64()?;
+    let type_str = n.get("type")?.as_str()?;
+    let nt = NotificationType::ALL
+        .iter()
+        .find(|t| t.as_str() == type_str)?;
+    let sev = match n.get("severity").and_then(|v| v.as_str()).unwrap_or("info") {
+        "critical" => Severity::Critical,
+        "warning" => Severity::Warning,
+        _ => Severity::Info,
+    };
+    Some(NotificationView {
+        id,
+        notification_type: *nt,
+        severity: sev,
+        title: n
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        body: n.get("body").and_then(|v| v.as_str()).map(str::to_string),
+        target_user_id: n.get("target_user_local_id").and_then(|v| v.as_i64()),
+        conversation_id: n.get("conversation_id").and_then(|v| v.as_i64()),
+        conversation_number: n.get("conversation_number").and_then(|v| v.as_i64()),
+        payload: None,
+        read: n.get("read_at").map(|r| !r.is_null()).unwrap_or(false),
+        created_at: n
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// One side-thread mention row (the `side_thread_mentions` list of
+/// `GET /api/notifications/mentions`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionView {
+    pub message_id: i64,
+    pub thread_id: i64,
+    pub thread_title: Option<String>,
+    pub conversation_id: i64,
+    pub conversation_number: Option<i64>,
+    pub author: Option<String>,
+    pub body: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// The active tab of the Notification Center.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationTab {
+    All,
+    Unread,
+    Mentions,
 }
 
 /// A user's preference for a notification type — enabled or disabled.
@@ -140,107 +207,386 @@ pub fn notification_description(notif_type: NotificationType) -> &'static str {
 
 /// The Notification Center page component.
 ///
-/// Wired to `notifications_list_unread` + `notifications_unread_count` IPC.
+/// Wired to the reference API: GET /api/notifications (with the `type` and
+/// `unreadOnly` filters), POST /api/notifications/:id/read,
+/// POST /api/notifications/read-all, GET/PUT /api/notifications/prefs and
+/// GET /api/notifications/mentions (the "mentions for me" queue).
 #[component]
 pub fn NotificationsPage() -> impl IntoView {
     let notifications = create_rw_signal(Vec::<NotificationView>::new());
+    let mentions = create_rw_signal(Vec::<MentionView>::new());
     let preferences = create_rw_signal(default_preferences());
+    let prefs_loaded = create_rw_signal(false);
     let retention_ttl_days = create_rw_signal(DEFAULT_TTL_DAYS_DISPLAY);
     let loading = create_rw_signal(true);
     let error_msg = create_rw_signal(None::<String>);
+    let unread = create_rw_signal(0i64);
+    let tab = create_rw_signal(NotificationTab::All);
+    let type_filter = create_rw_signal(String::new());
+    // Bumped after mark-read/mark-all-read/pref changes so the lists refetch.
+    let reload = create_rw_signal(0u32);
 
-    // Fetch unread notifications on mount.
+    // Fetch the notification list (respecting the tab's unread filter and
+    // the type filter) + the unread count.
     create_effect(move |_| {
+        let _ = reload.get();
+        let type_filter = type_filter.get();
+        let unread_only = tab.get() == NotificationTab::Unread;
+        let mut path = format!(
+            "/api/notifications?limit=50&unreadOnly={}",
+            if unread_only { "true" } else { "false" }
+        );
+        if !type_filter.is_empty() {
+            path.push_str("&type=");
+            path.push_str(&type_filter);
+        }
+        let path = path; // 'static for the spawned future
         let notifications = notifications;
+        let unread = unread;
         let loading = loading;
         let error_msg = error_msg;
+        let is_first = loading.get_untracked();
         wasm_bindgen_futures::spawn_local(async move {
-            match crate::api::get_json::<serde_json::Value>("/api/notifications?userId=1&limit=50")
-                .await
-            {
+            match crate::api::get_json::<serde_json::Value>(&path).await {
                 Ok(data) => {
                     let list = data
                         .get("notifications")
                         .and_then(|v| v.as_array())
                         .cloned()
                         .unwrap_or_default();
-                    let views: Vec<NotificationView> = list
-                        .into_iter()
-                        .filter_map(|n| {
-                            let id = n.get("id")?.as_i64()?;
-                            let type_str = n.get("notification_type")?.as_str()?;
-                            let nt = NotificationType::ALL
-                                .iter()
-                                .find(|t| t.as_str() == type_str)?;
-                            let severity_str = n.get("severity")?.as_str()?;
-                            let sev = match severity_str {
-                                "critical" => Severity::Critical,
-                                "warning" => Severity::Warning,
-                                _ => Severity::Info,
-                            };
-                            let read = n.get("read_at").map(|r| !r.is_null()).unwrap_or(false);
-                            let created_at = n.get("created_at")?.as_str()?.to_string();
-                            Some(NotificationView {
-                                id,
-                                notification_type: *nt,
-                                severity: sev,
-                                target_user_id: n.get("target_user_id").and_then(|v| v.as_i64()),
-                                conversation_id: n.get("conversation_id").and_then(|v| v.as_i64()),
-                                payload: None,
-                                read,
-                                created_at,
-                            })
-                        })
-                        .collect();
+                    let views: Vec<NotificationView> =
+                        list.iter().filter_map(parse_notification_row).collect();
                     notifications.set(views);
-                    loading.set(false);
+                    if let Some(n) = data.get("unread").and_then(|v| v.as_i64()) {
+                        unread.set(n);
+                    }
+                    if is_first {
+                        loading.set(false);
+                    }
                 }
                 Err(e) => {
                     error_msg.set(Some(e));
-                    loading.set(false);
+                    if is_first {
+                        loading.set(false);
+                    }
                 }
             }
         });
     });
 
+    // Fetch the mention queue once (tab content) + the persisted prefs.
+    create_effect(move |_| {
+        let _ = tab.get();
+        if tab.get() != NotificationTab::Mentions || !mentions.get_untracked().is_empty() {
+            return;
+        }
+        let mentions = mentions;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(data) =
+                crate::api::get_json::<serde_json::Value>("/api/notifications/mentions").await
+            {
+                let rows = data
+                    .get("side_thread_mentions")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let views: Vec<MentionView> = rows
+                    .iter()
+                    .filter_map(|m| {
+                        Some(MentionView {
+                            message_id: m.get("message_id")?.as_i64()?,
+                            thread_id: m.get("thread_id")?.as_i64()?,
+                            thread_title: m
+                                .get("thread_title")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            conversation_id: m.get("conversation_id")?.as_i64()?,
+                            conversation_number: m
+                                .get("conversation_number")
+                                .and_then(|v| v.as_i64()),
+                            author: m.get("author").and_then(|v| v.as_str()).map(str::to_string),
+                            body: m.get("body").and_then(|v| v.as_str()).map(str::to_string),
+                            created_at: m
+                                .get("created_at")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                        })
+                    })
+                    .collect();
+                mentions.set(views);
+            }
+        });
+    });
+
+    // Load the persisted preferences (GET /api/notifications/prefs).
+    create_effect(move |_| {
+        if prefs_loaded.get() {
+            return;
+        }
+        prefs_loaded.set(true);
+        let preferences = preferences;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(data) =
+                crate::api::get_json::<serde_json::Value>("/api/notifications/prefs").await
+            {
+                let rows = data
+                    .get("prefs")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                preferences.update(|p| {
+                    for row in rows {
+                        let type_str = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let enabled = row
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if let Some(entry) = p.iter_mut().find(|(t, _)| t.as_str() == type_str) {
+                            entry.1 = NotificationPreferenceView::from_bool(enabled);
+                        }
+                    }
+                });
+            }
+        });
+    });
+
+    // Mark one notification read (POST /api/notifications/:id/read).
+    let mark_read = move |id: i64| {
+        let reload = reload;
+        wasm_bindgen_futures::spawn_local(async move {
+            if crate::api::post_json::<serde_json::Value>(
+                &format!("/api/notifications/{id}/read"),
+                Some(&serde_json::json!({ "read": true })),
+            )
+            .await
+            .is_ok()
+            {
+                reload.set(reload.get_untracked() + 1);
+            }
+        });
+    };
+
+    // Mark everything read (POST /api/notifications/read-all).
+    let mark_all_read = move |_| {
+        let reload = reload;
+        let unread = unread;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(body) =
+                crate::api::post_json::<serde_json::Value>("/api/notifications/read-all", None)
+                    .await
+            {
+                if let Some(n) = body.get("unread").and_then(|v| v.as_i64()) {
+                    unread.set(n);
+                }
+                reload.set(reload.get_untracked() + 1);
+            }
+        });
+    };
+
+    // Toggle a preference and persist it (PUT /api/notifications/prefs/:type).
+    let on_toggle_pref = move |i: usize, v: bool| {
+        let (notif_type, _) = preferences.get_untracked().get(i).copied().unwrap_or((
+            NotificationType::CustomerReplied,
+            NotificationPreferenceView::Enabled,
+        ));
+        preferences.update(|p| {
+            if let Some(entry) = p.get_mut(i) {
+                entry.1 = NotificationPreferenceView::from_bool(v);
+            }
+        });
+        let preferences = preferences;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(data) = crate::api::put_json::<serde_json::Value>(
+                &format!("/api/notifications/prefs/{}", notif_type.as_str()),
+                &serde_json::json!({ "enabled": v }),
+            )
+            .await
+            {
+                // The PUT returns the authoritative prefs list — re-sync.
+                let rows = data
+                    .get("prefs")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                preferences.update(|p| {
+                    for row in rows {
+                        let type_str = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        let enabled = row
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if let Some(entry) = p.iter_mut().find(|(t, _)| t.as_str() == type_str) {
+                            entry.1 = NotificationPreferenceView::from_bool(enabled);
+                        }
+                    }
+                });
+            }
+        });
+    };
+
     view! {
         <div class="spp-page spp-page--notifications">
-            <h2 class="spp-page__title">"Notifications"</h2>
+            <h2 class="spp-page__title">
+                "Notifications"
+                <Show when=move || { unread.get() > 0 } fallback=|| ().into_view()>
+                    <span class="spp-badge spp-badge--err">{move || unread.get().to_string()}</span>
+                </Show>
+            </h2>
             <p class="spp-page__subtitle">
                 "Stay on top of replies, SLA risk, and system health. "
                 "Adjust which notifications you see, or change how long they're kept."
             </p>
 
-            // ── Notification list ──
-            <section class="spp-notifications-list">
-                <h3 class="spp-notifications-list__title">"Recent"</h3>
-                <Show
-                    when=move || !notifications.get().is_empty()
-                    fallback=move || {
-                        view! {
-                            <EmptyState message="No notifications yet. Once a sync settles, customer replies and ticket assignments will appear here." />
-                        }
-                    }
-                >
-                    <NotificationSeverityGroups notifications=notifications.get() />
+            // ── Tabs + filters ──
+            <div class="spp-notifications-toolbar" role="tablist">
+                <div class="spp-tabs">
+                    <button
+                        class=move || if tab.get() == NotificationTab::All { "spp-tab is-active" } else { "spp-tab" }
+                        type="button"
+                        role="tab"
+                        aria-selected=move || tab.get() == NotificationTab::All
+                        on:click=move |_| tab.set(NotificationTab::All)
+                    >
+                        "All"
+                    </button>
+                    <button
+                        class=move || if tab.get() == NotificationTab::Unread { "spp-tab is-active" } else { "spp-tab" }
+                        type="button"
+                        role="tab"
+                        aria-selected=move || tab.get() == NotificationTab::Unread
+                        on:click=move |_| tab.set(NotificationTab::Unread)
+                    >
+                        "Unread"
+                    </button>
+                    <button
+                        class=move || if tab.get() == NotificationTab::Mentions { "spp-tab is-active" } else { "spp-tab" }
+                        type="button"
+                        role="tab"
+                        aria-selected=move || tab.get() == NotificationTab::Mentions
+                        on:click=move |_| tab.set(NotificationTab::Mentions)
+                    >
+                        "Mentions"
+                    </button>
+                </div>
+                <Show when=move || tab.get() != NotificationTab::Mentions fallback=|| ().into_view()>
+                    <label class="spp-notifications-toolbar__filter" for="notification-type-filter">
+                        "Type"
+                        <select
+                            id="notification-type-filter"
+                            class="spp-input"
+                            prop:value=move || type_filter.get()
+                            on:change=move |ev| {
+                                type_filter.set(event_target_value(&ev));
+                                reload.set(reload.get_untracked() + 1);
+                            }
+                        >
+                            <option value="">"All types"</option>
+                            {NotificationType::ALL.iter().map(|t| {
+                                let key = t.as_str().to_string();
+                                view! { <option value=key.clone()>{notification_label(*t)}</option> }.into_view()
+                            }).collect::<Vec<_>>()}
+                        </select>
+                    </label>
+                    <button
+                        class="spp-button spp-button--ghost spp-button--small"
+                        type="button"
+                        disabled=move || unread.get() == 0
+                        on:click=mark_all_read
+                    >
+                        "Mark all read"
+                    </button>
                 </Show>
-            </section>
+            </div>
+
+            <Show when=move || error_msg.get().is_some() fallback=|| ().into_view()>
+                <div class="spp-state spp-state--error">
+                    <p class="spp-state__body">{move || error_msg.get().unwrap_or_default()}</p>
+                </div>
+            </Show>
+
+            // ── Mention queue tab ──
+            <Show when=move || tab.get() == NotificationTab::Mentions fallback=|| ().into_view()>
+                <section class="spp-notifications-list">
+                    <h3 class="spp-notifications-list__title">"Mentions for you"</h3>
+                    <Show
+                        when=move || !mentions.get().is_empty()
+                        fallback=move || {
+                            view! {
+                                <EmptyState message="No mentions yet. @mentions in conversations and side threads land here." />
+                            }
+                        }
+                    >
+                        <ul class="spp-notifications-severity-group__list">
+                            {move || mentions.get().iter().map(|m| {
+                                // Precompute every owned string so the
+                                // closures below capture only Copies/Options.
+                                let title = m.thread_title.clone()
+                                    .unwrap_or_else(|| "Side thread".to_string());
+                                let at = m.created_at.clone().unwrap_or_default();
+                                let body_line = match (&m.author, &m.body) {
+                                    (Some(a), Some(b)) => Some(format!("{a}: {b}")),
+                                    (Some(a), None) => Some(a.clone()),
+                                    (None, Some(b)) => Some(b.clone()),
+                                    (None, None) => None,
+                                };
+                                let body_display = body_line.unwrap_or_default();
+                                let has_body = !body_display.is_empty();
+                                let number_display = m.conversation_number
+                                    .map(|n| format!("#{n}"))
+                                    .unwrap_or_default();
+                                let has_number = !number_display.is_empty();
+                                view! {
+                                    <li class="spp-notification-row" title="Mentioned in a side thread">
+                                        <span class="spp-notification-row__label">{title}</span>
+                                        <Show when=move || has_body fallback=|| ().into_view()>
+                                            <span class="spp-notification-row__body">
+                                                {body_display.clone()}
+                                            </span>
+                                        </Show>
+                                        <Show when=move || has_number fallback=|| ().into_view()>
+                                            <span class="spp-notification-row__read-badge">
+                                                {number_display.clone()}
+                                            </span>
+                                        </Show>
+                                        <span class="spp-notification-row__time">{at}</span>
+                                    </li>
+                                }
+                            }).collect::<Vec<_>>()}
+                        </ul>
+                    </Show>
+                </section>
+            </Show>
+
+            // ── Notification list (All / Unread tabs) ──
+            <Show when=move || tab.get() != NotificationTab::Mentions fallback=|| ().into_view()>
+                <section class="spp-notifications-list">
+                    <h3 class="spp-notifications-list__title">
+                        {move || if tab.get() == NotificationTab::Unread { "Unread" } else { "Recent" }.to_string()}
+                    </h3>
+                    <Show
+                        when=move || !loading.get() && !notifications.get().is_empty()
+                        fallback=move || {
+                            view! {
+                                <EmptyState message="No notifications yet. Once a sync settles, customer replies and ticket assignments will appear here." />
+                            }
+                        }
+                    >
+                        <NotificationSeverityGroups
+                            notifications=notifications.get()
+                            on_mark_read=mark_read
+                        />
+                    </Show>
+                </section>
+            </Show>
 
             // ── Per-type preferences ──
             <section class="spp-notifications-prefs">
                 <h3 class="spp-notifications-prefs__title">"Notification preferences"</h3>
                 <p class="spp-notifications-prefs__help">
                     "Toggle which notification types you want to see. "
-                    "High-signal types (SLA, sync failures) are on by default; "
-                    "campaign and customer-event notifications are opt-in."
+                    "Changes are saved to your workspace immediately."
                 </p>
-                <PreferencesList preferences=preferences.get() on_toggle=move |i, v| {
-                    preferences.update(|p| {
-                        if let Some(entry) = p.get_mut(i) {
-                            entry.1 = NotificationPreferenceView::from_bool(v);
-                        }
-                    });
-                } />
+                <PreferencesList preferences=preferences.get() on_toggle=on_toggle_pref />
             </section>
 
             // ── Retention TTL setting ──
@@ -277,7 +623,15 @@ pub fn NotificationsPage() -> impl IntoView {
 
 /// The notification list grouped by severity (critical / warning / info).
 #[component]
-fn NotificationSeverityGroups(notifications: Vec<NotificationView>) -> impl IntoView {
+fn NotificationSeverityGroups<F>(
+    notifications: Vec<NotificationView>,
+    on_mark_read: F,
+) -> impl IntoView
+where
+    F: Fn(i64) + 'static + Clone,
+{
+    let on_critical = on_mark_read.clone();
+    let on_warning = on_mark_read.clone();
     let critical: Vec<NotificationView> = notifications
         .iter()
         .filter(|n| n.severity == Severity::Critical)
@@ -296,26 +650,30 @@ fn NotificationSeverityGroups(notifications: Vec<NotificationView>) -> impl Into
 
     view! {
         <div class="spp-notifications-severity-groups">
-            <NotificationSeveritySection title="Critical" notifications=critical />
-            <NotificationSeveritySection title="Warning" notifications=warning />
-            <NotificationSeveritySection title="Info" notifications=info />
+            <NotificationSeveritySection title="Critical" notifications=critical on_mark_read=on_critical />
+            <NotificationSeveritySection title="Warning" notifications=warning on_mark_read=on_warning />
+            <NotificationSeveritySection title="Info" notifications=info on_mark_read=on_mark_read />
         </div>
     }
 }
 
 /// A severity-grouped section of notifications.
 #[component]
-fn NotificationSeveritySection(
+fn NotificationSeveritySection<F>(
     title: &'static str,
     notifications: Vec<NotificationView>,
-) -> impl IntoView {
+    on_mark_read: F,
+) -> impl IntoView
+where
+    F: Fn(i64) + 'static + Clone,
+{
     let has_notifications = !notifications.is_empty();
     let rows_fragment = leptos::Fragment::new(
         notifications
             .iter()
             .map(|n| {
                 view! {
-                    <NotificationRow notification=n.clone() />
+                    <NotificationRow notification=n.clone() on_mark_read=on_mark_read.clone() />
                 }
                 .into_view()
             })
@@ -336,9 +694,13 @@ fn NotificationSeveritySection(
     }
 }
 
-/// A single notification row.
+/// A single notification row — "Mark as read" wired to
+/// POST /api/notifications/:id/read.
 #[component]
-fn NotificationRow(notification: NotificationView) -> impl IntoView {
+fn NotificationRow<F>(notification: NotificationView, on_mark_read: F) -> impl IntoView
+where
+    F: Fn(i64) + 'static + Clone,
+{
     let label = notification_label(notification.notification_type);
     let description = notification_description(notification.notification_type);
     let severity_class = format!(
@@ -351,18 +713,47 @@ fn NotificationRow(notification: NotificationView) -> impl IntoView {
         "spp-notification-row__read-badge spp-notification-row__read-badge--unread"
     };
     let read_label = if notification.read { "Read" } else { "Unread" };
-    // Pre-extract the owned String so the view! closure can borrow a 'static
-    // slice instead of borrowing the (soon-dropped) notification.
+    // Pre-extract the owned Strings so the view! closures can borrow 'static
+    // slices instead of borrowing the (soon-dropped) notification.
     let created_at = notification.created_at.clone();
+    let title_text = if notification.title.is_empty() {
+        label.to_string()
+    } else {
+        notification.title.clone()
+    };
+    let body_text = notification.body.clone().unwrap_or_default();
+    let has_body = !body_text.is_empty();
+    let number_display = notification
+        .conversation_number
+        .map(|n| format!("#{n}"))
+        .unwrap_or_default();
+    let has_number = !number_display.is_empty();
     let is_unread = !notification.read;
+    let row_id = notification.id;
+    // Rc-wrap the callback so the Show children closure can hand each re-run
+    // its own cheap clone (the click handler must not move it out).
+    let on_mark_read = std::rc::Rc::new(on_mark_read);
 
     view! {
         <li class=severity_class title=description>
-            <span class="spp-notification-row__label">{label}</span>
+            <span class="spp-notification-row__label">{title_text}</span>
+            <Show when=move || has_body fallback=|| ().into_view()>
+                <span class="spp-notification-row__body">{body_text.clone()}</span>
+            </Show>
+            <Show when=move || has_number fallback=|| ().into_view()>
+                <span class="spp-notification-row__read-badge">{number_display.clone()}</span>
+            </Show>
             <span class="spp-notification-row__time">{created_at}</span>
             <span class=read_badge_class>{read_label}</span>
             <Show when=move || is_unread fallback=|| ().into_view()>
-                <button class="spp-notification-row__mark-read" type="button">
+                <button
+                    class="spp-notification-row__mark-read"
+                    type="button"
+                    on:click={
+                        let handler = on_mark_read.clone();
+                        move |_| handler(row_id)
+                    }
+                >
                     "Mark as read"
                 </button>
             </Show>
@@ -526,8 +917,11 @@ mod tests {
             id: 1,
             notification_type: NotificationType::SlaBreach,
             severity: notification_severity(NotificationType::SlaBreach),
+            title: "SLA breached".into(),
+            body: Some("#101 went past its first-response SLA".into()),
             target_user_id: Some(42),
             conversation_id: Some(1001),
+            conversation_number: Some(101),
             payload: Some(r#"{"reason":"breached"}"#.into()),
             read: false,
             created_at: "2026-10-01T10:00:00Z".into(),
@@ -538,38 +932,66 @@ mod tests {
     }
 
     #[test]
+    fn parse_notification_row_reads_the_reference_field_names() {
+        // The reference wire row: `type` (not notification_type), `title`,
+        // `body`, `target_user_local_id` (not target_user_id),
+        // `conversation_number`, `read_at`.
+        let v = serde_json::json!({
+            "id": 7,
+            "type": "customer_replied",
+            "severity": "warning",
+            "title": "Customer replied on #33",
+            "body": "Refund question",
+            "target_user_local_id": 9,
+            "conversation_id": 33,
+            "conversation_number": 33,
+            "created_at": "2026-10-01T10:00:00Z",
+            "read_at": null,
+        });
+        let n = parse_notification_row(&v).expect("parses");
+        assert_eq!(n.id, 7);
+        assert_eq!(n.notification_type, NotificationType::CustomerReplied);
+        assert_eq!(n.severity, Severity::Warning);
+        assert_eq!(n.title, "Customer replied on #33");
+        assert_eq!(n.body.as_deref(), Some("Refund question"));
+        assert_eq!(n.target_user_id, Some(9));
+        assert_eq!(n.conversation_id, Some(33));
+        assert_eq!(n.conversation_number, Some(33));
+        assert!(!n.read);
+        // A read row carries read_at.
+        let v = serde_json::json!({
+            "id": 8, "type": "mentioned", "severity": "info", "title": "Mentioned",
+            "created_at": "2026-10-01T10:00:00Z", "read_at": "2026-10-01T11:00:00Z",
+        });
+        let n = parse_notification_row(&v).expect("parses");
+        assert!(n.read);
+        // Unknown types are dropped (closed vocabulary).
+        let v = serde_json::json!({
+            "id": 9, "type": "not_a_type", "severity": "info", "title": "x",
+            "created_at": "2026-10-01T10:00:00Z", "read_at": null,
+        });
+        assert!(parse_notification_row(&v).is_none());
+    }
+
+    #[test]
     fn notifications_can_be_grouped_by_severity() {
+        let mk = |t: NotificationType, read: bool| NotificationView {
+            id: 1,
+            notification_type: t,
+            severity: notification_severity(t),
+            title: String::new(),
+            body: None,
+            target_user_id: Some(42),
+            conversation_id: None,
+            conversation_number: None,
+            payload: None,
+            read,
+            created_at: "2026-10-01T10:00:00Z".into(),
+        };
         let notifications = [
-            NotificationView {
-                id: 1,
-                notification_type: NotificationType::SlaBreach,
-                severity: notification_severity(NotificationType::SlaBreach),
-                target_user_id: Some(42),
-                conversation_id: None,
-                payload: None,
-                read: false,
-                created_at: "2026-10-01T10:00:00Z".into(),
-            },
-            NotificationView {
-                id: 2,
-                notification_type: NotificationType::SlaRisk,
-                severity: notification_severity(NotificationType::SlaRisk),
-                target_user_id: Some(42),
-                conversation_id: None,
-                payload: None,
-                read: false,
-                created_at: "2026-10-01T10:00:00Z".into(),
-            },
-            NotificationView {
-                id: 3,
-                notification_type: NotificationType::Mentioned,
-                severity: notification_severity(NotificationType::Mentioned),
-                target_user_id: Some(42),
-                conversation_id: None,
-                payload: None,
-                read: true,
-                created_at: "2026-10-01T10:00:00Z".into(),
-            },
+            mk(NotificationType::SlaBreach, false),
+            mk(NotificationType::SlaRisk, false),
+            mk(NotificationType::Mentioned, true),
         ];
         let critical = notifications
             .iter()

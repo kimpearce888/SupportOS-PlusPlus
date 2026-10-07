@@ -1188,6 +1188,31 @@ body {
   color: var(--spp-bg);
 }
 
+/* UI-17: Notification Center toolbar (tabs + type filter + mark-all-read). */
+.spp-notifications-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--spp-space-3);
+}
+
+.spp-notifications-toolbar__filter {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+  font-size: var(--spp-text-sm);
+  color: var(--spp-fg-muted);
+}
+
+.spp-notification-row__body {
+  font-size: var(--spp-text-xs);
+  color: var(--spp-fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .spp-notification-row__read-badge--read {
   background: var(--spp-border-subtle);
   color: var(--spp-fg-muted);
