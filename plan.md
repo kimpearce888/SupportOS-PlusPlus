@@ -10,7 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 47 | IS-01 | Cluster list/detail/delete (+conversations) | Divergent | Major | M | - | Serve title/trend/members + conversations in cluster detail |
 | 48 | IS-02 | Known issues CRUD (rich fields) + link/unlink | Divergent | Major | M | M5 | Write/serve all MAIN fields |
 | 49 | IS-03 | Engineering refs + support cases (from-conversation capture) | Stub | Major | M | - | Implement refs CRUD + support-case capture from conversation |
 | 50 | TL-02 | Customer/organization timeline reads (kind counts, filters) | Divergent | Major | M | - | Serve event-kind timeline for customers with filters |
