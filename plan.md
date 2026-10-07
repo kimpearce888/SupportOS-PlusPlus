@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **58 remaining**.
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **53 remaining**.
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 59 | UI-22 | Command palette (live search, 12 hits, keyboard nav) | Stub | Major | M | M9 | Live search via POST /api/search, 200ms debounce, keyboard nav, 12 hits |
-| 60 | UI-26 | SSE toasts + cross-page invalidation | Missing | Major | M | - | Toast center for rating/webhook/campaign/critical events; subscribe error |
-| 61 | UI-27 | URL-backed state / deep links (view=, days=, doc=, article=, tab=) | Missing | Major | M | - | URL-backed filter state + deep links on dashboard/inbox/knowledge/docs/issues |
-| 62 | UI-01 | Dashboard page (ranges, mailbox/channel filters, charts, radar card, KPI links) | Partial | Major | L | - | Ranges, mailbox/channel filters, charts, radar card, linked KPIs, days param |
-| 63 | UI-04 | Customers + detail (properties, memories, ratings, interaction profile, health) | Partial | Major | L | - | Properties, memories, ratings, resolutions, interaction profile, support health, clickable conversations, pagination |
 | 64 | UI-07 | Issues page (5 tabs: radar/clusters/known/gaps/reuse) | Stub | Major | L | M26 | Port 5 tabs (radar/clusters/known/gaps/reuse) calling existing APIs |
 | 65 | UI-14 | Reports page (10 tabs) | Partial | Major | L | - | Port 6 missing tabs (SLA/why-contacting/intelligence/HS reports/definitions/release) |
 | 66 | UI-02 | Inbox page (~51 subfeatures: views, filters, bulk, snooze, schedule, attachments, tags/fields editors, AI draft composer, audit, activity) | Partial | Major | XL | M8 | Port ~30 missing subfeatures (views/filterbar/bulk/snooze/schedule/attachments/editors/audit/activity/draft composer/saved replies/cc/bcc/Cmd+Enter/close-confirm/pagination/URL state/assignee picker) |
