@@ -34,7 +34,10 @@ pub const M020_TO_M022_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_customer_timeline_customer
         ON customer_timeline (customer_id, occurred_at);
 
-    -- M022: graph_nodes + graph_edges
+    -- M022: graph_nodes (the human-edge store `graph_edges` — the
+    -- reference's support_graph_edges under the documented rename — is
+    -- created by support_graph::ensure_graph_edges_schema in the reference
+    -- migration-016 shape; GR-02)
     CREATE TABLE IF NOT EXISTS graph_nodes (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         kind            TEXT NOT NULL,
@@ -46,24 +49,17 @@ pub const M020_TO_M022_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_graph_nodes_kind
         ON graph_nodes (kind, entity_id);
 
-    CREATE TABLE IF NOT EXISTS graph_edges (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_id       INTEGER NOT NULL REFERENCES graph_nodes (id) ON DELETE CASCADE,
-        target_id       INTEGER NOT NULL REFERENCES graph_nodes (id) ON DELETE CASCADE,
-        edge_type       TEXT NOT NULL DEFAULT 'related',
-        created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_graph_edges_source
-        ON graph_edges (source_id, edge_type);
-    CREATE INDEX IF NOT EXISTS idx_graph_edges_target
-        ON graph_edges (target_id, edge_type);
-
     UPDATE app_state SET schema_version = 22 WHERE id = 1;
 "#;
 
-/// Apply M020–M022 migrations. Idempotent.
+/// Apply M020–M022 migrations. Idempotent. The human-edge store
+/// (graph_edges, the reference's support_graph_edges) is ensured in the
+/// reference migration-016 shape — including the reshape of pre-GR-02
+/// legacy databases whose graph_edges was a graph_nodes-surrogate model
+/// written only by the old unvalidated route.
 pub fn apply_m020_to_m022(conn: &Connection) -> Result<()> {
     conn.execute_batch(M020_TO_M022_SQL)?;
+    crate::support_graph::ensure_graph_edges_schema(conn)?;
     Ok(())
 }
 
@@ -2201,15 +2197,6 @@ pub struct GraphNode {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GraphEdge {
-    pub id: Option<i64>,
-    pub source_id: i64,
-    pub target_id: i64,
-    pub edge_type: String,
-    pub created_at: String,
-}
-
 /// Validate that a node kind is one of the 12 from the catalog.
 pub fn validate_graph_node_kind(kind: &str) -> Result<GraphNodeKind> {
     for k in GraphNodeKind::ALL {
@@ -2239,44 +2226,38 @@ pub fn add_graph_node(
     Ok(conn.last_insert_rowid())
 }
 
-/// Add a graph edge.
-pub fn add_graph_edge(
+/// Get neighbors of a node (both directions of the stored human edges
+/// touching (kind, local mirror id)) — the interim reader the graph routes
+/// use until the derived-edge layer lands (GR-01/GR-03). Kept for the
+/// module's public surface; the wire building lives in support_graph.
+pub fn get_graph_neighbors(
     conn: &Connection,
-    source_id: i64,
-    target_id: i64,
-    edge_type: &str,
-) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO graph_edges (source_id, target_id, edge_type)
-         VALUES (?1, ?2, ?3)",
-        params![source_id, target_id, edge_type],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-/// Get neighbors of a node (both outgoing and incoming edges).
-pub fn get_graph_neighbors(conn: &Connection, node_id: i64) -> Result<Vec<GraphNode>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT n.id, n.kind, n.entity_id, n.label, n.properties_json, n.created_at
-         FROM graph_nodes n
-         JOIN graph_edges e ON (e.target_id = n.id AND e.source_id = ?1)
-                            OR (e.source_id = n.id AND e.target_id = ?1)
-         WHERE n.id != ?1
-         ORDER BY n.id",
-    )?;
-    let rows = stmt
-        .query_map(params![node_id], |r| {
-            Ok(GraphNode {
-                id: r.get(0)?,
-                kind: r.get(1)?,
-                entity_id: r.get(2)?,
-                label: r.get(3)?,
-                properties: r.get(4)?,
-                created_at: r.get(5)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    kind: &str,
+    local_id: i64,
+) -> Result<Vec<crate::support_graph::GraphNodeRef>> {
+    let Some(kind) = validate_graph_node_kind(kind).ok() else {
+        return Ok(Vec::new());
+    };
+    let edges = crate::support_graph::human_edges_touching(conn, kind, local_id)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for edge in &edges {
+        for side in ["source", "target"] {
+            if let Some(v) = edge.get(side) {
+                let key = serde_json::to_string(v).unwrap_or_default();
+                if seen.insert(key) {
+                    if let Ok(r) =
+                        serde_json::from_value::<crate::support_graph::GraphNodeRef>(v.clone())
+                    {
+                        if r.kind != kind.as_str() || r.local_id != local_id {
+                            out.push(r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Get a node by id.
@@ -2441,6 +2422,33 @@ mod tests {
             .unwrap();
         assert_eq!(nodes, 0);
         assert_eq!(edges, 0);
+        // GR-02: graph_edges is the reference migration-016 human-edge
+        // shape (kind/local_id keyed, 5-relation CHECK), not the legacy
+        // graph_nodes-surrogate model.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(graph_edges)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for col in [
+            "source_kind",
+            "source_local_id",
+            "target_kind",
+            "target_local_id",
+            "relation",
+            "note",
+            "created_by_user_local_id",
+            "created_at",
+            "provenance",
+        ] {
+            assert!(cols.iter().any(|c| c == col), "graph_edges.{col} missing");
+        }
+        assert!(
+            !cols.iter().any(|c| c == "source_id"),
+            "legacy shape leaked"
+        );
     }
 
     #[test]
@@ -2677,17 +2685,40 @@ mod tests {
     #[test]
     fn add_graph_edge_and_get_neighbors_works() {
         let conn = fresh_db();
-        let n1 = add_graph_node(&conn, "customer", Some(2001), Some("Alice"), None).unwrap();
-        let n2 = add_graph_node(&conn, "conversation", Some(1001), Some("Bug"), None).unwrap();
-        let n3 = add_graph_node(&conn, "known_issue", Some(1), Some("Login bug"), None).unwrap();
+        // Human edges now address mirror rows by (kind, local id), so the
+        // neighbor reader needs real mirror rows, not graph_nodes surrogates
+        // (GR-02: the surrogate edge model is gone).
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id)
+             VALUES (1001, 1001, 'Bug', 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let conv_id: i64 = conn
+            .query_row(
+                "SELECT id FROM conversations WHERE remote_id = 1001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO known_issues (id, name, status) VALUES (1, 'Login bug', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO graph_edges (source_kind, source_local_id, target_kind, target_local_id, relation, provenance)
+             VALUES ('conversation', ?1, 'known_issue', 1, 'mentions', 'human_local')",
+            params![conv_id],
+        )
+        .unwrap();
 
-        // Alice → Bug → Login bug.
-        add_graph_edge(&conn, n1, n2, "filed").unwrap();
-        add_graph_edge(&conn, n2, n3, "linked_to").unwrap();
-
-        // n2's neighbors should include n1 and n3.
-        let neighbors = get_graph_neighbors(&conn, n2).unwrap();
-        assert_eq!(neighbors.len(), 2, "both incoming and outgoing neighbors");
+        let neighbors = get_graph_neighbors(&conn, "conversation", conv_id).unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].kind, "known_issue");
+        let incoming = get_graph_neighbors(&conn, "known_issue", 1).unwrap();
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].kind, "conversation");
     }
 
     #[test]

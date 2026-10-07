@@ -30,6 +30,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use crate::ai_lm_studio::ChatTool;
+use crate::catalog::GraphNodeKind;
 use crate::error::Result;
 
 /// Reference DDL for the friction findings table (migration 015), including
@@ -87,8 +88,6 @@ type HistoryTicket = (
 /// A knowledge-gap candidate row (id, kind, question, occurrences, status,
 /// detail).
 type GapRow = (i64, Option<String>, String, i64, String, Option<String>);
-/// A graph edge row (source kind/label, target kind/label, relation).
-type GraphEdgeRow = (String, Option<String>, String, Option<String>, String);
 /// A customer-memory row (key, value, source, confidence, last seen).
 type MemoryRow = (
     String,
@@ -1248,71 +1247,44 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             else {
                 return json!({ "error": "Invalid local_id" });
             };
-            let valid_kinds = [
-                "customer",
-                "organization",
-                "conversation",
-                "known_issue",
-                "issue_cluster",
-                "incident",
-                "knowledge_document",
-                "agent",
-                "campaign",
-                "product",
-                "custom_object",
-                "connector_data",
-            ];
-            if !valid_kinds.contains(&kind.as_str()) {
-                return json!({ "error": format!("Unknown node kind. Valid kinds: {}", valid_kinds.join(", ")) });
-            }
-            let node = conn
-                .query_row(
-                    "SELECT id, label FROM graph_nodes WHERE kind = ?1 AND entity_id = ?2 LIMIT 1",
-                    params![kind, local_id],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
-                )
-                .ok();
-            let Some((node_id, label)) = node else {
+            let Some(kind_enum) = GraphNodeKind::ALL.into_iter().find(|k| k.as_str() == kind)
+            else {
+                return json!({ "error": format!("Unknown node kind: {kind}") });
+            };
+            // GR-02: labels resolve from the mirror tables (the reference's
+            // NODE_LABEL_SQL), not the graph_nodes surrogate store; edges are
+            // the stored human-asserted ones (both directions).
+            let Some(node_ref) = crate::support_graph::node_ref(conn, kind_enum, local_id)
+                .ok()
+                .flatten()
+            else {
                 return json!({ "error": "Node not found" });
             };
-            let edges: Vec<GraphEdgeRow> = conn
-                .prepare(
-                    "SELECT sn.kind, sn.label, tn.kind, tn.label, e.edge_type
-                       FROM graph_edges e
-                       JOIN graph_nodes sn ON sn.id = e.source_id
-                       JOIN graph_nodes tn ON tn.id = e.target_id
-                      WHERE e.source_id = ?1 OR e.target_id = ?1
-                      LIMIT ?2",
-                )
-                .and_then(|mut stmt| {
-                    stmt.query_map(params![node_id, limit * 2], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, Option<String>>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                            r.get::<_, String>(4)?,
-                        ))
-                    })
-                    .map(|rows| rows.filter_map(|t| t.ok()).collect::<Vec<_>>())
-                })
+            let edges = crate::support_graph::human_edges_touching(conn, kind_enum, local_id)
                 .unwrap_or_default();
-            json!({
-                "node": { "kind": kind, "label": red_chars(conn, label.as_deref().unwrap_or(""), 160) },
-                "total_edges": edges.len(),
-                "edges": edges.iter().take(limit as usize).map(|(sk, sl, tk, tl, rel)| {
-                    let connected = if sk.as_str() == kind {
-                        red_chars(conn, tl.as_deref().unwrap_or(""), 120)
+            let center_key = json!({"kind": kind, "local_id": local_id});
+            let items: Vec<Value> = edges
+                .iter()
+                .map(|e| {
+                    let source_is_center = e["source"]["kind"] == center_key["kind"]
+                        && e["source"]["local_id"] == center_key["local_id"];
+                    let other = if source_is_center {
+                        &e["target"]
                     } else {
-                        format!("{} -> {}", red_chars(conn, sl.as_deref().unwrap_or(""), 120), red_chars(conn, tl.as_deref().unwrap_or(""), 120))
+                        &e["source"]
                     };
                     json!({
-                        "relation": rel,
-                        "connected_kind": if sk.as_str() == kind { tk.clone() } else { sk.clone() },
-                        "connected": connected,
-                        "note": Value::Null,
+                        "relation": e["relation"],
+                        "connected_kind": other["kind"],
+                        "connected": red_chars(conn, other["label"].as_str().unwrap_or(""), 120),
+                        "note": e["note"],
                     })
-                }).collect::<Vec<_>>(),
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "node": { "kind": kind, "label": red_chars(conn, &node_ref.label, 160) },
+                "total_edges": edges.len(),
+                "edges": items,
                 "note": "Edges are read from the local support graph store; only human-asserted edges are stored."
             })
         }
@@ -1326,13 +1298,19 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                     .map(|rows| rows.filter_map(|t| t.ok()).collect::<Vec<_>>())
                 })
                 .unwrap_or_default();
+            // GR-02: graph_edges is the reference support_graph_edges store —
+            // every stored edge is human-asserted, so the origin is the
+            // reference vocabulary's 'human_local' (never the invented
+            // 'human_asserted' the old reader reported).
             let edges: Vec<Value> = conn
-                .prepare("SELECT edge_type, COUNT(*) FROM graph_edges GROUP BY edge_type ORDER BY 2 DESC")
+                .prepare(
+                    "SELECT relation, COUNT(*) FROM graph_edges GROUP BY relation ORDER BY 2 DESC",
+                )
                 .and_then(|mut stmt| {
                     stmt.query_map([], |r| {
                         Ok(json!({
                             "relation": r.get::<_, String>(0)?,
-                            "origin": "human_asserted",
+                            "origin": "human_local",
                             "count": r.get::<_, i64>(1)?,
                         }))
                     })

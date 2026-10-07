@@ -101,6 +101,7 @@ pub mod segment;
 pub mod settings;
 pub mod side_threads;
 pub mod sla;
+pub mod support_graph;
 pub mod sync;
 pub mod sync_engine;
 pub mod sync_schema;
