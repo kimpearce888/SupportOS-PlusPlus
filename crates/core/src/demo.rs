@@ -381,11 +381,26 @@ fn create_known_issue(conn: &Connection, ki: KnownIssueSeed<'_>) -> i64 {
     for conv in ki.conversation_ids {
         conn.execute(
             "INSERT OR IGNORE INTO known_issue_links (known_issue_id, conversation_id, link_type)
-             VALUES (?1, ?2, 'related')",
-            rusqlite::params![id, conv],
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                id,
+                conv,
+                // Reference createKnownIssue: 'ai' only for ai_generated
+                // provenance, else 'human' (stored in the port's legacy
+                // link_type column — documented rename).
+                if ki.provenance == "ai_generated" {
+                    "ai"
+                } else {
+                    "human"
+                }
+            ],
         )
         .ok();
     }
+    // Reference createKnownIssue also maintains the counts/bounds
+    // (refreshKnownIssueCounts) and the FTS row.
+    crate::intelligence_features::refresh_known_issue_counts(conn, id).ok();
+    crate::search::index_known_issue_fts(conn, id).ok();
     id
 }
 

@@ -196,6 +196,46 @@ pub fn apply_m039(conn: &Connection) -> Result<()> {
         "provenance",
         "TEXT DEFAULT 'human_local'",
     )?;
+    // Known-issue serving columns (reference migration 003, IS-02): the
+    // legacy M015 table predates product, the maintained first/last-seen
+    // bounds and conversation_count. All nullable/defaulted exactly like
+    // the reference's own columns (they are maintained values, not
+    // user-written ones).
+    add_column_if_missing(conn, "known_issues", "product", "TEXT")?;
+    add_column_if_missing(conn, "known_issues", "first_seen_at", "TEXT")?;
+    add_column_if_missing(conn, "known_issues", "last_seen_at", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "known_issues",
+        "conversation_count",
+        "INTEGER DEFAULT 0",
+    )?;
+    // The reference's known_issue_conversations PK (known_issue_id,
+    // conversation_id): the legacy link table only carried a plain index,
+    // so INSERT OR IGNORE could not dedup. One-time: collapse any
+    // historical duplicates (keeping the first link), then enforce the
+    // uniqueness (IS-02).
+    let uq_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'index' AND name = 'uq_known_issue_links'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !uq_exists {
+        conn.execute(
+            "DELETE FROM known_issue_links WHERE id NOT IN (
+                 SELECT MIN(id) FROM known_issue_links
+                  GROUP BY known_issue_id, conversation_id)",
+            [],
+        )?;
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_known_issue_links
+                 ON known_issue_links (known_issue_id, conversation_id);",
+        )?;
+    }
     add_column_if_missing(conn, "issue_clusters", "title", "TEXT")?;
     add_column_if_missing(conn, "issue_clusters", "summary", "TEXT")?;
     add_column_if_missing(conn, "issue_clusters", "category", "TEXT")?;

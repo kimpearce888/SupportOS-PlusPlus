@@ -83,6 +83,13 @@ impl AuditEntry {
         self.before_state = Some(state);
         self
     }
+
+    /// Attach the conversation the entry is about (the reference's
+    /// `known_issue_linked`-style audit rows carry conversation_id).
+    pub fn with_conversation_id(mut self, conversation_id: i64) -> Self {
+        self.conversation_id = Some(conversation_id);
+        self
+    }
 }
 
 /// Record an audit entry — mirrors `jobRepo.audit()` exactly: states are

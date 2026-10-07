@@ -138,6 +138,36 @@ pub fn add_issue_link(
     Ok(conn.last_insert_rowid())
 }
 
+/// Reference `issueRepo.refreshKnownIssueCounts` (issueRepo.ts:152-162):
+/// maintain `conversation_count` and the `first_seen_at`/`last_seen_at`
+/// bounds from the linked member conversations.
+///
+/// Port adaptations:
+/// - the port's documented rename of the reference's
+///   `known_issue_conversations` is `known_issue_links` (see operations.rs,
+///   segment.rs, people_store.rs, reports.rs, issue_impact.rs);
+/// - the reference's `remote_created_at` bound columns are served as
+///   `COALESCE(remote_created_at, created_at)` because the port's sync
+///   stores the remote timestamp in `conversations.created_at`
+///   (same adaptation as IS-01's cluster bounds).
+///
+/// Unlike the cluster variant there is no NOT NULL guard: the known-issue
+/// bounds columns are nullable both here and in the reference (an issue
+/// with no linked conversations carries NULL bounds, count 0).
+pub fn refresh_known_issue_counts(conn: &Connection, known_issue_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE known_issues SET
+            conversation_count = (SELECT COUNT(*) FROM known_issue_links WHERE known_issue_id = ?1),
+            first_seen_at = (SELECT MIN(COALESCE(c.remote_created_at, c.created_at)) FROM known_issue_links kil
+                               JOIN conversations c ON c.id = kil.conversation_id WHERE kil.known_issue_id = ?1),
+            last_seen_at = (SELECT MAX(COALESCE(c.remote_created_at, c.created_at)) FROM known_issue_links kil
+                              JOIN conversations c ON c.id = kil.conversation_id WHERE kil.known_issue_id = ?1)
+         WHERE id = ?1",
+        params![known_issue_id],
+    )?;
+    Ok(())
+}
+
 pub fn list_known_issues(
     conn: &Connection,
     status_filter: Option<&str>,
