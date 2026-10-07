@@ -10,7 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 46 | GR-02 | Human edges (5 relations, dup/self/404 checks) | Divergent | Major | M | M4 | Adopt MAIN wire contract + dup/self/404 checks + 5-relation vocab |
 | 47 | IS-01 | Cluster list/detail/delete (+conversations) | Divergent | Major | M | - | Serve title/trend/members + conversations in cluster detail |
 | 48 | IS-02 | Known issues CRUD (rich fields) + link/unlink | Divergent | Major | M | M5 | Write/serve all MAIN fields |
 | 49 | IS-03 | Engineering refs + support cases (from-conversation capture) | Stub | Major | M | - | Implement refs CRUD + support-case capture from conversation |
