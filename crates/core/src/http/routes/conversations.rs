@@ -37,6 +37,30 @@ fn db_error_500(e: &rusqlite::Error) -> Response {
 /// v1.8.0 Operations Center drill-down: `?ops=<tileKey>` compiles to the
 /// SAME whitelisted fragment the tile count uses, so a tile can never
 /// disagree with its list (reference conversations.ts:81-93).
+///
+/// v1.7.0/1.9.0 (VW-03): `?savedViewId=N` compiles the stored condition
+/// tree at OPEN time through the same view engine the preview uses
+/// (reference conversations.ts:82-100), and `?aiAttribute=key&aiAttrOp=op
+/// &aiAttrValue=v` adds the live AI-attribute filter through the SAME
+/// compiler (reference conversations.ts:104-130) — one implementation,
+/// closed key catalog, every value a bound parameter, composable via AND
+/// with the ops/saved-view fragment.
+
+/// `clampListParam` (reference conversations.ts:11-15): fallback for
+/// absent/empty, `Number()` semantics otherwise — garbage falls back,
+/// finite numbers truncate toward zero and clamp into `[min, max]`.
+fn clamp_list_param(raw: Option<&String>, fallback: i64, min: i64, max: i64) -> i64 {
+    match raw {
+        Some(s) if !s.is_empty() => s
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(|n| (n.trunc() as i64).clamp(min, max))
+            .unwrap_or(fallback),
+        _ => fallback,
+    }
+}
+
 pub async fn list(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -58,8 +82,22 @@ pub async fn list(
     if let Some(number) = params.get("number") {
         filters.number = number.trim().parse::<i64>().ok();
     }
-    if let Some(limit) = params.get("pageSize") {
-        filters.limit = limit.parse().ok();
+    // v1.6.0 audit fix (reference conversations.ts:24-29): the route and
+    // the repo agree on the page clamps — page 1..100000 default 1,
+    // pageSize 1..100 default 50 (the days of silently skipping rows at
+    // 150/200 are over).
+    let page = clamp_list_param(params.get("page"), 1, 1, 100000);
+    let page_size = clamp_list_param(params.get("pageSize"), 50, 1, 100);
+    filters.limit = Some(page_size as u32);
+    filters.offset = Some(((page - 1) * page_size).max(0) as u32);
+    // mailboxId: '' stays "no filter" like the reference's null-keeping.
+    if let Some(mailbox_id) = params
+        .get("mailboxId")
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+        .and_then(|m| m.parse::<i64>().ok())
+    {
+        filters.mailbox_id = Some(mailbox_id);
     }
     let mut notes: Vec<String> = Vec::new();
     if let Some(ops) = params.get("ops").filter(|ops| !ops.is_empty()) {
@@ -89,6 +127,212 @@ pub async fn list(
         notes.push(format!("Operations Center tile '{ops}' applied."));
     }
 
+    // Saved view (dynamic: conditions compiled at OPEN time — reference
+    // conversations.ts:82-100). A saved view REPLACES the ops fragment
+    // (extraWhere is assigned, not ANDed) exactly like the reference.
+    if let Some(raw_id) = params.get("savedViewId").filter(|v| !v.is_empty()) {
+        // zod: savedViewId must match /^\d+$/ — anything else is the
+        // filter-schema 422 ("Invalid" with the dotted detail line).
+        let Ok(id) = raw_id.parse::<i64>() else {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "Invalid",
+                    "detail": ["savedViewId: Invalid"],
+                })),
+            );
+        };
+        let saved = match crate::saved_views::get_view(&conn, id) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "statusCode": 404,
+                        "error": "NotFound",
+                        "message": "Saved view not found.",
+                    })),
+                );
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "statusCode": 500,
+                        "error": "InternalError",
+                        "message": e.to_string(),
+                    })),
+                );
+            }
+        };
+        let tz = crate::saved_views::resolve_timezone(
+            params.get("timezone").map(|s| s.as_str()),
+            Some(
+                crate::settings::get_string(&conn, "display_timezone")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
+        );
+        let alerts = crate::sla::sla_alerts(&conn).ok();
+        let engine = crate::saved_views::ViewEngine::new(&tz).with_sla_resolver(Box::new(
+            move |states: &[&str]| {
+                alerts
+                    .as_ref()
+                    .map(|a| {
+                        a.alerts
+                            .iter()
+                            .filter(|alert| states.contains(&alert.state.as_str()))
+                            .map(|alert| alert.conversation_id)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            },
+        ));
+        match engine.compile(&saved.definition) {
+            Ok(compiled) => {
+                if compiled.where_sql != "1=1" {
+                    filters.extra_where = Some(compiled.where_sql);
+                    filters.extra_params = compiled.params;
+                }
+                notes.push(format!(
+                    "Saved view '{}' (v{}) applied.",
+                    saved.name, saved.version
+                ));
+                notes.extend(compiled.notes);
+            }
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": format!(
+                            "Saved view '{}' could not be evaluated: {}",
+                            saved.name, e.message
+                        ),
+                    })),
+                );
+            }
+        }
+    }
+
+    // v1.9.0 (M3): live AI-attribute filter (reference conversations.ts:
+    // 104-130) — compiled by the SAME viewEngine path as saved views (one
+    // implementation, closed key catalog, bound parameters) and composable
+    // with the ops/saved-view fragment via AND.
+    if let Some(attribute) = params.get("aiAttribute").filter(|v| !v.is_empty()) {
+        let value = match params.get("aiAttrValue") {
+            // zod z.string().min(1).max(120).optional(): an EMPTY value
+            // fails the schema, an ABSENT one hits the route's explicit
+            // requirement.
+            Some(v) if v.is_empty() => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": "String must contain at least 1 character(s)",
+                        "detail": ["aiAttrValue: String must contain at least 1 character(s)"],
+                    })),
+                );
+            }
+            Some(v) if v.chars().count() > 120 => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": "String must contain at most 120 character(s)",
+                        "detail": ["aiAttrValue: String must contain at most 120 character(s)"],
+                    })),
+                );
+            }
+            Some(v) => v.clone(),
+            None => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": "aiAttribute requires aiAttrValue (use 'unknown' to find tickets without a value).",
+                    })),
+                );
+            }
+        };
+        // zod enum AI_ATTR_FILTER_OPS — default 'equals'.
+        let op = params
+            .get("aiAttrOp")
+            .map(|s| s.as_str())
+            .unwrap_or("equals");
+        const AI_ATTR_FILTER_OPS: [&str; 8] = [
+            "equals",
+            "not_equals",
+            "contains",
+            "not_contains",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+        ];
+        if !AI_ATTR_FILTER_OPS.contains(&op) {
+            let expected = AI_ATTR_FILTER_OPS
+                .iter()
+                .map(|v| format!("'{v}'"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": format!(
+                        "Invalid enum value. Expected {expected}, received '{op}'"
+                    ),
+                    "detail": [format!("aiAttrOp: Invalid enum value. Expected {expected}, received '{op}'")],
+                })),
+            );
+        }
+        // The reference compiles with timezone 'UTC' and an empty SLA
+        // resolver (ai_attribute conditions need neither).
+        let engine = crate::saved_views::ViewEngine::new("UTC");
+        let definition = crate::saved_views::ViewDefinition {
+            combinator: "all".into(),
+            conditions: vec![crate::saved_views::ViewNode::AiAttribute {
+                attribute: attribute.clone(),
+                op: op.to_string(),
+                value: value.clone(),
+            }],
+        };
+        match engine.compile(&definition) {
+            Ok(compiled) => {
+                if compiled.where_sql != "1=1" {
+                    filters.extra_where = Some(match filters.extra_where.take() {
+                        Some(existing) => format!("({existing}) AND ({})", compiled.where_sql),
+                        None => compiled.where_sql,
+                    });
+                    filters.extra_params.extend(compiled.params);
+                }
+                notes.push(format!(
+                    "AI attribute filter: {attribute} {op} \"{value}\" (local layer; missing values read as unknown)."
+                ));
+            }
+            Err(e) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "statusCode": 422,
+                        "error": "ValidationError",
+                        "message": format!("AI attribute filter rejected: {}", e.message),
+                    })),
+                );
+            }
+        }
+    }
+
     match crate::inbox::list_conversations(&conn, &filters) {
         Ok((items, total)) => {
             let items_json: Vec<Value> = items
@@ -100,8 +344,8 @@ pub async fn list(
                 Json(json!({
                     "conversations": items_json,
                     "total": total,
-                    "page": 1,
-                    "page_size": 50,
+                    "page": page,
+                    "page_size": page_size,
                     "view": params.get("view").cloned().unwrap_or_default(),
                     "notes": notes,
                 })),
