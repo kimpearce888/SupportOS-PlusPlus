@@ -873,7 +873,7 @@ pub fn state_lifecycle(conn: &Connection, conversation_local_id: i64) -> Result<
             .as_ref()
             .map(|c| c.id == new_state_id)
             .unwrap_or(false);
-        let end = next_at.or_else(|| if is_current { Some("") } else { None });
+        let end = next_at.or(if is_current { Some("") } else { None });
         if let (Some(occurred), Some(end_raw)) = (t["occurred_at"].as_str(), end) {
             let end_ts = if end_raw.is_empty() {
                 Some(now)
