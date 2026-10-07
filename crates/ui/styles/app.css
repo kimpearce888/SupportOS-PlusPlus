@@ -2600,6 +2600,93 @@ body {
   gap: var(--spp-space-2);
 }
 
+/* UI-21: Onboarding wizard — steps, panel, checks, navigation. */
+.spp-onboarding-wizard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-4);
+}
+
+.spp-onboarding-steps {
+  display: flex;
+  gap: var(--spp-space-4);
+  flex-wrap: wrap;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  border-bottom: 1px solid var(--spp-border);
+  padding-bottom: var(--spp-space-2);
+}
+
+.spp-onboarding-steps__step {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spp-space-2);
+  color: var(--spp-fg-muted);
+  font-size: var(--spp-text-sm);
+}
+
+.spp-onboarding-steps__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--spp-radius-full);
+  border: 1px solid var(--spp-border);
+  font-size: var(--spp-text-xs);
+}
+
+.spp-onboarding-steps__step--current {
+  color: var(--spp-fg);
+  font-weight: 600;
+}
+
+.spp-onboarding-steps__step--current .spp-onboarding-steps__badge {
+  border-color: var(--spp-accent);
+  color: var(--spp-accent);
+}
+
+.spp-onboarding-steps__step--done .spp-onboarding-steps__badge {
+  background: var(--spp-accent);
+  border-color: var(--spp-accent);
+  color: var(--spp-bg);
+}
+
+.spp-onboarding-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spp-space-3);
+}
+
+.spp-onboarding-check {
+  display: flex;
+  align-items: center;
+  gap: var(--spp-space-3);
+  flex-wrap: wrap;
+}
+
+.spp-onboarding-check--detail {
+  flex-direction: column;
+  align-items: flex-start;
+  padding: var(--spp-space-3);
+  border: 1px solid var(--spp-border);
+  border-radius: var(--spp-radius);
+}
+
+.spp-onboarding-check__message {
+  font-size: var(--spp-text-sm);
+  margin: 0;
+}
+
+.spp-onboarding-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--spp-space-2);
+  border-top: 1px solid var(--spp-border);
+  padding-top: var(--spp-space-3);
+}
+
 .spp-incidents__title { font-size: var(--spp-text-sm); }
 
 /* The header selects (status / severity) on the detail page. */
