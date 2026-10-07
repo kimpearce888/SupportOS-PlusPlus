@@ -1035,26 +1035,245 @@ fn validate_known_issue_patch(
     Ok(KnownIssuePatch { id: 0, fields })
 }
 
-/// POST /api/issues/known/:id/refs
+// ─── IS-03: engineering refs + support cases ──────────────────────────
+
+/// POST /api/issues/known/:id/refs — reference routes/issues.ts:109-115 +
+/// issueRepo.addEngineeringRef (issueRepo.ts:231-235): the zod schema is
+/// two required bounded strings (`system` 1..100, `reference_id` 1..200)
+/// plus four optional bounded strings (`url` <=2000, `title` <=500,
+/// `status` <=100, `notes` <=5000) — none of them nullable, so an
+/// explicit `null` is the type mismatch like anywhere else. The reference
+/// route does not check the issue id: an unknown known-issue id violates
+/// the refs FK (foreign_keys=ON) and surfaces as the 500 envelope, the
+/// same convention the link route keeps (IS-02).
 pub async fn add_ref(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
-) -> Json<Value> {
-    Json(json!({"ok": true, "id": id}))
+) -> axum::response::Response {
+    let mut issues: Vec<(String, String)> = Vec::new();
+    if !body.is_object() && !body.is_null() {
+        return crate::conversation_ops::zod_422_multi(&[(
+            "",
+            &format!("Expected object, received {}", received_type(&body)),
+        )]);
+    }
+    let system = check_string_field(&body, "system", 100, true, false, true, &mut issues);
+    let reference_id =
+        check_string_field(&body, "reference_id", 200, true, false, true, &mut issues);
+    let url = check_string_field(&body, "url", 2000, false, false, false, &mut issues);
+    let title = check_string_field(&body, "title", 500, false, false, false, &mut issues);
+    let status = check_string_field(&body, "status", 100, false, false, false, &mut issues);
+    let notes = check_string_field(&body, "notes", 5000, false, false, false, &mut issues);
+    if !issues.is_empty() {
+        let refs: Vec<(&str, &str)> = issues
+            .iter()
+            .map(|(path, message)| (path.as_str(), message.as_str()))
+            .collect();
+        return crate::conversation_ops::zod_422_multi(&refs);
+    }
+    // Validation guarantees the two required strings; absent optionals
+    // land as NULL like the reference's `?? null`.
+    let system = system.ok().flatten().unwrap_or_default();
+    let reference_id = reference_id.ok().flatten().unwrap_or_default();
+    let (url, title, status, notes) = (
+        url.ok().flatten(),
+        title.ok().flatten(),
+        status.ok().flatten(),
+        notes.ok().flatten(),
+    );
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    match conn.execute(
+        "INSERT INTO known_issue_refs (known_issue_id, system, reference_id, url, title, status, notes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![id, system, reference_id, url, title, status, notes],
+    ) {
+        Ok(_) => {
+            Json(json!({"ok": true, "message": "Engineering reference added."})).into_response()
+        }
+        Err(e) => db_error_500(&e),
+    }
 }
 
-/// GET /api/issues/cases
-pub async fn list_cases(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({"cases": []}))
+/// The served support-case row — the reference `SupportCaseRecord`
+/// (issueRepo.ts:34-49 + migration 003 `SELECT *`): the full 16-column
+/// set with the tags column parsed from its JSON storage into the array
+/// the wire carries. The port column set matches the reference migration
+/// one-to-one.
+fn support_case_json(
+    r: &rusqlite::Row<'_>,
+) -> rusqlite::Result<std::result::Result<Value, String>> {
+    let tags: Option<String> = r.get(9)?;
+    let tags = match serde_json::from_str::<Value>(tags.as_deref().unwrap_or("[]")) {
+        Ok(v) if v.is_array() => Ok(v),
+        // The reference does `JSON.parse(r.tags || '[]')` — a malformed
+        // tags row throws and 500s; keep that instead of silently serving
+        // a wrong shape.
+        Ok(_) | Err(_) => Err(tags.unwrap_or_default()),
+    };
+    Ok(match tags {
+        Ok(tags) => Ok(json!({
+            "id": r.get::<_, i64>(0)?,
+            "conversation_id": r.get::<_, Option<i64>>(1)?,
+            "customer_id": r.get::<_, Option<i64>>(2)?,
+            "problem": r.get::<_, Option<String>>(3)?,
+            "root_question": r.get::<_, Option<String>>(4)?,
+            "resolution": r.get::<_, Option<String>>(5)?,
+            "answer": r.get::<_, Option<String>>(6)?,
+            "product": r.get::<_, Option<String>>(7)?,
+            "feature": r.get::<_, Option<String>>(8)?,
+            "tags": tags,
+            "fields": r.get::<_, Option<String>>(10)?,
+            "agent_user_id": r.get::<_, Option<i64>>(11)?,
+            "resolution_time_min": r.get::<_, Option<f64>>(12)?,
+            "rating": r.get::<_, Option<String>>(13)?,
+            "created_at": r.get::<_, String>(14)?,
+            "provenance": r.get::<_, Option<String>>(15)?,
+        })),
+        Err(bad) => Err(bad),
+    })
 }
 
-/// POST /api/issues/cases/from-conversation/:conversationId
+/// GET /api/issues/cases — reference routes/issues.ts:118 +
+/// issueRepo.listSupportCases (issueRepo.ts:271-276): every support case
+/// newest-first capped at 500, tags parsed to the served array.
+pub async fn list_cases(State(state): State<AppState>) -> axum::response::Response {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let rows: Vec<std::result::Result<Value, String>> = match conn.prepare(
+        "SELECT id, conversation_id, customer_id, problem, root_question, resolution,
+                answer, product, feature, tags, fields, agent_user_id, resolution_time_min,
+                rating, created_at, provenance
+         FROM support_cases ORDER BY created_at DESC LIMIT 500",
+    ) {
+        Ok(mut stmt) => match stmt.query_map([], support_case_json) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(e) => return db_error_500(&e),
+        },
+        Err(e) => return db_error_500(&e),
+    };
+    let mut cases = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row {
+            Ok(v) => cases.push(v),
+            Err(row) => {
+                // The malformed-tags row the reference's JSON.parse would
+                // throw on.
+                return db_error_500(&format!("support_cases.tags is not valid JSON: {row}"));
+            }
+        }
+    }
+    Json(json!({ "cases": cases })).into_response()
+}
+
+/// POST /api/issues/cases/from-conversation/:conversationId — reference
+/// routes/issues.ts:120-147 + issueRepo.upsertSupportCase
+/// (issueRepo.ts:245-269): capture a historical resolution for AI
+/// retrieval. Reads the conversation, the latest completed ticket
+/// analysis, the last published reply (both `resolution` and `answer`
+/// take its first 2000 chars — the char-boundary-truncating equivalent
+/// of JS `slice(0, 2000)`), the tag names and the rating. An unknown
+/// conversation answers the reference's 200 `{ok: false}` (no HTTP
+/// error); a known one upserts on conversation_id — a recapture
+/// overwrites every column, including clearing `resolution_time_min`,
+/// which the route does not pass (reference behavior).
 pub async fn case_from_conversation(
     State(state): State<AppState>,
     Path(conversation_id): Path<i64>,
-) -> Json<Value> {
-    Json(json!({"ok": true, "conversationId": conversation_id}))
+) -> axum::response::Response {
+    let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // getConversationByLocalId — subject/customer_id/assignee_id are the
+    // documented port renames of the reference's
+    // subject/customer_local_id/assignee_local_id.
+    let conv: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT subject, customer_id, assignee_id FROM conversations WHERE id = ?1",
+            rusqlite::params![conversation_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    let Some((subject, customer_id, agent_user_id)) = conv else {
+        return Json(json!({"ok": false, "message": "Conversation not found."})).into_response();
+    };
+    // `ctx.aiRepo.getLatestAnalysis(id)?.analysis ?? null`
+    let analysis = crate::ai_pipeline::get_latest_analysis(&conn, conversation_id)
+        .ok()
+        .flatten()
+        .map(|la| la.analysis);
+    // threads: the last published reply, newest first (COALESCE boundary
+    // adaptation — `body`/`thread_type` are the documented thread renames).
+    let last_reply: Option<String> = conn
+        .query_row(
+            "SELECT body FROM conversation_threads
+              WHERE conversation_id = ?1 AND thread_type = 'reply' AND state = 'published'
+              ORDER BY COALESCE(remote_created_at, created_at) DESC LIMIT 1",
+            rusqlite::params![conversation_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let truncated: Option<String> = last_reply
+        .as_deref()
+        .map(|b| b.chars().take(2000).collect::<String>());
+    let tags: Vec<String> = conn
+        .prepare(
+            "SELECT t.name FROM conversation_tags ct JOIN tags t ON t.id = ct.tag_id
+              WHERE ct.conversation_id = ?1",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map(rusqlite::params![conversation_id], |r| {
+                r.get::<_, String>(0)
+            })?;
+            Ok(rows.filter_map(std::result::Result::ok).collect())
+        })
+        .unwrap_or_default();
+    let rating: Option<String> = conn
+        .query_row(
+            "SELECT rating FROM ratings WHERE conversation_id = ?1 LIMIT 1",
+            rusqlite::params![conversation_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    // `analysis?.customer_goal ?? n2u(conv.subject)` — the analysis wins,
+    // else the subject, else NULL.
+    let problem = analysis
+        .as_ref()
+        .and_then(|a| a.customer_goal.clone())
+        .or(subject);
+    let root_question = analysis.as_ref().and_then(|a| a.primary_question.clone());
+    let product = analysis.as_ref().and_then(|a| a.product.clone());
+    let feature = analysis.as_ref().and_then(|a| a.feature.clone());
+    match conn.execute(
+        "INSERT INTO support_cases (conversation_id, customer_id, problem, root_question,
+                                    resolution, answer, product, feature, tags, agent_user_id,
+                                    resolution_time_min, rating)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)
+         ON CONFLICT(conversation_id) DO UPDATE SET
+           customer_id=excluded.customer_id, problem=excluded.problem,
+           root_question=excluded.root_question, resolution=excluded.resolution,
+           answer=excluded.answer, product=excluded.product, feature=excluded.feature,
+           tags=excluded.tags, agent_user_id=excluded.agent_user_id,
+           resolution_time_min=excluded.resolution_time_min, rating=excluded.rating",
+        rusqlite::params![
+            conversation_id,
+            customer_id,
+            problem,
+            root_question,
+            truncated,
+            truncated,
+            product,
+            feature,
+            serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
+            agent_user_id,
+            rating,
+        ],
+    ) {
+        Ok(_) => {
+            Json(json!({"ok": true, "message": "Support case captured from this conversation."}))
+                .into_response()
+        }
+        Err(e) => db_error_500(&e),
+    }
 }
 
 /// GET /api/issues/known/:id/impact — known-issue impact through the ONE
