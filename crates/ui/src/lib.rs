@@ -28,10 +28,13 @@ pub mod api;
 pub mod components;
 pub mod layout;
 pub mod pages;
+pub mod queries;
 pub mod shortcuts;
 pub mod sse;
+pub mod sse_bridge;
 pub mod state;
 pub mod toasts;
+pub mod url_state;
 
 // Re-export the catalog so the UI has type-safe access to closed
 // vocabularies (one source of truth per spec A12). The catalog crate is
@@ -63,6 +66,9 @@ fn app_view() -> impl IntoView {
     // The global toast stack (reference uiStore toasts) — created before
     // the shell mounts so any component can `toasts::push` from the start.
     toasts::init();
+    // The query-invalidation bus (UI-26): one version counter per reference
+    // query key; the SSE bridge bumps them, pages watch them.
+    queries::init();
 
     view! {
         <Router>
@@ -164,16 +170,15 @@ fn AppEffects() -> impl IntoView {
 
     // ── SSE bridge (reference ServerEventsBridge) ───────────────────────
     // One app-level subscription opens the shared EventSource for the whole
-    // app (pages must not subscribe per-page). The browser reconnects the
-    // stream automatically; live events that can move the badge counts
-    // trigger an immediate refresh (the reference invalidates the
-    // 'nav-counts'/'notification-unread' queries on the same events).
+    // app (pages must not subscribe per-page). The bridge (UI-26) is the
+    // full reference wiring: cross-page invalidation through the version
+    // counters, the nav-counts refresh wherever the reference invalidates
+    // 'nav-counts'/'notification-unread', and the reference's toasts (new
+    // ratings, webhook pushes, campaign completion/failure, CRITICAL
+    // notifications).
     {
-        let _unused_unsubscribe = crate::sse::subscribe(Box::new(move |event| match event {
-            crate::sse::LiveEvent::NotificationReceived { .. }
-            | crate::sse::LiveEvent::ConversationUpdated { .. }
-            | crate::sse::LiveEvent::SyncCompleted { .. } => ui.refresh_nav_counts(),
-            _ => {}
+        let _unused_unsubscribe = crate::sse::subscribe(Box::new(move |event| {
+            crate::sse_bridge::handle_event(&ui, event);
         }));
     }
 

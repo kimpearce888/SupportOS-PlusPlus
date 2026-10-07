@@ -11,6 +11,7 @@
 use std::rc::Rc;
 
 use leptos::*;
+use leptos_router::{use_location, use_navigate, use_query_map};
 
 use crate::components::state_view::{EmptyState, LoadingState};
 use crate::components::GapsTab;
@@ -32,6 +33,63 @@ pub fn KnowledgePage() -> impl IntoView {
     // list through it (signals are Copy — safe to pass as props).
     let reload_documents = create_rw_signal(0u32);
     let importing = create_rw_signal(false);
+
+    // ── Deep link (UI-27): /knowledge?doc=N opens that document's reader ──
+    // Used by search results (the search engine's knowledge hits link to
+    // /knowledge?doc=…) and the AI evidence chips — previously dead. The
+    // reference reads `searchParams.get('doc')` on mount and on every URL
+    // change (browser back / a new link into the page).
+    let query_map = use_query_map();
+    let location = use_location();
+    let navigate = use_navigate();
+    let reading = create_rw_signal(None::<i64>);
+    create_effect(move |_| {
+        let m = query_map.get();
+        let doc = crate::url_state::query_pos_int(&m, "doc");
+        // Number.isFinite guard parity: garbage means "no reader".
+        if reading.get_untracked() != doc {
+            reading.set(doc);
+        }
+    });
+    // Open a reader AND write ?doc=N (replace, like the reference's
+    // setSearchParams(next, { replace: true })).
+    let open_doc: Rc<dyn Fn(i64)> = {
+        let navigate = navigate.clone();
+        let pathname = location.pathname;
+        Rc::new(move |id: i64| {
+            reading.set(Some(id));
+            navigate(
+                &format!(
+                    "{}{}",
+                    pathname.get_untracked(),
+                    crate::url_state::query_string(&[("doc", Some(id.to_string()))])
+                ),
+                leptos_router::NavigateOptions {
+                    replace: true,
+                    ..Default::default()
+                },
+            );
+        })
+    };
+    // Close the reader AND drop ?doc= from the URL.
+    let close_doc: Rc<dyn Fn()> = {
+        let navigate = navigate.clone();
+        let pathname = location.pathname;
+        Rc::new(move || {
+            reading.set(None);
+            navigate(
+                &pathname.get_untracked(),
+                leptos_router::NavigateOptions {
+                    replace: true,
+                    ..Default::default()
+                },
+            );
+        })
+    };
+    // Copy handles for the Fn view closures (the close-handler pattern):
+    // <Show> children re-run, so they must not move the Rcs out.
+    let open_doc_stored = StoredValue::new(open_doc);
+    let close_doc_stored = StoredValue::new(close_doc);
 
     let do_reindex = move |_| {
         wasm_bindgen_futures::spawn_local(async move {
@@ -104,7 +162,10 @@ pub fn KnowledgePage() -> impl IntoView {
                 when=move || tab.get() == KnowledgeTab::Documents
                 fallback=|| ()
             >
-                <DocumentsTab reload=reload_documents />
+                {move || {
+                    let open = open_doc_stored.with_value(Rc::clone);
+                    view! { <DocumentsTab reload=reload_documents open_doc=open /> }
+                }}
             </Show>
             <Show
                 when=move || tab.get() == KnowledgeTab::Sources
@@ -134,18 +195,32 @@ pub fn KnowledgePage() -> impl IntoView {
                     })
                 />
             </Show>
+
+            // The document reader (deep link / row click). Mounted last so
+            // it layers over the page like the reference's `{reading ?
+            // <DocReader …/> : null}`.
+            <Show when=move || reading.get().is_some() fallback=|| ()>
+                {move || {
+                    let id = reading.get().unwrap_or_default();
+                    let close = close_doc_stored.with_value(Rc::clone);
+                    view! { <DocReader id=id on_close=close /> }
+                }}
+            </Show>
         </div>
     }
 }
 
 /// The Documents tab — the knowledge document list (reference
 /// Knowledge.tsx: title + preview, visibility, version, chunks, updated,
-/// delete).
+/// delete; a row click opens the reader).
 #[component]
-fn DocumentsTab(reload: RwSignal<u32>) -> impl IntoView {
+fn DocumentsTab(reload: RwSignal<u32>, open_doc: Rc<dyn Fn(i64)>) -> impl IntoView {
     let documents = create_rw_signal(Vec::<serde_json::Value>::new());
     let loading = create_rw_signal(true);
     let error_msg = create_rw_signal(None::<String>);
+    // Clone up front: the Show children closure is Fn and must not move
+    // `open_doc` out of the enclosing view closure.
+    let open_doc_for_table = StoredValue::new(open_doc);
 
     // (Re)load on mount and on every reload tick.
     create_effect(move |_| {
@@ -193,7 +268,10 @@ fn DocumentsTab(reload: RwSignal<u32>) -> impl IntoView {
                     }
                 }
             >
-                <DocumentsTable documents=documents reload=reload />
+                {move || {
+                    let open = open_doc_for_table.with_value(Rc::clone);
+                    view! { <DocumentsTable documents=documents reload=reload open_doc=open /> }
+                }}
             </Show>
         </Show>
     }
@@ -205,6 +283,7 @@ fn DocumentsTab(reload: RwSignal<u32>) -> impl IntoView {
 fn DocumentsTable(
     documents: RwSignal<Vec<serde_json::Value>>,
     reload: RwSignal<u32>,
+    open_doc: Rc<dyn Fn(i64)>,
 ) -> impl IntoView {
     let rows = move || {
         documents
@@ -212,7 +291,7 @@ fn DocumentsTable(
             .into_iter()
             .map(|doc| {
                 view! {
-                    <DocumentRow doc=doc reload=reload />
+                    <DocumentRow doc=doc reload=reload open_doc=Rc::clone(&open_doc) />
                 }
             })
             .collect::<Vec<_>>()
@@ -237,9 +316,14 @@ fn DocumentsTable(
 }
 
 /// One document row: the preview under the title, the delete action
-/// (confirm-gated; also removes its search-index entries).
+/// (confirm-gated; also removes its search-index entries). A row click
+/// opens the reader (reference: `onClick={() => openDoc(d.id)}`).
 #[component]
-fn DocumentRow(doc: serde_json::Value, reload: RwSignal<u32>) -> impl IntoView {
+fn DocumentRow(
+    doc: serde_json::Value,
+    reload: RwSignal<u32>,
+    open_doc: Rc<dyn Fn(i64)>,
+) -> impl IntoView {
     let id = doc.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
     let title = doc
         .get("title")
@@ -280,7 +364,7 @@ fn DocumentRow(doc: serde_json::Value, reload: RwSignal<u32>) -> impl IntoView {
     };
 
     view! {
-        <tr>
+        <tr class="spp-table__row-clickable" on:click=move |_| open_doc(id)>
             <td>
                 <strong class="spp-knowledge__title">{title.clone()}</strong>
                 <div class="spp-muted spp-text-xs">{format!("{preview}…")}</div>
@@ -932,6 +1016,150 @@ fn FreshnessRow(row: FreshnessDocument, reload: RwSignal<u32>) -> impl IntoView 
                 >
                     "Verify"
                 </button>
+            </div>
+        </div>
+    }
+}
+
+/// The document reader modal (UI-27 deep link target + the row click).
+/// Reference Knowledge.tsx DocReader: badges (visibility/version/source/
+/// chunks), the full content, and the related-tickets/known-issues footer.
+/// A failed/deleted fetch (or a stale ?doc= link) shows an error — never an
+/// infinite spinner (v1.6.0 audit fix).
+#[component]
+fn DocReader(id: i64, on_close: Rc<dyn Fn()>) -> impl IntoView {
+    let document = create_rw_signal(None::<serde_json::Value>);
+    let related_ticket_estimate = create_rw_signal(0i64);
+    let related_known_issues = create_rw_signal(Vec::<serde_json::Value>::new());
+    let loading = create_rw_signal(true);
+    let error_msg = create_rw_signal(None::<String>);
+
+    create_effect(move |_| {
+        let document = document;
+        let related_ticket_estimate = related_ticket_estimate;
+        let related_known_issues = related_known_issues;
+        let loading = loading;
+        let error_msg = error_msg;
+        loading.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            let path = format!("/api/knowledge/documents/{id}");
+            match crate::api::get_json::<serde_json::Value>(&path).await {
+                Ok(v) => {
+                    document.set(v.get("document").cloned());
+                    related_ticket_estimate.set(
+                        v.get("related_ticket_estimate")
+                            .and_then(|x| x.as_i64())
+                            .unwrap_or(0),
+                    );
+                    related_known_issues.set(
+                        v.get("related_known_issues")
+                            .and_then(|x| x.as_array())
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    error_msg.set(None);
+                }
+                Err(e) => error_msg.set(Some(e)),
+            }
+            loading.set(false);
+        });
+    });
+
+    view! {
+        <div class="spp-overlay" role="dialog" aria-modal="true" aria-label="Document reader">
+            <div class="spp-modal spp-modal--reader">
+                <div class="spp-modal__head">
+                    <h3 class="spp-modal__title">
+                        {move || {
+                            document
+                                .get()
+                                .and_then(|d| d.get("title").and_then(|t| t.as_str()).map(str::to_string))
+                                .unwrap_or_else(|| "Document".to_string())
+                        }}
+                    </h3>
+                    <button
+                        class="spp-button spp-button--ghost spp-button--tiny"
+                        aria-label="Close reader"
+                        on:click=move |_| on_close()
+                    >
+                        "\u{d7}"
+                    </button>
+                </div>
+                <Show when=move || loading.get() fallback=|| ()>
+                    <LoadingState />
+                </Show>
+                <Show when=move || error_msg.get().is_some() fallback=|| ()>
+                    <div class="spp-state spp-state--error">
+                        <span class="spp-state__icon" aria-hidden="true">"⚠"</span>
+                        <p class="spp-state__body">"Could not open this document."</p>
+                        <p class="spp-muted spp-text-xs">{move || error_msg.get().unwrap_or_default()}</p>
+                    </div>
+                </Show>
+                <Show
+                    when=move || !loading.get() && error_msg.get().is_none()
+                    fallback=|| ()
+                >
+                    {move || {
+                        let d = match document.get() {
+                            Some(d) => d,
+                            None => return view! { <div></div> }.into_view(),
+                        };
+                        let visibility = d
+                            .get("visibility")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("internal_only")
+                            .to_string();
+                        let version = d.get("version").and_then(|v| v.as_i64()).unwrap_or(1);
+                        let source_name = d
+                            .get("source_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("—")
+                            .to_string();
+                        let chunk_count = d.get("chunk_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let content = d
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let estimate = related_ticket_estimate.get();
+                        let issues = related_known_issues.get();
+                        view! {
+                            <div class="spp-doc-reader__badges">
+                                <span class=if visibility == "customer_safe" {
+                                    "spp-badge spp-badge--ok"
+                                } else {
+                                    "spp-badge"
+                                }>
+                                    {if visibility == "customer_safe" { "customer-safe" } else { "internal-only" }}
+                                </span>
+                                <span class="spp-badge">{format!("v{version}")}</span>
+                                <span class="spp-badge">{format!("source: {source_name}")}</span>
+                                <span class="spp-badge">{format!("{chunk_count} chunks")}</span>
+                            </div>
+                            <div class="spp-doc-reader__content">{content}</div>
+                            <div class="spp-doc-reader__related">
+                                <strong>"Related:"</strong>
+                                " cited by AI analysis in "
+                                {format!("{estimate} conversation{}", if estimate == 1 { "" } else { "s" })}
+                                {if issues.is_empty() {
+                                    ().into_view()
+                                } else {
+                                    view! {
+                                        " · "
+                                        {issues.iter().map(|ki| {
+                                            let title = ki
+                                                .get("title")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("(untitled)")
+                                                .to_string();
+                                            view! { <span class="spp-chip">{title}</span> }
+                                        }).collect::<Vec<_>>()}
+                                    }.into_view()
+                                }}
+                            </div>
+                        }.into_view()
+                    }}
+                </Show>
             </div>
         </div>
     }

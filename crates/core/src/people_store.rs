@@ -768,6 +768,388 @@ fn build_support_health_report(
     }))
 }
 
+// ─── Customer reads (UI-04: the reference peopleRepo customer surface) ─────
+
+/// GET /api/customers — the paginated customer summary list (reference
+/// `peopleRepo.listCustomers` + `CustomerSummary`):
+/// name/email search with ESCAPED LIKE wildcards (the v2.2.1 audit rule —
+/// '50%' or 'a_b' must match literally), real `total` from the SAME where
+/// clause, and per-row conversation/open/last-activity/average-rating
+/// aggregates. `q` also matches the customer_emails table (Help Scout
+/// identity linking) exactly like the reference.
+///
+/// The port serves `email`/`phone` from the flat legacy columns when the
+/// mirror tables have no rows for the customer (documented deviation: the
+/// port's customers table pre-dates the per-value mirror tables).
+pub fn list_customers_summary(
+    conn: &Connection,
+    query: Option<&str>,
+    page: i64,
+    page_size: i64,
+) -> Result<(Vec<Value>, i64)> {
+    let page = page.clamp(1, 100_000);
+    let page_size = page_size.clamp(1, 200);
+    let offset = (page - 1) * page_size;
+
+    let (where_sql, like): (String, Option<String>) = match query {
+        Some(q) if !q.trim().is_empty() => {
+            let like = format!(
+                "%{}%",
+                q.trim()
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            );
+            (
+                "WHERE (c.first_name LIKE ?1 ESCAPE '\\'
+                    OR c.last_name LIKE ?1 ESCAPE '\\'
+                    OR c.email LIKE ?1 ESCAPE '\\'
+                    OR c.organization LIKE ?1 ESCAPE '\\'
+                    OR EXISTS (SELECT 1 FROM customer_emails ce
+                                WHERE ce.customer_id = c.id
+                                  AND ce.value LIKE ?1 ESCAPE '\\'))
+                  AND c.deleted_at IS NULL"
+                    .to_string(),
+                Some(like),
+            )
+        }
+        _ => ("WHERE c.deleted_at IS NULL".to_string(), None),
+    };
+
+    // Real total under the same predicate (the reference counts, then pages).
+    let total: i64 = if let Some(ref like) = like {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM customers c {where_sql}"),
+            params![like],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    } else {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM customers c {where_sql}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+    };
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT c.id, c.remote_id, c.first_name, c.last_name, c.job_title,
+                c.email, c.phone, c.organization, c.organization_id,
+                (SELECT o.name FROM organizations o WHERE o.id = c.organization_id) AS organization_name,
+                (SELECT GROUP_CONCAT(ce.value) FROM customer_emails ce WHERE ce.customer_id = c.id) AS emails_csv,
+                (SELECT GROUP_CONCAT(cp.value) FROM customer_phones cp WHERE cp.customer_id = c.id) AS phones_csv,
+                (SELECT COUNT(*) FROM conversations cv
+                  WHERE cv.customer_id = c.id AND cv.deleted_at IS NULL) AS conversation_count,
+                (SELECT COUNT(*) FROM conversations cv
+                  WHERE cv.customer_id = c.id AND cv.status IN ('active','pending')
+                    AND cv.deleted_at IS NULL) AS open_conversation_count,
+                (SELECT MAX(cv.last_activity_at) FROM conversations cv
+                  WHERE cv.customer_id = c.id) AS last_activity_at,
+                (SELECT AVG(CASE r.rating WHEN 'great' THEN 5 WHEN 'okay' THEN 3 WHEN 'not-good' THEN 1 END)
+                   FROM ratings r WHERE r.customer_local_id = c.id) AS average_rating
+         FROM customers c
+         {where_sql}
+         ORDER BY COALESCE(
+             (SELECT MAX(cv.last_activity_at) FROM conversations cv WHERE cv.customer_id = c.id),
+             c.local_created_at,
+             c.created_at) DESC
+         LIMIT ?2 OFFSET ?3"
+    ))?;
+
+    // The statement numbers its bind slots from ?1 (the LIKE term when `q`
+    // is present; an unused placeholder otherwise) through ?3 — always
+    // bind all three so the indexes line up in both branches.
+    let like_param = like.clone().unwrap_or_else(|| "%".to_string());
+    let rows: Vec<Value> = stmt
+        .query_map(params![like_param, page_size, offset], customer_summary_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok((rows, total))
+}
+
+/// Map one list row to the wire `CustomerSummary` (reference shape). The
+/// GROUP_CONCAT fallbacks keep the legacy flat `email`/`phone` columns
+/// visible when the mirror tables have no rows (documented deviation).
+fn customer_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let flat_email: Option<String> = row.get("email")?;
+    let flat_phone: Option<String> = row.get("phone")?;
+    let org_name: Option<String> = row.get("organization_name")?;
+    let legacy_org: Option<String> = row.get("organization")?;
+    let emails_csv: Option<String> = row.get("emails_csv")?;
+    let phones_csv: Option<String> = row.get("phones_csv")?;
+    let average_rating: Option<f64> = row.get("average_rating")?;
+    Ok(json!({
+        "id": row.get::<_, i64>("id")?,
+        "remote_id": row.get::<_, i64>("remote_id")?,
+        "first_name": row.get::<_, Option<String>>("first_name")?,
+        "last_name": row.get::<_, Option<String>>("last_name")?,
+        "job_title": row.get::<_, Option<String>>("job_title")?,
+        "emails": csv_or_legacy(emails_csv, flat_email),
+        "phones": csv_or_legacy(phones_csv, flat_phone),
+        "organization_id": row.get::<_, Option<i64>>("organization_id")?,
+        "organization_name": org_name.or(legacy_org),
+        "conversation_count": row.get::<_, i64>("conversation_count")?,
+        "open_conversation_count": row.get::<_, i64>("open_conversation_count")?,
+        "last_activity_at": row.get::<_, Option<String>>("last_activity_at")?,
+        "average_rating": average_rating,
+    }))
+}
+
+/// GROUP_CONCAT of the mirror table, falling back to the legacy flat column
+/// (both empty → the empty array the reference's GROUP_CONCAT produces).
+fn csv_or_legacy(csv: Option<String>, legacy: Option<String>) -> Vec<String> {
+    let from_csv = csv
+        .as_deref()
+        .map(|c| {
+            c.split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !from_csv.is_empty() {
+        return from_csv;
+    }
+    legacy.map(|e| vec![e]).unwrap_or_default()
+}
+
+/// GET /api/customers/:id — the reference `CustomerDetailData` envelope:
+/// `{customer, conversations, ratings, memories, properties, websites,
+/// social_profiles, address, topics, resolutions}`.
+///
+/// The customer object carries the summary aggregates (`open_conversation_count`,
+/// `average_rating`, `emails[]`, `phones[]`, `organization_name`) like the
+/// reference `getCustomerByLocalId` → `getCustomerByRemoteId` chain.
+/// `None` when the id is unknown or soft-deleted.
+pub fn get_customer_detail(conn: &Connection, customer_id: i64) -> Result<Option<Value>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM customers WHERE id = ?1 AND deleted_at IS NULL",
+            params![customer_id],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !exists {
+        return Ok(None);
+    }
+
+    // Customer summary (same shape as the list rows).
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.remote_id, c.first_name, c.last_name, c.job_title,
+                c.email, c.phone, c.organization, c.organization_id,
+                (SELECT o.name FROM organizations o WHERE o.id = c.organization_id) AS organization_name,
+                (SELECT GROUP_CONCAT(ce.value) FROM customer_emails ce WHERE ce.customer_id = c.id) AS emails_csv,
+                (SELECT GROUP_CONCAT(cp.value) FROM customer_phones cp WHERE cp.customer_id = c.id) AS phones_csv,
+                (SELECT COUNT(*) FROM conversations cv
+                  WHERE cv.customer_id = c.id AND cv.deleted_at IS NULL) AS conversation_count,
+                (SELECT COUNT(*) FROM conversations cv
+                  WHERE cv.customer_id = c.id AND cv.status IN ('active','pending')
+                    AND cv.deleted_at IS NULL) AS open_conversation_count,
+                (SELECT MAX(cv.last_activity_at) FROM conversations cv
+                  WHERE cv.customer_id = c.id) AS last_activity_at,
+                (SELECT AVG(CASE r.rating WHEN 'great' THEN 5 WHEN 'okay' THEN 3 WHEN 'not-good' THEN 1 END)
+                   FROM ratings r WHERE r.customer_local_id = c.id) AS average_rating
+         FROM customers c WHERE c.id = ?1",
+    )?;
+    let customer = stmt
+        .query_row(params![customer_id], customer_summary_row)
+        .map_err(crate::error::Error::from)?;
+
+    // Conversations (reference: 50 newest with assignee names).
+    let mut stmt = conn.prepare(
+        "SELECT cv.id, cv.number, cv.subject, cv.status, cv.preview,
+                cv.remote_created_at, cv.closed_at, cv.assignee_id,
+                TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS assignee
+         FROM conversations cv
+         LEFT JOIN users u ON u.id = cv.assignee_id
+         WHERE cv.customer_id = ?1 AND cv.deleted_at IS NULL
+         ORDER BY COALESCE(cv.remote_created_at, cv.created_at) DESC LIMIT 50",
+    )?;
+    let conversations: Vec<Value> = stmt
+        .query_map(params![customer_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "number": r.get::<_, i64>(1)?,
+                "subject": r.get::<_, Option<String>>(2)?,
+                "status": r.get::<_, String>(3)?,
+                "preview": r.get::<_, Option<String>>(4)?,
+                "remote_created_at": r.get::<_, Option<String>>(5)?,
+                "closed_at": r.get::<_, Option<String>>(6)?,
+                "assignee": r.get::<_, Option<String>>(8)?.filter(|s| !s.trim().is_empty()),
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Ratings (reference getRatingsForCustomer: newest first).
+    let mut stmt = conn.prepare(
+        "SELECT rating, comments, remote_created_at, conversation_id
+         FROM ratings WHERE customer_local_id = ?1
+         ORDER BY remote_created_at DESC LIMIT 50",
+    )?;
+    let ratings: Vec<Value> = stmt
+        .query_map(params![customer_id], |r| {
+            Ok(json!({
+                "rating": r.get::<_, Option<String>>(0)?,
+                "comments": r.get::<_, Option<String>>(1)?,
+                "created_at": r.get::<_, Option<String>>(2)?,
+                "conversation_id": r.get::<_, Option<i64>>(3)?,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Memories (reference aiRepo.getMemories — the port's customer_memory
+    // table; the composed ME-01 profile lives at /api/memory/:id).
+    let mut stmt = conn.prepare(
+        "SELECT id, memory_key, memory_value, source, confidence, last_seen_at
+         FROM customer_memory WHERE customer_id = ?1
+         ORDER BY COALESCE(last_seen_at, created_at) DESC LIMIT 50",
+    )?;
+    let memories: Vec<Value> = stmt
+        .query_map(params![customer_id], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "key": r.get::<_, String>(1)?,
+                "value": r.get::<_, String>(2)?,
+                "source": r.get::<_, String>(3)?,
+                "confidence": r.get::<_, Option<String>>(4)?,
+                "last_seen_at": r.get::<_, Option<String>>(5)?,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Properties (reference getCustomerProperties — definition names).
+    let mut stmt = conn.prepare(
+        "SELECT d.name, cp.value
+         FROM customer_properties cp
+         LEFT JOIN customer_property_definitions d ON d.id = cp.definition_id
+         WHERE cp.customer_id = ?1
+         ORDER BY 1 LIMIT 50",
+    )?;
+    let properties: Vec<Value> = stmt
+        .query_map(params![customer_id], |r| {
+            Ok(json!({
+                "name": r.get::<_, String>(0)?,
+                "value": r.get::<_, Option<String>>(1)?,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Websites / social profiles / address (the mirror tables; empty arrays
+    // when the sync has not brought any).
+    let websites: Vec<Value> = string_column(
+        conn,
+        "SELECT value FROM customer_websites WHERE customer_id = ?1 ORDER BY id LIMIT 20",
+        customer_id,
+    )?;
+    let social_profiles: Vec<Value> = conn
+        .prepare(
+            "SELECT type, value FROM customer_social_profiles
+             WHERE customer_id = ?1 ORDER BY id LIMIT 20",
+        )?
+        .query_map(params![customer_id], |r| {
+            Ok(json!({
+                "type": r.get::<_, Option<String>>(0)?,
+                "value": r.get::<_, Option<String>>(1)?,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    let address: Option<String> = conn
+        .prepare(
+            "SELECT lines, city, state, postal_code, country
+             FROM customer_addresses WHERE customer_id = ?1 ORDER BY id LIMIT 1",
+        )?
+        .query_row(params![customer_id], |r| {
+            let parts = [
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ];
+            let joined = parts
+                .iter()
+                .flatten()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            })
+        })
+        .unwrap_or(None);
+
+    // Recent topics (reference: subjects of the 10 newest conversations).
+    let topics: Vec<Value> = conversations
+        .iter()
+        .take(10)
+        .map(|c| {
+            json!({
+                "number": c.get("number").cloned().unwrap_or(Value::Null),
+                "topic": c.get("subject").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+
+    // Previous resolutions (reference: last published reply per closed
+    // conversation, newest close first, 5 rows, resolution truncated to 400).
+    let mut stmt = conn.prepare(
+        "SELECT cv.number, cv.subject,
+                (SELECT t.body FROM conversation_threads t
+                  WHERE t.conversation_id = cv.id AND t.thread_type = 'reply'
+                    AND t.state = 'published'
+                  ORDER BY COALESCE(t.remote_created_at, t.created_at) DESC LIMIT 1) AS resolution,
+                cv.closed_at
+         FROM conversations cv
+         WHERE cv.customer_id = ?1 AND cv.status = 'closed' AND cv.deleted_at IS NULL
+         ORDER BY cv.closed_at DESC LIMIT 5",
+    )?;
+    let resolutions: Vec<Value> = stmt
+        .query_map(params![customer_id], |r| {
+            let resolution: Option<String> = r.get(2)?;
+            Ok(json!({
+                "number": r.get::<_, i64>(0)?,
+                "subject": r.get::<_, Option<String>>(1)?,
+                "resolution": resolution.map(|res| res.chars().take(400).collect::<String>()),
+                "closed_at": r.get::<_, Option<String>>(3)?,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Some(json!({
+        "customer": customer,
+        "conversations": conversations,
+        "ratings": ratings,
+        "memories": memories,
+        "properties": properties,
+        "websites": websites,
+        "social_profiles": social_profiles,
+        "address": address,
+        "topics": topics,
+        "resolutions": resolutions,
+    })))
+}
+
+/// Read a single TEXT column into JSON strings (websites list helper).
+fn string_column(conn: &Connection, sql: &str, id: i64) -> Result<Vec<Value>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows: Vec<Value> = stmt
+        .query_map(params![id], |r| Ok(json!(r.get::<_, Option<String>>(0)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 /// Support health for one customer (audit M22 / AN-15; reference
 /// `SupportHealthService.forCustomer`, supportHealth.ts:25-32). `None` when
 /// the id is unknown or soft-deleted.

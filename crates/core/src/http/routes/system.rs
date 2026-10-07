@@ -49,7 +49,15 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
 ///
 /// Reference response shape includes subsystems: database, helpscout,
 /// lmstudio, qdrant, sync, workers, in addition to status/version/time.
-pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse {
+///
+/// `?format=ui` (reference system.ts:87): the UI variant ALWAYS answers
+/// 200 — the dashboard's health banner must not treat a degraded system
+/// as a failed request (only the plain health endpoint 503s).
+pub async fn health_detailed(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let ui_format = params.get("format").map(String::as_str) == Some("ui");
     // All guard use is confined to this block — the awaits below must never
     // hold the connection mutex (the future must stay Send).
     let (db_ok, lmstudio_base, lmstudio_embedding) = {
@@ -256,7 +264,7 @@ pub async fn health_detailed(State(state): State<AppState>) -> impl IntoResponse
     } else {
         "error"
     };
-    let code = if status == "error" {
+    let code = if status == "error" && !ui_format {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
         axum::http::StatusCode::OK

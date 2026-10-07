@@ -57,33 +57,28 @@ fn internal(e: crate::error::Error) -> Response {
         .into_response()
 }
 
-/// GET /api/customers — list/search customers.
+/// GET /api/customers — the paginated customer summary list (UI-04,
+/// reference people.ts:6-12 + peopleRepo.listCustomers): `q` searches
+/// name/email/organization (+ customer_emails) with escaped LIKE
+/// wildcards; page clamps mirror the reference `clampListParam`
+/// (page 1..100000 default 1, pageSize 1..200 default 50); `total` counts
+/// the SAME predicate the rows were drawn from.
 pub async fn list_customers(
     State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let query = params.get("q").cloned().unwrap_or_default();
-    let limit = params
-        .get("limit")
-        .and_then(|l| l.parse::<u32>().ok())
-        .unwrap_or(20);
-    let page = params
-        .get("page")
-        .and_then(|p| p.parse::<u32>().ok())
-        .unwrap_or(1);
-    match crate::customers::search_customers(&conn, &query, Some(limit)) {
-        Ok(customers) => {
-            let items: Vec<Value> = customers
-                .iter()
-                .filter_map(|c| serde_json::to_value(c).ok())
-                .collect();
-            let total = items.len() as i64;
-            (
-                StatusCode::OK,
-                Json(json!({"customers": items, "total": total, "page": page})),
-            )
-        }
+    let page = clamp_list_param(params.get("page"), 1, 1, 100_000);
+    let page_size = clamp_list_param(params.get("pageSize"), 50, 1, 200);
+    let query = params
+        .get("q")
+        .map(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty());
+    match people_store::list_customers_summary(&conn, query, page, page_size) {
+        Ok((customers, total)) => (
+            StatusCode::OK,
+            Json(json!({"customers": customers, "total": total, "page": page})),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"message": e.to_string(), "customers": [], "total": 0, "page": page})),
@@ -91,41 +86,25 @@ pub async fn list_customers(
     }
 }
 
-/// GET /api/customers/:id — customer detail.
+/// GET /api/customers/:id — the customer detail (UI-04, reference
+/// people.ts:14-56): the full `CustomerDetailData` envelope — customer
+/// summary + conversations (50 newest, with assignee names), ratings,
+/// AI memories, properties, websites, social profiles, address, recent
+/// topics and previous resolutions.
 pub async fn get_customer(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    match crate::customers::get_customer(&conn, id) {
-        Ok(Some(c)) => {
-            // Reference CustomerDetailData: the customer payload carries the
-            // recent conversations (50, newest first) alongside the record.
-            let conversations = crate::inbox::list_conversations(
-                &conn,
-                &crate::inbox::InboxFilters {
-                    customer_id: Some(id),
-                    ..Default::default()
-                },
-            )
-            .map(|(items, _)| {
-                items
-                    .iter()
-                    .filter_map(|i| serde_json::to_value(i).ok())
-                    .collect::<Vec<Value>>()
-            })
-            .unwrap_or_default();
-            let mut payload = serde_json::to_value(&c).unwrap_or(json!({}));
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("conversations".to_string(), Value::Array(conversations));
-            }
-            (StatusCode::OK, Json(payload))
-        }
+    match people_store::get_customer_detail(&conn, id) {
+        Ok(Some(detail)) => (StatusCode::OK, Json(detail)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"message": "Customer not found."})),
-        ),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"message": e.to_string()})),
-        ),
+        )
+            .into_response(),
     }
 }
 

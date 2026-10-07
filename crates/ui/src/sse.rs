@@ -18,14 +18,19 @@ use std::sync::Mutex;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
-/// The named SSE events the server sends (reference wire names).
-pub const EVENT_NAMES: [&str; 6] = [
+/// The named SSE events the server sends (reference wire names). The
+/// reference listens for 7 named events (events.ts:47) — including `error`
+/// (UI-26: the stream-level error the reference subscribes to; e.g. the
+/// too-many-streams notice). Keep-alive comments arrive without a
+/// listener and are ignored by the browser.
+pub const EVENT_NAMES: [&str; 7] = [
     "hello",
     "ratings",
     "sync",
     "conversation",
     "campaign",
     "notification",
+    "error",
 ];
 
 /// A live event from the server, parsed from the `data:` JSON of a named

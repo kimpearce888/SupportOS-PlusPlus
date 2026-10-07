@@ -77,6 +77,25 @@ pub async fn list(
     if let Some(query) = params.get("q") {
         filters.query = Some(query.clone());
     }
+    // Channel scope (UI-27 deep links; reference conversations.ts:38-44):
+    // only 'email' | 'chat' is valid — anything else is the reference 422.
+    if let Some(channel) = params.get("channel").filter(|c| !c.is_empty()) {
+        if channel != "email" && channel != "chat" {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "statusCode": 422,
+                    "error": "ValidationError",
+                    "message": "channel must be 'email' or 'chat'."
+                })),
+            );
+        }
+        filters.channel = Some(channel.clone());
+    }
+    // Tag filter (reference conversations.ts:152: `tag: q.tag ?? null`).
+    if let Some(tag) = params.get("tag").filter(|t| !t.is_empty()) {
+        filters.tag = Some(tag.clone());
+    }
     // v2.0.0 (M4): exact number lookup (?number=N) for deep links and the
     // incident link-by-number flow; garbage is ignored, never a 500.
     if let Some(number) = params.get("number") {

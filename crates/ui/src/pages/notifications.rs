@@ -225,11 +225,17 @@ pub fn NotificationsPage() -> impl IntoView {
     let type_filter = create_rw_signal(String::new());
     // Bumped after mark-read/mark-all-read/pref changes so the lists refetch.
     let reload = create_rw_signal(0u32);
+    // Cross-page invalidation (UI-26): the SSE bridge bumps the
+    // 'notifications' + 'notification-unread' counters when a new
+    // notification lands — this page refetches both like the reference's
+    // invalidated ['notifications'] / ['notification-unread'] queries.
+    let sse_refresh = crate::queries::version("notifications");
 
     // Fetch the notification list (respecting the tab's unread filter and
     // the type filter) + the unread count.
     create_effect(move |_| {
         let _ = reload.get();
+        let _ = sse_refresh.get();
         let type_filter = type_filter.get();
         let unread_only = tab.get() == NotificationTab::Unread;
         let mut path = format!(

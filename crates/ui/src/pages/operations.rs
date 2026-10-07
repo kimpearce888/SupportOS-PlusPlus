@@ -191,9 +191,16 @@ pub fn OperationsPage() -> impl IntoView {
     let snapshot = create_rw_signal(OperationsSnapshotView::default());
     let loading = create_rw_signal(true);
     let error_msg = create_rw_signal(None::<String>);
+    // Cross-page invalidation (UI-26): the SSE bridge bumps the
+    // 'operations-center' counter on conversation/sync/notification events —
+    // the same refetch the reference gets from invalidating
+    // ['operations-center'].
+    let sse_refresh = crate::queries::version("operations-center");
 
-    // Fetch the operations snapshot on mount.
+    // Fetch the operations snapshot on mount (re-runs when the bridge
+    // invalidates the center).
     create_effect(move |_| {
+        let _ = sse_refresh.get();
         let snapshot = snapshot;
         let loading = loading;
         let error_msg = error_msg;

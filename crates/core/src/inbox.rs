@@ -115,6 +115,13 @@ pub struct InboxFilters {
     pub customer_id: Option<i64>,
     /// Filter by priority. None = any priority.
     pub priority: Option<String>,
+    /// Filter by channel ('email' | 'chat' — Beacon sessions; the
+    /// reference `params.channel`, conversations.ts:38-44). None = any
+    /// channel.
+    pub channel: Option<String>,
+    /// Filter by tag name, case-insensitive (the reference `params.tag`,
+    /// conversationRepo.ts:429-432). None = any tag.
+    pub tag: Option<String>,
     /// Free-text search in subject + preview.
     pub query: Option<String>,
     /// Exact conversation-number lookup (?number=N — v2.0.0 M4: deep
@@ -217,6 +224,24 @@ pub fn list_conversations(
     if let Some(ref priority) = filters.priority {
         where_parts.push("c.priority = ?".to_string());
         params_vec.push(priority.clone().into());
+    }
+    // Channel scope (UI-27 deep links: /inbox?view=all&channel=chat —
+    // reference conversations.ts:38-44 validates 'email'|'chat'; the port
+    // validates at the route).
+    if let Some(ref channel) = filters.channel {
+        where_parts.push("c.type = ?".to_string());
+        params_vec.push(channel.clone().into());
+    }
+    // Tag filter (reference conversationRepo.ts:429-432): case-insensitive
+    // name match through the join table — parameterized, never interpolated.
+    if let Some(ref tag) = filters.tag {
+        where_parts.push(
+            "EXISTS (SELECT 1 FROM conversation_tags ct JOIN tags t \
+             ON t.id = ct.tag_id WHERE ct.conversation_id = c.id \
+             AND t.name = ? COLLATE NOCASE)"
+                .to_string(),
+        );
+        params_vec.push(tag.clone().into());
     }
     // v2.0.0 (M4): exact number lookup — takes precedence over the
     // free-text query when present.

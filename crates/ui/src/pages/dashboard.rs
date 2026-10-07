@@ -1,145 +1,815 @@
-//! Dashboard page — the `/` route.
+//! Dashboard page — the `/` route (UI-01).
 //!
-//! Wired to the `dashboard_metrics` Tauri IPC command on mount.
-//! Shows real KPI metrics: total/new/closed/active conversations, avg response
-//! times, SLA breach count, customer waiting count.
+//! Mirrors the reference `pages/Dashboard.tsx`:
+//! - Scope lives in the URL (UI-27): `/?days=30&mailboxes=1,2&channel=chat`
+//!   — shareable + back-button safe. Range buttons (7/30/90/365 days), a
+//!   multi-select mailbox filter (empty selection = all mailboxes) and the
+//!   email/chat channel scope.
+//! - KPI stat cards linked to inbox views (Active/Pending/Closed/Unassigned),
+//!   backlog, first-response/resolution averages, replies sent, and the
+//!   great-ratings share (live via /api/events — the SSE bridge bumps the
+//!   `dashboard` counter, which re-runs this page's metrics load).
+//! - The daily-new conversations barchart, the Issue Radar card (top 6
+//!   alerts, each linking to its conversations), the channel mix + speed
+//!   card, the mailbox comparison, and the by-inbox/by-tag/by-agent teams
+//!   cards.
+//! - A degraded-system banner from `/health/detailed?format=ui` (60 s
+//!   refresh) linking to Sync Health.
+
+use std::rc::Rc;
 
 use leptos::*;
+use leptos_router::{use_location, use_navigate, use_query_map, A};
 
 use crate::components::state_view::{EmptyState, LoadingState};
 
-/// Dashboard KPI metrics displayed on the page.
-#[derive(Debug, Clone, Default)]
-pub struct DashboardKpis {
-    pub total_conversations: u32,
-    pub new_conversations: u32,
-    pub closed_conversations: u32,
-    pub active_conversations: u32,
-    pub pending_conversations: u32,
-    pub unassigned: u32,
-    pub backlog: u32,
-    pub avg_first_response_minutes: Option<f64>,
-    pub avg_resolution_minutes: Option<f64>,
-}
+/// The reference RANGES: 7/30/90/365 days.
+const RANGES: [(u32, &str); 4] = [
+    (7, "7 days"),
+    (30, "30 days"),
+    (90, "90 days"),
+    (365, "1 year"),
+];
 
-/// The dashboard page. Fetches metrics from `GET /api/analytics/dashboard`.
+/// The reference CHANNELS: null (all) / email / chat.
+const CHANNELS: [(&str, &str); 3] = [
+    ("", "All channels"),
+    ("email", "Email"),
+    ("chat", "Chat (Beacon)"),
+];
+
+/// The dashboard URL-writer: `setParam(key, value|null)` with replace.
+type SetParamFn = Rc<dyn Fn(&str, Option<&str>)>;
+
+/// The dashboard page — `/`.
 #[component]
 pub fn DashboardPage() -> impl IntoView {
-    let kpis = create_rw_signal(DashboardKpis::default());
-    let loading = create_rw_signal(true);
-    let error_msg = create_rw_signal(None::<String>);
+    // ── URL-backed scope (UI-27): ?days= &mailboxes= &channel= ────────────
+    let query_map = use_query_map();
+    let location = use_location();
+    let navigate = use_navigate();
 
-    create_effect(move |_| {
-        let kpis = kpis;
-        let loading = loading;
-        let error_msg = error_msg;
-        wasm_bindgen_futures::spawn_local(async move {
-            match crate::api::get_json::<serde_json::Value>("/api/analytics/dashboard?daysBack=7")
-                .await
-            {
-                Ok(data) => {
-                    let active = data
-                        .get("active_conversations")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    let pending = data
-                        .get("pending_conversations")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    let closed = data
-                        .get("closed_conversations")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32;
-                    kpis.set(DashboardKpis {
-                        total_conversations: active + pending + closed,
-                        new_conversations: data
-                            .get("new_conversations")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32,
-                        closed_conversations: closed,
-                        active_conversations: active,
-                        pending_conversations: pending,
-                        unassigned: data.get("unassigned").and_then(|v| v.as_u64()).unwrap_or(0)
-                            as u32,
-                        backlog: data.get("backlog").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                        avg_first_response_minutes: data
-                            .get("first_response_time_avg_min")
-                            .and_then(|v| v.as_f64()),
-                        avg_resolution_minutes: data
-                            .get("resolution_time_avg_min")
-                            .and_then(|v| v.as_f64()),
-                    });
-                    loading.set(false);
-                }
-                Err(e) => {
-                    error_msg.set(Some(e));
-                    loading.set(false);
+    // days: Number(param ?? 30) || 30 — garbage falls back to 30.
+    let days = create_memo(move |_| {
+        let m = query_map.get();
+        crate::url_state::query_pos_int(&m, "days")
+            .map(|d| (d as u32).clamp(1, 3650))
+            .unwrap_or(30)
+    });
+    // mailboxes: comma list of positive integers; anything else is dropped.
+    let mailbox_ids = create_memo(move |_| {
+        let m = query_map.get();
+        crate::url_state::query_str(&m, "mailboxes")
+            .map(|raw| {
+                raw.split(',')
+                    .filter_map(|t| t.trim().parse::<i64>().ok().filter(|id| *id > 0))
+                    .collect::<Vec<i64>>()
+            })
+            .unwrap_or_default()
+    });
+    // channel: 'email' | 'chat'; anything else means no filter.
+    let channel = create_memo(move |_| {
+        let m = query_map.get();
+        match crate::url_state::query_str(&m, "channel").as_deref() {
+            Some("email") => Some("email".to_string()),
+            Some("chat") => Some("chat".to_string()),
+            _ => None,
+        }
+    });
+
+    // setParam(key, value|null) — the reference's replace:true URL writer.
+    let set_param: SetParamFn = {
+        let navigate = navigate.clone();
+        let pathname = location.pathname;
+        Rc::new(move |key: &str, value: Option<&str>| {
+            let m = query_map.get_untracked();
+            let mut pairs: Vec<crate::url_state::Param> = Vec::new();
+            for k in ["days", "mailboxes", "channel"] {
+                if k == key {
+                    pairs.push((k, value.map(str::to_string)));
+                } else {
+                    pairs.push((k, crate::url_state::query_str(&m, k)));
                 }
             }
+            crate::url_state::replace_query(&navigate, &pathname.get_untracked(), &pairs);
+        })
+    };
+    let set_param_stored = StoredValue::new(set_param);
+
+    // Multi-select toggle: clicking a mailbox adds/removes it; the empty
+    // selection means all mailboxes (the param drops out of the URL).
+    // StoredValue so every nested view closure can call it (Copy capture —
+    // the close-handler pattern).
+    let toggle_mailbox_stored = StoredValue::new({
+        Rc::new(move |id: i64| {
+            let mut next: Vec<i64> = mailbox_ids.get_untracked();
+            if next.contains(&id) {
+                next.retain(|m| *m != id);
+            } else {
+                next.push(id);
+            }
+            let joined = next
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            set_param_stored.with_value(|f| {
+                f(
+                    "mailboxes",
+                    if next.is_empty() {
+                        None
+                    } else {
+                        Some(joined.as_str())
+                    },
+                )
+            });
+        }) as Rc<dyn Fn(i64)>
+    });
+
+    // ── Data loads ────────────────────────────────────────────────────────
+    let metrics = create_rw_signal(None::<serde_json::Value>);
+    let metrics_loading = create_rw_signal(true);
+    let metrics_error = create_rw_signal(None::<String>);
+    let mailboxes = create_rw_signal(Vec::<serde_json::Value>::new());
+    let health = create_rw_signal(None::<serde_json::Value>);
+    let radar = create_rw_signal(Vec::<serde_json::Value>::new());
+
+    // Dashboard metrics: keyed on (days, mailboxIds, channel) + the SSE
+    // invalidation counter (reference: queryKey ['dashboard', …], bumped
+    // by the bridge on ratings/sync/conversation events).
+    create_effect(move |_| {
+        let days = days.get();
+        let mailbox_ids = mailbox_ids.get();
+        let channel = channel.get();
+        // The 'dashboard' version counter (UI-26 cross-page invalidation).
+        let _ = crate::queries::version("dashboard").get();
+        let metrics = metrics;
+        let metrics_loading = metrics_loading;
+        let metrics_error = metrics_error;
+        metrics_loading.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut path = format!("/api/analytics/dashboard?days={days}");
+            if !mailbox_ids.is_empty() {
+                let joined = mailbox_ids
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                path.push_str(&format!("&mailboxIds={joined}"));
+            }
+            if let Some(channel) = channel.as_deref() {
+                path.push_str(&format!("&channel={channel}"));
+            }
+            match crate::api::get_json::<serde_json::Value>(&path).await {
+                Ok(v) => {
+                    metrics.set(Some(v));
+                    metrics_error.set(None);
+                }
+                Err(e) => metrics_error.set(Some(e)),
+            }
+            metrics_loading.set(false);
         });
     });
 
+    // Mailbox list for the scope filter (once per mount).
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok(v) = crate::api::get_json::<serde_json::Value>("/api/mailboxes").await {
+            mailboxes.set(
+                v.get("mailboxes")
+                    .and_then(|m| m.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+    });
+
+    // Health banner: /health/detailed?format=ui, 60 s refresh (reference
+    // refetchInterval 60_000). format=ui always answers 200.
+    let load_health = move || {
+        let health = health;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(v) =
+                crate::api::get_json::<serde_json::Value>("/health/detailed?format=ui").await
+            {
+                health.set(Some(v));
+            }
+        });
+    };
+    load_health();
+    set_interval(load_health, std::time::Duration::from_secs(60));
+
+    // Issue radar alerts: 120 s refresh (reference refetchInterval 120_000).
+    let load_radar = move || {
+        let radar = radar;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(v) =
+                crate::api::get_json::<serde_json::Value>("/api/reports/issue-radar").await
+            {
+                radar.set(
+                    v.get("alerts")
+                        .and_then(|a| a.as_array())
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+        });
+    };
+    load_radar();
+    set_interval(load_radar, std::time::Duration::from_secs(120));
+
     view! {
         <div class="spp-page spp-page--dashboard">
-            <h2 class="spp-page__title">"Dashboard"</h2>
+            <div class="spp-flex spp-flex--between">
+                <div>
+                    <h2 class="spp-page__title">"Dashboard"</h2>
+                    <p class="spp-page__intro">
+                        "Local metrics · sources labeled Help Scout / local / AI-derived everywhere"
+                        {move || {
+                            let n = mailbox_ids.get().len();
+                            if n > 0 {
+                                format!(" · {n} mailbox{} selected", if n > 1 { "es" } else { "" })
+                            } else {
+                                " · all mailboxes".to_string()
+                            }
+                        }}
+                        {move || match channel.get().as_deref() {
+                            Some("chat") => " · chat (Beacon) channel".to_string(),
+                            Some("email") => " · email channel".to_string(),
+                            _ => String::new(),
+                        }}
+                    </p>
+                </div>
+                <div class="spp-flex spp-dashboard__ranges" role="group" aria-label="Date range">
+                    {RANGES.iter().map(|(d, label)| {
+                        let d = *d;
+                        let label = *label;
+                        view! {
+                            <button
+                                class=move || {
+                                    if days.get() == d {
+                                        "spp-button spp-button--primary spp-button--small"
+                                    } else {
+                                        "spp-button spp-button--small"
+                                    }
+                                }
+                                on:click=move |_| {
+                                    set_param_stored.with_value(|f| f("days", Some(d.to_string().as_str())));
+                                }
+                            >
+                                {label}
+                            </button>
+                        }
+                    }).collect::<Vec<_>>()}
+                </div>
+            </div>
 
-            <Show when=move || loading.get() fallback=|| ()>
-                <LoadingState />
-            </Show>
+            // ── Scope: multi-mailbox + channel ───────────────────────────
+            <div class="spp-card spp-dashboard__scope">
+                <div class="spp-flex spp-flex--wrap spp-dashboard__scope-row">
+                    <span class="spp-dashboard__scope-label">"Mailboxes"</span>
+                    <button
+                        class=move || {
+                            if mailbox_ids.get().is_empty() {
+                                "spp-button spp-button--primary spp-button--small"
+                            } else {
+                                "spp-button spp-button--small"
+                            }
+                        }
+                        on:click=move |_| {
+                            set_param_stored.with_value(|f| f("mailboxes", None));
+                        }
+                    >
+                        "All"
+                    </button>
+                    {move || {
+                        mailboxes.get().iter().map(|m| {
+                            let id = m.get("id").and_then(|v| v.as_i64()).unwrap_or_default();
+                            let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)").to_string();
+                            view! {
+                                <button
+                                    class=move || {
+                                        if mailbox_ids.get().contains(&id) {
+                                            "spp-button spp-button--primary spp-button--small"
+                                        } else {
+                                            "spp-button spp-button--small"
+                                        }
+                                    }
+                                    aria-pressed=move || mailbox_ids.get().contains(&id)
+                                    on:click=move |_| toggle_mailbox_stored.with_value(|f| f(id))
+                                >
+                                    {name}
+                                </button>
+                            }
+                        }).collect::<Vec<_>>()
+                    }}
+                    <span class="spp-dashboard__scope-label spp-dashboard__scope-label--gap">"Channel"</span>
+                    {CHANNELS.iter().map(|(value, label)| {
+                        let value = *value;
+                        let label = *label;
+                        view! {
+                            <button
+                                class=move || {
+                                    let active = match value {
+                                        "" => channel.get().is_none(),
+                                        v => channel.get().as_deref() == Some(v),
+                                    };
+                                    if active {
+                                        "spp-button spp-button--primary spp-button--small"
+                                    } else {
+                                        "spp-button spp-button--small"
+                                    }
+                                }
+                                aria-pressed=move || {
+                                    match value {
+                                        "" => channel.get().is_none(),
+                                        v => channel.get().as_deref() == Some(v),
+                                    }
+                                }
+                                on:click=move |_| {
+                                    let v = if value.is_empty() { None } else { Some(value) };
+                                    set_param_stored.with_value(|f| f("channel", v));
+                                }
+                            >
+                                {label}
+                            </button>
+                        }
+                    }).collect::<Vec<_>>()}
+                </div>
+            </div>
 
-            <Show when=move || error_msg.get().is_some() fallback=|| ()>
-                <div class="spp-state spp-state--error">
-                    <span class="spp-state__icon" aria-hidden="true">"⚠"</span>
-                    <p class="spp-state__body">{move || error_msg.get().unwrap_or_default()}</p>
+            // ── Degraded-system banner ──────────────────────────────────
+            <Show when=move || {
+                health.get()
+                    .and_then(|h| h.get("status").and_then(|s| s.as_str()).map(str::to_string))
+                    .is_some_and(|s| s != "ok")
+            } fallback=|| ()>
+                <div class=move || {
+                    match health.get()
+                        .and_then(|h| h.get("status").and_then(|s| s.as_str().map(str::to_string)))
+                        .as_deref()
+                    {
+                        Some("error") => "spp-banner spp-banner--error",
+                        _ => "spp-banner spp-banner--warn",
+                    }
+                }>
+                    {move || {
+                        let h = health.get().unwrap_or_default();
+                        let status = h
+                            .get("status")
+                            .and_then(|s| s.as_str().map(str::to_string))
+                            .unwrap_or_else(|| "degraded".to_string());
+                        let hs_connected = h
+                            .pointer("/helpscout/connected")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let demo = h
+                            .pointer("/helpscout/demo_mode")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let lm = h
+                            .pointer("/lmstudio/connected")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let qdrant = h
+                            .pointer("/qdrant/connected")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        view! {
+                            <span>
+                                "System status: " <strong>{status}</strong>". "
+                                {if !hs_connected && !demo {
+                                    "Help Scout is unreachable — remote actions disabled, local data remains browsable. "
+                                } else {
+                                    ""
+                                }}
+                                {if !lm {
+                                    "LM Studio is offline — AI features unavailable (everything else works). "
+                                } else {
+                                    ""
+                                }}
+                                {if !qdrant {
+                                    "Qdrant is offline — keyword search remains fully functional. "
+                                } else {
+                                    ""
+                                }}
+                                <A href="/sync-health" class="spp-dashboard__banner-link">"Open Sync Health"</A>
+                            </span>
+                        }
+                    }}
                 </div>
             </Show>
 
+            // ── Metrics ─────────────────────────────────────────────────
+            <Show when=move || metrics_loading.get() fallback=|| ()>
+                <LoadingState />
+            </Show>
+            <Show when=move || metrics_error.get().is_some() fallback=|| ()>
+                <div class="spp-state spp-state--error">
+                    <span class="spp-state__icon" aria-hidden="true">"⚠"</span>
+                    <p class="spp-state__body">{move || metrics_error.get().unwrap_or_default()}</p>
+                </div>
+            </Show>
             <Show
-                when=move || !loading.get() && error_msg.get().is_none()
+                when=move || !metrics_loading.get() && metrics_error.get().is_none()
                 fallback=|| ()
             >
-                <Show
-                    when=move || kpis.with(|k| k.total_conversations > 0)
-                    fallback=move || {
-                        view! {
-                            <EmptyState message="No conversations synced yet. Try demo mode or connect Help Scout." />
-                        }
-                    }
-                >
-                    <div class="spp-dashboard-grid">
-                        <KpiCard label="Total conversations" value={move || kpis.get().total_conversations.to_string()} />
-                        <KpiCard label="New (7d)" value={move || kpis.get().new_conversations.to_string()} />
-                        <KpiCard label="Active" value={move || kpis.get().active_conversations.to_string()} />
-                        <KpiCard label="Closed" value={move || kpis.get().closed_conversations.to_string()} />
-                        <KpiCard label="Pending" value={move || kpis.get().pending_conversations.to_string()} />
-                        <KpiCard label="Unassigned" value={move || kpis.get().unassigned.to_string()} />
-                        <KpiCard label="Backlog" value={move || kpis.get().backlog.to_string()} />
-                        <KpiCard
-                            label="Avg first response (min)"
-                            value={move || kpis.get().avg_first_response_minutes
-                                .map(|m| format!("{m:.1}"))
-                                .unwrap_or_else(|| "—".into())}
-                        />
-                        <KpiCard
-                            label="Avg resolution (min)"
-                            value={move || kpis.get().avg_resolution_minutes
-                                .map(|m| format!("{m:.1}"))
-                                .unwrap_or_else(|| "—".into())}
-                        />
-                    </div>
-                </Show>
+                {move || {
+                    let Some(data) = metrics.get() else {
+                        return view! { <div></div> }.into_view();
+                    };
+                    // Owned values up front (no borrowing closure — nested
+                    // view closures would outlive the borrow).
+                    let active = data.get("active_conversations").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let pending = data.get("pending_conversations").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let closed = data.get("closed_conversations").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let unassigned = data.get("unassigned").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let backlog = data.get("backlog").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let replies_sent = data.get("replies_sent").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let first_response = data.get("first_response_time_avg_min").and_then(|v| v.as_f64());
+                    let resolution_time = data.get("resolution_time_avg_min").and_then(|v| v.as_f64());
+                    let great = data.pointer("/ratings/great").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let okay = data.pointer("/ratings/okay").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let not_good = data.pointer("/ratings/not-good").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let total_ratings = great + okay + not_good;
+                    let great_share = if total_ratings > 0 {
+                        format!("{}%", (great * 100) / total_ratings)
+                    } else {
+                        "—".to_string()
+                    };
+                    let daily_new = data.get("daily_new").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let max_daily = daily_new
+                        .iter()
+                        .map(|d| d.get("value").and_then(|v| v.as_i64()).unwrap_or(0))
+                        .max()
+                        .unwrap_or(1)
+                        .max(1);
+                    view! {
+                        <div class="spp-dashboard-grid">
+                            <A href="/inbox?view=active" class="spp-kpi-card spp-kpi-card--link">
+                                <span class="spp-kpi-card__label">"Active"</span>
+                                <span class="spp-kpi-card__value">{fmt_u64(Some(active))}</span>
+                            </A>
+                            <A href="/inbox?view=pending" class="spp-kpi-card spp-kpi-card--link">
+                                <span class="spp-kpi-card__label">"Pending"</span>
+                                <span class="spp-kpi-card__value">{fmt_u64(Some(pending))}</span>
+                            </A>
+                            <A href="/inbox?view=closed" class="spp-kpi-card spp-kpi-card--link">
+                                <span class="spp-kpi-card__label">"Closed (in range)"</span>
+                                <span class="spp-kpi-card__value">{fmt_u64(Some(closed))}</span>
+                            </A>
+                            <A href="/inbox?view=unassigned" class="spp-kpi-card spp-kpi-card--link">
+                                <span class="spp-kpi-card__label">"Unassigned"</span>
+                                <span class="spp-kpi-card__value">{fmt_u64(Some(unassigned))}</span>
+                            </A>
+                            <div class="spp-kpi-card">
+                                <span class="spp-kpi-card__label">"Backlog (7d+)"</span>
+                                <span class="spp-kpi-card__value">{fmt_u64(Some(backlog))}</span>
+                                <span class="spp-kpi-card__hint">"local definition"</span>
+                            </div>
+                            <div class="spp-kpi-card">
+                                <span class="spp-kpi-card__label">"First response (avg)"</span>
+                                <span class="spp-kpi-card__value">{fmt_min(first_response)}</span>
+                                <span class="spp-kpi-card__hint">"local definition"</span>
+                            </div>
+                            <div class="spp-kpi-card">
+                                <span class="spp-kpi-card__label">"Resolution (avg)"</span>
+                                <span class="spp-kpi-card__value">{fmt_min(resolution_time)}</span>
+                                <span class="spp-kpi-card__hint">"local definition"</span>
+                            </div>
+                            <div class="spp-kpi-card">
+                                <span class="spp-kpi-card__label">"Replies sent"</span>
+                                <span class="spp-kpi-card__value">{fmt_u64(Some(replies_sent))}</span>
+                            </div>
+                            <div class="spp-kpi-card">
+                                <span class="spp-kpi-card__label">"Great ratings"</span>
+                                <span class="spp-kpi-card__value">{great_share}</span>
+                                <span class="spp-kpi-card__hint">
+                                    {format!("{great} great · {okay} okay · {not_good} not-good · live via /api/events")}
+                                </span>
+                            </div>
+                        </div>
+
+                        // ── New conversations per day + Issue Radar ──────
+                        <div class="spp-dashboard-grid spp-dashboard-grid--two">
+                            <div class="spp-card">
+                                <h3 class="spp-card__title">"New conversations per day (local)"</h3>
+                                {if daily_new.is_empty() {
+                                    view! { <EmptyState message="No conversations in range" /> }.into_view()
+                                } else {
+                                    view! {
+                                        <div class="spp-barchart" role="img" aria-label="New conversations per day">
+                                            {daily_new.iter().map(|d| {
+                                                let value = d.get("value").and_then(|v| v.as_i64()).unwrap_or(0);
+                                                let date = d.get("date").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                let height = (value.max(0) * 100) / max_daily;
+                                                view! {
+                                                    <div
+                                                        class="spp-barchart__bar"
+                                                        style=format!("height: {height}%")
+                                                        title=format!("{date}: {value}")
+                                                    ></div>
+                                                }
+                                            }).collect::<Vec<_>>()}
+                                        </div>
+                                        <div class="spp-flex spp-flex--between spp-dashboard__chart-ends">
+                                            <span class="spp-muted spp-text-xs">
+                                                {daily_new.first()
+                                                    .and_then(|d| d.get("date").and_then(|v| v.as_str()).map(str::to_string))
+                                                    .unwrap_or_default()}
+                                            </span>
+                                            <span class="spp-muted spp-text-xs">
+                                                {daily_new.last()
+                                                    .and_then(|d| d.get("date").and_then(|v| v.as_str()).map(str::to_string))
+                                                    .unwrap_or_default()}
+                                            </span>
+                                        </div>
+                                    }.into_view()
+                                }}
+                            </div>
+                            <div class="spp-card">
+                                <h3 class="spp-card__title">"Issue Radar (AI + local)"</h3>
+                                <Show
+                                    when=move || !radar.with(|r| r.is_empty())
+                                    fallback=|| {
+                                        view! {
+                                            <EmptyState message="No alerts right now. Alerts appear when clusters rise, new issues appear or volume spikes." />
+                                        }
+                                    }
+                                >
+                                    {move || radar.get().iter().take(6).map(|a| {
+                                        let title = a.get("title").and_then(|v| v.as_str()).unwrap_or("(alert)").to_string();
+                                        let detail = a.get("detail").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                        let severity = a.get("severity").and_then(|v| v.as_str()).unwrap_or("info").to_string();
+                                        let conv_links: Vec<(String, String)> = a
+                                            .get("conversation_ids")
+                                            .and_then(|v| v.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|c| c.as_i64())
+                                                    .take(6)
+                                                    .map(|cid| {
+                                                        (
+                                                            format!("/inbox/conversation/{cid}"),
+                                                            format!("#{cid}"),
+                                                        )
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        view! {
+                                            <div class=match severity.as_str() {
+                                                "critical" => "spp-issues__alert spp-issues__alert--critical",
+                                                "warning" => "spp-issues__alert spp-issues__alert--warning",
+                                                _ => "spp-issues__alert spp-issues__alert--info",
+                                            }>
+                                                <strong>{title}</strong>
+                                                <p class="spp-muted spp-text-xs">{detail}</p>
+                                                <div class="spp-issues__alert-convs">
+                                                    {conv_links.iter().map(|(href, label)| {
+                                                        let href = href.clone();
+                                                        let label = label.clone();
+                                                        view! {
+                                                            <A href=href class="spp-badge">
+                                                                {label}
+                                                            </A>
+                                                        }
+                                                    }).collect::<Vec<_>>()}
+                                                </div>
+                                            </div>
+                                        }
+                                    }).collect::<Vec<_>>()}
+                                </Show>
+                                <A href="/issues" class="spp-dashboard__banner-link">"Open Issues screen →"</A>
+                            </div>
+                        </div>
+
+                        // ── Channel mix + mailbox comparison ─────────────
+                        <div class="spp-dashboard-grid spp-dashboard-grid--two">
+                            <div class="spp-card">
+                                <h3 class="spp-card__title">"Channel mix & speed"</h3>
+                                {move || {
+                                    let data = metrics.get().unwrap_or_default();
+                                    let rows = data.get("channel_metrics").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                                    if rows.is_empty() {
+                                        view! { <EmptyState message="No conversations in range" /> }.into_view()
+                                    } else {
+                                        rows.iter().map(|c| {
+                                            let channel = c.get("channel").and_then(|v| v.as_str()).unwrap_or("email").to_string();
+                                            let count = c.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+                                            let first = c.get("first_response_avg_min").and_then(|v| v.as_f64());
+                                            let resolution = c.get("resolution_avg_min").and_then(|v| v.as_f64());
+                                            let label = if channel == "chat" {
+                                                "Chat (Beacon)".to_string()
+                                            } else {
+                                                channel.clone()
+                                            };
+                                            view! {
+                                                <div class="spp-dashboard__channel-row">
+                                                    <div class="spp-flex spp-flex--between">
+                                                        <A href={format!("/inbox?view=all&channel={}", crate::url_state::encode_value(&channel))} class="spp-badge">
+                                                            {label}
+                                                        </A>
+                                                        <span class="spp-badge">{count.to_string()}</span>
+                                                    </div>
+                                                    <div class="spp-muted spp-text-xs">
+                                                        {format!("first response {} · resolution {}", fmt_min(first), fmt_min(resolution))}
+                                                    </div>
+                                                </div>
+                                            }
+                                        }).collect::<Vec<_>>().into_view()
+                                    }
+                                }}
+                                <p class="spp-muted spp-text-xs">
+                                    "Chat sessions are Beacon conversations (type=chat, source via=beacon) — see the Docs page for the mirror overview."
+                                </p>
+                            </div>
+                            <div class="spp-card">
+                                <h3 class="spp-card__title">"Mailbox comparison"</h3>
+                                {move || {
+                                        let data = metrics.get().unwrap_or_default();
+                                    let rows = data.get("mailbox_comparison").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                                    let max_new = rows.iter()
+                                        .map(|m| m.get("new_conversations").and_then(|v| v.as_i64()).unwrap_or(0))
+                                        .max()
+                                        .unwrap_or(1)
+                                        .max(1);
+                                    if rows.is_empty() {
+                                        view! { <EmptyState message="No mailboxes yet" /> }.into_view()
+                                    } else {
+                                        rows.iter().map(move |m| {
+                                            let mailbox_id = m.get("mailbox_id").and_then(|v| v.as_i64()).unwrap_or_default();
+                                            let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("(unnamed)").to_string();
+                                            let new_conversations = m.get("new_conversations").and_then(|v| v.as_i64()).unwrap_or(0);
+                                            let active = m.get("active_conversations").and_then(|v| v.as_i64()).unwrap_or(0);
+                                            let closed = m.get("closed_conversations").and_then(|v| v.as_i64()).unwrap_or(0);
+                                            let backlog = m.get("backlog").and_then(|v| v.as_i64()).unwrap_or(0);
+                                            let first = m.get("first_response_avg_min").and_then(|v| v.as_f64());
+                                            let resolution = m.get("resolution_avg_min").and_then(|v| v.as_f64());
+                                            let great_ratings = m.get("great_ratings").and_then(|v| v.as_i64()).unwrap_or(0);
+                                            let total_ratings = m.get("total_ratings").and_then(|v| v.as_i64()).unwrap_or(0);
+                                            let width = (new_conversations.max(0) * 100) / max_new;
+                                            let toggle = toggle_mailbox_stored;
+                                            view! {
+                                                <div class="spp-dashboard__mailbox-row">
+                                                    <div class="spp-flex spp-flex--between">
+                                                        <button
+                                                            class="spp-button spp-button--ghost spp-button--small"
+                                                            on:click=move |_| {
+                                                                set_param_stored.with_value(|f| f("mailboxes", Some(mailbox_id.to_string().as_str())));
+                                                            }
+                                                        >
+                                                            {name}
+                                                        </button>
+                                                        <span class="spp-badge">{format!("{new_conversations} new")}</span>
+                                                    </div>
+                                                    <div class="spp-dashboard__meter">
+                                                        <div class="spp-dashboard__meter-fill" style=format!("width: {width}%")></div>
+                                                    </div>
+                                                    <div class="spp-muted spp-text-xs">
+                                                        {format!(
+                                                            "{active} active · {closed} closed · backlog {backlog} · first response {} · resolution {}",
+                                                            fmt_min(first),
+                                                            fmt_min(resolution)
+                                                        )}
+                                                        {" · "}
+                                                        {if total_ratings > 0 {
+                                                            format!("{}% great", (great_ratings * 100) / total_ratings)
+                                                        } else {
+                                                            "no ratings".to_string()
+                                                        }}
+                                                    </div>
+                                                    <button class="spp-button spp-button--tiny" on:click=move |_| toggle.with_value(|f| f(mailbox_id))>
+                                                        {if mailbox_ids.get().contains(&mailbox_id) { "Remove from scope" } else { "Add to scope" }}
+                                                    </button>
+                                                </div>
+                                            }
+                                        }).collect::<Vec<_>>().into_view()
+                                    }
+                                }}
+                            </div>
+                        </div>
+
+                        // ── By inbox / by tag / by agent ──────────────────
+                        <div class="spp-dashboard-grid spp-dashboard-grid--three">
+                            <div class="spp-card">
+                                <h3 class="spp-card__title">"Tickets by inbox"</h3>
+                                <NameCountList data=data.clone() key="by_mailbox" link="inbox" />
+                            </div>
+                            <div class="spp-card">
+                                <h3 class="spp-card__title">"Tickets by tag"</h3>
+                                <NameCountList data=data.clone() key="by_tag" link="tag" />
+                            </div>
+                            <div class="spp-card">
+                                <h3 class="spp-card__title">"Tickets by agent"</h3>
+                                <NameCountList data=data.clone() key="by_agent" link="none" />
+                                <Show when=move || {
+                                    metrics.get()
+                                        .and_then(|d| d.get("by_team").and_then(|t| t.as_array()).map(|a| !a.is_empty()))
+                                        .unwrap_or(false)
+                                } fallback=|| ()>
+                                    <div class="spp-dashboard__scope-label spp-dashboard__scope-label--gap">"By team"</div>
+                                    <NameCountList data=data.clone() key="by_team" link="none" />
+                                </Show>
+                            </div>
+                        </div>
+
+                        <p class="spp-muted spp-text-xs">
+                            "All metrics are local calculations from the synchronized mirror; definitions and limitations are listed in Reports → Metric definitions. AI-derived numbers are labeled as AI-derived. Ratings update in real time over Server-Sent Events (/api/events)."
+                        </p>
+                    }.into_view()
+                }}
             </Show>
         </div>
     }
 }
 
-/// A single KPI card with a label and value.
+/// One `{name, count}` row with an optional link (by inbox → the inbox
+/// list; by tag → the inbox with ?tag=; agents/teams are plain rows).
 #[component]
-fn KpiCard(label: &'static str, value: impl Fn() -> String + 'static) -> impl IntoView {
+fn NameCountList(data: serde_json::Value, key: &'static str, link: &'static str) -> impl IntoView {
+    // by_tag is capped at 8 rows by the reference.
+    let rows: Vec<serde_json::Value> = data
+        .get(key)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let rows = if key == "by_tag" {
+        rows.into_iter().take(8).collect::<Vec<_>>()
+    } else {
+        rows
+    };
     view! {
-        <div class="spp-kpi-card">
-            <span class="spp-kpi-card__label">{label}</span>
-            <span class="spp-kpi-card__value">{value}</span>
-        </div>
+        {if rows.is_empty() {
+            view! { <span class="spp-muted spp-text-xs">{if key == "by_tag" { "No tags yet" } else { "Unassigned work only" } }</span> }.into_view()
+        } else {
+            rows.iter().map(|r| {
+                let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("—").to_string();
+                let count = r.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let href = match link {
+                    "inbox" => "/inbox?view=all".to_string(),
+                    "tag" => format!("/inbox?view=all&tag={}", crate::url_state::encode_value(&name)),
+                    _ => String::new(),
+                };
+                view! {
+                    <div class="spp-flex spp-flex--between spp-dashboard__name-row">
+                        {if href.is_empty() {
+                            view! { <span>{name}</span> }.into_view()
+                        } else {
+                            view! { <A href=href class="spp-dashboard__name-link">{name}</A> }.into_view()
+                        }}
+                        <span class="spp-badge">{count.to_string()}</span>
+                    </div>
+                }
+            }).collect::<Vec<_>>().into_view()
+        }}
+    }
+}
+
+/// The reference `fmtMin`: null → "—", <60 → "Nm", <60*24 → "Nh", else "Nd"
+/// (hours/days rounded).
+fn fmt_min(m: Option<f64>) -> String {
+    let Some(m) = m else {
+        return "—".to_string();
+    };
+    if m < 60.0 {
+        format!("{}m", m.round() as i64)
+    } else if m < 60.0 * 24.0 {
+        format!("{}h", (m / 60.0).round() as i64)
+    } else {
+        format!("{}d", (m / (60.0 * 24.0)).round() as i64)
+    }
+}
+
+/// Render an optional count (defaults to 0 like the reference's numbers).
+fn fmt_u64(v: Option<i64>) -> String {
+    v.unwrap_or(0).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_min_matches_reference_buckets() {
+        // null → em dash
+        assert_eq!(fmt_min(None), "—");
+        // minutes as-is (rounded)
+        assert_eq!(fmt_min(Some(0.0)), "0m");
+        assert_eq!(fmt_min(Some(5.4)), "5m");
+        assert_eq!(fmt_min(Some(59.9)), "60m");
+        // hours
+        assert_eq!(fmt_min(Some(60.0)), "1h");
+        assert_eq!(fmt_min(Some(90.0)), "2h");
+        assert_eq!(fmt_min(Some(23.5 * 60.0)), "24h");
+        // days
+        assert_eq!(fmt_min(Some(24.0 * 60.0)), "1d");
+        assert_eq!(fmt_min(Some(3.0 * 24.0 * 60.0)), "3d");
+        assert_eq!(fmt_min(Some(45.0 * 60.0 * 24.0)), "45d");
+    }
+
+    #[test]
+    fn fmt_u64_defaults_to_zero() {
+        assert_eq!(fmt_u64(None), "0");
+        assert_eq!(fmt_u64(Some(12)), "12");
     }
 }

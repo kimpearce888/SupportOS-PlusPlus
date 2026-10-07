@@ -16,6 +16,7 @@
 //! - Bulk select + apply calls `inbox_change_status` for each.
 
 use leptos::*;
+use leptos_router::{use_location, use_navigate, use_query_map};
 
 use crate::components::attribute_snapshot::AttributeSnapshotCard;
 use crate::components::coaching_panel::CoachingPanel;
@@ -119,6 +120,10 @@ pub struct InboxFilters {
     pub mailbox_id: Option<i64>,
     pub priority: Option<String>,
     pub query: Option<String>,
+    /// URL-backed deep-link filters (UI-27): `?tag=` + `?channel=` land
+    /// here from the dashboard / search links (reference Inbox.tsx:46-66).
+    pub tag: Option<String>,
+    pub channel: Option<String>,
 }
 
 /// The composer mode — reply or note.
@@ -208,21 +213,71 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     let ai_analyzing = create_rw_signal(false);
     let similar = create_rw_signal(Vec::<SimilarConversation>::new());
 
-    // ── SSE subscription: refresh the list when conversations change ──────
-    // Mirrors the reference's ServerEventsBridge — when the server pushes a
-    // `conversation` (conversation-updated) or `sync` (sync-completed) event,
-    // we bump `sse_refresh` to re-trigger the list-load effect below.
-    let sse_refresh = create_rw_signal(0u32);
-    {
-        let sse_refresh_clone = sse_refresh;
-        let _ = crate::sse::subscribe(Box::new(move |event| match event {
-            crate::sse::LiveEvent::ConversationUpdated { .. }
-            | crate::sse::LiveEvent::SyncCompleted { .. } => {
-                sse_refresh_clone.update(|n| *n = n.wrapping_add(1));
+    // ── Cross-page invalidation (UI-26) ─────────────────────────────────
+    // The app-level SSE bridge (lib.rs) owns the ONE subscription; it bumps
+    // the shared version counters the reference invalidates. The inbox list
+    // watches the 'conversations' counter — the same refetch the reference
+    // gets from invalidating ['conversations'] on conversation/sync events
+    // (previously this page held its own subscription; the bridge now does
+    // the fan-out for every page at once).
+    let sse_refresh = crate::queries::version("conversations");
+
+    // ── URL-backed state (UI-27) ──────────────────────────────────────
+    // `?view=`, `?tag=`, `?channel=` (+ `?page=` reads) are deep-link
+    // targets (dashboard KPI/tag links, channel chips, search hits). The
+    // query map seeds the filters on mount and re-syncs them when the URL
+    // changes (browser back / a link into the page), like the reference's
+    // useSearchParams-driven state. `q`/`priority` stay local signals — the
+    // reference keeps them out of the URL too.
+    let query_map = use_query_map();
+    let location = use_location();
+    let navigate = use_navigate();
+    create_effect(move |_| {
+        let m = query_map.get();
+        let url_status = crate::url_state::query_str(&m, "view");
+        let url_tag = crate::url_state::query_str(&m, "tag");
+        let url_channel = crate::url_state::query_str(&m, "channel");
+        // Only touch the URL-managed fields; a redundant set would
+        // re-run the list effect for nothing.
+        let mut changed = false;
+        filters.update(|f| {
+            if f.status != url_status {
+                f.status = url_status;
+                changed = true;
             }
-            _ => {}
-        }));
-    }
+            if f.tag != url_tag {
+                f.tag = url_tag;
+                changed = true;
+            }
+            if f.channel != url_channel {
+                f.channel = url_channel;
+                changed = true;
+            }
+        });
+        if changed {
+            list_loading.set(true);
+        }
+    });
+    // Write the URL-managed filters back to the query string (replace,
+    // like the reference's setSearchParams(..., { replace: true })).
+    // StoredValue so the Fn view closure and every chip handler can call it
+    // without moving it out (the close-handler pattern).
+    let sync_url = StoredValue::new({
+        let navigate = navigate.clone();
+        let pathname = location.pathname;
+        std::rc::Rc::new(move || {
+            let f = filters.get_untracked();
+            crate::url_state::replace_query(
+                &navigate,
+                &pathname.get_untracked(),
+                &[
+                    ("view", f.status.clone()),
+                    ("tag", f.tag.clone()),
+                    ("channel", f.channel.clone()),
+                ],
+            );
+        }) as std::rc::Rc<dyn Fn()>
+    });
 
     // ── Load conversation list on mount + on filter change + on SSE refresh ─
     create_effect(move |_| {
@@ -235,7 +290,8 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         let _ = sse_refresh.get();
         wasm_bindgen_futures::spawn_local(async move {
             // GET /api/conversations — the reference list endpoint. The view
-            // param carries the status filter; q the text filter.
+            // param carries the status filter; q the text filter; tag/channel
+            // the URL-backed deep-link filters (UI-27).
             let mut path = String::from("/api/conversations?pageSize=50");
             if let Some(status) = current_filters.status {
                 path.push_str(&format!("&view={status}"));
@@ -245,6 +301,12 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
             }
             if let Some(q) = current_filters.query {
                 path.push_str(&format!("&q={}", urlencode(&q)));
+            }
+            if let Some(tag) = current_filters.tag {
+                path.push_str(&format!("&tag={}", urlencode(&tag)));
+            }
+            if let Some(channel) = current_filters.channel {
+                path.push_str(&format!("&channel={channel}"));
             }
             match crate::api::get_json::<serde_json::Value>(&path).await {
                 Ok(data) => {
@@ -577,10 +639,12 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                 <div class="spp-inbox__filters">
                     <select
                         class="spp-inbox__filter"
+                        prop:value=move || filters.with(|f| f.status.clone().unwrap_or_default())
                         on:change=move |ev| {
                             let val = event_target_value(&ev);
                             let val = if val.is_empty() { None } else { Some(val) };
                             filters.update(|f| f.status = val);
+                            sync_url.with_value(|f| f());
                             list_loading.set(true);
                         }
                     >
@@ -616,6 +680,63 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                         }
                     />
                 </div>
+
+                // Deep-link filter chips (UI-27): tag/channel arrive via
+                // ?tag=/?channel= — show them so the filtered list is
+                // explainable and clearable (the reference exposes them in
+                // the FilterBar; that bar is UI-02 scope).
+                <Show when=move || filters.with(|f| f.tag.is_some() || f.channel.is_some()) fallback=|| ()>
+                    <div class="spp-inbox__url-chips">
+                        {move || {
+                            let f = filters.get();
+                            let mut chips: Vec<leptos::View> = Vec::new();
+                            if let Some(channel) = f.channel {
+                                let clear = {
+                                    let filters = filters;
+                                    let sync_url = sync_url;
+                                    move |_| {
+                                        filters.update(|f| f.channel = None);
+                                        sync_url.with_value(|f| f());
+                                        list_loading.set(true);
+                                    }
+                                };
+                                let label = if channel == "chat" {
+                                    "channel: chat (Beacon)".to_string()
+                                } else {
+                                    format!("channel: {channel}")
+                                };
+                                chips.push(
+                                    view! {
+                                        <span class="spp-chip">
+                                            <span class="spp-chip__label">{label}</span>
+                                            <button class="spp-chip__clear" aria-label="Clear channel filter" on:click=clear>"\u{d7}"</button>
+                                        </span>
+                                    }.into_view(),
+                                );
+                            }
+                            if let Some(tag) = f.tag {
+                                let clear = {
+                                    let filters = filters;
+                                    let sync_url = sync_url;
+                                    move |_| {
+                                        filters.update(|f| f.tag = None);
+                                        sync_url.with_value(|f| f());
+                                        list_loading.set(true);
+                                    }
+                                };
+                                chips.push(
+                                    view! {
+                                        <span class="spp-chip">
+                                            <span class="spp-chip__label">{format!("tag: {tag}")}</span>
+                                            <button class="spp-chip__clear" aria-label="Clear tag filter" on:click=clear>"\u{d7}"</button>
+                                        </span>
+                                    }.into_view(),
+                                );
+                            }
+                            chips
+                        }}
+                    </div>
+                </Show>
 
                 // Saved views
                 <Show when=move || !saved_views.with(|v| v.is_empty()) fallback=|| ()>
