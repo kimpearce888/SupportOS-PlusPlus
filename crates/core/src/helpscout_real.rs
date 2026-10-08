@@ -107,7 +107,64 @@ fn is_retryable(status: u16) -> bool {
 // Rate limiter (rateLimiter.ts parity)
 // ---------------------------------------------------------------------------
 
-/// Persisted rate-limit state (`application_settings.hs_rate_limit`).
+/// M043 (SY-08) — create the singleton `hs_rate_limit` table and adopt any
+/// legacy JSON state from `application_settings.hs_rate_limit`.
+///
+/// The audit contract: "Persist rate-limit state to a table like MAIN's
+/// hs_rate_limit". The table carries the limiter's state as typed columns
+/// (one row, `id = 1`); the previous port-and-reference JSON blob in
+/// `application_settings` is adopted once — parsed, written as the
+/// singleton row, then the legacy key is dropped (the M029
+/// rename-copy-drop pattern).
+pub fn apply_m043(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS hs_rate_limit (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            limit_per_minute INTEGER NOT NULL DEFAULT 150,
+            remaining INTEGER,
+            retry_after_sec INTEGER,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )?;
+    // One-time adoption of the legacy JSON blob (if a limiter ever wrote
+    // one before this migration).
+    let have_row: i64 = conn
+        .query_row("SELECT COUNT(*) FROM hs_rate_limit", [], |r| r.get(0))
+        .unwrap_or(0);
+    if have_row == 0 {
+        let legacy: Option<String> = conn
+            .query_row(
+                "SELECT value FROM application_settings WHERE key = 'hs_rate_limit'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(raw) = legacy {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO hs_rate_limit
+                        (id, limit_per_minute, remaining, retry_after_sec, updated_at)
+                     VALUES (1, ?1, ?2, ?3, COALESCE(?4, datetime('now')))",
+                    rusqlite::params![
+                        v["limitPerMinute"].as_i64().unwrap_or(150),
+                        v["remaining"].as_i64(),
+                        v["retryAfterSec"].as_i64(),
+                        v["updatedAt"].as_str(),
+                    ],
+                );
+            }
+            // Either way the blob is superseded — drop the legacy key so the
+            // table is the single source of truth.
+            let _ = conn.execute(
+                "DELETE FROM application_settings WHERE key = 'hs_rate_limit'",
+                [],
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persisted rate-limit state — the singleton `hs_rate_limit` row (M043).
 #[derive(Debug, Clone)]
 pub struct RateLimitState {
     pub limit_per_minute: i64,
@@ -148,40 +205,49 @@ impl HsRateLimiter {
     fn load(&self) {
         let Some(conn) = &self.conn else { return };
         let Ok(conn) = conn.lock() else { return };
+        // The table rides the boot chain (M043); ensure defensively so a
+        // limiter built on a not-yet-migrated DB still persists (the
+        // runtime-guard pattern).
+        let _ = apply_m043(&conn);
         let Ok(row) = conn.query_row(
-            "SELECT value FROM application_settings WHERE key = 'hs_rate_limit'",
+            "SELECT limit_per_minute, remaining, retry_after_sec, updated_at
+               FROM hs_rate_limit WHERE id = 1",
             [],
-            |r| r.get::<_, String>(0),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
         ) else {
             return;
         };
-        if let Ok(v) = serde_json::from_str::<Value>(&row) {
-            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(n) = v["limitPerMinute"].as_i64() {
-                state.limit_per_minute = n;
-            }
-            state.remaining = v["remaining"].as_i64();
-            state.retry_after_sec = v["retryAfterSec"].as_i64();
-            if let Some(t) = v["updatedAt"].as_str() {
-                state.updated_at = t.to_string();
-            }
-        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.limit_per_minute = row.0;
+        state.remaining = row.1;
+        state.retry_after_sec = row.2;
+        state.updated_at = row.3;
     }
 
     fn persist(&self, state: &RateLimitState) {
         let Some(conn) = &self.conn else { return };
         let Ok(conn) = conn.lock() else { return };
-        let v = json!({
-            "limitPerMinute": state.limit_per_minute,
-            "remaining": state.remaining,
-            "retryAfterSec": state.retry_after_sec,
-            "updatedAt": state.updated_at,
-        });
         let _ = conn.execute(
-            "INSERT INTO application_settings (key, value, updated_at)
-             VALUES ('hs_rate_limit', ?1, datetime('now'))
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            rusqlite::params![v.to_string()],
+            "INSERT INTO hs_rate_limit (id, limit_per_minute, remaining, retry_after_sec, updated_at)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                limit_per_minute = excluded.limit_per_minute,
+                remaining = excluded.remaining,
+                retry_after_sec = excluded.retry_after_sec,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                state.limit_per_minute,
+                state.remaining,
+                state.retry_after_sec,
+                state.updated_at
+            ],
         );
     }
 
@@ -398,9 +464,17 @@ pub struct RealHelpScoutProvider {
 impl RealHelpScoutProvider {
     #[must_use]
     pub fn new(conn: Arc<Mutex<Connection>>, credentials: HsCredentials) -> Self {
-        let limiter = Arc::new(HsRateLimiter::new(None));
+        // SY-08: the limiters hold the connection so their state persists
+        // to the hs_rate_limit table across restarts (previously the conn
+        // was dropped here and persistence was dead code). The lock is
+        // taken only for the brief load/persist writes — never held across
+        // an HTTP await.
+        let limiter = Arc::new(HsRateLimiter::new(Some(conn.clone())));
         let queue = ApiQueue::new(Arc::clone(&limiter), DEFAULT_CONCURRENCY);
-        let docs_queue = ApiQueue::new(Arc::new(HsRateLimiter::new(None)), DEFAULT_CONCURRENCY);
+        let docs_queue = ApiQueue::new(
+            Arc::new(HsRateLimiter::new(Some(conn.clone()))),
+            DEFAULT_CONCURRENCY,
+        );
         Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -2295,6 +2369,133 @@ mod tests {
         let snap = limiter.snapshot();
         assert_eq!(snap["retryAfterSec"], json!(17));
         assert_eq!(snap["remaining"], json!(0));
+    }
+
+    // ---- SY-08: hs_rate_limit table persistence ----------------------------
+
+    fn rate_limit_db() -> Arc<Mutex<Connection>> {
+        let f = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
+    fn hs_rate_limit_row(conn: &Connection) -> (i64, Option<i64>, Option<i64>) {
+        conn.query_row(
+            "SELECT limit_per_minute, remaining, retry_after_sec FROM hs_rate_limit WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rate_limit_state_persists_to_the_table_across_restart() {
+        let conn = rate_limit_db();
+        let limiter = HsRateLimiter::new(Some(conn.clone()));
+        limiter.record_response(Some(200), Some(180), None, false);
+        {
+            let c = conn.lock().unwrap();
+            let (limit, remaining, retry) = hs_rate_limit_row(&c);
+            assert_eq!((limit, remaining, retry), (200, Some(180), None));
+            // The legacy JSON blob key is not (re)introduced.
+            let legacy: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM application_settings WHERE key = 'hs_rate_limit'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(legacy, 0);
+        }
+        // A "restart": a fresh limiter over the same database loads the
+        // persisted state instead of the 150/None/None default.
+        let restarted = HsRateLimiter::new(Some(conn.clone()));
+        let snap = restarted.snapshot();
+        assert_eq!(snap["limitPerMinute"], json!(200));
+        assert_eq!(snap["remaining"], json!(180));
+        assert_eq!(snap["retryAfterSec"], json!(null));
+    }
+
+    #[test]
+    fn record_429_persists_retry_state_to_the_table() {
+        let conn = rate_limit_db();
+        let limiter = HsRateLimiter::new(Some(conn.clone()));
+        limiter.record_error_429(Some(23));
+        let restarted = HsRateLimiter::new(Some(conn.clone()));
+        let snap = restarted.snapshot();
+        assert_eq!(snap["retryAfterSec"], json!(23));
+        assert_eq!(snap["remaining"], json!(0));
+        let (limit, _remaining, retry) = {
+            let c = conn.lock().unwrap();
+            hs_rate_limit_row(&c)
+        };
+        assert_eq!(limit, 150, "429 without headers keeps the last limit");
+        assert_eq!(retry, Some(23));
+    }
+
+    #[test]
+    fn legacy_json_blob_is_adopted_and_dropped() {
+        // A pre-M043 database: only the SQL-string migrations have run, the
+        // limiter used to persist JSON into application_settings.
+        let f = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::db::ensure_migrations_table(&mut conn).unwrap();
+        crate::migrations::run_all(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO application_settings (key, value)
+             VALUES ('hs_rate_limit', ?1)",
+            rusqlite::params![
+                r#"{"limitPerMinute":120,"remaining":90,"retryAfterSec":null,"updatedAt":"2026-01-01T00:00:00.000Z"}"#
+            ],
+        )
+        .unwrap();
+        // Constructing the limiter runs M043: the blob becomes the singleton
+        // row, the legacy key is dropped.
+        let limiter = HsRateLimiter::new(Some(Arc::new(Mutex::new(conn))));
+        let snap = limiter.snapshot();
+        assert_eq!(snap["limitPerMinute"], json!(120));
+        assert_eq!(snap["remaining"], json!(90));
+        {
+            let c = limiter.conn.as_ref().unwrap().lock().unwrap();
+            let (limit, remaining, _retry) = hs_rate_limit_row(&c);
+            assert_eq!((limit, remaining), (120, Some(90)));
+            let legacy: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM application_settings WHERE key = 'hs_rate_limit'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(legacy, 0, "the superseded JSON blob is deleted");
+        }
+    }
+
+    #[test]
+    fn provider_wires_its_limiters_to_the_connection() {
+        let conn = rate_limit_db();
+        let provider = RealHelpScoutProvider::new(conn.clone(), HsCredentials::default());
+        // The main-API limiter persists through the provider's connection —
+        // previously this was dead code (the limiter was built with None).
+        provider.limiter.record_response(Some(150), Some(149), None, true);
+        let (limit, remaining, _retry) = {
+            let c = conn.lock().unwrap();
+            hs_rate_limit_row(&c)
+        };
+        assert_eq!((limit, remaining), (150, Some(149)));
+        // And the provider's queue is bound to the SAME limiter instance.
+        assert_eq!(
+            provider.queue.snapshot()["active"].as_i64().unwrap_or(0), 0,
+            "queue construction does not enqueue anything by itself"
+        );
     }
 
     #[test]

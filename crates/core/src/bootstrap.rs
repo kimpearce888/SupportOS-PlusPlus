@@ -223,6 +223,16 @@ const BOOT_STEPS: &[BootStep] = &[
         label: "runtime_table_guards",
         apply: apply_runtime_guards,
     },
+    BootStep {
+        version: 33,
+        label: "m042_sync_cursors_reference",
+        apply: crate::sync_schema::apply_m042,
+    },
+    BootStep {
+        version: 34,
+        label: "m043_hs_rate_limit",
+        apply: crate::helpscout_real::apply_m043,
+    },
 ];
 
 /// Apply the pending boot steps, each in one transaction with its

@@ -457,6 +457,44 @@ fn apply_inner(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// M042 — reshape `sync_cursors` to the reference shape (DB-12).
+///
+/// The reference's `syncRepo.getCursor/setCursor` (syncRepo.ts:118-129)
+/// ride a dedicated table created by its migration 002:
+/// `sync_cursors (resource TEXT PRIMARY KEY, cursor TEXT, updated_at TEXT)`.
+/// The port's migration 2 already created a table with that NAME but the
+/// legacy port shape (`last_page` / `last_seen_at` / `cursor_token` —
+/// never read or written by any code). This batch reshapes it to the
+/// reference columns and adopts any stored token, so the DB-12
+/// `get_cursor`/`set_cursor` helpers have the reference's exact SQL shape
+/// to ride on. Idempotent: only runs when the legacy shape is detected.
+pub fn apply_m042(conn: &Connection) -> Result<()> {
+    if table_exists(conn, "sync_cursors")? && !column_exists(conn, "sync_cursors", "cursor")? {
+        conn.execute_batch(
+            "ALTER TABLE sync_cursors RENAME TO sync_cursors_legacy_m042;
+             CREATE TABLE sync_cursors (
+                resource TEXT PRIMARY KEY,
+                cursor TEXT,
+                updated_at TEXT
+             );
+             INSERT INTO sync_cursors (resource, cursor, updated_at)
+               SELECT resource, cursor_token, COALESCE(last_seen_at, datetime('now'))
+                 FROM sync_cursors_legacy_m042
+                WHERE cursor_token IS NOT NULL AND cursor_token != '';
+             DROP TABLE sync_cursors_legacy_m042;",
+        )?;
+    } else if !table_exists(conn, "sync_cursors")? {
+        conn.execute_batch(
+            "CREATE TABLE sync_cursors (
+                resource TEXT PRIMARY KEY,
+                cursor TEXT,
+                updated_at TEXT
+             );",
+        )?;
+    }
+    Ok(())
+}
+
 /// Whether `table.column` exists (SQLite pragma helper).
 pub fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;

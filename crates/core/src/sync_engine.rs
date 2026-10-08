@@ -246,13 +246,14 @@ pub fn last_successful_sync(conn: &Connection) -> Option<String> {
     .flatten()
 }
 
-/// `getCursor(resource)` — the persisted page token for a paged resource
-/// walk (syncRepo.getCursor). Used by the initial-sync page loop so an
-/// interrupted run resumes from the next page instead of page 1; `None`
-/// when no token is saved (fresh start).
+/// `getCursor(resource)` (syncRepo.ts:118-121) — the persisted page token
+/// for a paged resource walk, stored in the reference's `sync_cursors`
+/// table (resource / cursor / updated_at — migration 002). Used by the
+/// initial-sync page loop so an interrupted run resumes from the next
+/// page instead of page 1; `None` when no token is saved (fresh start).
 pub fn get_cursor(conn: &Connection, resource: &str) -> Option<String> {
     conn.query_row(
-        "SELECT remote_cursor FROM sync_checkpoints WHERE resource = ?1",
+        "SELECT cursor FROM sync_cursors WHERE resource = ?1",
         params![resource],
         |r| r.get::<_, Option<String>>(0),
     )
@@ -261,16 +262,17 @@ pub fn get_cursor(conn: &Connection, resource: &str) -> Option<String> {
     .filter(|c| !c.is_empty())
 }
 
-/// `setCursor(resource, cursor)` — save the page token the page loop is
-/// about to follow (syncRepo.setCursor). `None` CLEARS the token: the
-/// walk reached the last page, so the next full pass starts from page 1
-/// (upserts make re-processing a page idempotent, at-least-once).
+/// `setCursor(resource, cursor)` (syncRepo.ts:123-129) — save the page
+/// token the page loop is about to follow; `None` CLEARS the token (the
+/// walk reached the last page, so the next full pass starts from page 1 —
+/// upserts make re-processing a page idempotent, at-least-once). The
+/// reference SQL shape byte-for-byte: one upsert row per resource with an
+/// `updated_at` stamp.
 pub fn set_cursor(conn: &Connection, resource: &str, cursor: Option<&str>) {
     let _ = conn.execute(
-        "INSERT INTO sync_checkpoints (resource, remote_cursor)
-         VALUES (?1, ?2)
-         ON CONFLICT(resource) DO UPDATE SET remote_cursor = excluded.remote_cursor",
-        params![resource, cursor],
+        "INSERT INTO sync_cursors (resource, cursor, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(resource) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+        params![resource, cursor, now_iso()],
     );
 }
 
@@ -2741,27 +2743,85 @@ mod tests {
         // Save + read back.
         set_cursor(&conn, "customers", Some("token-abc"));
         assert_eq!(get_cursor(&conn, "customers"), Some("token-abc".into()));
-        // The checkpoint row coexists with the record_success fields.
-        record_success(&conn, "customers", 5);
-        assert_eq!(
-            get_cursor(&conn, "customers"),
-            Some("token-abc".into()),
-            "record_success must not clobber the page token"
-        );
+        // Every save stamps updated_at (the reference setCursor carries
+        // nowIso()).
+        let stamped: Option<String> = conn
+            .query_row(
+                "SELECT updated_at FROM sync_cursors WHERE resource = 'customers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+            assert!(stamped.is_some_and(|t| !t.is_empty()));
+        // The cursor rows never touch the checkpoint bookkeeping.
+        let checkpoints: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_checkpoints WHERE resource = 'customers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoints, 0);
         // Clear → None; a stored empty string also reads as None.
         set_cursor(&conn, "customers", None);
         assert_eq!(get_cursor(&conn, "customers"), None);
         set_cursor(&conn, "customers", Some(""));
         assert_eq!(get_cursor(&conn, "customers"), None);
-        // The row still exists (status untouched by set_cursor).
-        let status: String = conn
+        // The reference stores the NULL (row persists) — setCursor(resource, null).
+        let rows: i64 = conn
             .query_row(
-                "SELECT status FROM sync_checkpoints WHERE resource = 'customers'",
+                "SELECT COUNT(*) FROM sync_cursors WHERE resource = 'customers'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(status, "ok", "set_cursor leaves the checkpoint status alone");
+        assert_eq!(rows, 1, "the cleared row stays (NULL cursor), like the reference");
+    }
+
+    #[test]
+    fn boot_chain_reshapes_the_legacy_sync_cursors_table() {
+        // A pre-M042 database carries the port's legacy sync_cursors shape
+        // (last_page / last_seen_at / cursor_token). The boot chain must
+        // reshape it to the reference shape (resource / cursor / updated_at)
+        // and adopt any stored token.
+        let f = NamedTempFile::new().unwrap().into_temp_path().keep().unwrap();
+        let mut conn = crate::db::open(&f).unwrap();
+        crate::migrations::run_all(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sync_cursors (resource, last_page, last_seen_at, cursor_token)
+             VALUES ('conversations', 3, '2026-01-01T00:00:00Z', 'legacy-token')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_cursors (resource, last_page, last_seen_at, cursor_token)
+             VALUES ('customers', 1, '2026-01-01T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        // Reference shape: the token column is `cursor`.
+        let (conv_cursor, stamp): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT cursor, updated_at FROM sync_cursors WHERE resource = 'conversations'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(conv_cursor.as_deref(), Some("legacy-token"));
+        assert!(stamp.is_some_and(|s| !s.is_empty()));
+        // A NULL-token legacy row is NOT adopted (nothing to resume).
+        let adopted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_cursors WHERE resource = 'customers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(adopted, 0);
+        // The new helpers ride the table.
+        set_cursor(&conn, "customers", Some("fresh-token"));
+        assert_eq!(get_cursor(&conn, "customers"), Some("fresh-token".into()));
     }
 
     #[tokio::test]
