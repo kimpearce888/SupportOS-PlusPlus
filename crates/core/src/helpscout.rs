@@ -739,6 +739,26 @@ pub trait HelpScoutProvider: Send + Sync {
         ))
     }
 
+    /// SY-11 (demo simulate — fakeProvider.submitRating, fakeProvider.ts:
+    /// 564-581): push a CSAT rating into the simulated world for the
+    /// conversation; `None` when the conversation does not exist there (the
+    /// demo route 404s). Fake-only; the default keeps other implementors
+    /// compiling.
+    fn submit_rating(
+        &self,
+        _conversation_remote_id: i64,
+        _rating: &str,
+        _comments: Option<&str>,
+    ) -> Option<HsRating> {
+        None
+    }
+
+    /// SY-11 (demo simulate — fakeProvider.customerReplies, fakeProvider.ts:
+    /// 533-561): the customer answers on an existing conversation in the
+    /// simulated world (kind 'customer' thread, thread count + userUpdatedAt
+    /// bumped, pending/closed reactivated). Fake-only; default is a no-op.
+    fn customer_replies(&self, _conversation_remote_id: i64, _text: &str) {}
+
     /// Reset the provider's state (Fake only; Real is a no-op).
     /// Used by tests to get a clean slate.
     fn reset(&self) {}
@@ -2392,6 +2412,99 @@ impl FakeHelpScoutProvider {
     fn lock_world(&self) -> std::sync::MutexGuard<'_, FakeWorld> {
         self.world.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    /// SY-11 — fakeProvider.submitRating (fakeProvider.ts:564-581): push a
+    /// CSAT rating into the world for the conversation; `None` when the
+    /// conversation does not exist in the simulated account (the demo route
+    /// 404s). Customer name resolves through the conversation's customer.
+    pub fn submit_rating_in_world(
+        &self,
+        conversation_remote_id: i64,
+        rating: &str,
+        comments: Option<&str>,
+    ) -> Option<HsRating> {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let conv = world
+            .conversations
+            .iter()
+            .find(|c| c.remote_id == conversation_remote_id)?;
+        let next_id = world.ratings.iter().map(|r| r.remote_id).max().unwrap_or(0) + 1;
+        let customer_name = world
+            .customers
+            .iter()
+            .find(|c| c.remote_id == conv.customer_id)
+            .map(|c| {
+                format!(
+                    "{} {}",
+                    c.first_name.clone().unwrap_or_default(),
+                    c.last_name.clone().unwrap_or_default()
+                )
+                .trim()
+                .to_string()
+            });
+        let row = HsRating {
+            remote_id: next_id,
+            conversation_id: Some(conv.remote_id),
+            thread_id: None,
+            rating: Some(rating.to_string()),
+            comment: comments.map(str::to_string),
+            customer_id: Some(conv.customer_id),
+            customer_name,
+            user_id: conv.assignee_id,
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        world.ratings.push(row.clone());
+        Some(row)
+    }
+
+    /// SY-11 — fakeProvider.customerReplies (fakeProvider.ts:533-561): the
+    /// customer answers on an existing conversation: a kind 'customer'
+    /// thread, thread count bumped, updated_at refreshed, pending/closed
+    /// reactivated. Unknown conversations are a no-op (like the reference).
+    pub fn customer_replies_in_world(&self, conversation_remote_id: i64, text: &str) {
+        let mut guard = self.lock_world();
+        let world: &mut FakeWorld = &mut guard;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let next_id = world.threads.iter().map(|t| t.remote_id).max().unwrap_or(0) + 1;
+        let Some(conv) = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conversation_remote_id)
+        else {
+            return;
+        };
+        let customer_id = conv.customer_id;
+        world.threads.push(HsThread {
+            remote_id: next_id,
+            conversation_id: conversation_remote_id,
+            kind: "customer".into(),
+            status: None,
+            state: Some("published".into()),
+            body: Some(text.into()),
+            created_by_customer_id: Some(customer_id),
+            created_by_user_id: None,
+            assigned_to_id: None,
+            created_at: Some(now.clone()),
+            ..Default::default()
+        });
+        let count = world
+            .threads
+            .iter()
+            .filter(|t| t.conversation_id == conversation_remote_id)
+            .count() as i64;
+        let conv = world
+            .conversations
+            .iter_mut()
+            .find(|c| c.remote_id == conversation_remote_id)
+            .expect("conversation presence checked above");
+        conv.thread_count = count;
+        // conv.userUpdatedAt analog: the changed conversation re-pulls.
+        conv.updated_at = Some(now);
+        if conv.status == "pending" || conv.status == "closed" {
+            conv.status = "active".into();
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -3091,6 +3204,23 @@ impl HelpScoutProvider for FakeHelpScoutProvider {
             number: next_number,
             thread_id: next_thread_remote,
         })
+    }
+
+    // SY-11: the demo simulate endpoints mutate the simulated world first,
+    // then the sync lands the change (fakeProvider.submitRating /
+    // fakeProvider.customerReplies via the trait defaults).
+
+    fn submit_rating(
+        &self,
+        conversation_remote_id: i64,
+        rating: &str,
+        comments: Option<&str>,
+    ) -> Option<HsRating> {
+        self.submit_rating_in_world(conversation_remote_id, rating, comments)
+    }
+
+    fn customer_replies(&self, conversation_remote_id: i64, text: &str) {
+        self.customer_replies_in_world(conversation_remote_id, text);
     }
 
     // -----------------------------------------------------------------

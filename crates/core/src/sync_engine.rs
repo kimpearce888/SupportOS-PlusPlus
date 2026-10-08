@@ -216,6 +216,67 @@ pub fn set_checkpoint_running(conn: &Connection, resource: &str, running: bool) 
     );
 }
 
+/// What [`persist_rating`] reports: whether the rating row is FRESH (newly
+/// inserted) plus the local ids the SSE payload carries — (inserted,
+/// conversation_local, conversation_number, customer_local).
+pub type RatingPersistOutcome = (bool, Option<i64>, Option<i64>, Option<i64>);
+
+/// Persist one rating row (SY-11): the ratings sync pass and the demo
+/// simulate-rating route share this — resolve remote ids to LOCAL ids,
+/// upsert the `ratings` row, return whether it is FRESH (newly inserted)
+/// plus the ids the SSE payload carries.
+pub fn persist_rating(
+    conn: &Connection,
+    r: &crate::helpscout::HsRating,
+) -> Result<RatingPersistOutcome> {
+    let conv_local = r.conversation_id.and_then(|id| {
+        if id > 0 {
+            conversation_local_id(conn, id)
+        } else {
+            None
+        }
+    });
+    let conv_number = conv_local.and_then(|local| {
+        conn.query_row(
+            "SELECT number FROM conversations WHERE id = ?1",
+            params![local],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+    });
+    let customer_local = r.customer_id.and_then(|id| {
+        if id > 0 {
+            local_id(conn, "customers", id)
+        } else {
+            None
+        }
+    });
+    let user_local = r.user_id.and_then(|id| {
+        if id > 0 {
+            local_id(conn, "users", id)
+        } else {
+            None
+        }
+    });
+    let n = conn.execute(
+        "INSERT INTO ratings (remote_id, conversation_id, rating, comments,
+             customer_local_id, user_local_id, remote_created_at, last_synced_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+         ON CONFLICT(remote_id) DO UPDATE SET rating = excluded.rating,
+           comments = excluded.comments, last_synced_at = datetime('now')",
+        params![
+            r.remote_id,
+            conv_local,
+            r.rating,
+            r.comment,
+            customer_local,
+            user_local,
+            r.created_at
+        ],
+    )?;
+    Ok((n > 0, conv_local, conv_number, customer_local))
+}
+
 /// `getIncrementalSince(resource, overlapMinutes)` — the watermark.
 pub fn get_incremental_since(
     conn: &Connection,
@@ -1680,52 +1741,7 @@ impl SyncEngine {
                 for r in &ratings {
                     let (inserted, conv_local, conv_number, customer_local) = {
                         let conn = self.lock();
-                        let conv_local = r.conversation_id.and_then(|id| {
-                            if id > 0 {
-                                conversation_local_id(&conn, id)
-                            } else {
-                                None
-                            }
-                        });
-                        let conv_number = conv_local.and_then(|local| {
-                            conn.query_row(
-                                "SELECT number FROM conversations WHERE id = ?1",
-                                params![local],
-                                |row| row.get::<_, i64>(0),
-                            )
-                            .ok()
-                        });
-                        let customer_local = r.customer_id.and_then(|id| {
-                            if id > 0 {
-                                local_id(&conn, "customers", id)
-                            } else {
-                                None
-                            }
-                        });
-                        let user_local = r.user_id.and_then(|id| {
-                            if id > 0 {
-                                local_id(&conn, "users", id)
-                            } else {
-                                None
-                            }
-                        });
-                        let n = conn.execute(
-                            "INSERT INTO ratings (remote_id, conversation_id, rating, comments,
-                                 customer_local_id, user_local_id, remote_created_at, last_synced_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
-                             ON CONFLICT(remote_id) DO UPDATE SET rating = excluded.rating,
-                               comments = excluded.comments, last_synced_at = datetime('now')",
-                            params![
-                                r.remote_id,
-                                conv_local,
-                                r.rating,
-                                r.comment,
-                                customer_local,
-                                user_local,
-                                r.created_at
-                            ],
-                        )?;
-                        (n > 0, conv_local, conv_number, customer_local)
+                        persist_rating(&conn, r)?
                     };
                     if inserted {
                         fresh += 1;
