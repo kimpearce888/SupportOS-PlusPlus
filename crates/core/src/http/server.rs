@@ -104,21 +104,29 @@ impl AppState {
     }
 
     /// Run an async pipeline call that needs `&Connection` across its
-    /// await points (LM Studio HTTP round-trips).
+    /// await points (LM Studio HTTP round-trips) — WITHOUT holding the
+    /// shared AppState mutex (audit M28).
     ///
     /// A `std::sync::MutexGuard` is not `Send`, so an axum handler cannot
-    /// hold the shared connection across an `.await`. This helper moves the
-    /// whole call onto a blocking thread: the guard lives on the blocking
-    /// thread's stack (no `Send` requirement) while the future is driven by
-    /// `Handle::block_on` — the outer runtime's reactor still serves the
-    /// HTTP I/O. The port's other phase-based AI routes (attributes.rs)
-    /// avoid this by design; the multi-stage pipeline + Copilot tool loop
-    /// interleave DB and HTTP too tightly for that, so they run through
-    /// here instead.
+    /// hold the shared connection across an `.await`. Historically this
+    /// helper therefore locked the SHARED connection for the whole
+    /// pipeline — but the pipeline round-trips LM Studio between its DB
+    /// phases, so one hung AI call froze every HTTP route and every worker
+    /// timer for up to the LM Studio timeout. The fix keeps the async
+    /// plumbing and drops the shared lock:
     ///
-    /// The connection stays locked for the duration of the AI call — the
-    /// same characteristic a single-connection synchronous SQLite server
-    /// (the reference) has while a pipeline stage is in flight.
+    /// 1. briefly lock the shared connection just to read the database
+    ///    file path (`PRAGMA database_list`), then release it immediately;
+    /// 2. open a private connection to that same file via [`crate::db::open`]
+    ///    — identical pragmas (WAL, synchronous NORMAL, foreign_keys,
+    ///    busy_timeout 5s);
+    /// 3. drive the pipeline on a blocking thread against the private
+    ///    connection. WAL lets the two connections read concurrently and
+    ///    serializes their writes; the busy timeout absorbs contention.
+    ///
+    /// Fallback: an in-memory database (`:memory:`) has no file to reopen,
+    /// so those calls keep the old shared-lock behavior (still on a
+    /// blocking thread, so the async runtime never blocks).
     pub async fn run_ai<T>(
         &self,
         f: impl for<'a> FnOnce(
@@ -131,14 +139,55 @@ impl AppState {
     where
         T: Send + 'static,
     {
+        // Step 1: read the shared connection's database file (a metadata
+        // pragma — no statement work, no I/O) and drop the lock at once.
+        let db_path: Option<std::path::PathBuf> = {
+            let conn = lock_or_recover(&self.conn);
+            db_file_path(&conn)
+        };
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = lock_or_recover(&conn);
-            tokio::runtime::Handle::current().block_on(f(&conn))
+        tokio::task::spawn_blocking(move || -> std::result::Result<T, String> {
+            // Step 2: a private connection for this pipeline run (M28) —
+            // falls back to the shared one only when there is no file.
+            let private;
+            let shared_guard;
+            let conn_ref: &rusqlite::Connection = match &db_path {
+                Some(path) => {
+                    private = crate::db::open(path)
+                        .map_err(|e| format!("failed to open the AI pipeline connection: {e}"))?;
+                    &private
+                }
+                None => {
+                    shared_guard = lock_or_recover(&conn);
+                    &shared_guard
+                }
+            };
+            // Step 3: same as before — the future borrows the connection on
+            // this blocking thread while the outer runtime serves HTTP I/O.
+            Ok(tokio::runtime::Handle::current().block_on(f(conn_ref)))
         })
         .await
         .map_err(|e| e.to_string())
+        .and_then(|r| r)
     }
+}
+
+/// The `main` database file path of a connection, from
+/// `PRAGMA database_list` (the connection knows its own file). Returns
+/// `None` for in-memory databases — there is no path to reopen.
+fn db_file_path(conn: &rusqlite::Connection) -> Option<std::path::PathBuf> {
+    let mut stmt = conn.prepare("PRAGMA database_list").ok()?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+        })
+        .ok()?;
+    for (name, file) in rows.flatten() {
+        if name == "main" {
+            return file.filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+        }
+    }
+    None
 }
 
 /// The HTTP server. Owns the bound socket address.

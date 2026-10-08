@@ -1088,6 +1088,102 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    /// M28: while an AI pipeline call is in flight (here: parked in its
+    /// simulated LM Studio round-trip), the SHARED connection must stay
+    /// available — `try_lock` succeeds. Pre-fix, run_ai held the global
+    /// mutex across the whole call, freezing every route and worker.
+    #[tokio::test]
+    async fn run_ai_does_not_hold_the_shared_connection_during_the_call() {
+        let state = make_state();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let state2 = state.clone();
+        let join = tokio::spawn(async move {
+            state2
+                .run_ai(move |_conn| {
+                    Box::pin(async move {
+                        // "LM Studio round-trip started"…
+                        let _ = started_tx.send(());
+                        // …and hangs until the test releases it. Awaiting
+                        // the oneshot parks only this future (driven by
+                        // Handle::block_on on the dedicated blocking thread),
+                        // never the test runtime's thread.
+                        let _ = release_rx.await;
+                        42i32
+                    })
+                })
+                .await
+        });
+        started_rx.await.expect("the pipeline must start");
+        // The core M28 assertion: the shared connection is NOT locked
+        // while the pipeline call is in flight.
+        let guard = state
+            .conn
+            .try_lock()
+            .expect("M28: the shared connection must be free during an AI call");
+        // And a read through it works (the same DB file, WAL mode).
+        let convs: i64 = guard
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert!(convs >= 0);
+        drop(guard);
+        release_tx.send(()).expect("release the pipeline");
+        let out = join
+            .await
+            .expect("join the pipeline task")
+            .expect("run_ai ok");
+        assert_eq!(out, 42);
+    }
+
+    /// M28: the private pipeline connection sees the same database — a row
+    /// written through the shared connection before the call is visible
+    /// to the closure, and a row the closure writes is visible after.
+    #[tokio::test]
+    async fn run_ai_shares_the_database_with_the_shared_connection() {
+        let state = make_state();
+        let shared_id = seed_conversation(&state, 987_654);
+        let out = state
+            .run_ai(move |conn| {
+                Box::pin(async move {
+                    let seen: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM conversations WHERE id = ?1",
+                            rusqlite::params![shared_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    let wrote = conn
+                        .execute(
+                            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, created_at)
+                             VALUES (987_655, 987_655, 'active', 1, 3001, '2026-10-01T00:00:00Z')",
+                            [],
+                        )
+                        .unwrap();
+                    (seen, wrote)
+                })
+            })
+            .await
+            .expect("run_ai ok");
+        assert_eq!(
+            out,
+            (1, 1),
+            "the pre-existing row is visible to the pipeline"
+        );
+        let visible: i64 = {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            conn.query_row(
+                "SELECT COUNT(*) FROM conversations WHERE remote_id = 987655",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            visible, 1,
+            "the pipeline's write is visible to the shared conn"
+        );
+    }
+
     /// The status row must serve the reference shape with REAL counts: the
     /// queue stats over every job, `last_inference` as `{at, latencyMs}`
     /// from the last completed run, and the index block over
