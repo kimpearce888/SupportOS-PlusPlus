@@ -719,10 +719,7 @@ impl HttpServer {
             .route("/api/ai/jobs", get(routes::ai::jobs))
             .route("/api/ai/analytics", get(routes::ai::ai_analytics))
             .route("/api/ai/evaluation", get(routes::ai::evaluation))
-            .route(
-                "/api/ai/evaluation/run",
-                post(routes::ai::evaluation_run),
-            )
+            .route("/api/ai/evaluation/run", post(routes::ai::evaluation_run))
             .route("/api/ai/cluster-issues", post(routes::ai::cluster_issues))
             .route("/api/ai/draft/:draftId/rewrite", post(routes::ai::rewrite))
             .route("/api/ai/draft/:draftId/verify", post(routes::ai::verify))

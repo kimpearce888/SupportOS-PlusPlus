@@ -852,17 +852,16 @@ pub async fn evaluation_run(State(state): State<AppState>) -> Response {
                     )
                     .map(|mut stmt| {
                         let rows: Vec<std::result::Result<(String, String, String, String), _>> =
-                            stmt
-                                .query_map([], |r| {
-                                    Ok((
-                                        r.get::<_, String>(0)?,
-                                        r.get::<_, String>(1)?,
-                                        r.get::<_, String>(2)?,
-                                        r.get::<_, String>(3)?,
-                                    ))
-                                })
-                                .map(|rows| rows.collect())
-                                .unwrap_or_default();
+                            stmt.query_map([], |r| {
+                                Ok((
+                                    r.get::<_, String>(0)?,
+                                    r.get::<_, String>(1)?,
+                                    r.get::<_, String>(2)?,
+                                    r.get::<_, String>(3)?,
+                                ))
+                            })
+                            .map(|rows| rows.collect())
+                            .unwrap_or_default();
                         rows.into_iter().filter_map(|r| r.ok()).collect()
                     })
                     .unwrap_or_default();
@@ -878,7 +877,10 @@ pub async fn evaluation_run(State(state): State<AppState>) -> Response {
                 let mut results: Vec<Value> = Vec::new();
                 for (name, category, subject, body) in tests {
                     let outcome = run_one_golden_test(conn, &backend, &subject, &body).await;
-                    let ok = outcome.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let ok = outcome
+                        .get("passed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if ok {
                         passed += 1;
                     } else {
@@ -933,11 +935,7 @@ pub async fn evaluation_run(State(state): State<AppState>) -> Response {
                     },
                 )
                 .ok();
-            (
-                StatusCode::OK,
-                Json(json!({ "ok": true, "run": run })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(json!({ "ok": true, "run": run }))).into_response()
         }
         Err(join) => service_503(&join),
     }
@@ -1030,7 +1028,10 @@ async fn run_one_golden_test(
 /// run leaves no residue in the mirror (threads/drafts/facts cascade on
 /// conversation delete; the ai_runs ledger rows keep their history).
 fn cleanup_golden_conversation(conn: &rusqlite::Connection, conv_id: i64) {
-    let _ = conn.execute("DELETE FROM conversations WHERE id = ?1", rusqlite::params![conv_id]);
+    let _ = conn.execute(
+        "DELETE FROM conversations WHERE id = ?1",
+        rusqlite::params![conv_id],
+    );
 }
 
 #[cfg(test)]
