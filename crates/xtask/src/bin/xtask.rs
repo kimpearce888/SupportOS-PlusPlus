@@ -7,7 +7,9 @@
 //!   - `trunk-build` Internal: build the Leptos UI into ../ui/dist (called by tauri.conf.json beforeBuildCommand)
 //!   - `test`       Run all unit + integration tests across the workspace
 //!   - `lint`       rustfmt --check + clippy -D warnings
-//!   - `package`    Build installers for the host OS (tauri build)
+//!   - `verify-icons` Parse the desktop icon set (png/ico/icns) for structural validity
+//!   - `package`    Build installers for the host OS (tauri build; extra args
+//!     after `--` are forwarded, e.g. --target universal-apple-darwin)
 
 use std::process::Command;
 
@@ -32,8 +34,20 @@ enum Cmd {
     Test,
     /// Run rustfmt --check + clippy -D warnings.
     Lint,
-    /// Build installers for the host OS via Tauri.
-    Package,
+    /// Verify the desktop icon set (png/ico/icns structure) under
+    /// crates/app/src-tauri/icons.
+    VerifyIcons,
+    /// Build installers for the host OS via Tauri (deb/appimage on Linux,
+    /// msi/nsis on Windows, dmg/app on macOS — whatever bundle.targets
+    /// lists that the host supports).
+    ///
+    /// Extra args are forwarded to `cargo tauri build`, e.g.
+    /// `cargo xtask package -- --target universal-apple-darwin`.
+    Package {
+        /// Arguments forwarded to `cargo tauri build` (after `--`).
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,7 +61,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::TrunkBuild => run_trunk_release_build(),
         Cmd::Test => run_tests(),
         Cmd::Lint => run_lint(),
-        Cmd::Package => run_package(),
+        Cmd::VerifyIcons => run_verify_icons(),
+        Cmd::Package { args } => run_package(&args),
     }
 }
 
@@ -138,16 +153,28 @@ fn run_lint() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_package() -> anyhow::Result<()> {
+fn run_verify_icons() -> anyhow::Result<()> {
     let tauri_dir = workspace_root()
         .join("crates")
         .join("app")
         .join("src-tauri");
-    let status = Command::new("cargo")
-        .arg("tauri")
-        .arg("build")
-        .current_dir(tauri_dir)
-        .status()?;
+    spp_xtask::icons::verify_icons(&tauri_dir)?;
+    println!("icon set verified: png/ico/icns structures and the bundle.icon list are consistent");
+    Ok(())
+}
+
+fn run_package(extra_args: &[String]) -> anyhow::Result<()> {
+    let tauri_dir = workspace_root()
+        .join("crates")
+        .join("app")
+        .join("src-tauri");
+    let mut cmd = Command::new("cargo");
+    cmd.arg("tauri").arg("build");
+    // e.g. --target universal-apple-darwin, --bundles nsis
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let status = cmd.current_dir(tauri_dir).status()?;
     anyhow::ensure!(status.success(), "cargo tauri build failed");
     Ok(())
 }

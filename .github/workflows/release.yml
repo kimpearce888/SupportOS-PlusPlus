@@ -1,0 +1,119 @@
+# Release — the desktop release pipeline (BU-02).
+#
+# Builds the Tauri 2 app on the three-platform matrix and attaches the
+# installers to a drafted GitHub Release:
+#
+#   runner              bundles produced (bundle.targets in tauri.conf.json,
+#                       filtered to what the host supports)
+#   -----------------   ----------------------------------------------------
+#   ubuntu-22.04       .deb + .AppImage
+#   windows-latest      .msi + NSIS -setup.exe
+#   macos-latest        .dmg + .app  (universal: aarch64 + x86_64)
+#
+# Triggered by pushing a `v*` tag (e.g. `git tag v0.1.0 && git push --tags`),
+# or manually via workflow_dispatch (builds the bundles but does NOT create
+# a release — the tag-driven run is the one that publishes).
+#
+# The installers are unsigned (no code-signing certificates in this project):
+# Windows SmartScreen and macOS Gatekeeper will show the usual prompts.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # tauri-action creates the draft release and uploads assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            # deb + appimage (the Linux entries of bundle.targets)
+            args: ''
+          - os: windows-latest
+            # msi + nsis (the Windows entries of bundle.targets)
+            args: ''
+          - os: macos-latest
+            # dmg + app, universal binary (Apple silicon + Intel)
+            args: '--target universal-apple-darwin'
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Add the macOS universal targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install the Tauri 2 Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev
+
+      - name: Install trunk (the Leptos UI builder)
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: Cache the cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify the icon set (ico/icns/png structure)
+        if: runner.os == 'Linux'
+        run: cargo run -p supportos-plusplus-xtask --bin xtask -- verify-icons
+
+      # Runs tauri build: the beforeBuildCommand (cargo xtask trunk-build)
+      # produces the production WASM bundle, then the host bundles the
+      # configured targets. On tag pushes tauri-action creates a DRAFT
+      # GitHub release and attaches every produced installer; on manual
+      # dispatch (no tag) it builds the bundles as job artifacts only.
+      - name: Build the installers and upload to the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: crates/app
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: 'SupportOS++ ${{ github.ref_name }}'
+          releaseBody: |
+            Desktop installers for SupportOS++ ${{ github.ref_name }}.
+
+            | OS | Installer |
+            |----|-----------|
+            | Windows | `.msi` (per-machine WiX) or the NSIS `-setup.exe` |
+            | macOS | `.dmg` (universal: Apple silicon + Intel) |
+            | Linux | `.deb` or `.AppImage` |
+
+            The installers are **unsigned** — Windows SmartScreen and macOS
+            Gatekeeper will show the standard "unknown developer" prompts.
+            See the README for the local-first/no-telemetry design notes.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
