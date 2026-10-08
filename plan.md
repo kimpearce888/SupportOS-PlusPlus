@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **43 remaining** (count corrected 2026-10-08: the header previously said 38, but the table held 48 rows; the true remaining count is row-verified).
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **38 remaining** (count corrected 2026-10-08: the header previously said 38, but the table held 48 rows; the true remaining count is row-verified).
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 74 | DB-12 | syncRepo cursors (getCursor/setCursor page tokens) | Missing | Major | S | - | Implement getCursor/setCursor equivalents used by initial sync page loop |
-| 75 | SY-08 | HS rate limiter with persistence (hs_rate_limit) | Divergent | Major | S | - | Persist rate-limit state to a table like MAIN's hs_rate_limit |
-| 76 | AI-04 | Draft send provenance (aiDraftId -> was_sent + ai_involvement audit) | Missing | Major | M | - | Accept aiDraftId/originalAiText on reply; mark draft sent; record was_sent feedback + ai_involvement audit |
-| 77 | KN-02 | PDF/DOCX ingestion (pdf-parse, mammoth) | Missing | Major | M | - | Add PDF/DOCX parsing (e.g. pdf-extract/lopdf + docx-rs) or document unsupported |
-| 78 | SY-11 | Demo simulate endpoints (incoming/rating/webhook) | Divergent | Major | M | - | Route simulate endpoints through fake provider mutation + sync job, persist simulated ratings |
 | 79 | DB-02 | 123-table Help Scout mirror schema | Partial | Major | - | - | Complete the 123-table Help Scout mirror schema (add missing tables), keeping documented renames (threads->conversation_threads, segments->saved_segments, support_graph_edges->graph_edges, customer_memories->customer_memory, conversation_events->activity_events, knowledge_candidates->knowledge_gap_candidates). |
 | 80 | DB-04 | threads actor model (user/customer/system split) | Divergent | Major | - | - | Restore MAIN's threads actor model (created_by_user/customer/system 3-way split) instead of the collapsed actor_id+actor_type, or map it at query boundaries. |
 | 81 | DB-06 | FK enforcement + pragma parity (WAL, foreign_keys, busy_timeout) | Partial | Major | - | - | Declare foreign keys on base mirror tables (currently zero FKs) to match MAIN's enforcement; keep pragma parity (WAL, foreign_keys, busy_timeout). |
