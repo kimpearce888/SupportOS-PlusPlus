@@ -240,21 +240,21 @@ pub async fn add_message(
 /// POST /api/side-threads/:id/resolve
 pub async fn resolve(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute(
-        "UPDATE side_threads SET resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-        rusqlite::params![id],
-    );
-    Json(json!({"ok": true}))
+    // CL-08: the UPDATE + its audit_log row commit together.
+    match crate::side_threads::resolve_side_thread(&conn, id) {
+        Ok(_) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
 }
 
 /// POST /api/side-threads/:id/reopen
 pub async fn reopen(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = conn.execute(
-        "UPDATE side_threads SET resolved_at = NULL WHERE id = ?1",
-        rusqlite::params![id],
-    );
-    Json(json!({"ok": true}))
+    // CL-08: the UPDATE + its audit_log row commit together.
+    match crate::side_threads::reopen_side_thread(&conn, id) {
+        Ok(_) => Json(json!({"ok": true})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
 }
 
 /// POST /api/side-threads/:id/participants — reference

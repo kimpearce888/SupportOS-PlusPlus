@@ -173,6 +173,113 @@ pub fn create_side_thread(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// CL-08: the side-thread mutation audit trail.
+//
+// Every side-thread mutation writes an audit_log row INSIDE its
+// transaction (the M16 machinery): the row commits with the mutation or
+// rolls back with it — a mutation cannot land unaudited. The action
+// vocabulary follows the port's audit conventions (settings_updated,
+// backup_created, ...): side_thread_created, side_thread_message_added,
+// side_thread_participants_added, side_thread_resolved,
+// side_thread_reopened.
+// ---------------------------------------------------------------------------
+
+/// Write one audit_log row for a side-thread mutation (CL-08). Must be
+/// called from inside the mutation's transaction.
+fn audit_side_thread_event(
+    conn: &Connection,
+    action: &str,
+    conversation_id: Option<i64>,
+    after_state: serde_json::Value,
+) -> Result<()> {
+    let mut entry = crate::audit::AuditEntry::user(action);
+    if let Some(id) = conversation_id {
+        entry = entry.with_conversation_id(id);
+    }
+    crate::audit::audit(conn, &entry.with_after_state(after_state))
+}
+
+/// Resolve a conversation reference (local or remote id, depending on the
+/// caller) to the LOCAL conversations.id — the same lookup the mention
+/// fan-out uses.
+fn resolve_local_conversation_id(conn: &Connection, conversation_ref: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT id FROM conversations
+         WHERE id = ?1 OR remote_id = ?1
+         ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+        params![conversation_ref],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// A side thread's conversation reference, resolved to the LOCAL
+/// conversations.id when the conversation exists.
+fn thread_local_conversation_id(conn: &Connection, thread_id: i64) -> Option<i64> {
+    let conversation_ref: Option<i64> = conn
+        .query_row(
+            "SELECT conversation_id FROM side_threads WHERE id = ?1",
+            params![thread_id],
+            |r| r.get(0),
+        )
+        .ok();
+    conversation_ref.and_then(|c| resolve_local_conversation_id(conn, c))
+}
+
+/// Mark a side thread resolved (reference sideThreadRepo resolve): stamps
+/// `resolved_at` with now. One transaction with its CL-08 audit row.
+/// Returns `false` when the thread does not exist (no mutation, no audit).
+pub fn resolve_side_thread(conn: &Connection, thread_id: i64) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let rows = tx.execute(
+        "UPDATE side_threads SET resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ?1",
+        params![thread_id],
+    )?;
+    if rows == 0 {
+        return Ok(false);
+    }
+    let resolved_at: Option<String> = tx
+        .query_row(
+            "SELECT resolved_at FROM side_threads WHERE id = ?1",
+            params![thread_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    audit_side_thread_event(
+        &tx,
+        "side_thread_resolved",
+        thread_local_conversation_id(&tx, thread_id),
+        serde_json::json!({ "sideThreadId": thread_id, "resolvedAt": resolved_at }),
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Reopen a resolved side thread: clears `resolved_at`. One transaction
+/// with its CL-08 audit row. Returns `false` when the thread does not
+/// exist (no mutation, no audit).
+pub fn reopen_side_thread(conn: &Connection, thread_id: i64) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let rows = tx.execute(
+        "UPDATE side_threads SET resolved_at = NULL WHERE id = ?1",
+        params![thread_id],
+    )?;
+    if rows == 0 {
+        return Ok(false);
+    }
+    audit_side_thread_event(
+        &tx,
+        "side_thread_reopened",
+        thread_local_conversation_id(&tx, thread_id),
+        serde_json::json!({ "sideThreadId": thread_id }),
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // Create with the full reference schema (CL-01 / audit M14) + participants
 // add with existence checks (CL-04 / sideThreadRepo.ts:173-186).
 // ---------------------------------------------------------------------------
@@ -416,6 +523,21 @@ pub fn create_side_thread_full(
     if let Some(first) = &input.first_message {
         insert_side_thread_message_unchecked(&tx, bus, thread_id, first, input.created_by_user_id)?;
     }
+    // CL-08: the create mutation's audit row commits with the thread (and
+    // its first message writes its own side_thread_message_added row).
+    audit_side_thread_event(
+        &tx,
+        "side_thread_created",
+        resolve_local_conversation_id(&tx, conversation_id),
+        serde_json::json!({
+            "sideThreadId": thread_id,
+            "title": input.title,
+            "teamLocalId": input.team_local_id,
+            "createdByUserId": input.created_by_user_id,
+            "participantUserIds": input.participant_user_ids,
+            "firstMessage": input.first_message.is_some(),
+        }),
+    )?;
     tx.commit()?;
     Ok(thread_id)
 }
@@ -457,6 +579,19 @@ pub fn add_participants_checked(
     }
     let tx = conn.unchecked_transaction()?;
     let inserted = insert_participants_unchecked(&tx, thread_id, user_ids, added_by_user_local_id)?;
+    if !inserted.is_empty() {
+        // CL-08: the participant batch's audit row commits with the inserts.
+        audit_side_thread_event(
+            &tx,
+            "side_thread_participants_added",
+            thread_local_conversation_id(&tx, thread_id),
+            serde_json::json!({
+                "sideThreadId": thread_id,
+                "addedUserIds": inserted,
+                "addedByUserId": added_by_user_local_id,
+            }),
+        )?;
+    }
     tx.commit()?;
     Ok(inserted)
 }
@@ -551,6 +686,7 @@ fn insert_side_thread_message_unchecked(
     // Mention fan-out (immediate — the actor just typed it). The thread's
     // conversation facts resolve local-first (side threads may carry either
     // the local or the remote conversation id, depending on the caller).
+    let mut mention_count: usize = 0;
     let thread: Option<(i64, Option<String>)> = conn
         .query_row(
             "SELECT conversation_id, title FROM side_threads WHERE id = ?1",
@@ -583,7 +719,9 @@ fn insert_side_thread_message_unchecked(
         let trimmed_body = trim_200(body);
 
         let directory = mentions::build_mention_directory(conn)?;
-        for m in mentions::parse_mentions(body, &directory)? {
+        let resolved = mentions::parse_mentions(body, &directory)?;
+        mention_count = resolved.len();
+        for m in resolved {
             // Persist the resolved mention (the "mentions for me" store).
             // M16: the error propagates — a mention row that failed to
             // land while its message did would be a partial state; the
@@ -645,6 +783,19 @@ fn insert_side_thread_message_unchecked(
             }
         }
     }
+    // CL-08: the message mutation's audit row commits with the message (the
+    // mention + notification rows above are part of the same transaction).
+    audit_side_thread_event(
+        conn,
+        "side_thread_message_added",
+        thread_local_conversation_id(conn, thread_id),
+        serde_json::json!({
+            "sideThreadId": thread_id,
+            "messageId": message_id,
+            "authorUserId": author_user_id,
+            "mentionCount": mention_count,
+        }),
+    )?;
     Ok(message_id)
 }
 
@@ -1946,5 +2097,145 @@ mod tests {
             })
             .unwrap();
         assert_eq!(msgs, 0, "no orphan message row survives (M16)");
+    }
+
+    // ---- CL-08: the side-thread mutation audit trail -------------------------
+
+    /// Fetch the newest audit_log row for an action.
+    fn newest_audit_row(conn: &Connection, action: &str) -> (String, Option<i64>, String) {
+        conn.query_row(
+            "SELECT actor, conversation_id, after_state FROM audit_log
+              WHERE action = ?1 ORDER BY id DESC LIMIT 1",
+            params![action],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_side_thread_full_writes_the_audit_row() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let input = CreateSideThreadInput {
+            title: "audit me".into(),
+            team_local_id: None,
+            participant_user_ids: vec![1, 2],
+            created_by_user_id: Some(1),
+            first_message: Some("hello @priya".into()),
+        };
+        let thread_id = create_side_thread_full(&conn, None, 1, &input).unwrap();
+        // created + (first message) message_added, both inside the tx.
+        let (actor, conv, after) = newest_audit_row(&conn, "side_thread_created");
+        assert_eq!(actor, "user");
+        assert_eq!(
+            conv,
+            Some(1),
+            "the audit row carries the LOCAL conversation id"
+        );
+        assert!(after.contains(&format!("\"sideThreadId\":{thread_id}")));
+        assert!(after.contains("\"title\":\"audit me\""));
+        assert!(after.contains("\"firstMessage\":true"));
+        let (_, mconv, mafter) = newest_audit_row(&conn, "side_thread_message_added");
+        assert_eq!(mconv, Some(1));
+        assert!(mafter.contains(&format!("\"sideThreadId\":{thread_id}")));
+        assert!(
+            mafter.contains("\"mentionCount\":1"),
+            "the resolved @priya mention is counted: {mafter}"
+        );
+    }
+
+    #[test]
+    fn add_participants_writes_the_audit_row_only_for_real_adds() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 1, None).unwrap();
+        add_participants_checked(&conn, thread_id, &[1], None).unwrap();
+        let (actor, conv, after) = newest_audit_row(&conn, "side_thread_participants_added");
+        assert_eq!(actor, "user");
+        assert_eq!(conv, Some(1));
+        assert!(after.contains("\"addedUserIds\":[1]"));
+        // An idempotent re-add inserts nothing — no fresh audit row.
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'side_thread_participants_added'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        add_participants_checked(&conn, thread_id, &[1], None).unwrap();
+        let after_n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'side_thread_participants_added'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before, after_n,
+            "an all-duplicate re-add writes no audit row"
+        );
+    }
+
+    #[test]
+    fn message_without_mentions_still_audits_with_zero_count() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 1, None).unwrap();
+        add_side_thread_message(&conn, None, thread_id, "plain text", Some(1)).unwrap();
+        let (_, conv, after) = newest_audit_row(&conn, "side_thread_message_added");
+        assert_eq!(conv, Some(1));
+        assert!(after.contains("\"mentionCount\":0"));
+    }
+
+    #[test]
+    fn resolve_and_reopen_write_audit_rows() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 1, None).unwrap();
+        assert!(resolve_side_thread(&conn, thread_id).unwrap());
+        let (actor, conv, after) = newest_audit_row(&conn, "side_thread_resolved");
+        assert_eq!(actor, "user");
+        assert_eq!(conv, Some(1));
+        assert!(after.contains(&format!("\"sideThreadId\":{thread_id}")));
+        assert!(after.contains("resolvedAt"));
+        assert!(reopen_side_thread(&conn, thread_id).unwrap());
+        let (_, conv2, after2) = newest_audit_row(&conn, "side_thread_reopened");
+        assert_eq!(conv2, Some(1));
+        assert!(after2.contains(&format!("\"sideThreadId\":{thread_id}")));
+        // Unknown thread: no mutation, no audit row.
+        assert!(!resolve_side_thread(&conn, 999).unwrap());
+        assert!(!reopen_side_thread(&conn, 999).unwrap());
+        let unknown: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log
+                  WHERE after_state LIKE '%\"sideThreadId\":999%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown, 0, "unknown threads are not audited as mutations");
+    }
+
+    /// CL-08 + M16 together: a rolled-back mutation leaves NO audit row —
+    /// the trail can never claim a mutation that did not land.
+    #[test]
+    fn a_rolled_back_message_writes_no_audit_row() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 1, None).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER cl08_abort_mention BEFORE INSERT ON side_thread_mentions
+             BEGIN SELECT RAISE(ABORT, 'cl08 injected failure'); END",
+        )
+        .unwrap();
+        assert!(add_side_thread_message(&conn, None, thread_id, "ping @priya", Some(1)).is_err());
+        let audits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'side_thread_message_added'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audits, 0, "no audit row for a rolled-back mutation");
     }
 }
