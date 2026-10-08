@@ -1410,7 +1410,8 @@ fn failure_detail(e: &crate::error::Error) -> Option<String> {
     crate::helpscout_real::hs_error(e).map(|hs| format!("HTTP {}", hs.status_code))
 }
 
-/// Validated reply request (replyRequestSchema).
+/// Validated reply request (replyRequestSchema + the AI-04 send-provenance
+/// pair the reference's sendReply accepts, operations.ts:69).
 #[derive(Debug, Clone)]
 pub struct ReplyInput {
     pub conversation_id: i64,
@@ -1420,6 +1421,11 @@ pub struct ReplyInput {
     pub bcc: Vec<String>,
     pub status_after: Option<String>,
     pub assign_to: Option<i64>,
+    /// The AI draft this reply was generated from — marks the draft 'sent',
+    /// records was_sent feedback and flips the audit row's ai_involvement.
+    pub ai_draft_id: Option<i64>,
+    /// The draft's original AI text (edit-distance baseline).
+    pub original_ai_text: Option<String>,
 }
 
 /// `sendReply` (operations.ts:69).
@@ -1520,6 +1526,22 @@ pub async fn op_send_reply(state: &crate::http::server::AppState, input: ReplyIn
             if let Some(sync) = &state.sync {
                 let _ = sync.sync_single_conversation(conv.remote_id).await;
             }
+            // AI-04 (draft send provenance — reference operations.ts:105-107):
+            // a reply that rode an AI draft marks the draft 'sent' and
+            // records the was_sent feedback (edit distance between the
+            // original AI text and the final sent text).
+            if let Some(draft_id) = input.ai_draft_id {
+                let conn = state.conn_lock();
+                let _ = crate::ai_pipeline::ensure_pipeline_schema(&conn);
+                let _ = crate::ai_pipeline::set_draft_state(&conn, draft_id, "sent");
+                let _ = crate::ai_pipeline::record_feedback(
+                    &conn,
+                    draft_id,
+                    input.original_ai_text.as_deref().unwrap_or(""),
+                    &input.text,
+                    true,
+                );
+            }
             {
                 let conn = state.conn_lock();
                 let _ = crate::jobs::audit_entry(
@@ -1541,7 +1563,7 @@ pub async fn op_send_reply(state: &crate::http::server::AppState, input: ReplyIn
                         })
                         .to_string(),
                     ),
-                    false,
+                    input.ai_draft_id.is_some(),
                     Some(job_id),
                     None,
                 );

@@ -461,10 +461,11 @@ pub async fn reply(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let (text, draft, cc, bcc, status_after, assign_to) = match parse_reply_body(&body) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
+    let (text, draft, cc, bcc, status_after, assign_to, ai_draft_id, original_ai_text) =
+        match parse_reply_body(&body) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
     crate::conversation_ops::op_send_reply(
         &state,
         crate::conversation_ops::ReplyInput {
@@ -475,6 +476,8 @@ pub async fn reply(
             bcc,
             status_after,
             assign_to,
+            ai_draft_id,
+            original_ai_text,
         },
     )
     .await
@@ -962,7 +965,9 @@ fn parse_required_nullable_int(body: &Value, field: &str) -> Result<Option<i64>,
 /// the path by the handler): text min 1, draft default false, cc/bcc email
 /// arrays default [], statusAfter enum nullish, assignTo int nullish,
 /// attachmentIds int array default [] (validated only — sendReply never
-/// forwards attachments to the provider).
+/// forwards attachments to the provider). AI-04 adds the send-provenance
+/// pair the reference's sendReply accepts (operations.ts:69): aiDraftId
+/// positive int nullish, originalAiText string nullish.
 fn parse_reply_body(
     body: &Value,
 ) -> Result<
@@ -973,6 +978,8 @@ fn parse_reply_body(
         Vec<String>,
         Option<String>,
         Option<i64>,
+        Option<i64>,
+        Option<String>,
     ),
     Response,
 > {
@@ -1011,6 +1018,31 @@ fn parse_reply_body(
         }
     };
     let assign_to = parse_optional_int(body, "assignTo")?;
+    // AI-04 (send provenance): aiDraftId — positive int, nullish.
+    let ai_draft_id = match body.get("aiDraftId") {
+        None | Some(Value::Null) => None,
+        Some(v) => match zod_int_value(v) {
+            Ok(n) if n > 0 => Some(n),
+            Ok(_) => {
+                return Err(zod_422(
+                    "aiDraftId",
+                    "Number must be greater than 0",
+                ))
+            }
+            Err(m) => return Err(zod_422("aiDraftId", &m)),
+        },
+    };
+    // originalAiText — string, nullish (the AI text the user edited).
+    let original_ai_text = match body.get("originalAiText") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(v) => {
+            return Err(zod_422(
+                "originalAiText",
+                &format!("Expected string, received {}", zod_type_name(v)),
+            ))
+        }
+    };
     match body.get("attachmentIds") {
         None | Some(Value::Null) => {}
         Some(Value::Array(items)) => {
@@ -1027,7 +1059,16 @@ fn parse_reply_body(
             ))
         }
     }
-    Ok((text, draft, cc, bcc, status_after, assign_to))
+    Ok((
+        text,
+        draft,
+        cc,
+        bcc,
+        status_after,
+        assign_to,
+        ai_draft_id,
+        original_ai_text,
+    ))
 }
 
 /// GET /api/conversations/:id/events — the full event timeline for one
@@ -2611,6 +2652,164 @@ mod tests {
         .await;
         assert_eq!(send.0, StatusCode::OK);
         assert_eq!(send.1["message"], json!("Reply sent successfully."));
+    }
+
+    /// AI-04 (draft send provenance): a reply carrying aiDraftId +
+    /// originalAiText marks the draft sent, records the was_sent feedback
+    /// with the edit distance, and stamps ai_involvement on the audit row
+    /// (reference operations.ts:105-107,117).
+    #[tokio::test]
+    async fn reply_with_ai_draft_provenance_marks_sent_and_audits() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        // Seed an AI draft for this conversation the way the pipeline does.
+        let draft_id = {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::ai_pipeline::ensure_pipeline_schema(&conn).unwrap();
+            crate::ai_pipeline::create_draft(
+                &conn,
+                id,
+                "Here is the AI-generated answer to your question.",
+                &crate::ai_pipeline::CreateDraftOpts {
+                    run_id: None,
+                    mode: "standard",
+                    model: Some("test-model"),
+                    prompt_version: "",
+                    verification: None,
+                    sources: &[],
+                },
+            )
+            .unwrap()
+        };
+        let (code, body) = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({
+                    "text": "Here is the AI-generated answer to your question, with a human tweak.",
+                    "aiDraftId": draft_id,
+                    "originalAiText": "Here is the AI-generated answer to your question."
+                }))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body: {body}");
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // The draft is marked sent.
+        let state_val: String = conn
+            .query_row(
+                "SELECT state FROM ai_drafts WHERE id = ?1",
+                rusqlite::params![draft_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_val, "sent");
+        // The was_sent feedback row carries the edit distance between the
+        // original AI text and the final sent text.
+        let (was_sent, original, final_text, distance): (i64, String, String, i64) = conn
+            .query_row(
+                "SELECT was_sent, original_content, final_content, edit_distance
+                   FROM ai_feedback WHERE draft_id = ?1",
+                rusqlite::params![draft_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(was_sent, 1);
+        assert_eq!(
+            original,
+            "Here is the AI-generated answer to your question."
+        );
+        assert_eq!(
+            final_text,
+            "Here is the AI-generated answer to your question, with a human tweak."
+        );
+        assert!(distance > 0, "the human tweak shows as edit distance");
+        // The audit row flags AI involvement.
+        let (action, ai_involvement): (String, i64) = conn
+            .query_row(
+                "SELECT action, ai_involvement FROM audit_log
+                  WHERE action = 'reply_sent' AND conversation_id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, "reply_sent");
+        assert_eq!(ai_involvement, 1);
+    }
+
+    /// AI-04 negative paths: a plain reply (no aiDraftId) audits with
+    /// ai_involvement = 0 and writes no feedback; malformed provenance
+    /// fields are 422s in the reference envelope shape.
+    #[tokio::test]
+    async fn reply_without_ai_draft_audits_zero_and_bad_provenance_422s() {
+        let state = make_pipeline_state().await;
+        let (id, _remote) = first_conversation(&state);
+        let (code, body) = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "A purely human reply"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "body: {body}");
+        let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let (action, ai_involvement): (String, i64) = conn
+            .query_row(
+                "SELECT action, ai_involvement FROM audit_log
+                  WHERE action = 'reply_sent' AND conversation_id = ?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, "reply_sent");
+        assert_eq!(ai_involvement, 0);
+        let feedback: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_feedback", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(feedback, 0, "no ai_draft_id → no feedback row");
+
+        // Malformed aiDraftId: non-int.
+        let (code, body) = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "x", "aiDraftId": "abc"}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["issues"][0]["path"], json!("aiDraftId"));
+        // Malformed aiDraftId: non-positive.
+        let (code, _body) = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "x", "aiDraftId": 0}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        // Malformed originalAiText: non-string.
+        let (code, _body) = body_json(
+            reply(
+                State(state.clone()),
+                Path(id.to_string()),
+                Some(Json(json!({"text": "x", "originalAiText": 42}))),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// addNote: thread lands with type note, job confirmed, audit actor user.
