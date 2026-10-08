@@ -2,7 +2,7 @@
 
 Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs supportos (MAIN @ c346fb51); report tables T1–T20.
 
-- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **38 remaining** (count corrected 2026-10-08: the header previously said 38, but the table held 48 rows; the true remaining count is row-verified).
+- Population: every feature-matrix item whose status is **Partial (0.5)**, **Divergent (0.5)**, **Stub (0)** or **Missing (0)** — 104 items — plus 15 PORT-side defects from the audit issues register that have no dedicated matrix item (status `Defect`). Total: **119 items** — **33 remaining** (rows 84–116; the five-item batch DB-02, DB-04, DB-06, OP-04, DB-03 moved to progress.md on 2026-10-08).
 - Severity: taken from the audit issues register where the item maps to an issue (see *Audit ref*); SEC-02 is Critical per the safety-invariant audit (T11); otherwise Missing/Stub/Divergent → Major and Partial → Minor (Partial with L/XL effort → Major).
 - Order: severity first (Blocker → Critical → Major → Minor → Cosmetic), then the audit's blocker order (T17) and fix roadmap (T19), then effort (S < 1d, M < 1w, L < 1mo, XL > 1mo).
 - Out of scope for this repo (MAIN-side audit findings, reference only): N9/N10 (MAIN webhook rate-limit exemption ignores querystring), the MAIN half of C1 (bundle schema guard in MAIN), N11 MAIN-side panic containment, K5 (MAIN clean).
@@ -10,11 +10,6 @@ Source: code-evidence parity audit of SupportOS-PlusPlus (PORT @ 9bd73ce) vs sup
 
 |---|---|---|---|---|---|---|---|
 | # | ID | Item | Status | Severity | Effort | Audit ref | What needs to be fixed |
-| 79 | DB-02 | 123-table Help Scout mirror schema | Partial | Major | - | - | Complete the 123-table Help Scout mirror schema (add missing tables), keeping documented renames (threads->conversation_threads, segments->saved_segments, support_graph_edges->graph_edges, customer_memories->customer_memory, conversation_events->activity_events, knowledge_candidates->knowledge_gap_candidates). |
-| 80 | DB-04 | threads actor model (user/customer/system split) | Divergent | Major | - | - | Restore MAIN's threads actor model (created_by_user/customer/system 3-way split) instead of the collapsed actor_id+actor_type, or map it at query boundaries. |
-| 81 | DB-06 | FK enforcement + pragma parity (WAL, foreign_keys, busy_timeout) | Partial | Major | - | - | Declare foreign keys on base mirror tables (currently zero FKs) to match MAIN's enforcement; keep pragma parity (WAL, foreign_keys, busy_timeout). |
-| 82 | OP-04 | Automation-approvals tile (parked jobs count) | Divergent | Major | - | - | Automation-approvals operations tile always returns 0; count parked/awaiting-approval jobs (automation_approvals) as MAIN's tile does. |
-| 83 | DB-03 | conversations table shape (number UNIQUE, FK names, 47 cols) | Divergent | Major | L | - | Restore MAIN column names + UNIQUE(number) via new migration; rewrite ported SQL |
 | 84 | UI-25 | Modal system (Escape stack, focus trap, backdrop) | Partial | Minor | S | - | Escape-stack close, focus trap, backdrop click |
 | 85 | UI-03 | Search page (7 scopes, filters, semantic toggle, clickable hits) | Partial | Minor | M | - | 7 scopes, filters, semantic notices, <mark> snippets, clickable hits |
 | 86 | UI-05 | Organizations + detail (+health/timeline) | Partial | Minor | M | - | Health/timeline sections, pagination |
