@@ -530,7 +530,7 @@ struct DerivedEdge {
 /// * assigned_to          conversation -> agent           (conversations.assignee_id)
 /// * owns                 incident -> agent                (incidents.owner_user_local_id)
 /// * linked_to_issue      conversation -> known_issue      (known_issue_links, per-row ai/human)
-/// * clustered_into       conversation -> issue_cluster    (issue_cluster_members)
+/// * clustered_into       conversation -> issue_cluster    (issue_cluster_conversations)
 /// * promoted_to_issue    issue_cluster -> known_issue     (issue_clusters.known_issue_id)
 /// * affected_by          conversation -> incident          (incident_conversations)
 /// * related_to           incident -> {kind}               (incident_related)
@@ -714,7 +714,7 @@ fn derived_edges_touching(
             }
             // clustered_into out.
             for cluster in many_i64(
-                "SELECT cluster_id FROM issue_cluster_members WHERE conversation_id = ?1 LIMIT ?2",
+                "SELECT cluster_id FROM issue_cluster_conversations WHERE conversation_id = ?1 LIMIT ?2",
                 &[&local_id, &BRANCH_CAP],
             ) {
                 push(DerivedEdge {
@@ -932,7 +932,7 @@ fn derived_edges_touching(
             }
             // clustered_into in: the cluster's conversations.
             for conv in many_i64(
-                "SELECT conversation_id FROM issue_cluster_members WHERE cluster_id = ?1 LIMIT ?2",
+                "SELECT conversation_id FROM issue_cluster_conversations WHERE cluster_id = ?1 LIMIT ?2",
                 &[&local_id, &BRANCH_CAP],
             ) {
                 push(DerivedEdge {
@@ -1557,7 +1557,7 @@ fn kind_label(kind: GraphNodeKind) -> &'static str {
 /// graphService.ts:672-724): per-kind node counts and per-relation edge
 /// counts (origin labeled), plus the human-edge total. Port renames:
 /// known_issue_conversations→known_issue_links,
-/// issue_cluster_conversations→issue_cluster_members,
+/// issue_cluster_conversations→issue_cluster_conversations,
 /// knowledge_candidates→knowledge_gap_candidates,
 /// support_graph_edges→graph_edges, customer_local_id→customer_id,
 /// assignee_local_id→assignee_id (DB-04).
@@ -1610,7 +1610,7 @@ pub fn graph_stats(conn: &Connection) -> Result<Value> {
         ("assigned_to", "helpscout_mirror", "SELECT 1 FROM conversations c WHERE c.assignee_id IS NOT NULL AND c.deleted_at IS NULL"),
         ("owns", "helpscout_mirror", "SELECT 1 FROM incidents i WHERE i.owner_user_local_id IS NOT NULL"),
         ("linked_to_issue", "ai_derived", "SELECT 1 FROM known_issue_links"),
-        ("clustered_into", "deterministic_local", "SELECT 1 FROM issue_cluster_members"),
+        ("clustered_into", "deterministic_local", "SELECT 1 FROM issue_cluster_conversations"),
         ("promoted_to_issue", "helpscout_mirror", "SELECT 1 FROM issue_clusters WHERE known_issue_id IS NOT NULL"),
         ("affected_by", "deterministic_local", "SELECT 1 FROM incident_conversations"),
         ("related_to", "human_local", "SELECT 1 FROM incident_related"),

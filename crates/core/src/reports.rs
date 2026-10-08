@@ -566,7 +566,7 @@ fn attribute_unknown_expr() -> &'static str {
 /// - `client_support_outcomes` → `friction_scores` (effort_score; high
 ///   friction = effort_score >= 0.6 per HIGH_FRICTION_THRESHOLD)
 /// - `known_issue_conversations`/`issue_cluster_conversations` →
-///   `known_issue_links`/`issue_cluster_members`
+///   `known_issue_links`/`issue_cluster_conversations`
 fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
     const NO_WHERE: &[&str] = &[];
     match metric {
@@ -734,7 +734,7 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
             anchor: MetricAnchor::Conversations,
             from: "conversations c",
             date_expr: "c.created_at",
-            value_expr: "CAST(SUM(CASE WHEN (EXISTS (SELECT 1 FROM issue_cluster_members icc WHERE icc.conversation_id = c.id) OR EXISTS (SELECT 1 FROM known_issue_links kic WHERE kic.conversation_id = c.id)) THEN 1 ELSE 0 END) AS REAL) / COUNT(*)",
+            value_expr: "CAST(SUM(CASE WHEN (EXISTS (SELECT 1 FROM issue_cluster_conversations icc WHERE icc.conversation_id = c.id) OR EXISTS (SELECT 1 FROM known_issue_links kic WHERE kic.conversation_id = c.id)) THEN 1 ELSE 0 END) AS REAL) / COUNT(*)",
             extra_where: NO_WHERE,
             requires_attribute: false,
             requires_state: false,
@@ -890,11 +890,11 @@ fn dimension_spec(dimension: ReportDimensionKey) -> DimensionSpec {
         ReportDimensionKey::Issue => DimensionSpec {
             expr: "COALESCE(\
                 (SELECT ('KI: ' || ki.name) FROM known_issue_links kil JOIN known_issues ki ON ki.id = kil.known_issue_id WHERE kil.conversation_id = c.id LIMIT 1), \
-                (SELECT ('Cluster: ' || ic2.name) FROM issue_cluster_members icm JOIN issue_clusters ic2 ON ic2.id = icm.cluster_id WHERE icm.conversation_id = c.id LIMIT 1), \
+                (SELECT ('Cluster: ' || ic2.name) FROM issue_cluster_conversations icm JOIN issue_clusters ic2 ON ic2.id = icm.cluster_id WHERE icm.conversation_id = c.id LIMIT 1), \
                 '(not linked to an issue)')",
             group_by: "COALESCE(\
                 (SELECT kil.known_issue_id FROM known_issue_links kil WHERE kil.conversation_id = c.id LIMIT 1), \
-                (SELECT icm.cluster_id FROM issue_cluster_members icm WHERE icm.conversation_id = c.id LIMIT 1), \
+                (SELECT icm.cluster_id FROM issue_cluster_conversations icm WHERE icm.conversation_id = c.id LIMIT 1), \
                 -1)",
             joins: NO_JOINS,
         },

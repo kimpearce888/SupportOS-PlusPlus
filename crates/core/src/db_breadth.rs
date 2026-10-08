@@ -16,7 +16,7 @@
 //!   * `fts_*` virtual tables — owned by `search.rs` (another agent).
 //!   * Name-different port equivalents (never duplicated):
 //!     threads→conversation_threads, customer_memories→customer_memory,
-//!     issue_cluster_conversations→issue_cluster_members,
+//!     issue_cluster_conversations→issue_cluster_conversations,
 //!     conversation_events→activity_events, inbox_views→saved_views,
 //!     segments→saved_segments, knowledge_candidates→knowledge_gap_candidates,
 //!     friction_findings→friction_scores, interaction_signals (legacy
@@ -607,10 +607,10 @@ fn add_missing_reference_columns(conn: &Connection) -> Result<()> {
         "TEXT DEFAULT 'ai_generated'",
     )?;
 
-    // ---- issue_cluster_members (003 issue_cluster_conversations) ----
+    // ---- issue_cluster_conversations (003 issue_cluster_conversations) ----
     add(
         conn,
-        "issue_cluster_members",
+        "issue_cluster_conversations",
         "assigned_at",
         "TEXT NOT NULL DEFAULT (datetime('now'))",
     )?;
@@ -980,8 +980,8 @@ fn create_missing_reference_indexes(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_threads_embedding ON conversation_threads(embedding_state);
 
          -- 016 performance indexes, adapted to the port's link-table names.
-         CREATE INDEX IF NOT EXISTS idx_issue_cluster_members_conversation
-            ON issue_cluster_members(conversation_id);
+         CREATE INDEX IF NOT EXISTS idx_issue_cluster_conversations_conversation
+            ON issue_cluster_conversations(conversation_id);
 
          -- notifications (012); target_user_local_id→target_user_id adapted.
          CREATE INDEX IF NOT EXISTS idx_notifications_target_unread

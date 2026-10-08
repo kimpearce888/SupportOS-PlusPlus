@@ -94,7 +94,7 @@ async fn docs_api_matches_the_reference_contract() {
         let seeded = {
             let conn = http_conn.lock().unwrap_or_else(|p| p.into_inner());
             let docs: i64 = conn
-                .query_row("SELECT COUNT(*) FROM docs", [], |r| r.get(0))
+                .query_row("SELECT COUNT(*) FROM docs_articles", [], |r| r.get(0))
                 .unwrap_or(0);
             docs >= 9
         };

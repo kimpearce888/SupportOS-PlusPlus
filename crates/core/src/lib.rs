@@ -79,6 +79,7 @@ pub mod loopback;
 pub mod maintenance;
 pub mod mentions;
 pub mod migrations;
+pub mod mirror_parity;
 pub mod mirror_readouts;
 pub mod mirror_tables;
 pub mod notification_prefs;

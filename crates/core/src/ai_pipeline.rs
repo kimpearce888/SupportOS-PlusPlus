@@ -1656,7 +1656,7 @@ pub fn upsert_cluster(conn: &Connection, c: &ClusterUpsert) -> Result<i64> {
     };
     for id in &c.conversation_ids {
         conn.execute(
-            "INSERT OR IGNORE INTO issue_cluster_members (cluster_id, conversation_id)
+            "INSERT OR IGNORE INTO issue_cluster_conversations (cluster_id, conversation_id)
              VALUES (?1, ?2)",
             params![cluster_id, id],
         )?;
@@ -1667,13 +1667,13 @@ pub fn upsert_cluster(conn: &Connection, c: &ClusterUpsert) -> Result<i64> {
     // back to the existing values via COALESCE instead of writing NULL.
     conn.execute(
         "UPDATE issue_clusters SET
-            conversation_count = (SELECT COUNT(*) FROM issue_cluster_members WHERE cluster_id = ?1),
-            customer_count = (SELECT COUNT(DISTINCT c.customer_id) FROM issue_cluster_members m
+            conversation_count = (SELECT COUNT(*) FROM issue_cluster_conversations WHERE cluster_id = ?1),
+            customer_count = (SELECT COUNT(DISTINCT c.customer_id) FROM issue_cluster_conversations m
                                JOIN conversations c ON c.id = m.conversation_id
                               WHERE m.cluster_id = ?1 AND c.customer_id IS NOT NULL),
-            first_seen_at = COALESCE((SELECT MIN(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_members m
+            first_seen_at = COALESCE((SELECT MIN(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_conversations m
                                JOIN conversations c ON c.id = m.conversation_id WHERE m.cluster_id = ?1), first_seen_at),
-            last_seen_at = COALESCE((SELECT MAX(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_members m
+            last_seen_at = COALESCE((SELECT MAX(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_conversations m
                               JOIN conversations c ON c.id = m.conversation_id WHERE m.cluster_id = ?1), last_seen_at)
           WHERE id = ?1",
         params![cluster_id],
@@ -1692,9 +1692,9 @@ fn compute_trends(conn: &Connection) -> Result<()> {
     )?;
     let mut stmt = conn.prepare(
         "SELECT ic.id,
-            (SELECT COUNT(*) FROM issue_cluster_members m JOIN conversations c ON c.id = m.conversation_id
+            (SELECT COUNT(*) FROM issue_cluster_conversations m JOIN conversations c ON c.id = m.conversation_id
               WHERE m.cluster_id = ic.id AND julianday(COALESCE(c.remote_created_at, c.created_at)) >= julianday('now', '-14 days')) AS recent,
-            (SELECT COUNT(*) FROM issue_cluster_members m JOIN conversations c ON c.id = m.conversation_id
+            (SELECT COUNT(*) FROM issue_cluster_conversations m JOIN conversations c ON c.id = m.conversation_id
               WHERE m.cluster_id = ic.id AND julianday(COALESCE(c.remote_created_at, c.created_at)) >= julianday('now', '-28 days')
                 AND julianday(COALESCE(c.remote_created_at, c.created_at)) < julianday('now', '-14 days')) AS previous
            FROM issue_clusters ic",

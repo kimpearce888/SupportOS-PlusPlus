@@ -233,6 +233,11 @@ const BOOT_STEPS: &[BootStep] = &[
         label: "m043_hs_rate_limit",
         apply: crate::helpscout_real::apply_m043,
     },
+    BootStep {
+        version: 35,
+        label: "m044_mirror_schema_completion",
+        apply: crate::mirror_parity::apply_m044,
+    },
 ];
 
 /// Apply the pending boot steps, each in one transaction with its

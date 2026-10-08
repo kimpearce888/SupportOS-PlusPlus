@@ -55,7 +55,7 @@ const ARTICLE_SUMMARY_SELECT: &str = "SELECT a.id, a.remote_id,
        a.category_local_id, cat.name,
        a.number, a.slug, a.name, a.status, a.preview, a.words, a.views,
        a.remote_created_at, a.remote_updated_at
-  FROM docs a
+  FROM docs_articles a
   LEFT JOIN docs_collections c ON c.id = a.collection_local_id
   LEFT JOIN docs_categories cat ON cat.id = a.category_local_id";
 
@@ -208,12 +208,12 @@ pub async fn stats(State(state): State<AppState>) -> Json<Value> {
         .query_row(
             "SELECT
                (SELECT COUNT(*) FROM docs_collections),
-               (SELECT COUNT(*) FROM docs),
-               (SELECT COUNT(*) FROM docs WHERE status = 'published'),
-               (SELECT COUNT(*) FROM docs WHERE status = 'draft'),
-               (SELECT COUNT(*) FROM docs WHERE status = 'internal'),
-               (SELECT COALESCE(SUM(views), 0) FROM docs),
-               (SELECT MAX(last_synced_at) FROM docs)",
+               (SELECT COUNT(*) FROM docs_articles),
+               (SELECT COUNT(*) FROM docs_articles WHERE status = 'published'),
+               (SELECT COUNT(*) FROM docs_articles WHERE status = 'draft'),
+               (SELECT COUNT(*) FROM docs_articles WHERE status = 'internal'),
+               (SELECT COALESCE(SUM(views), 0) FROM docs_articles),
+               (SELECT MAX(last_synced_at) FROM docs_articles)",
             [],
             |r| {
                 Ok((
@@ -561,7 +561,7 @@ pub async fn articles(
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = binds.iter().map(|v| v.as_ref()).collect();
     let total: i64 = conn
         .query_row(
-            &format!("SELECT COUNT(*) FROM docs a {where_sql}"),
+            &format!("SELECT COUNT(*) FROM docs_articles a {where_sql}"),
             params_ref.as_slice(),
             |r| r.get(0),
         )
@@ -614,7 +614,7 @@ pub async fn article(State(state): State<AppState>, Path(id): Path<i64>) -> Repl
                         a.category_local_id, cat.name,
                         a.number, a.slug, a.name, a.status, a.preview, a.words, a.views,
                         a.remote_created_at, a.remote_updated_at, a.text
-                   FROM docs a
+                   FROM docs_articles a
                    LEFT JOIN docs_collections c ON c.id = a.collection_local_id
                    LEFT JOIN docs_categories cat ON cat.id = a.category_local_id
                   WHERE a.id = ?1"
@@ -704,7 +704,7 @@ mod tests {
              INSERT INTO docs_categories (id, remote_id, collection_local_id, slug, name) VALUES
                 (1, 851, 1, 'setup', 'Setup'),
                 (2, 853, 2, 'invoices', 'Invoices');
-             INSERT INTO docs (id, remote_id, collection_local_id, category_local_id, number, slug, name, status, preview, text, views, words, remote_created_at, remote_updated_at, last_synced_at) VALUES
+             INSERT INTO docs_articles (id, remote_id, collection_local_id, category_local_id, number, slug, name, status, preview, text, views, words, remote_created_at, remote_updated_at, last_synced_at) VALUES
                 (10, 8011, 1, 1, 101, 'first-report', 'Creating your first report', 'published',
                  'To create your first report, open the Reports section',
                  'To create your first report, open the Reports section and click New report. Pick a data source.', 320, 16,

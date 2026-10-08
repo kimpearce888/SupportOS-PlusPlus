@@ -290,7 +290,7 @@ fn health_flag(
 /// `c.customer_id`, `c.remote_created_at` -> `c.created_at`, `threads` ->
 /// `conversation_threads` (`type='customer'` -> `thread_type='customer_message'`),
 /// `conversation_tags.tag_local_id` -> `conversation_tags.tag_id`,
-/// `issue_cluster_conversations` -> `issue_cluster_members`,
+/// `issue_cluster_conversations` -> `issue_cluster_conversations`,
 /// `issue_clusters.title` -> `issue_clusters.name`,
 /// `known_issue_conversations` -> `known_issue_links`.
 fn build_support_health_report(
@@ -594,7 +594,7 @@ fn build_support_health_report(
             &format!(
                 "SELECT ic.name AS title, COUNT(*) AS n
                  FROM conversations c
-                 JOIN issue_cluster_members icm ON icm.conversation_id = c.id
+                 JOIN issue_cluster_conversations icm ON icm.conversation_id = c.id
                  JOIN issue_clusters ic ON ic.id = icm.cluster_id
                  WHERE {conv_scope} AND c.deleted_at IS NULL
                  GROUP BY ic.id HAVING COUNT(*) >= 2 ORDER BY COUNT(*) DESC LIMIT 1"
@@ -621,7 +621,7 @@ fn build_support_health_report(
         },
         "Most-repeated issue cluster for this subject (conversations within one cluster). \"None\" is honest when no cluster repeats.",
         ev(
-            "AND EXISTS (SELECT 1 FROM issue_cluster_members icm WHERE icm.conversation_id = c.id)",
+            "AND EXISTS (SELECT 1 FROM issue_cluster_conversations icm WHERE icm.conversation_id = c.id)",
             &[],
         ),
         "known",
@@ -633,7 +633,7 @@ fn build_support_health_report(
             "warning",
             format!("{repeated_n} conversations in the \"{repeated_title}\" issue cluster."),
             ev(
-                "AND EXISTS (SELECT 1 FROM issue_cluster_members icm JOIN issue_clusters ic ON ic.id = icm.cluster_id WHERE icm.conversation_id = c.id AND ic.name = ?)",
+                "AND EXISTS (SELECT 1 FROM issue_cluster_conversations icm JOIN issue_clusters ic ON ic.id = icm.cluster_id WHERE icm.conversation_id = c.id AND ic.name = ?)",
                 &[rusqlite::types::Value::Text(repeated_title.clone())],
             ),
         ));
@@ -1831,7 +1831,7 @@ mod tests {
         .unwrap();
         for conv in [1i64, 2, 3] {
             conn.execute(
-                "INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (1, ?1)",
+                "INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (1, ?1)",
                 params![conv],
             )
             .unwrap();

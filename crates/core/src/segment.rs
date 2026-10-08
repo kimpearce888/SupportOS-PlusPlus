@@ -22,7 +22,7 @@
 //! - `conversation_tags.tag_local_id` → `tag_id`
 //! - `conversation_fields.field_local_id` → `field_id`
 //! - `known_issue_conversations` → `known_issue_links`
-//! - `issue_cluster_conversations` → `issue_cluster_members`
+//! - `issue_cluster_conversations` (reference name, restored by DB-02/m044)
 //! - `known_issues.title` / `issue_clusters.title` → `name`
 //! - `do_not_contact.customer_local_id` → `customer_id`
 //! - `users.type` → `user_type`
@@ -2340,7 +2340,7 @@ impl<'a> SegmentEngine<'a> {
             return Vec::new();
         }
         let (link_table, id_col) = if issue_kind == "cluster" {
-            ("issue_cluster_members", "cluster_id")
+            ("issue_cluster_conversations", "cluster_id")
         } else {
             ("known_issue_links", "known_issue_id")
         };

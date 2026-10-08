@@ -969,7 +969,9 @@ fn radar_clusters(conn: &rusqlite::Connection) -> Vec<RadarCluster> {
         .into_iter()
         .filter_map(|(id, title)| {
             let member_ids: Vec<i64> = conn
-                .prepare("SELECT conversation_id FROM issue_cluster_members WHERE cluster_id = ?1")
+                .prepare(
+                    "SELECT conversation_id FROM issue_cluster_conversations WHERE cluster_id = ?1",
+                )
                 .and_then(|mut stmt| {
                     Ok(stmt
                         .query_map(rusqlite::params![id], |r| r.get::<_, i64>(0))?

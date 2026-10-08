@@ -62,13 +62,13 @@ pub async fn list_clusters(State(state): State<AppState>) -> Json<Value> {
 
 /// The cluster's member conversation ids (reference listClusters/getCluster's
 /// `SELECT conversation_id FROM issue_cluster_conversations WHERE cluster_id = ?`
-/// — the port's documented rename is `issue_cluster_members`).
+/// — the port's documented rename is `issue_cluster_conversations`).
 fn cluster_conversation_ids(
     conn: &rusqlite::Connection,
     cluster_id: i64,
 ) -> rusqlite::Result<Vec<i64>> {
-    let mut stmt =
-        conn.prepare("SELECT conversation_id FROM issue_cluster_members WHERE cluster_id = ?1")?;
+    let mut stmt = conn
+        .prepare("SELECT conversation_id FROM issue_cluster_conversations WHERE cluster_id = ?1")?;
     let ids = stmt
         .query_map(rusqlite::params![cluster_id], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -206,7 +206,7 @@ pub async fn get_cluster(
 /// DELETE /api/issues/clusters/:id — reference routes/issues.ts:23-26:
 /// removes the cluster row (members cascade; conversations are untouched —
 /// the reference's ON DELETE CASCADE on issue_cluster_conversations, which
-/// the port keeps on issue_cluster_members). Missing ids stay `{ok: true}`
+/// the port keeps on issue_cluster_conversations). Missing ids stay `{ok: true}`
 /// exactly like the reference (DELETE of zero rows is not an error).
 pub async fn delete_cluster(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());

@@ -878,7 +878,7 @@ fn list_pending_chunks(conn: &Connection, table: &str) -> Result<Vec<PendingChun
         "docs_chunks" => format!(
             "SELECT c.id, c.article_id, c.content, a.name,
                     CASE WHEN a.status = 'published' THEN 'customer_safe' ELSE 'internal_only' END
-             FROM docs_chunks c JOIN docs a ON a.id = c.article_id
+             FROM docs_chunks c JOIN docs_articles a ON a.id = c.article_id
              WHERE (c.embedding_state = 'not_indexed' OR c.embedding_state = 'failed')
                AND c.embedding_attempts < 5
              LIMIT {EMBED_PASS_LIMIT}"
@@ -1982,7 +1982,7 @@ mod tests {
         .unwrap();
         let docs_collection = conn.last_insert_rowid();
         conn.execute(
-            "INSERT INTO docs (collection_local_id, remote_id, name, text_plain) VALUES (?1, 10, 'Article', 'docs article body')",
+            "INSERT INTO docs_articles (collection_local_id, remote_id, name, text_plain) VALUES (?1, 10, 'Article', 'docs article body')",
             [docs_collection],
         )
         .unwrap();

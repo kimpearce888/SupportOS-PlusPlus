@@ -10,7 +10,7 @@
 //! - assigned_to         conversation -> agent           (conversations.assignee_id)
 //! - owns                incident -> agent                (incidents.owner_user_local_id)
 //! - linked_to_issue     conversation -> known_issue      (per-row ai/human provenance)
-//! - clustered_into      conversation -> issue_cluster   (issue_cluster_members)
+//! - clustered_into      conversation -> issue_cluster   (issue_cluster_conversations)
 //! - promoted_to_issue   issue_cluster -> known_issue     (issue_clusters.known_issue_id)
 //! - affected_by         conversation -> incident          (incident_conversations)
 //! - related_to          incident -> known_issue           (incident_related)
@@ -72,7 +72,7 @@ async fn graph_derived_edge_layer() {
              VALUES (1, 'how to unblock exports', 3, '[1,2]');
          INSERT INTO known_issue_links (known_issue_id, conversation_id, link_type) VALUES (1, 1, 'ai');
          INSERT INTO known_issue_links (known_issue_id, conversation_id, link_type) VALUES (1, 2, 'human');
-         INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (1, 1);
+         INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (1, 1);
          INSERT INTO incident_conversations (incident_id, conversation_id) VALUES (1, 1);
          INSERT INTO incident_related (incident_id, target_kind, target_local_id, note)
              VALUES (1, 'known_issue', 1, 'same login loop');

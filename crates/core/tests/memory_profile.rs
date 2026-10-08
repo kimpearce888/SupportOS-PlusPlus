@@ -71,7 +71,7 @@ async fn memory_profile_composition() {
          INSERT INTO known_issue_links (known_issue_id, conversation_id, link_type)
              VALUES (1, 2, 'related');
          INSERT INTO issue_clusters (id, name, conversation_count) VALUES (1, 'night exports', 2);
-         INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (1, 1);
+         INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (1, 1);
          INSERT INTO outreach_campaigns (id, name, subject, body, status) VALUES (1, 'Q4 outreach', 'Hello', 'Body', 'completed');
          INSERT INTO outreach_recipients (campaign_id, customer_local_id, email, state, sent_at, replied_at)
              VALUES (1, 11, 'ada@acme.com', 'sent', '2026-09-25T10:00:00.000Z', '2026-09-26T10:00:00.000Z');

@@ -559,7 +559,7 @@ fn upsert_doc_article(
     let content_hash = crate::embeddings::content_hash(&chunk_source);
     let existing: Option<(i64, Option<String>)> = conn
         .query_row(
-            "SELECT id, content_hash FROM docs WHERE remote_id = ?1",
+            "SELECT id, content_hash FROM docs_articles WHERE remote_id = ?1",
             params![a.remote_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -569,7 +569,7 @@ fn upsert_doc_article(
         _ => true,
     };
     conn.execute(
-        "INSERT INTO docs (remote_id, collection_local_id, category_local_id, number, slug, name, status, preview, text, views, words, remote_created_at, remote_updated_at, last_synced_at, content_hash)
+        "INSERT INTO docs_articles (remote_id, collection_local_id, category_local_id, number, slug, name, status, preview, text, views, words, remote_created_at, remote_updated_at, last_synced_at, content_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now'), ?14)
          ON CONFLICT(remote_id) DO UPDATE SET collection_local_id = excluded.collection_local_id,
            category_local_id = excluded.category_local_id, number = excluded.number,
@@ -598,7 +598,7 @@ fn upsert_doc_article(
     if content_changed {
         let id = match existing {
             Some((id, _)) => id,
-            None => local_id(conn, "docs", a.remote_id)
+            None => local_id(conn, "docs_articles", a.remote_id)
                 .ok_or_else(|| Error::Other("docs article upsert lost its row".into()))?,
         };
         reindex_doc_fts(conn, id, &a.name, a.text.as_deref())?;
@@ -2239,7 +2239,7 @@ mod tests {
         let (replies, workflows, docs): (i64, i64, i64) = conn
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM saved_replies), (SELECT COUNT(*) FROM workflows),
-                        (SELECT COUNT(*) FROM docs)",
+                        (SELECT COUNT(*) FROM docs_articles)",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -3116,43 +3116,50 @@ mod tests {
         let text_of =
             |sql: &str| -> Option<String> { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(None) };
         let id: i64 = conn
-            .query_row("SELECT id FROM docs WHERE remote_id = 9101", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM docs_articles WHERE remote_id = 9101",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         // Category remote -> local resolution: the article points at the
         // LOCAL id of the category with remote_id 951.
         assert_eq!(
-            scalar("SELECT COALESCE(category_local_id, 0) FROM docs WHERE remote_id = 9101"),
+            scalar(
+                "SELECT COALESCE(category_local_id, 0) FROM docs_articles WHERE remote_id = 9101"
+            ),
             scalar("SELECT id FROM docs_categories WHERE remote_id = 951"),
             "category remote id must resolve to its local id"
         );
-        assert_eq!(scalar("SELECT number FROM docs WHERE remote_id = 9101"), 42);
         assert_eq!(
-            scalar("SELECT COALESCE(views, 0) FROM docs WHERE remote_id = 9101"),
+            scalar("SELECT number FROM docs_articles WHERE remote_id = 9101"),
+            42
+        );
+        assert_eq!(
+            scalar("SELECT COALESCE(views, 0) FROM docs_articles WHERE remote_id = 9101"),
             7
         );
         assert_eq!(
-            text_of("SELECT status FROM docs WHERE remote_id = 9101").as_deref(),
+            text_of("SELECT status FROM docs_articles WHERE remote_id = 9101").as_deref(),
             Some("published")
         );
         // words: whitespace-split token count of the text.
         assert_eq!(
-            scalar("SELECT COALESCE(words, 0) FROM docs WHERE remote_id = 9101"),
+            scalar("SELECT COALESCE(words, 0) FROM docs_articles WHERE remote_id = 9101"),
             11
         );
         // preview: whitespace-collapsed text, UTF-16-capped at 220.
         assert_eq!(
-            text_of("SELECT preview FROM docs WHERE remote_id = 9101").as_deref(),
+            text_of("SELECT preview FROM docs_articles WHERE remote_id = 9101").as_deref(),
             Some("To invite teammates, open Settings and click Team. Roles decide access.")
         );
         // The text is short enough for one chunk; the FTS mirror has one row.
         assert_eq!(
-            scalar("SELECT COUNT(*) FROM docs_chunks WHERE article_id = (SELECT id FROM docs WHERE remote_id = 9101)"),
+            scalar("SELECT COUNT(*) FROM docs_chunks WHERE article_id = (SELECT id FROM docs_articles WHERE remote_id = 9101)"),
             1
         );
         assert_eq!(
-            scalar("SELECT COUNT(*) FROM docs_fts WHERE article_id = (SELECT id FROM docs WHERE remote_id = 9101)"),
+            scalar("SELECT COUNT(*) FROM docs_fts WHERE article_id = (SELECT id FROM docs_articles WHERE remote_id = 9101)"),
             1
         );
         // The chunk content is the reference `title\n\ntext` source with
@@ -3181,9 +3188,11 @@ mod tests {
         )
         .unwrap();
         let id: i64 = conn
-            .query_row("SELECT id FROM docs WHERE remote_id = 9102", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM docs_articles WHERE remote_id = 9102",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         // Simulate the embedding job having indexed the chunk.
         conn.execute(
@@ -3200,7 +3209,7 @@ mod tests {
         let (state, views, count): (String, Option<i64>, i64) = conn
             .query_row(
                 "SELECT (SELECT embedding_state FROM docs_chunks WHERE article_id = ?1),
-                        (SELECT views FROM docs WHERE id = ?1),
+                        (SELECT views FROM docs_articles WHERE id = ?1),
                         (SELECT COUNT(*) FROM docs_chunks WHERE article_id = ?1)",
                 params![id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -3239,7 +3248,7 @@ mod tests {
                 "SELECT (SELECT COUNT(*) FROM docs_chunks WHERE article_id = d.id),
                         (SELECT COUNT(*) FROM docs_fts WHERE article_id = d.id),
                         d.words, d.preview
-                   FROM docs d WHERE d.remote_id = 9103",
+                   FROM docs_articles d WHERE d.remote_id = 9103",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )

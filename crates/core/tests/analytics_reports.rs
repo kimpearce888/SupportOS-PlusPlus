@@ -137,13 +137,13 @@ async fn analytics_reports_batch() {
     .unwrap();
     for id in &a_ids {
         conn.execute(
-            "INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (1, ?1)",
+            "INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (1, ?1)",
             rusqlite::params![id],
         )
         .unwrap();
     }
     conn.execute(
-        "INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (1, ?1)",
+        "INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (1, ?1)",
         rusqlite::params![a_old],
     )
     .unwrap();
@@ -179,7 +179,7 @@ async fn analytics_reports_batch() {
     for remote in [300i64, 301] {
         let id = insert_conv(&conn, remote, 1, 110, "datetime('now', '-2 days')");
         conn.execute(
-            "INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (2, ?1)",
+            "INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (2, ?1)",
             rusqlite::params![id],
         )
         .unwrap();
@@ -204,7 +204,7 @@ async fn analytics_reports_batch() {
             &format!("datetime('now', '-{days} days')"),
         );
         conn.execute(
-            "INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (3, ?1)",
+            "INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (3, ?1)",
             rusqlite::params![id],
         )
         .unwrap();
@@ -232,7 +232,7 @@ async fn analytics_reports_batch() {
             &format!("datetime('now', '-{days} days')"),
         );
         conn.execute(
-            "INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (4, ?1)",
+            "INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (4, ?1)",
             rusqlite::params![id],
         )
         .unwrap();

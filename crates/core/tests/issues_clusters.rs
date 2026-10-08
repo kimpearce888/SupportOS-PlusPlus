@@ -335,7 +335,7 @@ async fn issues_clusters_serving_parity() {
         let guard = http_conn.lock().unwrap_or_else(|p| p.into_inner());
         let members: i64 = guard
             .query_row(
-                "SELECT COUNT(*) FROM issue_cluster_members WHERE cluster_id = ?1",
+                "SELECT COUNT(*) FROM issue_cluster_conversations WHERE cluster_id = ?1",
                 rusqlite::params![billing],
                 |r| r.get(0),
             )

@@ -385,7 +385,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT, known_issue_id INTEGER NOT NULL,
                 conversation_id INTEGER NOT NULL, link_type TEXT NOT NULL DEFAULT 'related');
              CREATE TABLE issue_clusters (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
-             CREATE TABLE issue_cluster_members (
+             CREATE TABLE issue_cluster_conversations (
                 cluster_id INTEGER NOT NULL, conversation_id INTEGER NOT NULL,
                 PRIMARY KEY (cluster_id, conversation_id));",
         )

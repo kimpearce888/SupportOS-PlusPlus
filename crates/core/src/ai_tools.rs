@@ -717,7 +717,7 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             );
             let sql = format!(
                 "SELECT ic.id, ic.title, ic.summary, ic.category, ic.product, ic.feature, ic.ai_generated,
-                        (SELECT GROUP_CONCAT(c.number) FROM issue_cluster_members icc
+                        (SELECT GROUP_CONCAT(c.number) FROM issue_cluster_conversations icc
                            JOIN conversations c ON c.id = icc.conversation_id
                           WHERE icc.cluster_id = ic.id ORDER BY c.number DESC) AS numbers
                    FROM issue_clusters ic

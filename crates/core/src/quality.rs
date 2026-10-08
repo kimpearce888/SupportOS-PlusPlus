@@ -23,7 +23,7 @@
 //! - `conversation_events` → `activity_events` (conversation_id = LOCAL id)
 //! - `client_support_outcomes` → `friction_scores` outcome rows (kind IS
 //!   NULL) with the counts in `factors_json`
-//! - `issue_cluster_conversations` → `issue_cluster_members`
+//! - `issue_cluster_conversations` → `issue_cluster_conversations`
 //! - `remote_created_at` → `COALESCE(remote_created_at, created_at)`
 
 use rusqlite::{params, Connection};
@@ -662,9 +662,9 @@ pub fn rebuild_gaps(conn: &Connection, days: i64) -> (usize, usize) {
     let cluster_rows: Vec<(i64, String, i64)> = conn
         .prepare(
             "SELECT c.id, c.title,
-                    (SELECT COUNT(*) FROM issue_cluster_members m WHERE m.cluster_id = c.id) AS n
+                    (SELECT COUNT(*) FROM issue_cluster_conversations m WHERE m.cluster_id = c.id) AS n
              FROM issue_clusters c
-             WHERE (SELECT COUNT(*) FROM issue_cluster_members m WHERE m.cluster_id = c.id) >= 3
+             WHERE (SELECT COUNT(*) FROM issue_cluster_conversations m WHERE m.cluster_id = c.id) >= 3
              ORDER BY n DESC LIMIT 30",
         )
         .and_then(|mut stmt| {
@@ -682,7 +682,7 @@ pub fn rebuild_gaps(conn: &Connection, days: i64) -> (usize, usize) {
         if knowledge_hits(conn, &title) == 0 {
             let members: Vec<i64> = conn
                 .prepare(
-                    "SELECT conversation_id FROM issue_cluster_members
+                    "SELECT conversation_id FROM issue_cluster_conversations
                      WHERE cluster_id = ?1 ORDER BY conversation_id DESC LIMIT 50",
                 )
                 .ok()

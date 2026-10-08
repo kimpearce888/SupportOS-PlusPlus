@@ -69,11 +69,11 @@ pub fn compute_trends(conn: &Connection) -> Result<()> {
     let clusters: Vec<(i64, i64, i64)> = {
         let mut stmt = conn.prepare(
             "SELECT ic.id,
-               (SELECT COUNT(*) FROM issue_cluster_members icm
+               (SELECT COUNT(*) FROM issue_cluster_conversations icm
                   JOIN conversations c ON c.id = icm.conversation_id
                  WHERE icm.cluster_id = ic.id
                    AND julianday(c.created_at) >= julianday('now', '-14 days')) AS recent,
-               (SELECT COUNT(*) FROM issue_cluster_members icm
+               (SELECT COUNT(*) FROM issue_cluster_conversations icm
                   JOIN conversations c ON c.id = icm.conversation_id
                  WHERE icm.cluster_id = ic.id
                    AND julianday(c.created_at) >= julianday('now', '-28 days')
@@ -272,7 +272,7 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO issue_cluster_members (cluster_id, conversation_id) VALUES (1, ?1)",
+                "INSERT INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (1, ?1)",
                 [i],
             )
             .unwrap();

@@ -31,7 +31,7 @@ pub const M015_TO_M019_SQL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_known_issue_links
         ON known_issue_links (known_issue_id, conversation_id);
 
-    -- M016: issue_clusters + issue_cluster_members
+    -- M016: issue_clusters + issue_cluster_conversations
     CREATE TABLE IF NOT EXISTS issue_clusters (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         name            TEXT NOT NULL,
@@ -40,7 +40,7 @@ pub const M015_TO_M019_SQL: &str = r#"
         last_seen_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
         status          TEXT NOT NULL DEFAULT 'active'
     );
-    CREATE TABLE IF NOT EXISTS issue_cluster_members (
+    CREATE TABLE IF NOT EXISTS issue_cluster_conversations (
         cluster_id      INTEGER NOT NULL REFERENCES issue_clusters (id) ON DELETE CASCADE,
         conversation_id INTEGER NOT NULL,
         PRIMARY KEY (cluster_id, conversation_id)
@@ -228,11 +228,11 @@ pub fn add_cluster_member(
     conversation_id: i64,
 ) -> Result<bool> {
     conn.execute(
-        "INSERT OR IGNORE INTO issue_cluster_members (cluster_id, conversation_id) VALUES (?1, ?2)",
+        "INSERT OR IGNORE INTO issue_cluster_conversations (cluster_id, conversation_id) VALUES (?1, ?2)",
         params![cluster_id, conversation_id],
     )?;
     conn.execute(
-        "UPDATE issue_clusters SET conversation_count = (SELECT COUNT(*) FROM issue_cluster_members WHERE cluster_id = ?1),
+        "UPDATE issue_clusters SET conversation_count = (SELECT COUNT(*) FROM issue_cluster_conversations WHERE cluster_id = ?1),
          last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
         params![cluster_id],
     )?;
@@ -1491,7 +1491,7 @@ pub fn delete_incident_release(
 /// id linked to the cluster, oldest link first.
 pub fn cluster_conversation_ids(conn: &Connection, cluster_id: i64) -> Vec<i64> {
     conn.prepare(
-        "SELECT conversation_id FROM issue_cluster_members WHERE cluster_id = ?1 ORDER BY rowid",
+        "SELECT conversation_id FROM issue_cluster_conversations WHERE cluster_id = ?1 ORDER BY rowid",
     )
     .map(|mut stmt| {
         stmt.query_map(params![cluster_id], |r| r.get::<_, i64>(0))

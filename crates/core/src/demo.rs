@@ -1746,7 +1746,7 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM user_statuses"), 3);
         assert_eq!(count("SELECT COUNT(*) FROM docs_collections"), 2);
         assert_eq!(count("SELECT COUNT(*) FROM docs_categories"), 4);
-        assert_eq!(count("SELECT COUNT(*) FROM docs"), 9);
+        assert_eq!(count("SELECT COUNT(*) FROM docs_articles"), 9);
 
         assert!(seed_demo_data(&conn, true));
 
@@ -1763,7 +1763,7 @@ mod tests {
         // tz cluster (3 conversations) + billing cluster (2 conversations).
         assert_eq!(count("SELECT COUNT(*) FROM issue_clusters"), 2);
         assert_eq!(
-            count("SELECT COUNT(*) FROM issue_cluster_members"),
+            count("SELECT COUNT(*) FROM issue_cluster_conversations"),
             5,
             "3 timezone + 2 billing cluster members"
         );

@@ -790,7 +790,7 @@ fn compose_memory_profile(conn: &rusqlite::Connection, customer_id: i64) -> Comp
         .prepare(
             "SELECT ic.id, ic.name, COUNT(icm.conversation_id) AS linked, MAX(ic.last_seen_at)
              FROM issue_clusters ic
-             JOIN issue_cluster_members icm ON icm.cluster_id = ic.id
+             JOIN issue_cluster_conversations icm ON icm.cluster_id = ic.id
              JOIN conversations cv ON cv.id = icm.conversation_id
              WHERE cv.customer_id = ?1
              GROUP BY ic.id

@@ -1709,7 +1709,7 @@ pub fn deterministic_records(
     // Issue cluster membership: derived from stored cluster rows.
     let cluster: Option<String> = conn
         .query_row(
-            "SELECT ic.name FROM issue_cluster_members icm
+            "SELECT ic.name FROM issue_cluster_conversations icm
              JOIN issue_clusters ic ON ic.id = icm.cluster_id
              WHERE icm.conversation_id = ?1
              ORDER BY ic.id DESC LIMIT 1",
@@ -1775,7 +1775,7 @@ mod tests {
                 first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
                 last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
                 status TEXT NOT NULL DEFAULT 'active');
-             CREATE TABLE issue_cluster_members (
+             CREATE TABLE issue_cluster_conversations (
                 cluster_id INTEGER NOT NULL, conversation_id INTEGER NOT NULL,
                 PRIMARY KEY (cluster_id, conversation_id));",
         )

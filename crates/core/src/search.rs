@@ -1336,10 +1336,10 @@ fn rebuild_indexes_tx(conn: &Connection) -> Result<usize> {
     )?;
 
     // docs_fts (soft-deleted articles excluded).
-    if table_exists(conn, "docs")? {
+    if table_exists(conn, "docs_articles")? {
         conn.execute(
             "INSERT INTO docs_fts (name, text, article_id)
-             SELECT name, COALESCE(text, ''), id FROM docs WHERE deleted_at IS NULL",
+             SELECT name, COALESCE(text, ''), id FROM docs_articles WHERE deleted_at IS NULL",
             [],
         )?;
     }
@@ -1490,18 +1490,10 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        crate::activity::apply_m003(&conn).unwrap();
-        crate::ticket_states::apply_m004(&conn).unwrap();
-        crate::data_tools::apply_m026_to_m027(&conn).unwrap();
-        crate::inbox::apply_m028(&conn).unwrap();
-        crate::sync_schema::apply_m029(&conn).unwrap();
-        crate::conversation_ops::apply_m030(&conn).unwrap();
-        crate::intelligence_features::apply_m015_to_m019(&conn).unwrap();
-        crate::embeddings::apply_m008(&conn).unwrap();
-        crate::customer_events::apply_m036(&conn).unwrap();
-        apply_fts_migration(&conn).unwrap();
+        // The canonical boot chain (bootstrap.rs contract: every path uses
+        // apply_all; this fixture predates it and hand-copied the steps,
+        // which stopped at M029's `docs` name before DB-02's m044).
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         conn
     }
 
@@ -2494,7 +2486,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO docs (remote_id, name, text) VALUES (1, 'Billing article', 'How billing works')",
+            "INSERT INTO docs_articles (remote_id, name, text) VALUES (1, 'Billing article', 'How billing works')",
             [],
         )
         .unwrap();
