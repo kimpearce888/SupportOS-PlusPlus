@@ -1861,7 +1861,11 @@ impl SyncEngine {
         }
     }
 
-    async fn sync_customers(&self, since: Option<&str>, initial: bool) -> Result<ResourceSyncResult> {
+    async fn sync_customers(
+        &self,
+        since: Option<&str>,
+        initial: bool,
+    ) -> Result<ResourceSyncResult> {
         let resource = "customers".to_string();
         let mut processed = 0;
         // DB-12 (syncRepo cursors): the initial page walk resumes from the
@@ -2752,7 +2756,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-            assert!(stamped.is_some_and(|t| !t.is_empty()));
+        assert!(stamped.is_some_and(|t| !t.is_empty()));
         // The cursor rows never touch the checkpoint bookkeeping.
         let checkpoints: i64 = conn
             .query_row(
@@ -2775,7 +2779,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 1, "the cleared row stays (NULL cursor), like the reference");
+        assert_eq!(
+            rows, 1,
+            "the cleared row stays (NULL cursor), like the reference"
+        );
     }
 
     #[test]
@@ -2784,7 +2791,11 @@ mod tests {
         // (last_page / last_seen_at / cursor_token). The boot chain must
         // reshape it to the reference shape (resource / cursor / updated_at)
         // and adopt any stored token.
-        let f = NamedTempFile::new().unwrap().into_temp_path().keep().unwrap();
+        let f = NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
         crate::migrations::run_all(&mut conn).unwrap();
         conn.execute(

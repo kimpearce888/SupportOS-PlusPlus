@@ -167,8 +167,9 @@ pub async fn import(State(state): State<AppState>, Json(body): Json<Value>) -> R
     }
 }
 
-/// POST /api/knowledge/import-file — import a file (MD/TXT/CSV/JSON/HTML;
-/// PDF/DOCX degrade honestly) confined to the knowledge-import folder.
+/// POST /api/knowledge/import-file — import a file (MD/TXT/CSV/JSON/HTML
+/// natively; PDF/DOCX with real text extraction — KN-02) confined to the
+/// knowledge-import folder.
 pub async fn import_file(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
     let Some(path) = body
         .get("path")

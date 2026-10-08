@@ -1023,12 +1023,7 @@ fn parse_reply_body(
         None | Some(Value::Null) => None,
         Some(v) => match zod_int_value(v) {
             Ok(n) if n > 0 => Some(n),
-            Ok(_) => {
-                return Err(zod_422(
-                    "aiDraftId",
-                    "Number must be greater than 0",
-                ))
-            }
+            Ok(_) => return Err(zod_422("aiDraftId", "Number must be greater than 0")),
             Err(m) => return Err(zod_422("aiDraftId", &m)),
         },
     };

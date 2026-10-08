@@ -2448,7 +2448,7 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&mut conn).unwrap();
+        crate::db::ensure_migrations_table(&conn).unwrap();
         crate::migrations::run_all(&mut conn).unwrap();
         conn.execute(
             "INSERT INTO application_settings (key, value)
@@ -2485,7 +2485,9 @@ mod tests {
         let provider = RealHelpScoutProvider::new(conn.clone(), HsCredentials::default());
         // The main-API limiter persists through the provider's connection —
         // previously this was dead code (the limiter was built with None).
-        provider.limiter.record_response(Some(150), Some(149), None, true);
+        provider
+            .limiter
+            .record_response(Some(150), Some(149), None, true);
         let (limit, remaining, _retry) = {
             let c = conn.lock().unwrap();
             hs_rate_limit_row(&c)
@@ -2493,7 +2495,8 @@ mod tests {
         assert_eq!((limit, remaining), (150, Some(149)));
         // And the provider's queue is bound to the SAME limiter instance.
         assert_eq!(
-            provider.queue.snapshot()["active"].as_i64().unwrap_or(0), 0,
+            provider.queue.snapshot()["active"].as_i64().unwrap_or(0),
+            0,
             "queue construction does not enqueue anything by itself"
         );
     }

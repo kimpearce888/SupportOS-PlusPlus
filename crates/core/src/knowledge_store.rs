@@ -22,6 +22,7 @@
 //!   data directory (the reference's v1.6.0 audit fix: `data/` itself —
 //!   the live SQLite DB, WAL files, sync bundles — is never importable).
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
@@ -745,8 +746,10 @@ pub fn import_file(
     )
 }
 
-/// Parse + upsert one file (MD/TXT/CSV/JSON/HTML native; PDF/DOCX error
-/// honestly — the reference degrades the same way without its parsers).
+/// Parse + upsert one file (MD/TXT/CSV/JSON/HTML native; PDF/DOCX parsed
+/// with real extractors — KN-02: pdf-extract for text-based PDFs,
+/// zip + w:t extraction for DOCX, mirroring the reference's pdf-parse +
+/// mammoth `extractRawText` pair, ingestor.ts:85-163).
 fn import_one_file(
     conn: &Connection,
     abs: &Path,
@@ -774,15 +777,23 @@ fn import_one_file(
             let body = html_to_text_keep_structure(&text);
             vec![(title, body, "html".to_string())]
         }
+        // KN-02: the reference's parsePdf (pdf-parse) + the scanned-images
+        // empty-text guard (ingestor.ts:85-90).
         "pdf" => {
-            return Err(Error::Validation(
-                "PDF parsing is unavailable or failed for this file. Supported best with text-based PDFs.".to_string(),
-            ));
+            let text = parse_pdf_text(&raw)?;
+            if text.trim().is_empty() {
+                return Err(Error::Validation(
+                    "No text could be extracted from this PDF (it may be scanned images)."
+                        .to_string(),
+                ));
+            }
+            vec![(base, text, "txt".to_string())]
         }
+        // KN-02: the reference's parseDocx (mammoth extractRawText,
+        // ingestor.ts:93-96): paragraphs joined with newlines.
         "docx" => {
-            return Err(Error::Validation(
-                "DOCX parsing is unavailable or failed for this file.".to_string(),
-            ));
+            let text = parse_docx_text(&raw)?;
+            vec![(base, text, "txt".to_string())]
         }
         other => {
             return Err(Error::Validation(format!(
@@ -797,6 +808,93 @@ fn import_one_file(
         let (id, changed) =
             upsert_document(conn, source_id, &title, &content, visibility, &format)?;
         out.push(import_result(id, &title, changed));
+    }
+    Ok(out)
+}
+
+/// Extract text from a (text-based) PDF — the reference's pdf-parse
+/// (ingestor.ts:147-154). Any decoder failure maps to the reference's
+/// catch-all message.
+fn parse_pdf_text(raw: &[u8]) -> Result<String> {
+    pdf_extract::extract_text_from_mem(raw).map_err(|_| {
+        Error::Validation(
+            "PDF parsing is unavailable or failed for this file. Supported best with text-based PDFs."
+                .to_string(),
+        )
+    })
+}
+
+/// Extract raw text from a DOCX — the reference's mammoth
+/// `extractRawText` (ingestor.ts:157-163): the text of every `w:t` run,
+/// with a newline at each paragraph boundary.
+fn parse_docx_text(raw: &[u8]) -> Result<String> {
+    let docx_unavailable =
+        || Error::Validation("DOCX parsing is unavailable or failed for this file.".to_string());
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(raw)).map_err(|_| docx_unavailable())?;
+    let mut xml = String::new();
+    {
+        let mut document = archive
+            .by_name("word/document.xml")
+            .map_err(|_| docx_unavailable())?;
+        document
+            .read_to_string(&mut xml)
+            .map_err(|_| docx_unavailable())?;
+    }
+    let mut out = String::new();
+    let mut in_text = false;
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    reader.config_mut().trim_text(false);
+    loop {
+        use quick_xml::events::Event;
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                if e.name().0 == "w:t" {
+                    in_text = true;
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_text {
+                    out.push_str(&t.xml10_content());
+                }
+            }
+            // quick-xml surfaces entity references as their own events —
+            // decode the five predefined XML entities + numeric refs
+            // (what mammoth's raw-text extraction yields).
+            Ok(Event::GeneralRef(r)) => {
+                if in_text {
+                    let decoded: Option<char> = match r.as_ref() {
+                        "amp" => Some('&'),
+                        "lt" => Some('<'),
+                        "gt" => Some('>'),
+                        "quot" => Some('"'),
+                        "apos" => Some('\''),
+                        numeric => {
+                            let n = numeric
+                                .strip_prefix("#x")
+                                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                .or_else(|| {
+                                    numeric
+                                        .strip_prefix('#')
+                                        .and_then(|d| d.parse::<u32>().ok())
+                                });
+                            n.and_then(char::from_u32)
+                        }
+                    };
+                    if let Some(c) = decoded {
+                        out.push(c);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match e.name().0 {
+                "w:t" => in_text = false,
+                "w:p" => out.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(_) => return Err(docx_unavailable()),
+        }
     }
     Ok(out)
 }
@@ -1449,6 +1547,177 @@ mod tests {
         std::fs::write(import.join("f.pdf"), "%PDF-1.4 fake").unwrap();
         let err = import_file(&conn, &root, "f.pdf", None, "internal_only").unwrap_err();
         assert!(err.to_string().contains("PDF"));
+    }
+
+    // ---- KN-02: PDF/DOCX ingestion (pdf-extract + w:t extraction) --------
+
+    /// A minimal, valid one-page PDF whose content stream shows `text`
+    /// with a standard Type1 font — enough for a real text extractor.
+    fn build_pdf(text: Option<&str>) -> Vec<u8> {
+        let stream = match text {
+            Some(t) => format!("BT /F1 12 Tf 72 720 Td ({t}) Tj ET"),
+            None => String::new(),
+        };
+        let content_obj = format!(
+            "4 0 obj\n<< /Length {} >>\nstream\n{}\nendstream\nendobj\n",
+            stream.len(),
+            stream
+        );
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n".to_string(),
+            content_obj,
+            "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n".to_string(),
+        ];
+        let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+        let mut offsets: Vec<usize> = Vec::new();
+        for obj in &objects {
+            offsets.push(out.len());
+            out.extend_from_slice(obj.as_bytes());
+        }
+        let xref_pos = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for off in offsets {
+            out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        out
+    }
+
+    /// A minimal DOCX (Office Open XML zip) with one `w:p` per paragraph —
+    /// the same shape mammoth's `extractRawText` reads.
+    fn build_docx(paragraphs: &[&str]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("word/document.xml", options).unwrap();
+            let body = paragraphs
+                .iter()
+                .map(|p| format!("<w:p><w:r><w:t>{p}</w:t></w:r></w:p>"))
+                .collect::<String>();
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+                 <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                 <w:body>{body}</w:body></w:document>"
+            );
+            writer.write_all(xml.as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn pdf_import_extracts_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let import = root.join(IMPORT_DIR_NAME);
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::write(
+            import.join("kb.pdf"),
+            build_pdf(Some("Hello knowledge base PDF.")),
+        )
+        .unwrap();
+
+        let conn = fresh_db();
+        let out = import_file(&conn, &root, "kb.pdf", None, "internal_only").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["title"], "kb");
+        let (content, format): (String, String) = conn
+            .query_row(
+                "SELECT content, format FROM knowledge_documents WHERE title = 'kb'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(content.contains("Hello knowledge base PDF."), "{content:?}");
+        assert_eq!(format, "txt");
+        // Re-import is checksum-gated: no churn.
+        let again = import_file(&conn, &root, "kb.pdf", None, "internal_only").unwrap();
+        assert_eq!(again[0]["changed"], json!(false));
+    }
+
+    #[test]
+    fn pdf_without_extractable_text_reports_scanned_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let import = root.join(IMPORT_DIR_NAME);
+        std::fs::create_dir_all(&import).unwrap();
+        // A structurally valid PDF whose content stream shows no text (the
+        // scanned-images case, ingestor.ts:89).
+        std::fs::write(import.join("scan.pdf"), build_pdf(None)).unwrap();
+
+        let conn = fresh_db();
+        let err = import_file(&conn, &root, "scan.pdf", None, "internal_only").unwrap_err();
+        assert!(err.to_string().contains("scanned images"), "{err}");
+    }
+
+    #[test]
+    fn docx_import_extracts_paragraphs_and_decodes_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let import = root.join(IMPORT_DIR_NAME);
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::write(
+            import.join("notes.docx"),
+            build_docx(&[
+                "First knowledge paragraph.",
+                "Tom &amp; Jerry &lt;support&gt;",
+                "Third paragraph.",
+            ]),
+        )
+        .unwrap();
+
+        let conn = fresh_db();
+        let out = import_file(&conn, &root, "notes.docx", None, "internal_only").unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["title"], "notes");
+        let (content, format): (String, String) = conn
+            .query_row(
+                "SELECT content, format FROM knowledge_documents WHERE title = 'notes'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(format, "txt");
+        assert!(
+            content.contains("First knowledge paragraph."),
+            "{content:?}"
+        );
+        // XML entities decode like mammoth's raw-text extraction.
+        assert!(content.contains("Tom & Jerry <support>"), "{content:?}");
+        assert!(content.contains("Third paragraph."), "{content:?}");
+        // Paragraph boundaries become newlines.
+        assert!(
+            content.contains("First knowledge paragraph.\n"),
+            "{content:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_docx_errors_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let import = root.join(IMPORT_DIR_NAME);
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::write(import.join("bad.docx"), b"not a zip at all").unwrap();
+
+        let conn = fresh_db();
+        let err = import_file(&conn, &root, "bad.docx", None, "internal_only").unwrap_err();
+        assert!(
+            err.to_string().contains("DOCX parsing is unavailable"),
+            "{err}"
+        );
     }
 
     #[test]
