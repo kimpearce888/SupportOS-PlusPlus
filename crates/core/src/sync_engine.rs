@@ -246,6 +246,34 @@ pub fn last_successful_sync(conn: &Connection) -> Option<String> {
     .flatten()
 }
 
+/// `getCursor(resource)` — the persisted page token for a paged resource
+/// walk (syncRepo.getCursor). Used by the initial-sync page loop so an
+/// interrupted run resumes from the next page instead of page 1; `None`
+/// when no token is saved (fresh start).
+pub fn get_cursor(conn: &Connection, resource: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT remote_cursor FROM sync_checkpoints WHERE resource = ?1",
+        params![resource],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .filter(|c| !c.is_empty())
+}
+
+/// `setCursor(resource, cursor)` — save the page token the page loop is
+/// about to follow (syncRepo.setCursor). `None` CLEARS the token: the
+/// walk reached the last page, so the next full pass starts from page 1
+/// (upserts make re-processing a page idempotent, at-least-once).
+pub fn set_cursor(conn: &Connection, resource: &str, cursor: Option<&str>) {
+    let _ = conn.execute(
+        "INSERT INTO sync_checkpoints (resource, remote_cursor)
+         VALUES (?1, ?2)
+         ON CONFLICT(resource) DO UPDATE SET remote_cursor = excluded.remote_cursor",
+        params![resource, cursor],
+    );
+}
+
 /// Resolve a local id from a remote id (`ref.getLocalId` parity).
 pub fn local_id(conn: &Connection, table: &str, remote_id: i64) -> Option<i64> {
     conn.query_row(
@@ -1030,7 +1058,7 @@ impl SyncEngine {
                     let conn = self.lock();
                     get_incremental_since(&conn, "customers", SYNC_OVERLAP_MINUTES)
                 };
-                let r = self.sync_customers(since.as_deref()).await;
+                let r = self.sync_customers(since.as_deref(), false).await;
                 let _ = self.finish_resource("customers", r, &mut results);
             }
             // 3. Conversations changed since checkpoint (overlap window).
@@ -1573,7 +1601,7 @@ impl SyncEngine {
                     let conn = self.lock();
                     get_incremental_since(&conn, "customers", SYNC_OVERLAP_MINUTES)
                 };
-                self.sync_customers(since.as_deref()).await
+                self.sync_customers(since.as_deref(), initial).await
             }
             "saved_replies" => {
                 let mbs = self.provider.list_mailboxes().await?;
@@ -1831,10 +1859,19 @@ impl SyncEngine {
         }
     }
 
-    async fn sync_customers(&self, since: Option<&str>) -> Result<ResourceSyncResult> {
+    async fn sync_customers(&self, since: Option<&str>, initial: bool) -> Result<ResourceSyncResult> {
         let resource = "customers".to_string();
         let mut processed = 0;
-        let mut cursor: Option<String> = None;
+        // DB-12 (syncRepo cursors): the initial page walk resumes from the
+        // persisted token and saves each next token, so an interrupted
+        // initial sync continues at the next page instead of page 1.
+        // Incremental passes always start fresh.
+        let mut cursor = if initial {
+            let conn = self.lock();
+            get_cursor(&conn, "customers")
+        } else {
+            None
+        };
         loop {
             let page = self
                 .provider
@@ -1853,8 +1890,22 @@ impl SyncEngine {
             }
             let empty = page.items.is_empty();
             match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
+                Some(next) => {
+                    if initial {
+                        let conn = self.lock();
+                        set_cursor(&conn, "customers", Some(&next));
+                    }
+                    cursor = Some(next);
+                }
+                None => {
+                    if initial {
+                        // Last page reached: clear the token so the next
+                        // full pass starts from page 1.
+                        let conn = self.lock();
+                        set_cursor(&conn, "customers", None);
+                    }
+                    break;
+                }
             }
             if since.is_some() && empty {
                 break;
@@ -1875,7 +1926,15 @@ impl SyncEngine {
     ) -> Result<ResourceSyncResult> {
         let resource = "conversations".to_string();
         let mut processed = 0;
-        let mut cursor: Option<String> = None;
+        // DB-12 (syncRepo cursors): resume/clear semantics as the customers
+        // walk — the token rides the 'conversations' checkpoint row (the
+        // 'threads' resource shares this loop and the same row).
+        let mut cursor = if initial {
+            let conn = self.lock();
+            get_cursor(&conn, "conversations")
+        } else {
+            None
+        };
         loop {
             let page = self
                 .provider
@@ -1902,8 +1961,20 @@ impl SyncEngine {
             }
             let empty = page.items.is_empty();
             match page.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
+                Some(next) => {
+                    if initial {
+                        let conn = self.lock();
+                        set_cursor(&conn, "conversations", Some(&next));
+                    }
+                    cursor = Some(next);
+                }
+                None => {
+                    if initial {
+                        let conn = self.lock();
+                        set_cursor(&conn, "conversations", None);
+                    }
+                    break;
+                }
             }
             if !initial && empty {
                 break;
@@ -2653,6 +2724,201 @@ mod tests {
             )
             .unwrap();
         assert!(with_emails >= 5, "customers with emails: {with_emails}");
+    }
+
+    // ---- DB-12: syncRepo cursors (getCursor/setCursor page tokens) --------
+
+    fn b64_index(n: usize) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(n.to_string())
+    }
+
+    #[test]
+    fn cursor_round_trip_and_clear() {
+        let conn = fresh_conn();
+        // Missing row / NULL → None (fresh start).
+        assert_eq!(get_cursor(&conn, "customers"), None);
+        // Save + read back.
+        set_cursor(&conn, "customers", Some("token-abc"));
+        assert_eq!(get_cursor(&conn, "customers"), Some("token-abc".into()));
+        // The checkpoint row coexists with the record_success fields.
+        record_success(&conn, "customers", 5);
+        assert_eq!(
+            get_cursor(&conn, "customers"),
+            Some("token-abc".into()),
+            "record_success must not clobber the page token"
+        );
+        // Clear → None; a stored empty string also reads as None.
+        set_cursor(&conn, "customers", None);
+        assert_eq!(get_cursor(&conn, "customers"), None);
+        set_cursor(&conn, "customers", Some(""));
+        assert_eq!(get_cursor(&conn, "customers"), None);
+        // The row still exists (status untouched by set_cursor).
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM sync_checkpoints WHERE resource = 'customers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "ok", "set_cursor leaves the checkpoint status alone");
+    }
+
+    #[tokio::test]
+    async fn initial_sync_resumes_conversations_from_the_persisted_token() {
+        let (conn, engine) = engine();
+        // An interrupted conversations walk left the page token at index 20
+        // (the demo world has 20 listable conversations: 21 minus 1 merged).
+        {
+            let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+            set_cursor(&c, "conversations", Some(&b64_index(20)));
+        }
+        let r = engine.sync_resource("conversations", true).await.unwrap();
+        assert_eq!(
+            r.processed, 0,
+            "the walk must resume AT the saved page, not re-walk from page 1"
+        );
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let convs: i64 = c
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(convs, 0, "nothing past the token was fetched");
+        assert_eq!(
+            get_cursor(&c, "conversations"),
+            None,
+            "the last page clears the token for the next full pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_sync_clears_the_customers_token_on_completion() {
+        let (conn, engine) = engine();
+        let r = engine.sync_resource("customers", true).await.unwrap();
+        assert_eq!(r.processed, 8, "the full demo customer set walks");
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(get_cursor(&c, "customers"), None);
+        let customers: i64 = c
+            .query_row("SELECT COUNT(*) FROM customers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(customers, 8);
+    }
+
+    /// A provider that pages customers 3-at-a-time and fails the SECOND
+    /// list_customers call (simulating an interrupted walk), then heals on
+    /// the next call. Everything else delegates to the fake provider.
+    struct InterruptedCustomersProvider {
+        inner: FakeHelpScoutProvider,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::helpscout::HelpScoutProvider for InterruptedCustomersProvider {
+        fn kind(&self) -> &'static str {
+            self.inner.kind()
+        }
+        async fn get_me(&self) -> Result<crate::helpscout::HsUser> {
+            self.inner.get_me().await
+        }
+        async fn list_mailboxes(&self) -> Result<Vec<crate::helpscout::HsMailbox>> {
+            self.inner.list_mailboxes().await
+        }
+        async fn list_users(&self) -> Result<Vec<crate::helpscout::HsUser>> {
+            self.inner.list_users().await
+        }
+        async fn list_teams(&self) -> Result<Vec<crate::helpscout::HsTeam>> {
+            self.inner.list_teams().await
+        }
+        async fn list_tags(&self) -> Result<Vec<crate::helpscout::HsTag>> {
+            self.inner.list_tags().await
+        }
+        async fn list_conversations(
+            &self,
+            query: &crate::helpscout::ConversationQuery,
+        ) -> Result<crate::helpscout::Page<crate::helpscout::HsConversation>> {
+            self.inner.list_conversations(query).await
+        }
+        async fn list_customers(
+            &self,
+            query: &crate::helpscout::CustomerQuery,
+        ) -> Result<crate::helpscout::Page<crate::helpscout::HsCustomer>> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 1 {
+                return Err(crate::error::Error::Other(
+                    "simulated interruption mid-walk".into(),
+                ));
+            }
+            let mut paged = query.clone();
+            paged.page_size = Some(3);
+            self.inner.list_customers(&paged).await
+        }
+        async fn list_beacon_chats(&self) -> Result<Vec<crate::helpscout::HsBeaconChat>> {
+            self.inner.list_beacon_chats().await
+        }
+        async fn list_docs(&self) -> Result<Vec<crate::helpscout::HsDocArticle>> {
+            self.inner.list_docs().await
+        }
+        async fn list_ratings(&self) -> Result<Vec<crate::helpscout::HsRating>> {
+            self.inner.list_ratings().await
+        }
+        async fn create_reply_thread(
+            &self,
+            input: crate::helpscout::CreateThreadInput,
+        ) -> Result<crate::helpscout::ThreadCreated> {
+            self.inner.create_reply_thread(input).await
+        }
+        async fn create_note_thread(
+            &self,
+            input: crate::helpscout::CreateThreadInput,
+        ) -> Result<crate::helpscout::ThreadCreated> {
+            self.inner.create_note_thread(input).await
+        }
+        async fn update_conversation(
+            &self,
+            conversation_id: i64,
+            patch: crate::helpscout::ConversationPatch,
+        ) -> Result<bool> {
+            self.inner.update_conversation(conversation_id, patch).await
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_customers_walk_saves_the_token_and_resumes() {
+        let conn = Arc::new(std::sync::Mutex::new(fresh_conn()));
+        let engine = SyncEngine::new(
+            conn.clone(),
+            Arc::new(InterruptedCustomersProvider {
+                inner: FakeHelpScoutProvider::new_demo(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        // First pass: page 1 (customers 0..3) lands, the page-2 fetch fails.
+        let first = engine.sync_resource("customers", true).await;
+        assert!(first.is_err(), "the simulated interruption propagates");
+        {
+            let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+            let mirrored: i64 = c
+                .query_row("SELECT COUNT(*) FROM customers", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(mirrored, 3, "page 1's customers landed before the failure");
+            assert_eq!(
+                get_cursor(&c, "customers"),
+                Some(b64_index(3)),
+                "the token for page 2 was persisted mid-walk"
+            );
+        }
+        // Second pass: resumes at the saved token, walks the remaining 5,
+        // completes and clears.
+        let second = engine.sync_resource("customers", true).await.unwrap();
+        assert_eq!(
+            second.processed, 5,
+            "the resumed walk only processes the remaining pages"
+        );
+        let c = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mirrored: i64 = c
+            .query_row("SELECT COUNT(*) FROM customers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mirrored, 8, "every customer landed across the two passes");
+        assert_eq!(get_cursor(&c, "customers"), None);
     }
 
     // ---- DC-01: docs mirror upserts (reference docsRepo.ts) ---------------

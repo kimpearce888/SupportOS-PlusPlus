@@ -1,6 +1,6 @@
-//! Sync mirror write-layer — cursor/checkpoint helpers + the Help Scout
-//! upsert helpers the SyncEngine (sync_engine.rs) and the worker job
-//! executor share. The coordinator itself (initial/incremental/reconcile)
+//! Sync mirror write-layer — the Help Scout upsert helpers the SyncEngine
+//! (sync_engine.rs) and the worker job executor share. The coordinator
+//! itself (initial/incremental/reconcile, checkpoint + cursor helpers)
 //! lives in `sync_engine.rs`; this module owns the SQL that lands rows.
 
 use rusqlite::{params, Connection};
