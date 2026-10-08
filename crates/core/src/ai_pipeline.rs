@@ -325,7 +325,40 @@ pub fn ensure_pipeline_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_ai_runs_conversation ON ai_runs(conversation_id);
         CREATE INDEX IF NOT EXISTS idx_ai_runs_type ON ai_runs(type, status);
         CREATE INDEX IF NOT EXISTS idx_ai_runs_cache ON ai_runs(type, input_hash, prompt_version);
-    ",
+        CREATE TABLE IF NOT EXISTS golden_test_set (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL UNIQUE,
+            category    TEXT NOT NULL,
+            subject     TEXT NOT NULL,
+            body        TEXT NOT NULL,
+            active      INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+        CREATE TABLE IF NOT EXISTS golden_test_runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            finished_at TEXT,
+            backend     TEXT NOT NULL DEFAULT '',
+            passed      INTEGER NOT NULL DEFAULT 0,
+            failed      INTEGER NOT NULL DEFAULT 0,
+            results     TEXT
+        );
+        ",
+    )?;
+    // The golden test seed (spec scenarios #78/#79; reference aiRepo creates
+    // the table at runtime and seeds the same nine) — idempotent by name.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO golden_test_set (name, category, subject, body) VALUES
+          ('simple question', 'simple', 'What time do you close?', 'Hi, what are your support hours?'),
+          ('multi-question ticket', 'multi', 'Two things: export + timezone', 'How do I export data? Also how do I change the timezone for scheduled reports?'),
+          ('ambiguous ticket', 'ambiguous', 'It does not work', 'The thing keeps failing sometimes. Not sure what is wrong.'),
+          ('known issue', 'known_issue', 'Meeting reminders one hour late', 'Since the DST change our reminders are all one hour late.'),
+          ('customer history', 'history', 'Follow-up on the export issue', 'The export you helped me with last month broke again.'),
+          ('timezone issue', 'timezone', 'Santiago timezone wrong', 'Scheduled report sends at 3 AM instead of 8 AM Chile time.'),
+          ('integration issue', 'integration', 'Slack integration broken', 'The Slack integration stopped posting updates to our channel.'),
+          ('billing question', 'billing', 'Card declined', 'My payment failed but the card works everywhere else.'),
+          ('internal escalation', 'escalation', 'URGENT outage for key account', 'Our production access is down, we need this escalated now.');
+        ",
     )?;
     Ok(())
 }

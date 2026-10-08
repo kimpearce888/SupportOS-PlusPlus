@@ -763,74 +763,274 @@ pub async fn ai_analytics(State(state): State<AppState>) -> Json<Value> {
 
 /// GET /api/ai/evaluation — the golden test set (spec #78, #79) + the
 /// configured evaluation mode (reference `getAllSettings().ai_evaluation_mode`
-/// — a boolean, default false; the checkbox in the UI depends on it).
+/// — a boolean, default false; the checkbox in the UI depends on it) + the
+/// latest recorded run (AI-23: `golden_test_set` is a seeded table and runs
+/// are restored — see [`evaluation_run`]).
 pub async fn evaluation(State(state): State<AppState>) -> Json<Value> {
     let conn = state.conn_lock();
     let mode = crate::settings::get_bool(&conn, "ai_evaluation_mode", false).unwrap_or(false);
-    let tests = [
-        (
-            "simple question",
-            "simple",
-            "What time do you close?",
-            "Hi, what are your support hours?",
-        ),
-        (
-            "multi-question ticket",
-            "multi",
-            "Two things: export + timezone",
-            "How do I export data? Also how do I change the timezone for scheduled reports?",
-        ),
-        (
-            "ambiguous ticket",
-            "ambiguous",
-            "It does not work",
-            "The thing keeps failing sometimes. Not sure what is wrong.",
-        ),
-        (
-            "known issue",
-            "known_issue",
-            "Meeting reminders one hour late",
-            "Since the DST change our reminders are all one hour late.",
-        ),
-        (
-            "customer history",
-            "history",
-            "Follow-up on the export issue",
-            "The export you helped me with last month broke again.",
-        ),
-        (
-            "timezone issue",
-            "timezone",
-            "Santiago timezone wrong",
-            "Scheduled report sends at 3 AM instead of 8 AM Chile time.",
-        ),
-        (
-            "integration issue",
-            "integration",
-            "Slack integration broken",
-            "The Slack integration stopped posting updates to our channel.",
-        ),
-        (
-            "billing question",
-            "billing",
-            "Card declined",
-            "My payment failed but the card works everywhere else.",
-        ),
-        (
-            "internal escalation",
-            "escalation",
-            "URGENT outage for key account",
-            "Our production access is down, we need this escalated now.",
-        ),
-    ];
+    // The pipeline schema owns the golden_test_set table + its seed.
+    ai_pipeline::ensure_pipeline_schema(&conn).ok();
+    let tests: Vec<Value> = conn
+        .prepare(
+            "SELECT name, category, subject, body FROM golden_test_set
+              WHERE active = 1 ORDER BY id",
+        )
+        .map(|mut stmt| {
+            let rows: Vec<std::result::Result<Value, _>> = stmt
+                .query_map([], |r| {
+                    Ok(json!({
+                        "name": r.get::<_, String>(0)?,
+                        "category": r.get::<_, String>(1)?,
+                        "payload": {
+                            "subject": r.get::<_, String>(2)?,
+                            "body": r.get::<_, String>(3)?,
+                        },
+                    }))
+                })
+                .map(|rows| rows.collect())
+                .unwrap_or_default();
+            rows.into_iter().filter_map(|r| r.ok()).collect()
+        })
+        .unwrap_or_default();
+    // The latest recorded run, parsed back from its results JSON.
+    let last_run: Option<Value> = conn
+        .query_row(
+            "SELECT id, started_at, finished_at, backend, passed, failed, results
+               FROM golden_test_runs ORDER BY id DESC LIMIT 1",
+            [],
+            |r| {
+                let results: Option<String> = r.get(6)?;
+                let results: Value = results
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| json!([]));
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "started_at": r.get::<_, Option<String>>(1)?,
+                    "finished_at": r.get::<_, Option<String>>(2)?,
+                    "backend": r.get::<_, String>(3)?,
+                    "passed": r.get::<_, i64>(4)?,
+                    "failed": r.get::<_, i64>(5)?,
+                    "results": results,
+                }))
+            },
+        )
+        .ok();
     Json(json!({
-        "tests": tests.iter().map(|(name, category, subject, body)| json!({
-            "name": name,
-            "category": category,
-            "payload": { "subject": subject, "body": body },
-        })).collect::<Vec<_>>(),
+        "tests": tests,
         "evaluation_mode": mode,
+        "last_run": last_run,
     }))
+}
+
+/// POST /api/ai/evaluation/run — run the golden test set through the real
+/// pipeline (AI-23). One synthetic LOCAL conversation per golden test
+/// (created, analyzed, drafted, verified, then removed — the reference's
+/// "deterministic mocked pipeline" seat: the port runs the actual stages
+/// against the configured backend and records the honest outcomes).
+///
+/// A test passes when the full chain completes: ticket analysis, draft
+/// generation, and the verification pass. With the AI backend disabled
+/// every test records the honest failure reason — nothing is fabricated.
+/// The run row (`golden_test_runs`) stores the per-test results; the
+/// synthetic conversations are cleaned up so evaluation never pollutes
+/// the mirror.
+pub async fn evaluation_run(State(state): State<AppState>) -> Response {
+    let result = state
+        .run_ai(move |conn| {
+            Box::pin(async move {
+                ai_pipeline::ensure_pipeline_schema(conn).ok();
+                let backend = ai_pipeline::backend_from_settings(conn);
+                let backend_label = match &backend {
+                    ai_pipeline::AiBackend::LmStudio { .. } => "lmstudio",
+                    ai_pipeline::AiBackend::Disabled => "disabled",
+                };
+                let tests: Vec<(String, String, String, String)> = conn
+                    .prepare(
+                        "SELECT name, category, subject, body FROM golden_test_set
+                          WHERE active = 1 ORDER BY id",
+                    )
+                    .map(|mut stmt| {
+                        let rows: Vec<std::result::Result<(String, String, String, String), _>> =
+                            stmt
+                                .query_map([], |r| {
+                                    Ok((
+                                        r.get::<_, String>(0)?,
+                                        r.get::<_, String>(1)?,
+                                        r.get::<_, String>(2)?,
+                                        r.get::<_, String>(3)?,
+                                    ))
+                                })
+                                .map(|rows| rows.collect())
+                                .unwrap_or_default();
+                        rows.into_iter().filter_map(|r| r.ok()).collect()
+                    })
+                    .unwrap_or_default();
+                let run_id: i64 = conn
+                    .query_row(
+                        "INSERT INTO golden_test_runs (backend) VALUES (?1) RETURNING id",
+                        rusqlite::params![backend_label],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let mut passed: i64 = 0;
+                let mut failed: i64 = 0;
+                let mut results: Vec<Value> = Vec::new();
+                for (name, category, subject, body) in tests {
+                    let outcome = run_one_golden_test(conn, &backend, &subject, &body).await;
+                    let ok = outcome.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if ok {
+                        passed += 1;
+                    } else {
+                        failed += 1;
+                    }
+                    results.push(json!({
+                        "name": name,
+                        "category": category,
+                        "passed": ok,
+                        "stages": outcome.get("stages").cloned().unwrap_or_else(|| json!({})),
+                        "error": outcome.get("error").cloned().unwrap_or_else(|| json!(null)),
+                    }));
+                }
+                let _ = conn.execute(
+                    "UPDATE golden_test_runs
+                        SET finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                            passed = ?1, failed = ?2, results = ?3
+                      WHERE id = ?4",
+                    rusqlite::params![
+                        passed,
+                        failed,
+                        serde_json::to_string(&results).unwrap_or_else(|_| "[]".into()),
+                        run_id
+                    ],
+                );
+                run_id
+            })
+        })
+        .await;
+    match result {
+        Ok(run_id) => {
+            let conn = state.conn_lock();
+            let run: Option<Value> = conn
+                .query_row(
+                    "SELECT id, started_at, finished_at, backend, passed, failed, results
+                       FROM golden_test_runs WHERE id = ?1",
+                    rusqlite::params![run_id],
+                    |r| {
+                        let results: Option<String> = r.get(6)?;
+                        let results: Value = results
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_else(|| json!([]));
+                        Ok(json!({
+                            "id": r.get::<_, i64>(0)?,
+                            "started_at": r.get::<_, Option<String>>(1)?,
+                            "finished_at": r.get::<_, Option<String>>(2)?,
+                            "backend": r.get::<_, String>(3)?,
+                            "passed": r.get::<_, i64>(4)?,
+                            "failed": r.get::<_, i64>(5)?,
+                            "results": results,
+                        }))
+                    },
+                )
+                .ok();
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "run": run })),
+            )
+                .into_response()
+        }
+        Err(join) => service_503(&join),
+    }
+}
+
+/// Run one golden test through the pipeline stages on a synthetic local
+/// conversation, then clean the conversation up. Returns
+/// `{passed, stages: {analysis, draft, verification}}` with per-stage
+/// `ok`/`error` and an overall `error` on the first failure.
+async fn run_one_golden_test(
+    conn: &rusqlite::Connection,
+    backend: &ai_pipeline::AiBackend,
+    subject: &str,
+    body: &str,
+) -> Value {
+    // ── The synthetic LOCAL conversation (negative remote ids never collide
+    //    with synced rows; deleted at the end so evaluation is invisible to
+    //    the mirror). ─────────────────────────────────────────────────────
+    let now = chrono::Utc::now().to_rfc3339();
+    let insert = (|| -> std::result::Result<i64, rusqlite::Error> {
+        let remote_id = -(conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) + 1000000 FROM conversations",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?);
+        conn.execute(
+            "INSERT INTO conversations
+                (remote_id, number, subject, status, mailbox_id, customer_id,
+                 priority, created_at, updated_at)
+             VALUES (?1, ?1, ?2, 'active', 1, 3001, 'normal', ?3, ?3)",
+            rusqlite::params![remote_id, subject, now],
+        )?;
+        let conv_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO conversation_threads
+                (conversation_id, thread_type, state, body, actor_type, created_at)
+             VALUES (?1, 'customer_message', 'published', ?2, 'customer', ?3)",
+            rusqlite::params![conv_id, body, now],
+        )?;
+        Ok(conv_id)
+    })();
+    let Ok(conv_id) = insert else {
+        return json!({
+            "passed": false,
+            "stages": {},
+            "error": "Could not create the synthetic evaluation conversation.",
+        });
+    };
+
+    // ── Stage 1: ticket analysis ────────────────────────────────────────
+    let analysis = ai_pipeline::analyze_ticket(conn, backend, conv_id, true).await;
+    let mut stages = serde_json::json!({});
+    match analysis {
+        Ok(outcome) => {
+            stages["analysis"] = json!({ "ok": true, "intent": outcome.analysis.intent.clone() });
+        }
+        Err(e) => {
+            cleanup_golden_conversation(conn, conv_id);
+            return json!({
+                "passed": false,
+                "stages": stages,
+                "error": format!("analysis: {}", e.message),
+            });
+        }
+    }
+
+    // ── Stage 2 + 3: draft generation + the verification pass ───────────
+    match ai_pipeline::generate_draft(conn, backend, conv_id, "verified_answer", true, None).await {
+        Ok((_draft, verification)) => {
+            stages["draft"] = json!({ "ok": true });
+            stages["verification"] = json!({
+                "ok": verification.as_ref().is_some_and(|v| v.verified),
+            });
+            let verified = verification.as_ref().is_some_and(|v| v.verified);
+            cleanup_golden_conversation(conn, conv_id);
+            json!({ "passed": verified, "stages": stages, "error": if verified { Value::Null } else { json!("verification: the draft did not pass the verification pass") } })
+        }
+        Err(e) => {
+            cleanup_golden_conversation(conn, conv_id);
+            json!({
+                "passed": false,
+                "stages": stages,
+                "error": format!("draft: {}", e.message),
+            })
+        }
+    }
+}
+
+/// Remove the synthetic evaluation conversation and its pipeline rows so a
+/// run leaves no residue in the mirror (threads/drafts/facts cascade on
+/// conversation delete; the ai_runs ledger rows keep their history).
+fn cleanup_golden_conversation(conn: &rusqlite::Connection, conv_id: i64) {
+    let _ = conn.execute("DELETE FROM conversations WHERE id = ?1", rusqlite::params![conv_id]);
 }
 
 #[cfg(test)]
@@ -1156,5 +1356,85 @@ mod tests {
         }
         let (_, body) = body_json(evaluation(State(state)).await.into_response()).await;
         assert_eq!(body["evaluation_mode"], json!(true));
+    }
+
+    /// AI-23: the golden set is a seeded TABLE (nine spec scenarios) served
+    /// through GET /api/ai/evaluation, and evaluation RUNS are restored —
+    /// POST /api/ai/evaluation/run records a run row with the honest
+    /// per-test outcomes. With the AI backend disabled every test reports
+    /// the AI-disabled reason instead of fabricating results, the run is
+    /// marked finished, and the synthetic conversations are cleaned up.
+    #[tokio::test]
+    async fn evaluation_run_records_honest_outcomes_and_cleans_up() {
+        let state = make_state();
+        // Force the Disabled backend (the default settings point at an
+        // unreachable LM Studio; ai_enabled=false resolves deterministically).
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::settings::set_bool(&conn, "ai_enabled", false).unwrap();
+        }
+
+        // GET first: the golden set arrives from the seeded table.
+        let (_, body) = body_json(evaluation(State(state.clone())).await.into_response()).await;
+        assert_eq!(body["tests"].as_array().unwrap().len(), 9);
+        assert!(body["last_run"].is_null());
+
+        // Run the evaluation.
+        let (status, body) =
+            body_json(evaluation_run(State(state.clone())).await.into_response()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        let run = &body["run"];
+        assert_eq!(run["backend"], json!("disabled"));
+        assert_eq!(run["passed"], json!(0));
+        assert_eq!(run["failed"], json!(9));
+        assert!(run["finished_at"].as_str().is_some_and(|s| !s.is_empty()));
+        let results = run["results"].as_array().unwrap();
+        assert_eq!(results.len(), 9);
+        // Every failed test carries the honest AI-disabled reason on the
+        // analysis stage, never a fabricated pass.
+        for r in results {
+            assert_eq!(r["passed"], json!(false));
+            let error = r["error"].as_str().unwrap_or_default();
+            assert!(error.starts_with("analysis:"), "error was: {error}");
+        }
+
+        // The mirror is untouched: no synthetic conversations remain.
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let leftover: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversations WHERE remote_id < 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(leftover, 0, "evaluation must clean up its conversations");
+        }
+
+        // GET now serves the recorded run as last_run.
+        let (_, body) = body_json(evaluation(State(state)).await.into_response()).await;
+        let last = &body["last_run"];
+        assert_eq!(last["backend"], json!("disabled"));
+        assert_eq!(last["failed"], json!(9));
+        assert_eq!(last["results"].as_array().unwrap().len(), 9);
+    }
+
+    /// AI-23: the golden_test_set seed is idempotent — re-running the
+    /// pipeline schema never duplicates the nine scenarios.
+    #[tokio::test]
+    async fn golden_set_seed_is_idempotent() {
+        let state = make_state();
+        {
+            let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+            ai_pipeline::ensure_pipeline_schema(&conn).unwrap();
+            ai_pipeline::ensure_pipeline_schema(&conn).unwrap();
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM golden_test_set", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 9);
+        }
+        let (_, body) = body_json(evaluation(State(state)).await.into_response()).await;
+        assert_eq!(body["tests"].as_array().unwrap().len(), 9);
     }
 }

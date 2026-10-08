@@ -97,6 +97,15 @@ pub async fn delete_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     request_json::<T>("DELETE", path, None).await
 }
 
+/// DELETE `path` WITH a JSON body (the schedule-delete route takes its
+/// `threadId` in the body) and parse the JSON response.
+pub async fn delete_json_with_body<T: DeserializeOwned>(
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<T, String> {
+    request_json::<T>("DELETE", path, Some(body)).await
+}
+
 async fn request_json<T: DeserializeOwned>(
     method: &str,
     path: &str,

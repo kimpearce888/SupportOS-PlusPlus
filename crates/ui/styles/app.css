@@ -3338,3 +3338,12 @@ a.spp-kpi-card--link:hover { border-color: var(--spp-accent); }
 .spp-customer__hidden { display: none; }
 
 .spp-customer-profile__timeline { display: flex; flex-direction: column; gap: var(--spp-space-2); }
+
+/* ── Issues page full tab depth (UI-07) ───────────────────────────── */
+.spp-input--tiny { min-width: 0; padding: 2px 8px; font-size: var(--spp-text-xs); }
+.spp-table__cell-actions { white-space: nowrap; text-align: right; }
+.spp-table__cell-actions .spp-button { margin-left: 4px; }
+.spp-def-list { display: grid; grid-template-columns: minmax(140px, max-content) 1fr; gap: 6px 16px; margin: var(--spp-space-3) 0 0; }
+.spp-def-list dt { font-weight: 600; color: var(--spp-fg-muted); font-size: var(--spp-text-xs); }
+.spp-def-list dd { margin: 0; font-size: var(--spp-text-sm); white-space: pre-wrap; overflow-wrap: anywhere; }
+.spp-visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }

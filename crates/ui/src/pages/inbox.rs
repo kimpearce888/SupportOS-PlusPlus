@@ -78,6 +78,9 @@ pub struct ThreadEntry {
     pub actor_id: Option<i64>,
     pub actor_name: Option<String>,
     pub created_at: String,
+    /// The thread state (published / draft — draft replies are the
+    /// schedule-send targets, UI-02).
+    pub state: Option<String>,
 }
 
 /// A conversation detail — matches the Rust `ConversationDetail`.
@@ -124,6 +127,19 @@ pub struct InboxFilters {
     /// here from the dashboard / search links (reference Inbox.tsx:46-66).
     pub tag: Option<String>,
     pub channel: Option<String>,
+    /// The applied saved view (UI-02): `?savedViewId=` compiles the stored
+    /// condition tree server-side (VW-03). None = the plain filters.
+    pub saved_view_id: Option<i64>,
+    /// The current page (UI-02 pagination): 1-based; `?page=` deep link.
+    pub page: u32,
+}
+
+impl InboxFilters {
+    /// Reset to the first page (every filter change restarts paging —
+    /// the reference's reset-on-filter behavior).
+    fn reset_page(&mut self) {
+        self.page = 1;
+    }
 }
 
 /// The composer mode — reply or note.
@@ -133,12 +149,14 @@ pub enum ComposerMode {
     Note,
 }
 
-/// The context-pane tab (reference ContextPane: 'ai' | 'customer' | 'copilot').
+/// The context-pane tab (reference ContextPane: 'ai' | 'customer' |
+/// 'copilot'; UI-02 adds the activity/audit 'activity' tab).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextTab {
     Ai,
     Customer,
     Copilot,
+    Activity,
 }
 
 /// One similar-conversation row (reference AiSidebar / /api/ai/similar/:id).
@@ -184,6 +202,17 @@ fn parse_similar_conversation(v: &serde_json::Value) -> SimilarConversation {
     }
 }
 
+/// Parse a comma/semicolon-separated recipient line into the email array
+/// the replyRequestSchema expects (empty entries dropped) — the CC/BCC
+/// composer fields (UI-02).
+fn parse_recipients(raw: &str) -> Vec<String> {
+    raw.split([',', ';'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The inbox page — 3-pane layout.
 ///
 /// `conversation_id` is set on the `/inbox/conversation/:id` route (the
@@ -213,6 +242,37 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
     let ai_analyzing = create_rw_signal(false);
     let similar = create_rw_signal(Vec::<SimilarConversation>::new());
 
+    // ── UI-02 reference data (users / mailboxes / tags / saved replies) ──
+    // One (local_id, remote_id, name) row per user — assignment posts the
+    // REMOTE id (assignRequestSchema), the detail badge shows the local.
+    let users = create_rw_signal(Vec::<(i64, i64, String)>::new());
+    let mailboxes = create_rw_signal(Vec::<(i64, String)>::new());
+    let tag_names = create_rw_signal(Vec::<String>::new());
+    let saved_replies = create_rw_signal(Vec::<(String, String)>::new()); // (name, text)
+
+    // ── UI-02 composer state (cc/bcc + AI drafting) ──────────────────
+    let composer_cc = create_rw_signal(String::new());
+    let composer_bcc = create_rw_signal(String::new());
+    let ai_drafting = create_rw_signal(false);
+
+    // ── UI-02 detail-editing state (subject / snooze) ─────────────────
+    let editing_subject = create_rw_signal(false);
+    let subject_draft = create_rw_signal(String::new());
+    let snooze_until = create_rw_signal(String::new());
+
+    // ── UI-02 bulk-action bar state ──────────────────────────────────
+    let bulk_action = create_rw_signal("close".to_string());
+    let bulk_param = create_rw_signal(String::new());
+
+    // ── UI-02 tag-editor state (add-tag input on the detail) ──────────
+    let tag_input = create_rw_signal(String::new());
+
+    // ── UI-02 save-current-view state ────────────────────────────────
+    let saving_view = create_rw_signal(false);
+    let view_name = create_rw_signal(String::new());
+    // The selected saved reply (the picker's value signal).
+    let saved_reply_pick = create_rw_signal(String::new());
+
     // ── Cross-page invalidation (UI-26) ─────────────────────────────────
     // The app-level SSE bridge (lib.rs) owns the ONE subscription; it bumps
     // the shared version counters the reference invalidates. The inbox list
@@ -237,6 +297,11 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         let url_status = crate::url_state::query_str(&m, "view");
         let url_tag = crate::url_state::query_str(&m, "tag");
         let url_channel = crate::url_state::query_str(&m, "channel");
+        let url_page = crate::url_state::query_pos_int(&m, "page")
+            .unwrap_or(1)
+            .max(1) as u32;
+        let url_view_id = crate::url_state::query_pos_int(&m, "savedViewId");
+        let url_mailbox = crate::url_state::query_pos_int(&m, "mailboxId");
         // Only touch the URL-managed fields; a redundant set would
         // re-run the list effect for nothing.
         let mut changed = false;
@@ -251,6 +316,18 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
             }
             if f.channel != url_channel {
                 f.channel = url_channel;
+                changed = true;
+            }
+            if f.page != url_page {
+                f.page = url_page;
+                changed = true;
+            }
+            if f.saved_view_id != url_view_id {
+                f.saved_view_id = url_view_id;
+                changed = true;
+            }
+            if f.mailbox_id != url_mailbox {
+                f.mailbox_id = url_mailbox;
                 changed = true;
             }
         });
@@ -274,9 +351,102 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                     ("view", f.status.clone()),
                     ("tag", f.tag.clone()),
                     ("channel", f.channel.clone()),
+                    ("savedViewId", f.saved_view_id.map(|id| id.to_string())),
+                    ("mailboxId", f.mailbox_id.map(|id| id.to_string())),
+                    (
+                        "page",
+                        if f.page > 1 {
+                            Some(f.page.to_string())
+                        } else {
+                            None
+                        },
+                    ),
                 ],
             );
         }) as std::rc::Rc<dyn Fn()>
+    });
+
+    // ── Load reference data once (UI-02) ──────────────────────────────
+    create_effect(move |_| {
+        let users = users;
+        let mailboxes = mailboxes;
+        let tag_names = tag_names;
+        let saved_replies = saved_replies;
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(v) = crate::api::get_json::<serde_json::Value>("/api/users").await {
+                let rows = v
+                    .get("users")
+                    .and_then(|u| u.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                users.set(
+                    rows.iter()
+                        .filter_map(|u| {
+                            Some((
+                                u.get("id").and_then(|x| x.as_i64())?,
+                                u.get("remote_id").and_then(|x| x.as_i64())?,
+                                u.get("display_name")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            ))
+                        })
+                        .collect(),
+                );
+            }
+            if let Ok(v) = crate::api::get_json::<serde_json::Value>("/api/mailboxes").await {
+                mailboxes.set(
+                    v.as_array()
+                        .map(|rows| {
+                            rows.iter()
+                                .filter_map(|m| {
+                                    Some((
+                                        m.get("id").and_then(|x| x.as_i64())?,
+                                        m.get("name")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+            if let Ok(v) = crate::api::get_json::<serde_json::Value>("/api/tags").await {
+                tag_names.set(
+                    v.as_array()
+                        .map(|rows| {
+                            rows.iter()
+                                .filter_map(|t| {
+                                    t.get("name").and_then(|x| x.as_str()).map(str::to_string)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+            if let Ok(v) = crate::api::get_json::<serde_json::Value>("/api/saved-replies").await {
+                saved_replies.set(
+                    v.get("saved_replies")
+                        .and_then(|r| r.as_array())
+                        .map(|rows| {
+                            rows.iter()
+                                .filter_map(|r| {
+                                    let name = r.get("name").and_then(|x| x.as_str())?.to_string();
+                                    let text = r
+                                        .get("text")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    Some((name, text))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+        });
     });
 
     // ── Load conversation list on mount + on filter change + on SSE refresh ─
@@ -291,7 +461,8 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         wasm_bindgen_futures::spawn_local(async move {
             // GET /api/conversations — the reference list endpoint. The view
             // param carries the status filter; q the text filter; tag/channel
-            // the URL-backed deep-link filters (UI-27).
+            // the URL-backed deep-link filters (UI-27); mailboxId, savedViewId
+            // and page the UI-02 FilterBar/pagination additions.
             let mut path = String::from("/api/conversations?pageSize=50");
             if let Some(status) = current_filters.status {
                 path.push_str(&format!("&view={status}"));
@@ -308,6 +479,14 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
             if let Some(channel) = current_filters.channel {
                 path.push_str(&format!("&channel={channel}"));
             }
+            if let Some(mailbox_id) = current_filters.mailbox_id {
+                path.push_str(&format!("&mailboxId={mailbox_id}"));
+            }
+            if let Some(view_id) = current_filters.saved_view_id {
+                path.push_str(&format!("&savedViewId={view_id}"));
+            }
+            let page = current_filters.page.max(1);
+            path.push_str(&format!("&page={page}"));
             match crate::api::get_json::<serde_json::Value>(&path).await {
                 Ok(data) => {
                     let items = data
@@ -488,11 +667,20 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         // text survives the failure (spec #20 — state survives async failures).
         let is_reply = mode == ComposerMode::Reply;
         let path = format!("/api/conversations/{conv_local_id}/{sub_path}");
-        // replyRequestSchema / noteRequestSchema field name: `text`.
-        let body_payload = serde_json::json!({ "text": body });
+        // replyRequestSchema / noteRequestSchema field name: `text`; the
+        // reply schema adds cc/bcc string arrays (UI-02) — absent for notes.
+        let body_payload = if is_reply {
+            let cc = parse_recipients(&composer_cc.get_untracked());
+            let bcc = parse_recipients(&composer_bcc.get_untracked());
+            serde_json::json!({ "text": body, "cc": cc, "bcc": bcc })
+        } else {
+            serde_json::json!({ "text": body })
+        };
         let composer_error = composer_error;
         let composer_body = composer_body;
         let selected_id = selected_id;
+        let composer_cc = composer_cc;
+        let composer_bcc = composer_bcc;
         wasm_bindgen_futures::spawn_local(async move {
             match crate::api::post_json::<serde_json::Value>(&path, Some(&body_payload)).await {
                 Ok(result) => {
@@ -509,6 +697,8 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                     if ok {
                         composer_error.set(None);
                         composer_body.set(String::new());
+                        composer_cc.set(String::new());
+                        composer_bcc.set(String::new());
                         // Refresh the detail by re-selecting it.
                         if let Some(id) = selected_id.get() {
                             selected_id.set(None);
@@ -543,8 +733,21 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         }
     };
 
-    // ── Change status ──────────────────────────────────────────────────
+    // ── Change status (close gets a confirmation — UI-02) ──────────────
     let change_status = move |new_status: String| {
+        if new_status == "closed" {
+            let confirmed = web_sys::window()
+                .and_then(|w| {
+                    w.confirm_with_message(
+                        "Close this conversation? The customer can no longer reply unless it is reopened.",
+                    )
+                    .ok()
+                })
+                .unwrap_or(false);
+            if !confirmed {
+                return;
+            }
+        }
         let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
         if let Some(conv_local_id) = conv_local_id {
             let selected_id = selected_id;
@@ -624,6 +827,576 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
         }
     };
 
+    // ── Shared post-write refresh of the open detail + list ─────────────
+    let refresh_detail = move || {
+        if let Some(id) = selected_id.get_untracked() {
+            selected_id.set(None);
+            selected_id.set(Some(id));
+        }
+    };
+
+    // ── Change priority (UI-02) ────────────────────────────────────────
+    let change_priority = move |new_priority: String| {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        if let Some(conv_local_id) = conv_local_id {
+            let refresh_detail = refresh_detail;
+            wasm_bindgen_futures::spawn_local(async move {
+                let path = format!("/api/conversations/{conv_local_id}/priority");
+                let payload = serde_json::json!({ "priority": new_priority });
+                match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
+                    Ok(result) => {
+                        let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let message = result
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(if ok {
+                                "Priority updated."
+                            } else {
+                                "Priority rejected"
+                            })
+                            .to_string();
+                        if ok {
+                            refresh_detail();
+                        }
+                        let kind = if ok {
+                            crate::toasts::ToastKind::Success
+                        } else {
+                            crate::toasts::ToastKind::Error
+                        };
+                        crate::toasts::push(kind, message, None);
+                    }
+                    Err(e) => toasts::error(e),
+                }
+            });
+        }
+    };
+
+    // ── Save subject (UI-02) ────────────────────────────────────────────
+    let save_subject = move || {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        let Some(conv_local_id) = conv_local_id else {
+            return;
+        };
+        let subject = subject_draft.get_untracked();
+        if subject.trim().is_empty() {
+            toasts::error("Subject cannot be empty.");
+            return;
+        }
+        let refresh_detail = refresh_detail;
+        wasm_bindgen_futures::spawn_local(async move {
+            let path = format!("/api/conversations/{conv_local_id}/subject");
+            let payload = serde_json::json!({ "subject": subject.trim() });
+            match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
+                Ok(result) => {
+                    let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let message = result
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if ok {
+                            "Subject updated."
+                        } else {
+                            "Subject rejected"
+                        })
+                        .to_string();
+                    if ok {
+                        editing_subject.set(false);
+                        refresh_detail();
+                    }
+                    let kind = if ok {
+                        crate::toasts::ToastKind::Success
+                    } else {
+                        crate::toasts::ToastKind::Error
+                    };
+                    crate::toasts::push(kind, message, None);
+                }
+                Err(e) => toasts::error(e),
+            }
+        });
+    };
+
+    // ── Add / remove tags (UI-02) ──────────────────────────────────────
+    let apply_tag_change = move |add: Vec<String>, remove: Vec<String>| {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        if let Some(conv_local_id) = conv_local_id {
+            let refresh_detail = refresh_detail;
+            wasm_bindgen_futures::spawn_local(async move {
+                let path = format!("/api/conversations/{conv_local_id}/tags");
+                let payload = serde_json::json!({ "add": add, "remove": remove });
+                match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
+                    Ok(result) => {
+                        let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let message = result
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(if ok {
+                                "Tags updated."
+                            } else {
+                                "Tag change rejected"
+                            })
+                            .to_string();
+                        if ok {
+                            refresh_detail();
+                        }
+                        let kind = if ok {
+                            crate::toasts::ToastKind::Success
+                        } else {
+                            crate::toasts::ToastKind::Error
+                        };
+                        crate::toasts::push(kind, message, None);
+                    }
+                    Err(e) => toasts::error(e),
+                }
+            });
+        }
+    };
+
+    // ── Snooze / unsnooze (UI-02) ───────────────────────────────────────
+    let do_snooze = move || {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        let Some(conv_local_id) = conv_local_id else {
+            return;
+        };
+        let until = snooze_until.get_untracked();
+        if until.trim().is_empty() {
+            toasts::error("Pick a snooze-until date/time first.");
+            return;
+        }
+        let refresh_detail = refresh_detail;
+        wasm_bindgen_futures::spawn_local(async move {
+            let path = format!("/api/conversations/{conv_local_id}/snooze");
+            let payload =
+                serde_json::json!({ "snoozedUntil": until, "unsnoozeOnCustomerReply": true });
+            match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
+                Ok(result) => {
+                    let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let message = result
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if ok { "Snoozed." } else { "Snooze rejected" })
+                        .to_string();
+                    if ok {
+                        snooze_until.set(String::new());
+                        refresh_detail();
+                    }
+                    let kind = if ok {
+                        crate::toasts::ToastKind::Success
+                    } else {
+                        crate::toasts::ToastKind::Error
+                    };
+                    crate::toasts::push(kind, message, None);
+                }
+                Err(e) => toasts::error(e),
+            }
+        });
+    };
+
+    let do_unsnooze = move || {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        if let Some(conv_local_id) = conv_local_id {
+            let refresh_detail = refresh_detail;
+            wasm_bindgen_futures::spawn_local(async move {
+                let path = format!("/api/conversations/{conv_local_id}/snooze");
+                match crate::api::delete_json::<serde_json::Value>(&path).await {
+                    Ok(result) => {
+                        let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let message = result
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(if ok {
+                                "Snooze removed."
+                            } else {
+                                "Unsnooze rejected"
+                            })
+                            .to_string();
+                        if ok {
+                            refresh_detail();
+                        }
+                        let kind = if ok {
+                            crate::toasts::ToastKind::Success
+                        } else {
+                            crate::toasts::ToastKind::Error
+                        };
+                        crate::toasts::push(kind, message, None);
+                    }
+                    Err(e) => toasts::error(e),
+                }
+            });
+        }
+    };
+
+    // ── Schedule / cancel a draft reply (UI-02) ─────────────────────────
+    // Scheduling targets an existing DRAFT thread (threadId); the composer
+    // saves one via "Save as draft", then the thread row schedules it.
+    let schedule_draft = move |thread_id: i64| {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        let Some(conv_local_id) = conv_local_id else {
+            return;
+        };
+        let confirmed = web_sys::window()
+            .and_then(|w| {
+                w.prompt_with_message(
+                    "Send this draft at (ISO date-time, e.g. 2026-10-09T09:00:00Z):",
+                )
+                .ok()
+                .flatten()
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let Some(scheduled_for) = confirmed else {
+            return;
+        };
+        let refresh_detail = refresh_detail;
+        wasm_bindgen_futures::spawn_local(async move {
+            let path = format!("/api/conversations/{conv_local_id}/schedule");
+            let payload = serde_json::json!({ "threadId": thread_id, "scheduledFor": scheduled_for, "unscheduleOnCustomerReply": true });
+            match crate::api::post_json::<serde_json::Value>(&path, Some(&payload)).await {
+                Ok(result) => {
+                    let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let message = result
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if ok {
+                            "Reply scheduled."
+                        } else {
+                            "Schedule rejected"
+                        })
+                        .to_string();
+                    if ok {
+                        refresh_detail();
+                    }
+                    let kind = if ok {
+                        crate::toasts::ToastKind::Success
+                    } else {
+                        crate::toasts::ToastKind::Error
+                    };
+                    crate::toasts::push(kind, message, None);
+                }
+                Err(e) => toasts::error(e),
+            }
+        });
+    };
+
+    let cancel_schedule = move |thread_id: i64| {
+        let conv_local_id = detail.with(|d| d.as_ref().map(|d| d.id));
+        if let Some(conv_local_id) = conv_local_id {
+            let refresh_detail = refresh_detail;
+            wasm_bindgen_futures::spawn_local(async move {
+                let path = format!("/api/conversations/{conv_local_id}/schedule");
+                let payload = serde_json::json!({ "threadId": thread_id });
+                match crate::api::delete_json_with_body::<serde_json::Value>(&path, &payload).await
+                {
+                    Ok(result) => {
+                        let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let message = result
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(if ok {
+                                "Schedule removed."
+                            } else {
+                                "Cancel rejected"
+                            })
+                            .to_string();
+                        if ok {
+                            refresh_detail();
+                        }
+                        let kind = if ok {
+                            crate::toasts::ToastKind::Success
+                        } else {
+                            crate::toasts::ToastKind::Error
+                        };
+                        crate::toasts::push(kind, message, None);
+                    }
+                    Err(e) => toasts::error(e),
+                }
+            });
+        }
+    };
+
+    // ── Bulk actions (UI-02: the full vocabulary, not just close) ────────
+    let apply_bulk = move || {
+        let ids = selected_ids.get_untracked();
+        if ids.is_empty() {
+            return;
+        }
+        let action = bulk_action.get_untracked();
+        let param = bulk_param.get_untracked();
+        let params = match action.as_str() {
+            "tag" | "untag" => {
+                if param.trim().is_empty() {
+                    toasts::error("Enter a tag name for the bulk tag action.");
+                    return;
+                }
+                serde_json::json!({ "tag": param.trim() })
+            }
+            "assign" => {
+                // The REMOTE user id (bulk assign passes userId through to
+                // the provider patch).
+                let remote = users.with(|rows| {
+                    param.trim().parse::<i64>().ok().and_then(|local| {
+                        rows.iter()
+                            .find(|(l, _, _)| *l == local)
+                            .map(|(_, r, _)| *r)
+                    })
+                });
+                let Some(remote) = remote else {
+                    toasts::error("Pick a user for the bulk assign action.");
+                    return;
+                };
+                serde_json::json!({ "userId": remote })
+            }
+            "status" => {
+                if param.is_empty() {
+                    toasts::error("Pick a status for the bulk status action.");
+                    return;
+                }
+                serde_json::json!({ "status": param })
+            }
+            _ => serde_json::json!({}),
+        };
+        if action == "close" {
+            let confirmed = web_sys::window()
+                .and_then(|w| {
+                    w.confirm_with_message(&format!(
+                        "Close {} selected conversation(s)?",
+                        ids.len()
+                    ))
+                    .ok()
+                })
+                .unwrap_or(false);
+            if !confirmed {
+                return;
+            }
+        }
+        let open_in_selection = selected_id
+            .get_untracked()
+            .is_some_and(|open| ids.contains(&open));
+        let filters = filters;
+        let selected_id = selected_id;
+        let selected_ids = selected_ids;
+        wasm_bindgen_futures::spawn_local(async move {
+            let body = serde_json::json!({
+                "conversationIds": ids,
+                "action": action,
+                "params": params,
+            });
+            match crate::api::post_json::<serde_json::Value>("/api/conversations/bulk", Some(&body))
+                .await
+            {
+                Ok(r) => {
+                    let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let message = r
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Bulk action failed")
+                        .to_string();
+                    if ok {
+                        // v2.2.1 audit fix: the OPEN detail also showed the
+                        // pre-bulk state when the selection included it.
+                        if open_in_selection {
+                            if let Some(id) = selected_id.get() {
+                                selected_id.set(None);
+                                selected_id.set(Some(id));
+                            }
+                        }
+                        let current = filters.get();
+                        filters.set(InboxFilters::default());
+                        filters.set(current);
+                    }
+                    let kind = if ok {
+                        crate::toasts::ToastKind::Success
+                    } else {
+                        crate::toasts::ToastKind::Error
+                    };
+                    crate::toasts::push(kind, message, None);
+                }
+                Err(e) => toasts::error(e),
+            }
+            selected_ids.set(Vec::new());
+        });
+    };
+
+    // ── AI draft composer (UI-02) ────────────────────────────────────────
+    let run_ai_draft = move || {
+        let Some(id) = selected_id.get_untracked() else {
+            return;
+        };
+        if ai_drafting.get_untracked() {
+            return;
+        }
+        ai_drafting.set(true);
+        let body = serde_json::json!({ "mode": "verified_answer" });
+        let ai_drafting = ai_drafting;
+        let composer_body = composer_body;
+        wasm_bindgen_futures::spawn_local(async move {
+            match crate::api::post_json::<serde_json::Value>(
+                &format!("/api/ai/draft/{id}"),
+                Some(&body),
+            )
+            .await
+            {
+                Ok(r) => {
+                    if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        if let Some(text) = r
+                            .get("draft")
+                            .and_then(|d| d.get("text"))
+                            .and_then(|x| x.as_str())
+                        {
+                            composer_body.set(text.to_string());
+                            toasts::success("AI draft inserted — review before sending.");
+                        } else {
+                            toasts::error("The AI returned no draft text.");
+                        }
+                    } else {
+                        let reason = r
+                            .get("error")
+                            .and_then(|x| x.as_str())
+                            .or_else(|| r.get("message").and_then(|x| x.as_str()))
+                            .unwrap_or("Draft failed");
+                        toasts::error(reason);
+                    }
+                }
+                Err(e) => toasts::error(e),
+            }
+            ai_drafting.set(false);
+        });
+    };
+
+    // ── Save current filters as a saved view (UI-02) ────────────────────
+    let save_current_view = move || {
+        let name = view_name.get_untracked();
+        if name.trim().is_empty() {
+            toasts::error("Enter a name for the view.");
+            return;
+        }
+        let f = filters.get_untracked();
+        // Build a simple definition from the current filters: an AND group
+        // over status/mailbox/tag/channel conditions.
+        let mut conditions: Vec<serde_json::Value> = Vec::new();
+        if let Some(status) = f.status.as_deref() {
+            conditions.push(serde_json::json!({
+                "kind": "status", "statuses": [status]
+            }));
+        }
+        if let Some(mailbox_id) = f.mailbox_id {
+            conditions.push(serde_json::json!({
+                "kind": "mailbox", "mailboxLocalIds": [mailbox_id]
+            }));
+        }
+        if let Some(tag) = f.tag.as_deref() {
+            conditions.push(serde_json::json!({ "kind": "tag", "tag": tag }));
+        }
+        if let Some(channel) = f.channel.as_deref() {
+            conditions.push(serde_json::json!({
+                "kind": "channel", "channels": [channel]
+            }));
+        }
+        let definition = serde_json::json!({
+            "combinator": "all",
+            "conditions": conditions,
+        });
+        let saved_views = saved_views;
+        let filters = filters;
+        let view_name = view_name;
+        let saving_view = saving_view;
+        wasm_bindgen_futures::spawn_local(async move {
+            let payload = serde_json::json!({
+                "name": name.trim(),
+                "definition": definition,
+            });
+            match crate::api::post_json::<serde_json::Value>("/api/inbox-views", Some(&payload))
+                .await
+            {
+                Ok(r) => {
+                    let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let message = r
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if ok { "View saved." } else { "Save failed" })
+                        .to_string();
+                    if ok {
+                        // Apply the new view immediately + reload the list.
+                        if let Some(id) = r.pointer("/view/id").and_then(|x| x.as_i64()) {
+                            filters.update(|f| {
+                                f.saved_view_id = Some(id);
+                                f.reset_page();
+                            });
+                        }
+                        view_name.set(String::new());
+                        saving_view.set(false);
+                        // Reload the saved-views list.
+                        if let Ok(v) =
+                            crate::api::get_json::<serde_json::Value>("/api/inbox-views").await
+                        {
+                            let arr = v
+                                .get("views")
+                                .and_then(|x| x.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            saved_views.set(
+                                arr.iter()
+                                    .map(|v| SavedView {
+                                        id: v.get("id").and_then(|x| x.as_i64()),
+                                        name: v
+                                            .get("name")
+                                            .and_then(|x| x.as_str())
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        mailbox_id: v.get("mailbox_id").and_then(|x| x.as_i64()),
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+                    let kind = if ok {
+                        crate::toasts::ToastKind::Success
+                    } else {
+                        crate::toasts::ToastKind::Error
+                    };
+                    crate::toasts::push(kind, message, None);
+                }
+                Err(e) => toasts::error(e),
+            }
+        });
+    };
+
+    // ── Delete a saved view (UI-02) ─────────────────────────────────────
+    let delete_saved_view = move |view_id: i64| {
+        let saved_views = saved_views;
+        let filters = filters;
+        wasm_bindgen_futures::spawn_local(async move {
+            let path = format!("/api/inbox-views/{view_id}");
+            match crate::api::delete_json::<serde_json::Value>(&path).await {
+                Ok(r) => {
+                    let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let message = r
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(if ok { "View deleted." } else { "Delete failed" })
+                        .to_string();
+                    if ok {
+                        // Unapply if it was the active view.
+                        if filters.with_untracked(|f| f.saved_view_id == Some(view_id)) {
+                            filters.update(|f| {
+                                f.saved_view_id = None;
+                                f.reset_page();
+                            });
+                        }
+                        saved_views.update(|views| {
+                            views.retain(|v| v.id != Some(view_id));
+                        });
+                    }
+                    let kind = if ok {
+                        crate::toasts::ToastKind::Success
+                    } else {
+                        crate::toasts::ToastKind::Error
+                    };
+                    crate::toasts::push(kind, message, None);
+                }
+                Err(e) => toasts::error(e),
+            }
+        });
+    };
+
     view! {
         <div class="spp-inbox">
             // ── List pane (left) ──
@@ -635,7 +1408,8 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                     </span>
                 </div>
 
-                // Filters
+                // Filters (UI-02 FilterBar: view / mailbox / tag /
+                // channel / priority / search — the reference Inbox.tsx bar)
                 <div class="spp-inbox__filters">
                     <select
                         class="spp-inbox__filter"
@@ -643,7 +1417,10 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                         on:change=move |ev| {
                             let val = event_target_value(&ev);
                             let val = if val.is_empty() { None } else { Some(val) };
-                            filters.update(|f| f.status = val);
+                            filters.update(|f| {
+                                f.status = val;
+                                f.reset_page();
+                            });
                             sync_url.with_value(|f| f());
                             list_loading.set(true);
                         }
@@ -652,13 +1429,89 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                         <option value="active">"Active"</option>
                         <option value="pending">"Pending"</option>
                         <option value="closed">"Closed"</option>
+                        <option value="spam">"Spam"</option>
+                    </select>
+                    <select
+                        class="spp-inbox__filter"
+                        prop:value=move || {
+                            filters.with(|f| f.mailbox_id.map(|id| id.to_string()).unwrap_or_default())
+                        }
+                        on:change=move |ev| {
+                            let val = event_target_value(&ev);
+                            let id = if val.is_empty() { None } else { val.parse::<i64>().ok() };
+                            filters.update(|f| {
+                                f.mailbox_id = id;
+                                f.reset_page();
+                            });
+                            sync_url.with_value(|f| f());
+                            list_loading.set(true);
+                        }
+                    >
+                        <option value="">"All mailboxes"</option>
+                        {move || {
+                            mailboxes.with(|rows| {
+                                rows.iter()
+                                    .map(|(id, name)| {
+                                        view! {
+                                            <option value={id.to_string()}>{name.clone()}</option>
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        }}
+                    </select>
+                    <select
+                        class="spp-inbox__filter"
+                        prop:value=move || filters.with(|f| f.channel.clone().unwrap_or_default())
+                        on:change=move |ev| {
+                            let val = event_target_value(&ev);
+                            let val = if val.is_empty() { None } else { Some(val) };
+                            filters.update(|f| {
+                                f.channel = val;
+                                f.reset_page();
+                            });
+                            sync_url.with_value(|f| f());
+                            list_loading.set(true);
+                        }
+                    >
+                        <option value="">"All channels"</option>
+                        <option value="email">"Email"</option>
+                        <option value="chat">"Chat (Beacon)"</option>
+                    </select>
+                    <select
+                        class="spp-inbox__filter"
+                        prop:value=move || filters.with(|f| f.tag.clone().unwrap_or_default())
+                        on:change=move |ev| {
+                            let val = event_target_value(&ev);
+                            let val = if val.is_empty() { None } else { Some(val) };
+                            filters.update(|f| {
+                                f.tag = val;
+                                f.reset_page();
+                            });
+                            sync_url.with_value(|f| f());
+                            list_loading.set(true);
+                        }
+                    >
+                        <option value="">"All tags"</option>
+                        {move || {
+                            tag_names.with(|names| {
+                                names.iter()
+                                    .map(|name| {
+                                        view! { <option value={name.clone()}>{name.clone()}</option> }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        }}
                     </select>
                     <select
                         class="spp-inbox__filter"
                         on:change=move |ev| {
                             let val = event_target_value(&ev);
                             let val = if val.is_empty() { None } else { Some(val) };
-                            filters.update(|f| f.priority = val);
+                            filters.update(|f| {
+                                f.priority = val;
+                                f.reset_page();
+                            });
                             list_loading.set(true);
                         }
                     >
@@ -675,7 +1528,10 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                         on:input=move |ev| {
                             let val = event_target_value(&ev);
                             let val = if val.is_empty() { None } else { Some(val) };
-                            filters.update(|f| f.query = val);
+                            filters.update(|f| {
+                                f.query = val;
+                                f.reset_page();
+                            });
                             list_loading.set(true);
                         }
                     />
@@ -738,22 +1594,85 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                     </div>
                 </Show>
 
-                // Saved views
-                <Show when=move || !saved_views.with(|v| v.is_empty()) fallback=|| ()>
-                    <div class="spp-inbox__saved-views">
-                        <label>"Saved views:"</label>
-                        <select class="spp-inbox__filter">
-                            <option value="">"— select —"</option>
-                            {move || saved_views.with(|views| views.iter().map(|v| {
-                                let id = v.id.unwrap_or(0);
-                                let name = v.name.clone();
-                                view! {
-                                    <option value={id.to_string()}>{name.clone()}</option>
+                // Saved views (UI-02: functional — selecting applies
+                // ?savedViewId=, which compiles the stored condition tree
+                // server-side; the current filters can be saved as a new
+                // view; saved views can be deleted).
+                <div class="spp-inbox__saved-views">
+                    <select
+                        class="spp-inbox__filter"
+                        prop:value=move || {
+                            filters.with(|f| f.saved_view_id.map(|id| id.to_string()).unwrap_or_default())
+                        }
+                        on:change=move |ev| {
+                            let val = event_target_value(&ev);
+                            let id = if val.is_empty() { None } else { val.parse::<i64>().ok() };
+                            filters.update(|f| {
+                                f.saved_view_id = id;
+                                f.reset_page();
+                            });
+                            sync_url.with_value(|f| f());
+                            list_loading.set(true);
+                        }
+                    >
+                        <option value="">"— standard filters —"</option>
+                        {move || {
+                            saved_views.with(|views| {
+                                views.iter()
+                                    .map(|v| {
+                                        let id = v.id.unwrap_or(0).to_string();
+                                        let name = v.name.clone();
+                                        view! {
+                                            <option value=id>{name.clone()}</option>
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        }}
+                    </select>
+                    <button
+                        class="spp-button spp-button--ghost spp-button--tiny"
+                        type="button"
+                        on:click=move |_| saving_view.update(|s| *s = !*s)
+                    >
+                        "Save current…"
+                    </button>
+                    <Show when=move || {
+                        filters.with(|f| f.saved_view_id.is_some())
+                            && !saved_views.with(|v| v.is_empty())
+                    } fallback=|| ()>
+                        <button
+                            class="spp-button spp-button--ghost spp-button--tiny"
+                            type="button"
+                            on:click=move |_| {
+                                if let Some(view_id) = filters.with_untracked(|f| f.saved_view_id) {
+                                    delete_saved_view(view_id);
                                 }
-                            }).collect::<Vec<_>>())}
-                        </select>
-                    </div>
-                </Show>
+                            }
+                        >
+                            "Delete view"
+                        </button>
+                    </Show>
+                    <Show when=move || saving_view.get() fallback=|| ()>
+                        <div class="spp-flex spp-mt-8">
+                            <input
+                                class="spp-input"
+                                type="text"
+                                placeholder="View name"
+                                maxlength=100
+                                prop:value=view_name
+                                on:input=move |ev| view_name.set(event_target_value(&ev))
+                            />
+                            <button
+                                class="spp-button spp-button--primary spp-button--small"
+                                type="button"
+                                on:click=move |_| save_current_view()
+                            >
+                                "Save"
+                            </button>
+                        </div>
+                    </Show>
+                </div>
 
                 // List body
                 <div class="spp-inbox__list-body">
@@ -839,72 +1758,78 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                     </Show>
                 </div>
 
-                // Bulk actions bar (shown when items are selected)
+                // Bulk actions bar (UI-02: the full vocabulary — close /
+                // status / assign / unassign / tag / untag — applied through
+                // one POST /api/conversations/bulk per action).
                 <Show when=move || !selected_ids.with(|ids| ids.is_empty()) fallback=|| ()>
                     <div class="spp-inbox__bulk-actions">
                         <span>
                             {move || format!("{} selected", selected_ids.with(|ids| ids.len()))}
                         </span>
-                        <button
-                            class="spp-button spp-button--ghost"
-                            on:click=move |_| {
-                                // Bulk close (reference: one POST /api/conversations/bulk
-                                // with action "close"; the queue applies it per
-                                // conversation). Outcomes surface as a toast like
-                                // the reference's bulk mutation.
-                                let ids = selected_ids.get();
-                                let selected_id = selected_id;
-                                let filters = filters;
-                                let open_in_selection = selected_id
-                                    .get()
-                                    .is_some_and(|open| ids.contains(&open));
-                                wasm_bindgen_futures::spawn_local(async move {
-                                    let body = serde_json::json!({
-                                        "conversationIds": ids,
-                                        "action": "close",
-                                        "params": {},
-                                    });
-                                    match crate::api::post_json::<serde_json::Value>(
-                                        "/api/conversations/bulk",
-                                        Some(&body),
-                                    )
-                                    .await
-                                    {
-                                        Ok(r) => {
-                                            let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                                            let message = r
-                                                .get("message")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("Bulk close failed")
-                                                .to_string();
-                                            if ok {
-                                                // v2.2.1 audit fix: the OPEN detail also
-                                                // showed the pre-bulk state when the
-                                                // selection included it — refresh it too.
-                                                if open_in_selection {
-                                                    if let Some(id) = selected_id.get() {
-                                                        selected_id.set(None);
-                                                        selected_id.set(Some(id));
-                                                    }
-                                                }
-                                                let current = filters.get();
-                                                filters.set(InboxFilters::default());
-                                                filters.set(current);
-                                            }
-                                            let kind = if ok {
-                                                crate::toasts::ToastKind::Success
-                                            } else {
-                                                crate::toasts::ToastKind::Error
-                                            };
-                                            crate::toasts::push(kind, message, None);
-                                        }
-                                        Err(e) => toasts::error(e),
-                                    }
-                                });
-                                selected_ids.set(Vec::new());
+                        <select
+                            class="spp-inbox__filter"
+                            prop:value=move || bulk_action.get()
+                            on:change=move |ev| {
+                                bulk_action.set(event_target_value(&ev));
+                                bulk_param.set(String::new());
                             }
                         >
-                            "Close all"
+                            <option value="close">"Close"</option>
+                            <option value="status">"Set status"</option>
+                            <option value="assign">"Assign to"</option>
+                            <option value="unassign">"Unassign"</option>
+                            <option value="tag">"Add tag"</option>
+                            <option value="untag">"Remove tag"</option>
+                        </select>
+                        <Show when=move || bulk_action.get() == "status" fallback=|| ()>
+                            <select
+                                class="spp-inbox__filter"
+                                prop:value=move || bulk_param.get()
+                                on:change=move |ev| bulk_param.set(event_target_value(&ev))
+                            >
+                                <option value="">"— status —"</option>
+                                <option value="active">"Active"</option>
+                                <option value="pending">"Pending"</option>
+                                <option value="spam">"Spam"</option>
+                            </select>
+                        </Show>
+                        <Show when=move || bulk_action.get() == "assign" fallback=|| ()>
+                            <select
+                                class="spp-inbox__filter"
+                                prop:value=move || bulk_param.get()
+                                on:change=move |ev| bulk_param.set(event_target_value(&ev))
+                            >
+                                <option value="">"— user —"</option>
+                                {move || {
+                                    users.with(|rows| {
+                                        rows.iter()
+                                            .map(|(local, _remote, name)| {
+                                                view! {
+                                                    <option value={local.to_string()}>{name.clone()}</option>
+                                                }
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                }}
+                            </select>
+                        </Show>
+                        <Show
+                            when=move || bulk_action.get() == "tag" || bulk_action.get() == "untag"
+                            fallback=|| ()
+                        >
+                            <input
+                                class="spp-inbox__search"
+                                type="text"
+                                placeholder="Tag name"
+                                prop:value=bulk_param
+                                on:input=move |ev| bulk_param.set(event_target_value(&ev))
+                            />
+                        </Show>
+                        <button
+                            class="spp-button spp-button--primary spp-button--small"
+                            on:click=move |_| apply_bulk()
+                        >
+                            "Apply"
                         </button>
                         <button
                             class="spp-button spp-button--ghost"
@@ -916,6 +1841,49 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                         </button>
                     </div>
                 </Show>
+
+                // Pagination (UI-02: prev/next over the 50-row pages).
+                <div class="spp-inbox__pagination">
+                    <button
+                        class="spp-button spp-button--ghost spp-button--small"
+                        type="button"
+                        disabled=move || filters.with(|f| f.page <= 1)
+                        on:click=move |_| {
+                            filters.update(|f| {
+                                if f.page > 1 {
+                                    f.page -= 1;
+                                }
+                            });
+                            sync_url.with_value(|f| f());
+                            list_loading.set(true);
+                        }
+                    >
+                        "← Prev"
+                    </button>
+                    <span class="spp-muted spp-text-xs">
+                        {move || {
+                            let page = filters.with(|f| f.page).max(1);
+                            let pages = total.get().div_ceil(50);
+                            format!("Page {page} of {}", pages.max(1))
+                        }}
+                    </span>
+                    <button
+                        class="spp-button spp-button--ghost spp-button--small"
+                        type="button"
+                        disabled=move || {
+                            let page = filters.with(|f| f.page);
+                            let pages = total.get().div_ceil(50);
+                            page >= pages.max(1)
+                        }
+                        on:click=move |_| {
+                            filters.update(|f| f.page += 1);
+                            sync_url.with_value(|f| f());
+                            list_loading.set(true);
+                        }
+                    >
+                        "Next →"
+                    </button>
+                </div>
             </aside>
 
             // ── Detail pane (center) ──
@@ -948,7 +1916,6 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                 Some(d) => d.clone(),
                                 None => return view! { <div></div> }.into_view(),
                             };
-                            let d_subject = d.subject.clone().unwrap_or_else(|| format!("#{}", d.number));
                             let d_status = d.status.clone();
                             let d_priority = d.priority.clone();
                             let d_response_state = d.response_state.clone();
@@ -964,7 +1931,67 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                 <div class="spp-inbox__detail-content">
                                     <header class="spp-inbox__detail-header">
                                         <h3 class="spp-inbox__detail-subject">
-                                            {d_subject}
+                                            // UI-02: subject edit — the branch closures
+                                            // read Copy signals only (the Fn-context rule).
+                                            {move || {
+                                                if editing_subject.get() {
+                                                    view! {
+                                                        <div class="spp-flex">
+                                                            <input
+                                                                class="spp-input"
+                                                                maxlength=200
+                                                                prop:value=subject_draft
+                                                                on:input=move |ev| {
+                                                                    subject_draft.set(event_target_value(&ev));
+                                                                }
+                                                            />
+                                                            <button
+                                                                class="spp-button spp-button--primary spp-button--small"
+                                                                type="button"
+                                                                on:click=move |_| save_subject()
+                                                            >
+                                                                "Save"
+                                                            </button>
+                                                            <button
+                                                                class="spp-button spp-button--ghost spp-button--small"
+                                                                type="button"
+                                                                on:click=move |_| editing_subject.set(false)
+                                                            >
+                                                                "Cancel"
+                                                            </button>
+                                                        </div>
+                                                    }.into_view()
+                                                } else {
+                                                    view! {
+                                                        {move || {
+                                                            detail.with(|d| {
+                                                                d.as_ref()
+                                                                    .map(|d| {
+                                                                        d.subject.clone()
+                                                                            .unwrap_or_else(|| format!("#{}", d.number))
+                                                                    })
+                                                                    .unwrap_or_default()
+                                                            })
+                                                        }}
+                                                        <button
+                                                            class="spp-button spp-button--ghost spp-button--tiny"
+                                                            type="button"
+                                                            aria-label="Edit subject"
+                                                            on:click=move |_| {
+                                                                let subject = detail.with_untracked(|d| {
+                                                                    d.as_ref()
+                                                                        .and_then(|d| d.subject.clone())
+                                                                        .unwrap_or_default()
+                                                                });
+                                                                subject_draft.set(subject);
+                                                                editing_subject.set(true);
+                                                            }
+                                                        >
+                                                            "Edit"
+                                                        </button>
+                                                    }.into_view()
+                                                }
+                                            }}
                                         </h3>
                                         <div class="spp-inbox__detail-meta">
                                             <span class="spp-badge spp-badge--status">
@@ -979,7 +2006,9 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                         </div>
                                     </header>
 
-                                    // Status + assignment controls
+                                    // Status + assignment + priority + snooze
+                                    // controls (UI-02: priority select, the
+                                    // real user list, snooze/unsnooze).
                                     <div class="spp-inbox__controls">
                                         <label>"Status:"</label>
                                         <select
@@ -992,6 +2021,7 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                             <option value="active">"Active"</option>
                                             <option value="pending">"Pending"</option>
                                             <option value="closed">"Closed"</option>
+                                            <option value="spam">"Spam"</option>
                                         </select>
 
                                         <label>"Assignee:"</label>
@@ -1000,15 +2030,63 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                             value=d_assignee_id.clone()
                                             on:change=move |ev| {
                                                 let val = event_target_value(&ev);
-                                                let id: i64 = val.parse().unwrap_or(0);
-                                                let assignee_id = if id == 0 { None } else { Some(id) };
-                                                assign_to(assignee_id);
+                                                // The select carries the REMOTE id
+                                                // (assignRequestSchema); 0 = unassign.
+                                                let remote: i64 = val.parse().unwrap_or(0);
+                                                let assignee = if remote == 0 { None } else { Some(remote) };
+                                                assign_to(assignee);
                                             }
                                         >
                                             <option value="0">"Unassigned"</option>
-                                            <option value="1">"User 1 (Alice)"</option>
-                                            <option value="2">"User 2 (Bob)"</option>
+                                            {move || {
+                                                users.with(|rows| {
+                                                    rows.iter()
+                                                        .map(|(_local, remote, name)| {
+                                                            view! {
+                                                                <option value={remote.to_string()}>{name.clone()}</option>
+                                                            }
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                })
+                                            }}
                                         </select>
+
+                                        <label>"Priority:"</label>
+                                        <select
+                                            class="spp-inbox__control"
+                                            value=d_priority.clone().unwrap_or_default()
+                                            on:change=move |ev| {
+                                                change_priority(event_target_value(&ev));
+                                            }
+                                        >
+                                            <option value="">"—"</option>
+                                            <option value="low">"Low"</option>
+                                            <option value="normal">"Normal"</option>
+                                            <option value="high">"High"</option>
+                                            <option value="urgent">"Urgent"</option>
+                                        </select>
+
+                                        <label>"Snooze until:"</label>
+                                        <input
+                                            class="spp-inbox__control"
+                                            type="datetime-local"
+                                            prop:value=snooze_until
+                                            on:input=move |ev| snooze_until.set(event_target_value(&ev))
+                                        />
+                                        <button
+                                            class="spp-button spp-button--ghost spp-button--small"
+                                            type="button"
+                                            on:click=move |_| do_snooze()
+                                        >
+                                            "Snooze"
+                                        </button>
+                                        <button
+                                            class="spp-button spp-button--ghost spp-button--small"
+                                            type="button"
+                                            on:click=move |_| do_unsnooze()
+                                        >
+                                            "Unsnooze"
+                                        </button>
                                     </div>
 
                                     // Side collaboration threads (internal only).
@@ -1033,6 +2111,11 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                                 let entry_actor = entry.actor_name.clone().unwrap_or_else(|| entry.actor_type.clone());
                                                 let entry_time = entry.created_at.clone();
                                                 let entry_body = entry.body.clone();
+                                                // UI-02: draft replies carry the
+                                                // schedule controls (a draft
+                                                // thread is the schedule target).
+                                                let is_draft = entry.state.as_deref() == Some("draft");
+                                                let entry_id = entry.id;
                                                 view! {
                                                     <div class={class}>
                                                         <div class="spp-thread-entry__header">
@@ -1045,10 +2128,39 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                                             <span class="spp-thread-entry__time">
                                                                 {entry_time}
                                                             </span>
+                                                            {if is_draft {
+                                                                view! {
+                                                                    <span class="spp-badge spp-badge--warn">"draft"</span>
+                                                                }.into_view()
+                                                            } else {
+                                                                ().into_view()
+                                                            }}
                                                         </div>
                                                         // Sanitized server-side (reference SafeHtml:
                                                         // body_html with body_text fallback).
                                                         <SafeHtml html=entry_body fallback_text=String::new() />
+                                                        {if is_draft {
+                                                            view! {
+                                                                <div class="spp-flex spp-mt-8">
+                                                                    <button
+                                                                        class="spp-button spp-button--ghost spp-button--tiny"
+                                                                        type="button"
+                                                                        on:click=move |_| schedule_draft(entry_id)
+                                                                    >
+                                                                        "Schedule send"
+                                                                    </button>
+                                                                    <button
+                                                                        class="spp-button spp-button--ghost spp-button--tiny"
+                                                                        type="button"
+                                                                        on:click=move |_| cancel_schedule(entry_id)
+                                                                    >
+                                                                        "Cancel schedule"
+                                                                    </button>
+                                                                </div>
+                                                            }.into_view()
+                                                        } else {
+                                                            ().into_view()
+                                                        }}
                                                     </div>
                                                 }
                                             }).collect::<Vec<_>>().into_view()
@@ -1089,16 +2201,110 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                                     value=composer_body
                                                     placeholder="Type an internal note (visible only to your team) — @ to mention"
                                                     rows=6
+                                                    submit_on_enter=true
+                                                    submit_key_code=13
+                                                    on_submit={std::rc::Rc::new(request_submit) as std::rc::Rc<dyn Fn()>}
                                                 />
                                             }
                                         >
                                             <MentionTextarea
                                                 value=composer_body
-                                                placeholder="Type your reply to the customer..."
+                                                placeholder="Type your reply to the customer... (Ctrl+Enter sends)"
                                                 rows=6
+                                                submit_on_enter=true
+                                                submit_key_code=13
+                                                on_submit={std::rc::Rc::new(request_submit) as std::rc::Rc<dyn Fn()>}
                                             />
                                         </Show>
+                                        // UI-02: the reply composer's cc/bcc fields
+                                        // (replyRequestSchema string arrays).
+                                        <Show
+                                            when=move || composer_mode.get() == ComposerMode::Reply
+                                            fallback=|| ()
+                                        >
+                                            <div class="spp-inbox__composer-recipients">
+                                                <input
+                                                    class="spp-input"
+                                                    type="text"
+                                                    placeholder="Cc (comma-separated emails)"
+                                                    prop:value=composer_cc
+                                                    on:input=move |ev| composer_cc.set(event_target_value(&ev))
+                                                />
+                                                <input
+                                                    class="spp-input"
+                                                    type="text"
+                                                    placeholder="Bcc (comma-separated emails)"
+                                                    prop:value=composer_bcc
+                                                    on:input=move |ev| composer_bcc.set(event_target_value(&ev))
+                                                />
+                                            </div>
+                                            // UI-02: the saved-replies picker
+                                            // (GET /api/saved-replies → insert text).
+                                            <Show when=move || !saved_replies.with(|r| r.is_empty()) fallback=|| ()>
+                                                <div class="spp-flex spp-mt-8">
+                                                    <select
+                                                        class="spp-inbox__filter"
+                                                        aria-label="Insert saved reply"
+                                                        prop:value=move || saved_reply_pick.get()
+                                                        on:change=move |ev| {
+                                                            saved_reply_pick.set(event_target_value(&ev));
+                                                        }
+                                                    >
+                                                        <option value="">"— insert saved reply —"</option>
+                                                        {move || {
+                                                            saved_replies.with(|rows| {
+                                                                rows.iter()
+                                                                    .map(|(name, _text)| {
+                                                                        view! {
+                                                                            <option value={name.clone()}>{name.clone()}</option>
+                                                                        }
+                                                                    })
+                                                                    .collect::<Vec<_>>()
+                                                            })
+                                                        }}
+                                                    </select>
+                                                    <button
+                                                        class="spp-button spp-button--ghost spp-button--small"
+                                                        type="button"
+                                                        on:click=move |_| {
+                                                            let pick = saved_reply_pick.get_untracked();
+                                                            if pick.is_empty() {
+                                                                return;
+                                                            }
+                                                            if let Some((_name, text)) = saved_replies
+                                                                .with_untracked(|rows| {
+                                                                    rows.iter()
+                                                                        .find(|(name, _)| *name == pick)
+                                                                        .cloned()
+                                                                })
+                                                            {
+                                                                let current = composer_body.get_untracked();
+                                                                if current.is_empty() {
+                                                                    composer_body.set(text);
+                                                                } else {
+                                                                    composer_body
+                                                                        .set(format!("{current}\n\n{text}"));
+                                                                }
+                                                                toasts::success(
+                                                                    "Saved reply inserted — review before sending.",
+                                                                );
+                                                            }
+                                                        }
+                                                    >
+                                                        "Insert"
+                                                    </button>
+                                                </div>
+                                            </Show>
+                                        </Show>
                                         <div class="spp-inbox__composer-actions">
+                                            <button
+                                                class="spp-button spp-button--ghost spp-button--small"
+                                                type="button"
+                                                disabled=move || ai_drafting.get()
+                                                on:click=move |_| run_ai_draft()
+                                            >
+                                                {move || if ai_drafting.get() { "Drafting…" } else { "AI draft" }.to_string()}
+                                            </button>
                                             <button
                                                 class="spp-button"
                                                 on:click=move |_| request_submit()
@@ -1185,6 +2391,14 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                             title="Ask the Local Copilot about this ticket (read-only, evidence-cited)"
                                         >
                                             "Copilot"
+                                        </button>
+                                        <button
+                                            class="spp-inbox__context-tab"
+                                            class:is-active=move || context_tab.get() == ContextTab::Activity
+                                            on:click=move |_| context_tab.set(ContextTab::Activity)
+                                            title="The event timeline and the audit trail for this conversation"
+                                        >
+                                            "Activity"
                                         </button>
                                     </div>
                                     <button
@@ -1337,18 +2551,62 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                                 {if !c_tags_clone.is_empty() {
                                                     view! {
                                                         <h3>"Tags"</h3>
-                                                        <ul class="spp-inbox__tags">
+                                                        // UI-02 tags editor: removable chips + the
+                                                        // add input (POST /tags add/remove).
+                                                        <div class="spp-inbox__tags">
                                                             {c_tags_clone.iter().map(|tag| {
                                                                 let tag = tag.clone();
                                                                 view! {
-                                                                    <li class="spp-inbox__tag">{tag}</li>
+                                                                    <span class="spp-inbox__tag">
+                                                                        {tag.clone()}
+                                                                        <button
+                                                                            class="spp-chip__clear"
+                                                                            aria-label={format!("Remove tag {tag}")}
+                                                                            on:click=move |_| {
+                                                                                apply_tag_change(
+                                                                                    Vec::new(),
+                                                                                    vec![tag.clone()],
+                                                                                );
+                                                                            }
+                                                                        >
+                                                                            "\u{d7}"
+                                                                        </button>
+                                                                    </span>
                                                                 }
                                                             }).collect::<Vec<_>>()}
-                                                        </ul>
+                                                        </div>
                                                     }.into_view()
                                                 } else {
-                                                    ().into_view()
+                                                    view! {
+                                                        <h3>"Tags"</h3>
+                                                        <div class="spp-muted spp-text-xs">"No tags yet."</div>
+                                                    }.into_view()
                                                 }}
+                                                <div class="spp-flex spp-mt-8">
+                                                    <input
+                                                        class="spp-input"
+                                                        type="text"
+                                                        placeholder="Add a tag"
+                                                        maxlength=100
+                                                        prop:value=tag_input
+                                                        on:input=move |ev| tag_input.set(event_target_value(&ev))
+                                                    />
+                                                    <button
+                                                        class="spp-button spp-button--primary spp-button--small"
+                                                        type="button"
+                                                        on:click=move |_| {
+                                                            let raw = tag_input.get_untracked();
+                                                            let name = raw.trim().to_string();
+                                                            if name.is_empty() {
+                                                                return;
+                                                            }
+                                                            apply_tag_change(vec![name], Vec::new());
+                                                            tag_input.set(String::new());
+                                                        }
+                                                    >
+                                                        "Add tag"
+                                                    </button>
+                                                </div>
                                             </div>
                                         }.into_view()
                                     })}
@@ -1362,11 +2620,150 @@ pub fn InboxPage(#[prop(optional, into)] conversation_id: Option<i64>) -> impl I
                                         <CopilotPanel conversation_id=conv_id />
                                     </div>
                                 </Show>
+
+                                // UI-02 Activity tab: the event timeline
+                                // (GET /api/conversations/:id/events) and
+                                // the audit trail (GET /api/audit?conversationId=).
+                                <Show
+                                    when=move || context_open.get() && context_tab.get() == ContextTab::Activity
+                                    fallback=|| ()
+                                >
+                                    <ActivityTab conversation_id=conv_id />
+                                </Show>
                             </div>
                         }.into_view()
                     }}
                 </Show>
             </aside>
+        </div>
+    }
+}
+
+/// The Activity context tab — the conversation's event timeline plus the
+/// audit trail (UI-02).
+#[component]
+fn ActivityTab(conversation_id: i64) -> impl IntoView {
+    let events = create_rw_signal(Vec::<serde_json::Value>::new());
+    let audit = create_rw_signal(Vec::<serde_json::Value>::new());
+    let loading = create_rw_signal(true);
+    let error_msg = create_rw_signal(None::<String>);
+
+    create_effect(move |_| {
+        let conversation_id = conversation_id;
+        let events = events;
+        let audit = audit;
+        let loading = loading;
+        let error_msg = error_msg;
+        loading.set(true);
+        error_msg.set(None);
+        wasm_bindgen_futures::spawn_local(async move {
+            let ev = crate::api::get_json::<serde_json::Value>(&format!(
+                "/api/conversations/{conversation_id}/events"
+            ))
+            .await;
+            let au = crate::api::get_json::<serde_json::Value>(&format!(
+                "/api/audit?conversationId={conversation_id}"
+            ))
+            .await;
+            match (ev, au) {
+                (Ok(e), Ok(a)) => {
+                    events.set(
+                        e.get("events")
+                            .and_then(|x| x.as_array())
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    audit.set(
+                        a.get("entries")
+                            .and_then(|x| x.as_array())
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                }
+                (Err(e), _) | (_, Err(e)) => error_msg.set(Some(e)),
+            }
+            loading.set(false);
+        });
+    });
+
+    view! {
+        <div class="spp-inbox__context-body">
+            <Show when=move || loading.get() fallback=|| ()>
+                <LoadingState />
+            </Show>
+            <Show when=move || error_msg.get().is_some() fallback=|| ()>
+                <div class="spp-state spp-state--error">
+                    <span class="spp-state__icon" aria-hidden="true">"⚠"</span>
+                    <p class="spp-state__body">{move || error_msg.get().unwrap_or_default()}</p>
+                </div>
+            </Show>
+            <Show when=move || !loading.get() && error_msg.get().is_none() fallback=|| ()>
+                <h3>"Events"</h3>
+                <Show
+                    when=move || !events.with(|e| e.is_empty())
+                    fallback=|| view! { <EmptyState message="No events recorded yet." /> }
+                >
+                    <ul class="spp-inbox__activity-list">
+                        {move || {
+                            events.get()
+                                .iter()
+                                .map(|e| {
+                                    let kind = e.get("type").and_then(|x| x.as_str()).unwrap_or("event").to_string();
+                                    let actor = e
+                                        .get("actor_name")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("system")
+                                        .to_string();
+                                    let at = e
+                                        .get("created_at")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    view! {
+                                        <li class="spp-inbox__activity-item">
+                                            <span class="spp-badge">{kind}</span>
+                                            <span class="spp-text-xs">{actor}</span>
+                                            <span class="spp-muted spp-text-xs">{at}</span>
+                                        </li>
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }}
+                    </ul>
+                </Show>
+
+                <h3 class="spp-mt-8">"Audit trail"</h3>
+                <Show
+                    when=move || !audit.with(|a| a.is_empty())
+                    fallback=|| view! { <EmptyState message="No audit entries for this conversation." /> }
+                >
+                    <ul class="spp-inbox__activity-list">
+                        {move || {
+                            audit.get()
+                                .iter()
+                                .map(|a| {
+                                    let action = a
+                                        .get("action")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("audit")
+                                        .to_string();
+                                    let at = a
+                                        .get("created_at")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    view! {
+                                        <li class="spp-inbox__activity-item">
+                                            <span class="spp-badge">{action}</span>
+                                            <span class="spp-muted spp-text-xs">{at}</span>
+                                        </li>
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }}
+                    </ul>
+                </Show>
+            </Show>
         </div>
     }
 }
@@ -1536,6 +2933,10 @@ fn parse_thread_entry(v: &serde_json::Value) -> ThreadEntry {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        state: v
+            .get("state")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     }
 }
 
@@ -1637,5 +3038,32 @@ mod tests {
         assert!(e.body.is_none());
         assert!(e.actor_id.is_none());
         assert!(e.actor_name.is_none());
+        // UI-02: draft threads (the schedule-send targets) carry state.
+        let draft = parse_thread_entry(&serde_json::json!({
+            "id": 7,
+            "conversation_id": 1,
+            "thread_type": "reply",
+            "state": "draft",
+            "body": "reply text",
+            "actor_type": "user",
+            "created_at": "2025-01-01T00:00:00Z",
+        }));
+        assert_eq!(draft.state.as_deref(), Some("draft"));
+        assert!(parse_thread_entry(&serde_json::json!({})).state.is_none());
+    }
+
+    #[test]
+    fn parse_recipients_drops_empty_and_trims() {
+        // The CC/BCC fields (UI-02): commas or semicolons, whitespace
+        // trimmed, empty tokens dropped.
+        assert!(parse_recipients("").is_empty());
+        assert_eq!(
+            parse_recipients("a@example.com, b@example.com"),
+            vec!["a@example.com".to_string(), "b@example.com".to_string()]
+        );
+        assert_eq!(
+            parse_recipients("a@example.com;; b@example.com ,"),
+            vec!["a@example.com".to_string(), "b@example.com".to_string()]
+        );
     }
 }

@@ -1,0 +1,107 @@
+# CI — the port of the reference's lint/typecheck/build/test/smoke pipeline
+# (audit M12 / BU-01). The reference ran on Node 20; this repository is
+# Rust-native, so the toolchain is the pinned stable rust-toolchain.toml
+# (rustfmt + clippy + the wasm32 target) plus the Tauri 2 Linux system
+# libraries, and the steps map one-to-one:
+#
+#   reference (Node 20)         this workflow
+#   ------------------------    ------------------------------------------
+#   lint (eslint/prettier)  ->  cargo fmt --check
+#   typecheck (tsc)         ->  cargo clippy -D warnings
+#   build                   ->  cargo build --workspace + trunk release bundle
+#   test (vitest/jest)      ->  cargo test --workspace --all-targets
+#   smoke (e2e boot class)  ->  cargo test --test e2e_demo_boot (the real
+#                               HTTP server booted against a throwaway data
+#                               dir, exactly the way the Tauri shell boots)
+#
+# Runs on every push and every pull request.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: fmt + clippy + test + build + smoke
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Install the Tauri 2 Linux system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev
+
+      - name: Cache the cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # ── lint (cargo xtask lint = these two steps; README.md) ───────────
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # ── test ───────────────────────────────────────────────────────────
+      - name: Tests
+        run: cargo test --workspace --all-targets
+
+      # ── build (the workspace + the production WASM UI bundle) ──────────
+      - name: Build the workspace
+        run: cargo build --workspace --all-targets
+
+      - name: Install trunk (the Leptos UI builder)
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: Build the WASM UI bundle (release)
+        run: cargo xtask trunk-build
+
+      # ── smoke: the e2e boot class counterpart ───────────────────────────
+      # Boots the REAL HTTP server against a throwaway data dir exactly the
+      # way the Tauri shell does, then exercises health, conversations, the
+      # SSE hello, the simulated webhook + rating, Operations Center, the
+      # dashboard, search and the embedded vector engine lifecycle.
+      - name: Smoke test (demo boot)
+        run: cargo test -p supportos-plusplus-core --test e2e_demo_boot -- --nocapture
+
+  wasm-check:
+    name: wasm32 UI compile check
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain with the wasm target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache the cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check the UI crate for wasm32
+        run: cargo check -p supportos-plusplus-ui --target wasm32-unknown-unknown

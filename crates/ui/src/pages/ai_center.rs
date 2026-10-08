@@ -975,6 +975,8 @@ fn EvaluationTab() -> impl IntoView {
     let error_msg = create_rw_signal(None::<String>);
     let toggling = create_rw_signal(false);
     let reload = create_rw_signal(0u32);
+    // AI-23: the evaluation-run state (POST /api/ai/evaluation/run).
+    let running = create_rw_signal(false);
 
     create_effect(move |_| {
         let _ = reload.get();
@@ -1017,6 +1019,31 @@ fn EvaluationTab() -> impl IntoView {
                 Err(e) => crate::toasts::error(e),
             }
             toggling.set(false);
+        });
+    };
+
+    // AI-23: run the golden set through the real pipeline. The response
+    // carries the run row; the driving GET refetch picks up last_run.
+    let run_evaluation = move || {
+        if running.get() {
+            return;
+        }
+        running.set(true);
+        let reload = reload;
+        wasm_bindgen_futures::spawn_local(async move {
+            match crate::api::post_json::<serde_json::Value>("/api/ai/evaluation/run", None).await {
+                Ok(r) if r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) => {
+                    crate::toasts::success("Evaluation run recorded.");
+                    reload.update(|n| *n = n.wrapping_add(1));
+                }
+                Ok(r) => crate::toasts::error(
+                    r.get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Evaluation run failed"),
+                ),
+                Err(e) => crate::toasts::error(e),
+            }
+            running.set(false);
         });
     };
 
@@ -1083,9 +1110,94 @@ fn EvaluationTab() -> impl IntoView {
                         </tbody>
                     </table>
                     <p class="spp-text-xs spp-text-muted spp-mt-2">
-                        "The golden set evaluates classification, retrieval, draft generation, verification, internal leakage, missing questions and unsupported claims. Automated runs use the deterministic mocked pipeline."
+                        "The golden set evaluates classification, retrieval, draft generation, verification, internal leakage, missing questions and unsupported claims. Runs execute the real pipeline against the configured backend; the AI-disabled backend reports the honest failure reason per test."
                     </p>
+                    <div class="spp-modal__actions spp-mt-8">
+                        <button
+                            class="spp-button spp-button--primary"
+                            type="button"
+                            disabled=move || running.get()
+                            on:click=move |_| run_evaluation()
+                        >
+                            {move || if running.get() { "Running…" } else { "Run evaluation" }}
+                        </button>
+                    </div>
                 </div>
+
+                // AI-23: the latest recorded run (started/finished, backend,
+                // pass/fail and the per-test outcomes).
+                {move || {
+                    let last = e.get("last_run").cloned();
+                    let Some(last) = last.filter(|l| !l.is_null()) else {
+                        return ().into_view();
+                    };
+                    let results: Vec<serde_json::Value> = last
+                        .get("results")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let passed = last.get("passed").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let failed = last.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let backend = str_field(&last, "backend");
+                    let finished = str_field(&last, "finished_at");
+                    // A clone for the when-closure (the table keeps the original).
+                    let has_results = !results.is_empty();
+                    view! {
+                        <div class="spp-card spp-mt-4">
+                            <h3 class="spp-card__title">
+                                {format!("Last run ({backend}): {passed} passed / {failed} failed")}
+                            </h3>
+                            <p class="spp-muted spp-text-xs">{format!("finished {finished}")}</p>
+                            <Show
+                                when=move || has_results
+                                fallback=|| view! { <EmptyState message="No per-test outcomes recorded." /> }
+                            >
+                                <table class="spp-table">
+                                    <thead>
+                                        <tr>
+                                            <th>"Test"</th>
+                                            <th>"Category"</th>
+                                            <th>"Outcome"</th>
+                                            <th>"Stages"</th>
+                                            <th>"Error"</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {results.iter().map(|r| {
+                                            let name = str_field(r, "name");
+                                            let category = str_field(r, "category");
+                                            let ok = r.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+                                            let error = str_field(r, "error");
+                                            let stages = r.get("stages").cloned().unwrap_or_default();
+                                            let analysis_ok = stages.get("analysis").and_then(|s| s.get("ok")).and_then(|v| v.as_bool()).unwrap_or(false);
+                                            let draft_ok = stages.get("draft").and_then(|s| s.get("ok")).and_then(|v| v.as_bool()).unwrap_or(false);
+                                            let verification_ok = stages.get("verification").and_then(|s| s.get("ok")).and_then(|v| v.as_bool()).unwrap_or(false);
+                                            view! {
+                                                <tr>
+                                                    <td>{name}</td>
+                                                    <td><span class="spp-badge">{category}</span></td>
+                                                    <td>
+                                                        <span class=if ok {
+                                                            "spp-badge spp-badge--ok"
+                                                        } else {
+                                                            "spp-badge spp-badge--warn"
+                                                        }>
+                                                            {if ok { "pass" } else { "fail" }}
+                                                        </span>
+                                                    </td>
+                                                    <td class="spp-text-xs">
+                                                        {format!("analysis {} · draft {} · verification {}", if analysis_ok { "ok" } else { "-" }, if draft_ok { "ok" } else { "-" }, if verification_ok { "ok" } else { "-" })}
+                                                    </td>
+                                                    <td class="spp-table__cell-muted spp-text-xs">{error}</td>
+                                                </tr>
+                                            }
+                                        }).collect::<Vec<_>>()}
+                                    </tbody>
+                                </table>
+                            </Show>
+                        </div>
+                    }.into_view()
+                }}
             }.into_view()
         }}
     }

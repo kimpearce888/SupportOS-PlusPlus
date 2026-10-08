@@ -78,8 +78,13 @@ pub fn MentionTextarea(
     #[prop(default = 3)] rows: u8,
     #[prop(default = false)] submit_on_enter: bool,
     #[prop(default = 3)] submit_key: u8,
+    /// The submit callback (UI-02): fired on Ctrl/Cmd+Enter when
+    /// `submit_on_enter` is set and the mention popup is closed.
+    #[prop(default = 13)]
+    submit_key_code: u32,
+    #[prop(optional)] on_submit: Option<std::rc::Rc<dyn Fn()>>,
 ) -> impl IntoView {
-    let _ = (submit_on_enter, submit_key);
+    let _ = submit_key;
     let directory = use_mention_directory();
     let popup_open = create_rw_signal(false);
     let active = create_rw_signal(0usize);
@@ -148,6 +153,17 @@ pub fn MentionTextarea(
                                 popup_open.set(false);
                             }
                             _ => {}
+                        }
+                    } else if submit_on_enter
+                        && ev.key_code() == submit_key_code
+                        && (ev.ctrl_key() || ev.meta_key())
+                    {
+                        // Ctrl/Cmd+Enter submits (UI-02): the composer's
+                        // send path, exactly like the reference's keyboard
+                        // shortcut. Plain Enter keeps inserting newlines.
+                        ev.prevent_default();
+                        if let Some(on_submit) = on_submit.as_ref() {
+                            on_submit();
                         }
                     }
                 }
