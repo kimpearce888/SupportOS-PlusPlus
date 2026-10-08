@@ -18,20 +18,15 @@ use rusqlite::Connection;
 use crate::error::Result;
 
 /// Apply the M029 migration batch (idempotent).
+///
+/// DB-01: the versioned boot-step wrapper in `bootstrap::apply_all` owns
+/// the transaction (batch + `_migrations` row commit together), so this
+/// body only applies the idempotent DDL. Callers that apply it standalone
+/// get the same end state — every statement is `IF NOT EXISTS`-guarded.
 pub fn apply_m029(conn: &Connection) -> Result<()> {
-    conn.execute_batch("BEGIN")?;
-    let r = apply_inner(conn);
-    match r {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            let _ = conn.execute("UPDATE app_state SET schema_version = 29 WHERE id = 1", []);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(e)
-        }
-    }
+    apply_inner(conn)?;
+    let _ = conn.execute("UPDATE app_state SET schema_version = 29 WHERE id = 1", []);
+    Ok(())
 }
 
 fn apply_inner(conn: &Connection) -> Result<()> {

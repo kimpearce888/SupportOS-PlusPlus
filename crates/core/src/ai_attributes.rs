@@ -107,20 +107,51 @@ pub fn apply_m033(conn: &Connection) -> Result<()> {
     }
 
     // Old M010 shape (attribute_key) — migrate rows forward, then drop it.
-    // Foreign keys are disabled for the duration (the SQLite-recommended
-    // pattern for table rebuilds: legacy rows may predate FK enforcement),
-    // restored to their prior setting afterwards. The rebuild itself is
-    // wrapped in one transaction so an interrupted migration rolls back.
-    let fk_was_on: bool = conn
-        .query_row("PRAGMA foreign_keys", [], |r| {
-            r.get::<_, i64>(0).map(|v| v != 0)
-        })
-        .unwrap_or(false);
-    let _ = conn.execute_batch("PRAGMA foreign_keys = OFF");
-    conn.execute_batch("BEGIN")?;
-    let migrated = (|| -> Result<()> {
-        conn.execute_batch(
-            "ALTER TABLE ai_attributes RENAME TO ai_attributes_m010;
+    //
+    // DB-01: two execution modes. Standalone (autocommit): this function
+    // owns its transaction and toggles foreign_keys off around the table
+    // rebuild (the SQLite-recommended pattern: legacy rows may predate FK
+    // enforcement), restoring the prior setting afterwards. Inside a
+    // caller's transaction (the versioned boot step): the caller owns
+    // atomicity, and foreign_keys cannot be toggled mid-transaction, so
+    // defer_foreign_keys — which IS allowed inside transactions — guards
+    // the legacy rows instead.
+    if conn.is_autocommit() {
+        let fk_was_on: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |r| {
+                r.get::<_, i64>(0).map(|v| v != 0)
+            })
+            .unwrap_or(false);
+        let _ = conn.execute_batch("PRAGMA foreign_keys = OFF");
+        conn.execute_batch("BEGIN")?;
+        match rebuild_m010_to_reference(conn) {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                if fk_was_on {
+                    let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+                }
+                return Err(e);
+            }
+        }
+        if fk_was_on {
+            let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+        }
+    } else {
+        let _ = conn.execute_batch("PRAGMA defer_foreign_keys = ON");
+        rebuild_m010_to_reference(conn)?;
+    }
+    let _ = conn.execute("UPDATE app_state SET schema_version = 33 WHERE id = 1", []);
+    Ok(())
+}
+
+/// The M010 → reference-shape rebuild: rename the legacy table, create the
+/// reference shape, pull every migratable legacy row forward, drop the
+/// legacy table. Runs inside a transaction owned by the caller (or by
+/// [`apply_m033`] when standalone).
+fn rebuild_m010_to_reference(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE ai_attributes RENAME TO ai_attributes_m010;
              CREATE TABLE ai_attributes (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -141,84 +172,64 @@ pub fn apply_m033(conn: &Connection) -> Result<()> {
                 ON ai_attributes (attribute, value, superseded_at);
              CREATE INDEX IF NOT EXISTS idx_ai_attributes_run
                 ON ai_attributes (run_id);",
-        )?;
+    )?;
 
-        // Pull the legacy rows.
-        let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, attribute_key, value, evidence_excerpt, thread_ref,
-                    confidence, created_at
-             FROM ai_attributes_m010",
-        )?;
-        let legacy: Vec<LegacyM010Row> = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                ))
-            })?
-            .filter_map(|row| row.ok())
-            .collect();
-        drop(stmt);
+    // Pull the legacy rows.
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, attribute_key, value, evidence_excerpt, thread_ref,
+                confidence, created_at
+         FROM ai_attributes_m010",
+    )?;
+    let legacy: Vec<LegacyM010Row> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .collect();
+    drop(stmt);
 
-        for (id, conversation_id, key, value, excerpt, thread_ref, confidence, created_at) in legacy
-        {
-            // Closed catalog: unknown keys have no value_type and cannot migrate.
-            let Some(def) = AiAttributeKey::parse(&key) else {
-                continue;
-            };
-            let confidence = if confidence <= 0.0 {
-                "unknown"
-            } else {
-                "medium"
-            };
-            // Legacy evidence: excerpt + thread_ref, JSON-array shaped.
-            let evidence = json!([{ "excerpt": excerpt, "thread_ref": thread_ref }]).to_string();
-            conn.execute(
-                "INSERT INTO ai_attributes
+    for (id, conversation_id, key, value, excerpt, thread_ref, confidence, created_at) in legacy {
+        // Closed catalog: unknown keys have no value_type and cannot migrate.
+        let Some(def) = AiAttributeKey::parse(&key) else {
+            continue;
+        };
+        let confidence = if confidence <= 0.0 {
+            "unknown"
+        } else {
+            "medium"
+        };
+        // Legacy evidence: excerpt + thread_ref, JSON-array shaped.
+        let evidence = json!([{ "excerpt": excerpt, "thread_ref": thread_ref }]).to_string();
+        conn.execute(
+            "INSERT INTO ai_attributes
                     (id, conversation_id, attribute, value, value_type, confidence, source,
                      evidence, run_id, schema_version, computed_at, superseded_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ai', ?7, NULL, ?8, ?9, NULL)",
-                params![
-                    id,
-                    conversation_id,
-                    def.as_str(),
-                    value,
-                    def.value_type().as_str(),
-                    confidence,
-                    evidence,
-                    AI_ATTRIBUTE_SCHEMA_VERSION,
-                    created_at,
-                ],
-            )?;
-        }
-
-        conn.execute_batch("DROP TABLE ai_attributes_m010")?;
-        Ok(())
-    })();
-
-    match migrated {
-        Ok(()) => {
-            conn.execute_batch("COMMIT")?;
-            if fk_was_on {
-                let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
-            }
-            let _ = conn.execute("UPDATE app_state SET schema_version = 33 WHERE id = 1", []);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            if fk_was_on {
-                let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
-            }
-            Err(e)
-        }
+            params![
+                id,
+                conversation_id,
+                def.as_str(),
+                value,
+                def.value_type().as_str(),
+                confidence,
+                evidence,
+                AI_ATTRIBUTE_SCHEMA_VERSION,
+                created_at,
+            ],
+        )?;
     }
+
+    conn.execute_batch("DROP TABLE ai_attributes_m010")?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
