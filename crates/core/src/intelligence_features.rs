@@ -726,6 +726,10 @@ fn next_incident_code(conn: &Connection) -> String {
 /// Reference incidentRepo.create, reduced to the columns the port stores:
 /// generates the INC code, inserts the row, and links every conversation
 /// id (`linked_by = 'human'`, INSERT OR IGNORE). Returns the new row id.
+///
+/// One transaction (M16): the incident row, the `created` event, and the
+/// per-conversation links + events commit atomically — a failure part-way
+/// through the link loop strands no orphan incident.
 #[allow(clippy::too_many_arguments)]
 pub fn create_incident_from_source(
     conn: &Connection,
@@ -737,7 +741,8 @@ pub fn create_incident_from_source(
     description: Option<&str>,
     conversation_ids: &[i64],
 ) -> Result<i64> {
-    let code = next_incident_code(conn);
+    let tx = conn.unchecked_transaction()?;
+    let code = next_incident_code(&tx);
     let resolved_at = if status == "resolved" {
         "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
     } else {
@@ -747,7 +752,7 @@ pub fn create_incident_from_source(
         "INSERT INTO incidents (known_issue_id, status, severity, source, description, title, code, resolved_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, {resolved_at})"
     );
-    conn.execute(
+    tx.execute(
         &sql,
         params![
             known_issue_id,
@@ -759,12 +764,12 @@ pub fn create_incident_from_source(
             code
         ],
     )?;
-    let id = conn.last_insert_rowid();
+    let id = tx.last_insert_rowid();
     // Reference repo.create: the 'created' event plus one
     // 'conversation_linked' event per linked conversation (idempotent by
     // dedup key).
     let _ = record_incident_event(
-        conn,
+        &tx,
         id,
         "created",
         None,
@@ -772,22 +777,23 @@ pub fn create_incident_from_source(
             &serde_json::json!({ "code": code, "title": title, "status": status, "severity": severity }),
         ),
         &format!("incident:{id}:created:0"),
-    );
+    )?;
     for conv_id in conversation_ids {
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id, linked_by)
              VALUES (?1, ?2, 'human')",
             params![id, conv_id],
         )?;
         let _ = record_incident_event(
-            conn,
+            &tx,
             id,
             "conversation_linked",
             None,
             Some(&serde_json::json!({ "conversation_id": conv_id })),
             &format!("incident:{id}:conversation_linked:conv:{conv_id}"),
-        );
+        )?;
     }
+    tx.commit()?;
     Ok(id)
 }
 
@@ -826,9 +832,12 @@ pub struct ManualIncident {
 }
 
 /// Create a manual incident with the full reference 014 field set
-/// (reference incidentService.create with source='manual').
+/// (reference incidentService.create with source='manual'). One
+/// transaction (M16): row + created event + links + link events are
+/// atomic.
 pub fn create_manual_incident(conn: &Connection, inc: &ManualIncident) -> Result<i64> {
-    let code = next_incident_code(conn);
+    let tx = conn.unchecked_transaction()?;
+    let code = next_incident_code(&tx);
     let resolved_at = if inc.status == "resolved" {
         "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
     } else {
@@ -840,7 +849,7 @@ pub fn create_manual_incident(conn: &Connection, inc: &ManualIncident) -> Result
              customer_safe_explanation, known_cause, workaround, resolution, started_at)
          VALUES (NULL, ?1, ?2, 'manual', ?3, ?4, {resolved_at}, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
     );
-    conn.execute(
+    tx.execute(
         &sql,
         params![
             inc.status,
@@ -859,12 +868,12 @@ pub fn create_manual_incident(conn: &Connection, inc: &ManualIncident) -> Result
             inc.started_at,
         ],
     )?;
-    let id = conn.last_insert_rowid();
+    let id = tx.last_insert_rowid();
     // Reference repo.create: the 'created' event plus one
     // 'conversation_linked' event per linked conversation (idempotent by
     // dedup key).
     let _ = record_incident_event(
-        conn,
+        &tx,
         id,
         "created",
         None,
@@ -872,22 +881,23 @@ pub fn create_manual_incident(conn: &Connection, inc: &ManualIncident) -> Result
             &serde_json::json!({ "code": code, "title": inc.title, "status": inc.status, "severity": inc.severity }),
         ),
         &format!("incident:{id}:created:0"),
-    );
+    )?;
     for conv_id in &inc.conversation_ids {
-        conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO incident_conversations (incident_id, conversation_id, linked_by)
              VALUES (?1, ?2, 'human')",
             params![id, conv_id],
         )?;
         let _ = record_incident_event(
-            conn,
+            &tx,
             id,
             "conversation_linked",
             None,
             Some(&serde_json::json!({ "conversation_id": conv_id })),
             &format!("incident:{id}:conversation_linked:conv:{conv_id}"),
-        );
+        )?;
     }
+    tx.commit()?;
     Ok(id)
 }
 
@@ -1687,6 +1697,115 @@ mod tests {
     }
 
     // ---- M7-T05: Incidents -------------------------------------------------
+
+    /// M035+M041 add the incident_conversations links and the title/code
+    /// columns the create paths write; the plain fresh_db chain stops
+    /// before them, so the M16 tests layer them on.
+    fn fresh_db_incidents() -> Connection {
+        let conn = fresh_db();
+        apply_m035(&conn).unwrap();
+        apply_m041(&conn).unwrap();
+        conn
+    }
+
+    /// M16: a failure part-way through the conversation-link loop leaves
+    /// no orphan incident row or `created` event (injected via a trigger).
+    #[test]
+    fn create_incident_from_source_rolls_back_on_link_failure() {
+        let conn = fresh_db_incidents();
+        conn.execute_batch(
+            "CREATE TRIGGER m16_abort_link BEFORE INSERT ON incident_conversations
+             BEGIN SELECT RAISE(ABORT, 'm16 injected failure'); END",
+        )
+        .unwrap();
+        let err = create_incident_from_source(
+            &conn,
+            None,
+            "high",
+            "open",
+            "manual",
+            "Payment failures",
+            None,
+            &[7, 8],
+        );
+        assert!(err.is_err(), "the link insert must abort");
+        let incidents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM incidents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(incidents, 0, "no orphan incident row (M16)");
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM incident_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 0, "no orphan created event (M16)");
+        let links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM incident_conversations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(links, 0, "no partial link rows (M16)");
+    }
+
+    /// M16 happy path: the whole batch commits and the link events landed.
+    #[test]
+    fn create_incident_from_source_commits_the_whole_batch() {
+        let conn = fresh_db_incidents();
+        let id = create_incident_from_source(
+            &conn,
+            None,
+            "medium",
+            "open",
+            "manual",
+            "Login spikes",
+            None,
+            &[11, 12],
+        )
+        .unwrap();
+        assert!(id > 0);
+        let (incidents, links, events): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM incidents),
+                        (SELECT COUNT(*) FROM incident_conversations),
+                        (SELECT COUNT(*) FROM incident_events)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        // 1 created event + 2 conversation_linked events
+        assert_eq!((incidents, links, events), (1, 2, 3));
+    }
+
+    /// M16: the manual create path is transactional too.
+    #[test]
+    fn create_manual_incident_rolls_back_on_link_failure() {
+        let conn = fresh_db_incidents();
+        conn.execute_batch(
+            "CREATE TRIGGER m16_abort_link BEFORE INSERT ON incident_conversations
+             BEGIN SELECT RAISE(ABORT, 'm16 injected failure'); END",
+        )
+        .unwrap();
+        let inc = ManualIncident {
+            title: "Checkout down".into(),
+            status: "open".into(),
+            severity: "critical".into(),
+            owner_user_local_id: None,
+            product: None,
+            feature: None,
+            description: None,
+            internal_explanation: None,
+            customer_safe_explanation: None,
+            known_cause: None,
+            workaround: None,
+            resolution: None,
+            started_at: None,
+            conversation_ids: vec![1],
+        };
+        let err = create_manual_incident(&conn, &inc);
+        assert!(err.is_err(), "the link insert must abort");
+        let incidents: i64 = conn
+            .query_row("SELECT COUNT(*) FROM incidents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(incidents, 0, "no orphan incident row (M16)");
+    }
 
     #[test]
     fn promote_to_incident_creates_with_correct_severity_and_source() {

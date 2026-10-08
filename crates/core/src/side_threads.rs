@@ -161,6 +161,18 @@ pub fn create_side_thread(
 }
 
 // ---------------------------------------------------------------------------
+// Transaction helpers (audit M16).
+//
+// The multi-step writers below are wrapped in a single
+// `unchecked_transaction` so a failure part-way through cannot strand a
+// partial state (e.g. a side_threads row whose participants or first
+// message never landed). The `*_unchecked` inner fns take any
+// `&Connection`-shaped handle (a `&Transaction` derefs to one) and are
+// ONLY called from inside an open transaction; the public entry points
+// own the BEGIN/COMMIT.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // Create with the full reference schema (CL-01 / audit M14) + participants
 // add with existence checks (CL-04 / sideThreadRepo.ts:173-186).
 // ---------------------------------------------------------------------------
@@ -376,7 +388,11 @@ pub fn create_side_thread_full(
     conversation_id: i64,
     input: &CreateSideThreadInput,
 ) -> Result<i64> {
-    conn.execute(
+    // M16: one transaction — the thread row, the initial participants, and
+    // the first message (with its mentions + notifications) commit
+    // together or not at all.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "INSERT INTO side_threads (conversation_id, title, team_local_id, created_by_user_id)
          VALUES (?1, ?2, ?3, ?4)",
         params![
@@ -386,11 +402,11 @@ pub fn create_side_thread_full(
             input.created_by_user_id
         ],
     )?;
-    let thread_id = conn.last_insert_rowid();
+    let thread_id = tx.last_insert_rowid();
     // Initial participants (reference createThread: participantUserIds each
     // become side_thread_participants rows, added_by = the creator).
-    add_participants_checked(
-        conn,
+    insert_participants_unchecked(
+        &tx,
         thread_id,
         &input.participant_user_ids,
         input.created_by_user_id,
@@ -398,8 +414,9 @@ pub fn create_side_thread_full(
     // The optional first message runs through the same mention-aware path
     // as POST /messages (reference sideThreadService.addMessage).
     if let Some(first) = &input.first_message {
-        add_side_thread_message(conn, bus, thread_id, first, input.created_by_user_id)?;
+        insert_side_thread_message_unchecked(&tx, bus, thread_id, first, input.created_by_user_id)?;
     }
+    tx.commit()?;
     Ok(thread_id)
 }
 
@@ -411,6 +428,9 @@ pub fn create_side_thread_full(
 /// reference's INSERT OR IGNORE).
 ///
 /// Returns the ids actually inserted.
+///
+/// The whole batch is one transaction (M16): an insert failure part-way
+/// through the loop leaves no partial participant set.
 ///
 /// # Errors
 ///
@@ -435,6 +455,21 @@ pub fn add_participants_checked(
             .into(),
         ));
     }
+    let tx = conn.unchecked_transaction()?;
+    let inserted = insert_participants_unchecked(&tx, thread_id, user_ids, added_by_user_local_id)?;
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// The raw participant loop (M16 inner helper — no own transaction; the
+/// caller holds one). Re-checks nothing: the public wrapper has already
+/// validated the user ids.
+fn insert_participants_unchecked(
+    conn: &Connection,
+    thread_id: i64,
+    user_ids: &[i64],
+    added_by_user_local_id: Option<i64>,
+) -> Result<Vec<i64>> {
     let mut inserted = Vec::new();
     for uid in user_ids {
         let rows = conn.execute(
@@ -467,6 +502,24 @@ pub fn add_participants_checked(
 /// Returns `Error::Sqlite` if the insert fails, or `Error::Other` if the
 /// body exceeds `mentions::MAX_BODY_BYTES`.
 pub fn add_side_thread_message(
+    conn: &Connection,
+    bus: Option<&crate::http::EventBus>,
+    thread_id: i64,
+    body: &str,
+    author_user_id: Option<i64>,
+) -> Result<i64> {
+    // M16: the message row, its resolved mentions, and the notification
+    // fan-out rows commit atomically.
+    let tx = conn.unchecked_transaction()?;
+    let message_id =
+        insert_side_thread_message_unchecked(&tx, bus, thread_id, body, author_user_id)?;
+    tx.commit()?;
+    Ok(message_id)
+}
+
+/// The raw message insert + mention fan-out (M16 inner helper — no own
+/// transaction; the caller holds one).
+fn insert_side_thread_message_unchecked(
     conn: &Connection,
     bus: Option<&crate::http::EventBus>,
     thread_id: i64,
@@ -532,12 +585,15 @@ pub fn add_side_thread_message(
         let directory = mentions::build_mention_directory(conn)?;
         for m in mentions::parse_mentions(body, &directory)? {
             // Persist the resolved mention (the "mentions for me" store).
-            let _ = conn.execute(
+            // M16: the error propagates — a mention row that failed to
+            // land while its message did would be a partial state; the
+            // enclosing transaction rolls the message back instead.
+            conn.execute(
                 "INSERT INTO side_thread_mentions
                     (side_thread_id, message_id, user_local_id, team_local_id)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![thread_id, message_id, m.user_local_id, m.team_local_id],
-            );
+            )?;
             if let Some(user) = m.user_local_id {
                 if Some(user) == author_user_id {
                     continue;
@@ -1784,5 +1840,111 @@ mod tests {
         assert!(s.contains("\"thread_id\":7"));
         assert!(s.contains("\"body\":\"Heads up @alice\""));
         assert!(s.contains(r#""mentions_json":"[\"@alice\"]""#));
+    }
+
+    // ---- M16: multi-step writes are transactional ----------------------------
+
+    /// The audit M16 scenario: `create_side_thread_full` used to leave the
+    /// side_threads row + participants behind when the first message failed
+    /// (e.g. oversized body). With the transaction, nothing lands.
+    #[test]
+    fn create_side_thread_full_rolls_back_when_the_first_message_fails() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let oversized = "x".repeat(mentions::MAX_BODY_BYTES + 1);
+        let input = CreateSideThreadInput {
+            title: "needs rollback".into(),
+            team_local_id: None,
+            participant_user_ids: vec![1, 2],
+            created_by_user_id: Some(1),
+            first_message: Some(oversized),
+        };
+        let err = create_side_thread_full(&conn, None, 1, &input);
+        assert!(err.is_err(), "the oversized first message must fail");
+        for table in [
+            "side_threads",
+            "side_thread_participants",
+            "side_thread_messages",
+            "side_thread_mentions",
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} must be empty after the rollback (M16)");
+        }
+    }
+
+    /// The same guarantee for a happy path: everything the call wrote is
+    /// visible after it returns (the transaction actually commits).
+    #[test]
+    fn create_side_thread_full_commits_the_whole_batch() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let input = CreateSideThreadInput {
+            title: "ships whole".into(),
+            team_local_id: None,
+            participant_user_ids: vec![1, 2],
+            created_by_user_id: Some(1),
+            first_message: Some("hello @priya".into()),
+        };
+        let thread_id = create_side_thread_full(&conn, None, 1, &input).unwrap();
+        assert!(thread_id > 0);
+        let (threads, parts, msgs): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM side_threads),
+                        (SELECT COUNT(*) FROM side_thread_participants),
+                        (SELECT COUNT(*) FROM side_thread_messages)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((threads, parts, msgs), (1, 2, 1));
+    }
+
+    /// M16: a failure part-way through the participant loop leaves no
+    /// partial participant set (injected via an abort trigger).
+    #[test]
+    fn add_participants_checked_rolls_back_mid_loop() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 1, None).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER m16_abort_second BEFORE INSERT ON side_thread_participants
+             WHEN NEW.user_local_id = 2
+             BEGIN SELECT RAISE(ABORT, 'm16 injected failure'); END",
+        )
+        .unwrap();
+        let err = add_participants_checked(&conn, thread_id, &[1, 2], None);
+        assert!(err.is_err(), "the second insert must abort");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM side_thread_participants", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "no partial participant rows survive (M16)");
+    }
+
+    /// M16: the message + its mentions + notifications are one batch —
+    /// a failure after the message insert leaves no orphan message row.
+    #[test]
+    fn add_side_thread_message_rolls_back_on_fanout_failure() {
+        let conn = fresh_db();
+        seed_identities(&conn);
+        let thread_id = create_side_thread(&conn, 1, None).unwrap();
+        // Abort when the mention is resolved into side_thread_mentions
+        // (after the message row itself was inserted).
+        conn.execute_batch(
+            "CREATE TRIGGER m16_abort_mention BEFORE INSERT ON side_thread_mentions
+             BEGIN SELECT RAISE(ABORT, 'm16 injected failure'); END",
+        )
+        .unwrap();
+        let err = add_side_thread_message(&conn, None, thread_id, "ping @priya", Some(1));
+        assert!(err.is_err(), "the mention insert must abort");
+        let msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM side_thread_messages", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(msgs, 0, "no orphan message row survives (M16)");
     }
 }
