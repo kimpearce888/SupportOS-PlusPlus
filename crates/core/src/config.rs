@@ -255,6 +255,15 @@ fn redact_string(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// env vars are process-global mutable state: the tests that read or
+    /// write them must not interleave. Found during DB-02 verification —
+    /// `env_config_defaults_match_reference` observed the value another
+    /// test was setting concurrently (LMSTUDIO_CONCURRENCY=7 instead of
+    /// the default 2), a timing-dependent flake that reproduced 3/3 when
+    /// the pair ran on the two cores. All four env-touching tests in this
+    /// module serialize through this lock; no other module sets env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn default_config_has_sane_values() {
         let c = AppConfig::default();
@@ -293,6 +302,7 @@ mod tests {
 
     #[test]
     fn data_dir_respects_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("SPP_DATA_DIR", "/tmp/spp-test-data-dir");
         let d = default_data_dir();
         assert!(d.to_string_lossy().contains("spp-test-data-dir"));
@@ -304,6 +314,7 @@ mod tests {
     fn env_config_defaults_match_reference() {
         // Run in a subprocess-clean env: tests share one process, so only
         // assert keys no other test touches.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let c = load_env_config();
         assert_eq!(
             c.helpscout.redirect_uri,
@@ -321,6 +332,7 @@ mod tests {
 
     #[test]
     fn env_config_reads_set_vars() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("LMSTUDIO_CONCURRENCY", "7");
         std::env::set_var("HELPSCOUT_DOCS_API_KEY", "docs-key-123");
         let c = load_env_config();
@@ -332,6 +344,7 @@ mod tests {
 
     #[test]
     fn env_bool_parses_reference_forms() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("QDRANT_ENABLED", "true");
         assert!(load_env_config().qdrant.enabled);
         std::env::set_var("QDRANT_ENABLED", "TRUE");
