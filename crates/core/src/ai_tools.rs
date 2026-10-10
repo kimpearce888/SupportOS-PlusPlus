@@ -488,7 +488,7 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             let id = row["id"].as_i64().unwrap_or_default();
             let threads = conn
                 .prepare(
-                    "SELECT thread_type, COALESCE(body, ''), COALESCE(remote_created_at, created_at)
+                    "SELECT type, COALESCE(body_text, ''), COALESCE(remote_created_at, created_at)
                        FROM conversation_threads
                       WHERE conversation_id = ?1
                       ORDER BY COALESCE(remote_created_at, created_at) DESC LIMIT 3",
@@ -576,8 +576,8 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             let id = conv["id"].as_i64().unwrap_or_default();
             let messages: Vec<(String, String, Option<String>, String)> = conn
                 .prepare(
-                    "SELECT COALESCE(from_name, thread_type, 'unknown'), thread_type,
-                            COALESCE(remote_created_at, created_at), COALESCE(body_html, body, '')
+                    "SELECT COALESCE(from_name, type, 'unknown'), type,
+                            COALESCE(remote_created_at, created_at), COALESCE(body_html, body_text, '')
                        FROM conversation_threads
                       WHERE conversation_id = ?1 AND deleted_at IS NULL AND state = 'published'
                       ORDER BY COALESCE(remote_created_at, created_at) ASC LIMIT 30",
@@ -641,12 +641,12 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             let tickets: Vec<HistoryTicket> = conn
                 .prepare(
                     "SELECT c.number, c.subject, c.status, COALESCE(c.remote_created_at, c.created_at), c.closed_at,
-                            (SELECT COALESCE(t.body, '') FROM conversation_threads t
+                            (SELECT COALESCE(t.body_text, '') FROM conversation_threads t
                               WHERE t.conversation_id = c.id AND t.deleted_at IS NULL AND t.state='published'
                               ORDER BY COALESCE(t.remote_created_at, t.created_at) ASC LIMIT 1),
-                            (SELECT COALESCE(t.body, '') FROM conversation_threads t
+                            (SELECT COALESCE(t.body_text, '') FROM conversation_threads t
                               WHERE t.conversation_id = c.id AND t.deleted_at IS NULL AND t.state='published'
-                                AND t.thread_type='reply'
+                                AND t.type='reply'
                               ORDER BY COALESCE(t.remote_created_at, t.created_at) DESC LIMIT 1)
                        FROM conversations c
                       WHERE c.customer_id = ?1 AND c.deleted_at IS NULL

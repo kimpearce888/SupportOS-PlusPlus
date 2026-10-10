@@ -1602,7 +1602,7 @@ pub fn compute_outcome(conn: &Connection, conversation_id: i64) -> Result<Option
         return Ok(None);
     };
     let mut stmt = conn.prepare(
-        "SELECT thread_type, body_html, body, created_at
+        "SELECT type, body_html, body_text, created_at
            FROM conversation_threads
           WHERE conversation_id = ?1 AND deleted_at IS NULL AND state = 'published'
           ORDER BY remote_created_at ASC",
@@ -2512,7 +2512,7 @@ mod tests {
 
     fn seed_thread(conn: &Connection, conv: i64, kind: &str, body: &str) {
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
              VALUES (?1, ?2, 'published', ?3, ?4, datetime('now', '-9 days'))",
             params![conv, kind, body, if kind == "customer" { "customer" } else { "user" }],
         )

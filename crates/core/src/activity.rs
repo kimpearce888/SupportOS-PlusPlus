@@ -329,15 +329,18 @@ pub struct RebuildSummary {
     pub events_total: i64,
 }
 
-/// One row of the thread mirror as the rebuild reads it.
+/// One row of the thread mirror as the rebuild reads it (the DB-04/M045
+/// reference actor model: `from_type` + the three-way `created_by_*`
+/// split).
 struct MirrorThread {
     id: i64,
     remote_id: Option<i64>,
     thread_type: String,
     state: Option<String>,
     body: Option<String>,
-    actor_type: String,
-    actor_id: Option<i64>,
+    from_type: Option<String>,
+    created_by_user_id: Option<i64>,
+    created_by_customer_id: Option<i64>,
     created_at: Option<String>,
 }
 
@@ -346,8 +349,8 @@ struct MirrorThread {
 /// the stored mirror instead of a provider payload:
 /// `note` → `internal_note` (user actor); `lineitem` → the conservative
 /// status/assign/moved/tag text mapping with `system_user`; everything else
-/// splits on the stored actor (`customer` → customer message, `user` →
-/// human agent message, unknown fallback).
+/// splits on the stored 3-way actor (`created_by_customer_id` → customer
+/// message, `created_by_user_id` → human agent message, unknown fallback).
 fn derive_mirror_event(t: &MirrorThread) -> Option<(String, String, Option<i64>)> {
     // Drafts / scheduled replies are not history yet — the sync path only
     // derives events for `state = 'published'` (a NULL state on an older
@@ -356,7 +359,7 @@ fn derive_mirror_event(t: &MirrorThread) -> Option<(String, String, Option<i64>)
         return None;
     }
     match t.thread_type.as_str() {
-        "note" => Some(("internal_note".into(), "user".into(), t.actor_id)),
+        "note" => Some(("internal_note".into(), "user".into(), t.created_by_user_id)),
         "lineitem" => {
             let text = t.body.as_deref().unwrap_or("").to_lowercase();
             let event_type = if text.contains("status") {
@@ -372,9 +375,17 @@ fn derive_mirror_event(t: &MirrorThread) -> Option<(String, String, Option<i64>)
             };
             Some((event_type.into(), "system_user".into(), None))
         }
-        _ => match t.actor_type.as_str() {
-            "customer" => Some(("customer_message".into(), "customer".into(), t.actor_id)),
-            "user" | "agent" => Some(("human_agent_message".into(), "user".into(), t.actor_id)),
+        _ => match t.from_type.as_deref().unwrap_or("") {
+            "customer" => Some((
+                "customer_message".into(),
+                "customer".into(),
+                t.created_by_customer_id,
+            )),
+            "user" | "agent" => Some((
+                "human_agent_message".into(),
+                "user".into(),
+                t.created_by_user_id,
+            )),
             _ => Some(("customer_message".into(), "unknown".into(), None)),
         },
     }
@@ -516,7 +527,8 @@ pub fn rebuild_all(conn: &Connection) -> Result<RebuildSummary> {
         //    soft-deleted threads only).
         let threads: Vec<MirrorThread> = {
             let mut stmt = conn.prepare(
-                "SELECT id, remote_id, thread_type, state, body, actor_type, actor_id, created_at
+                "SELECT id, remote_id, type, state, body_text, from_type,
+                        created_by_user_id, created_by_customer_id, created_at
                  FROM conversation_threads
                  WHERE conversation_id = ?1 AND deleted_at IS NULL",
             )?;
@@ -527,9 +539,10 @@ pub fn rebuild_all(conn: &Connection) -> Result<RebuildSummary> {
                     thread_type: r.get(2)?,
                     state: r.get(3)?,
                     body: r.get(4)?,
-                    actor_type: r.get(5)?,
-                    actor_id: r.get(6)?,
-                    created_at: r.get(7)?,
+                    from_type: r.get(5)?,
+                    created_by_user_id: r.get(6)?,
+                    created_by_customer_id: r.get(7)?,
+                    created_at: r.get(8)?,
                 })
             })?;
             rows.filter_map(|r| r.ok()).collect()
@@ -889,18 +902,22 @@ mod tests {
 
     /// The minimal thread-mirror shape the rebuild reads (the full chain's
     /// table comes from later migrations; the unit tests here run a slim
-    /// M003-only database).
+    /// M003-only database). DB-04 (M045): the reference actor model —
+    /// `type` / `body_text` / `from_type` + the three-way `created_by_*`
+    /// split (no FKs on the slim fixture; the real chain enforces them).
     fn ensure_thread_mirror(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS conversation_threads (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id INTEGER NOT NULL,
                 remote_id       INTEGER,
-                thread_type     TEXT NOT NULL,
+                type            TEXT NOT NULL,
                 state           TEXT DEFAULT 'published',
-                body            TEXT,
-                actor_type      TEXT NOT NULL,
-                actor_id        INTEGER,
+                body_text       TEXT,
+                from_type       TEXT,
+                created_by_user_id        INTEGER,
+                created_by_customer_id    INTEGER,
+                created_by_system_user_id INTEGER,
                 created_at      TEXT,
                 deleted_at      TEXT
             );",
@@ -922,9 +939,25 @@ mod tests {
     ) -> i64 {
         conn.execute(
             "INSERT INTO conversation_threads
-                (conversation_id, remote_id, thread_type, state, body, actor_type, actor_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![conv_local, remote_id, thread_type, state, body, actor_type, actor_id, created_at],
+                (conversation_id, remote_id, type, state, body_text, from_type,
+                 created_by_user_id, created_by_customer_id,
+                 created_by_system_user_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5,
+                     CASE WHEN ?6 = 'system' THEN 'system_user' ELSE ?6 END,
+                     CASE WHEN ?6 = 'user' THEN ?7 END,
+                     CASE WHEN ?6 = 'customer' THEN ?7 END,
+                     CASE WHEN ?6 IN ('system', 'system_user') THEN ?7 END,
+                     ?8)",
+            params![
+                conv_local,
+                remote_id,
+                thread_type,
+                state,
+                body,
+                actor_type,
+                actor_id,
+                created_at
+            ],
         )
         .unwrap();
         conn.last_insert_rowid()

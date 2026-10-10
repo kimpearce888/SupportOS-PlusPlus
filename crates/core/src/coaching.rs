@@ -312,7 +312,8 @@ struct ConvRow {
 fn load_thread_rows(conn: &Connection, conversation_id: i64) -> Vec<ThreadRow> {
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, thread_type, html_stripped FROM (
-             SELECT id, thread_type, COALESCE(body_html, body, '') AS html_stripped,
+             SELECT id, type AS thread_type,
+                    COALESCE(body_html, body_text, '') AS html_stripped,
                     COALESCE(remote_created_at, created_at) AS at
              FROM conversation_threads
              WHERE conversation_id = ?1 AND deleted_at IS NULL AND state = 'published'
@@ -1676,13 +1677,20 @@ mod tests {
 
     fn insert_thread(conn: &Connection, conv: i64, ttype: &str, body: &str, at: &str) -> i64 {
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'published', ?5)",
+            "INSERT INTO conversation_threads
+                 (conversation_id, type, body_text, from_type,
+                  created_by_customer_id, state, created_at)
+             VALUES (?1, ?2, ?3, ?4, CASE WHEN ?4 = 'customer' THEN 1 END,
+                     'published', ?5)",
             params![
                 conv,
                 ttype,
                 body,
-                if ttype == "customer" { "customer" } else { "user" },
+                if ttype == "customer" {
+                    "customer"
+                } else {
+                    "user"
+                },
                 at
             ],
         )

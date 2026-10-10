@@ -55,7 +55,7 @@ async fn interaction_routes_serve_the_reference_card_contract() {
     .expect("seed history conversation");
     conn.execute(
         "INSERT INTO conversation_threads
-            (conversation_id, thread_type, state, body, actor_type, created_at)
+            (conversation_id, type, state, body_text, from_type, created_at)
          VALUES (699, 'customer', 'published',
             'The API returns 401 again. This is STILL not working, very annoying. Please fix ASAP.',
             'customer', datetime('now', '-20 days'))",
@@ -64,7 +64,7 @@ async fn interaction_routes_serve_the_reference_card_contract() {
     .expect("seed history thread");
     conn.execute(
         "INSERT INTO conversation_threads
-            (conversation_id, thread_type, state, body, actor_type, created_at)
+            (conversation_id, type, state, body_text, from_type, created_at)
          VALUES (699, 'reply', 'published', 'Rotated the token for you.',
             'user', datetime('now', '-19 days'))",
         [],
@@ -72,7 +72,7 @@ async fn interaction_routes_serve_the_reference_card_contract() {
     .expect("seed history reply");
     conn.execute(
         "INSERT INTO conversation_threads
-            (conversation_id, thread_type, state, body, actor_type, created_at)
+            (conversation_id, type, state, body_text, from_type, created_at)
          VALUES (699, 'customer', 'published', 'Thanks, that worked!',
             'customer', datetime('now', '-19 days'))",
         [],
@@ -91,7 +91,7 @@ async fn interaction_routes_serve_the_reference_card_contract() {
     // 401, token) and an explicit step-by-step preference.
     conn.execute(
         "INSERT INTO conversation_threads
-            (conversation_id, thread_type, state, body, actor_type, created_at)
+            (conversation_id, type, state, body_text, from_type, created_at)
          VALUES (700, 'customer', 'published',
             'This is STILL not working. I already called twice and nobody fixed it. Every time the same thing. Please walk me through step by step how to fix the API endpoint, the 401 says the token expired.',
             'customer', datetime('now', '-1 day'))",

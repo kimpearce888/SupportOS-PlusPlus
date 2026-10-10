@@ -99,7 +99,7 @@ pub(crate) struct ThreadLite {
 pub(crate) fn published_threads(conn: &Connection, conversation_local: i64) -> Vec<ThreadLite> {
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, thread_type, html_stripped, at FROM (
-             SELECT id, thread_type, COALESCE(body_html, body, '') AS html_stripped,
+             SELECT id, type AS thread_type, COALESCE(body_html, body_text, '') AS html_stripped,
                     COALESCE(remote_created_at, created_at) AS at
              FROM conversation_threads
              WHERE conversation_id = ?1 AND state = 'published' AND deleted_at IS NULL
@@ -1464,7 +1464,7 @@ pub fn rebuild_friction(conn: &Connection) -> (usize, usize) {
     let ids: Vec<i64> = {
         let Ok(mut stmt) = conn.prepare(
             "SELECT DISTINCT c.id FROM conversations c
-             JOIN conversation_threads t ON t.conversation_id = c.id AND t.thread_type = 'customer'
+             JOIN conversation_threads t ON t.conversation_id = c.id AND t.type = 'customer'
              WHERE c.deleted_at IS NULL",
         ) else {
             return (0, 0);
@@ -1962,7 +1962,7 @@ pub async fn compute_qa_ai_layer(
     }
     let threads: Vec<(i64, String, String)> = conn
         .prepare(
-            "SELECT id, thread_type, COALESCE(body_html, body, '') FROM conversation_threads
+            "SELECT id, type, COALESCE(body_html, body_text, '') FROM conversation_threads
              WHERE conversation_id = ?1 AND deleted_at IS NULL AND state = 'published'
              ORDER BY COALESCE(remote_created_at, created_at) ASC LIMIT 40",
         )
@@ -2282,7 +2282,7 @@ pub fn effectiveness_report(conn: &Connection, days: i64) -> Value {
                AND COALESCE(julianday(c.remote_created_at), julianday(c.created_at))
                    >= julianday('now', ?1)
                AND EXISTS (SELECT 1 FROM conversation_threads t
-                           WHERE t.conversation_id = c.id AND t.thread_type = 'reply'
+                           WHERE t.conversation_id = c.id AND t.type = 'reply'
                              AND t.state = 'published' AND t.deleted_at IS NULL)";
     let total_in_window: i64 = conn
         .query_row(
@@ -2572,13 +2572,18 @@ mod tests {
 
     fn insert_thread(conn: &Connection, conv: i64, ttype: &str, body: &str, at: &str) -> i64 {
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, state, created_at)
+            "INSERT INTO conversation_threads
+                 (conversation_id, type, body_text, from_type, state, created_at)
              VALUES (?1, ?2, ?3, ?4, 'published', ?5)",
             params![
                 conv,
                 ttype,
                 body,
-                if ttype == "customer" { "customer" } else { "user" },
+                if ttype == "customer" {
+                    "customer"
+                } else {
+                    "user"
+                },
                 at
             ],
         )

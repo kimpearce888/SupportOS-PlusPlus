@@ -861,8 +861,8 @@ pub struct CustomerMessage {
 /// Returns `Error::Sqlite` if the query fails.
 pub fn customer_messages(conn: &Connection, conversation_id: i64) -> Result<Vec<CustomerMessage>> {
     let mut stmt = conn.prepare(
-        "SELECT id, COALESCE(body, '') FROM conversation_threads
-         WHERE conversation_id = ?1 AND thread_type = 'customer'
+        "SELECT id, COALESCE(body_text, '') FROM conversation_threads
+         WHERE conversation_id = ?1 AND type = 'customer'
          ORDER BY created_at ASC, id ASC LIMIT 30",
     )?;
     let rows: Vec<CustomerMessage> = stmt
@@ -1758,8 +1758,10 @@ mod tests {
                 local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
              CREATE TABLE conversation_threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
-                thread_type TEXT NOT NULL, body TEXT, actor_type TEXT NOT NULL,
-                actor_id INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+                type TEXT NOT NULL, body_text TEXT, from_type TEXT,
+                created_by_user_id INTEGER, created_by_customer_id INTEGER,
+                created_by_system_user_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')));
              CREATE TABLE known_issues (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active', description TEXT,
@@ -1827,7 +1829,7 @@ mod tests {
 
     fn insert_customer_thread(conn: &Connection, conv: i64, body: &str) {
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type)
              VALUES (?1, 'customer', ?2, 'customer')",
             params![conv, body],
         )

@@ -619,7 +619,7 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
             date_expr: "t.created_at",
             value_expr: "COUNT(*)",
             extra_where: &[
-                "t.thread_type = 'reply'",
+                "t.type = 'reply'",
                 "t.deleted_at IS NULL",
                 "t.state = 'published'",
             ],
@@ -633,7 +633,7 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
             date_expr: "t.created_at",
             value_expr: "COUNT(*)",
             extra_where: &[
-                "t.thread_type = 'customer_message'",
+                "t.type = 'customer_message'",
                 "t.deleted_at IS NULL",
                 "t.state = 'published'",
             ],

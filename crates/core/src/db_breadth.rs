@@ -1254,6 +1254,55 @@ mod tests {
         crate::connectors::apply_m038(&conn).unwrap();
         crate::mirror_tables::apply_m039(&conn).unwrap();
         apply_m040(&conn).unwrap();
+        // DB-04 (M045): the reference actor model (the slim chain's M028
+        // creates the collapsed shape; swap in the rebuilt result — with
+        // the M040-added columns this test asserts on).
+        conn.execute_batch(
+            "DROP TABLE conversation_threads;
+             CREATE TABLE conversation_threads (
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_id                 INTEGER,
+                conversation_id           INTEGER NOT NULL,
+                type                      TEXT,
+                state                     TEXT DEFAULT 'published',
+                body_text                 TEXT,
+                body_html                 TEXT,
+                from_name                 TEXT,
+                from_email                TEXT,
+                from_type                 TEXT,
+                created_by_user_id        INTEGER,
+                created_by_customer_id    INTEGER,
+                created_by_system_user_id INTEGER,
+                assigned_to_type          TEXT,
+                assigned_to_id            INTEGER,
+                saved_reply_local_id      INTEGER,
+                action_type               TEXT,
+                action_text               TEXT,
+                to_list                   TEXT,
+                cc_list                   TEXT,
+                bcc_list                  TEXT,
+                scheduled_for             TEXT,
+                remote_created_at         TEXT,
+                remote_updated_at         TEXT,
+                local_created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+                local_updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+                last_synced_at            TEXT,
+                raw_json                  TEXT,
+                raw_json_hash             TEXT,
+                deleted_at                TEXT,
+                fts_indexed               INTEGER DEFAULT 0,
+                embedding_state           TEXT DEFAULT 'not_indexed',
+                created_at                TEXT NOT NULL
+                                              DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_threads_remote
+                 ON conversation_threads (remote_id);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_conv
+                 ON conversation_threads (conversation_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_type
+                 ON conversation_threads (type);",
+        )
+        .unwrap();
         conn
     }
 
@@ -1375,7 +1424,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type)
              VALUES (1, 'customer', 'hello', 'customer')",
             [],
         )

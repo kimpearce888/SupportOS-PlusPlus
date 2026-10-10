@@ -660,30 +660,73 @@ fn rechunk_doc_article(
 }
 
 fn upsert_thread(conn: &Connection, conversation_local: i64, t: &HsThread) -> Result<()> {
-    // The local thread rows carry LOCAL actor ids (reference threadToSummary
-    // joins `users WHERE id = ?`), so remote ids resolve through the mirror —
-    // same mapping upsert_conversation applies to the assignee.
-    let (actor_type, actor_id) = if let Some(cid) = t.created_by_customer_id {
-        ("customer", local_id(conn, "customers", cid).unwrap_or(cid))
-    } else if let Some(uid) = t.created_by_user_id {
-        ("user", local_id(conn, "users", uid).unwrap_or(uid))
+    // DB-04 (M045): the reference actor model — `from_type` plus the
+    // three-way `created_by_*` split (conversationRepo.ts:646-662). Local
+    // ids resolve through the mirror (same mapping upsert_conversation
+    // applies to the assignee); a miss resolves to NULL — never a remote id
+    // in a local FK column (the N2 rule the reference FKs enforce).
+    let from_type: &str = if t.created_by_customer_id.is_some() {
+        "customer"
+    } else if t.created_by_user_id.is_some() {
+        "user"
     } else {
-        ("system", 0)
+        "system_user"
     };
+    let created_by_user_id = (from_type == "user")
+        .then(|| {
+            t.created_by_user_id
+                .and_then(|rid| local_id(conn, "users", rid))
+        })
+        .flatten();
+    let created_by_customer_id = (from_type == "customer")
+        .then(|| {
+            t.created_by_customer_id
+                .and_then(|rid| local_id(conn, "customers", rid))
+        })
+        .flatten();
+    // System lines (lineitems) carry no resolvable system user on the wire
+    // shape the port syncs — the reference's `localIds.systemUser` path
+    // lands NULL for them too (record_thread_event records 'system_user'
+    // with no id).
+    let created_by_system_user_id: Option<i64> = None;
     conn.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at, remote_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO conversation_threads
+             (conversation_id, type, state, body_text, from_type,
+              created_by_user_id, created_by_customer_id, created_by_system_user_id,
+              created_at, remote_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(remote_id) DO UPDATE SET
-            conversation_id = excluded.conversation_id, thread_type = excluded.thread_type,
+            conversation_id = excluded.conversation_id, type = excluded.type,
             state = excluded.state,
-            body = excluded.body, actor_type = excluded.actor_type, actor_id = excluded.actor_id,
+            body_text = excluded.body_text, from_type = excluded.from_type,
+            created_by_user_id = excluded.created_by_user_id,
+            created_by_customer_id = excluded.created_by_customer_id,
+            created_by_system_user_id = excluded.created_by_system_user_id,
             created_at = excluded.created_at,
             -- DB-05 (M18): threads resurrect on upsert too
             -- (conversationRepo.ts:667 `deleted_at=NULL`).
             deleted_at = NULL",
-        params![conversation_local, t.kind, t.state, t.body, actor_type, actor_id, t.created_at, t.remote_id],
+        params![
+            conversation_local,
+            t.kind,
+            t.state,
+            t.body,
+            from_type,
+            created_by_user_id,
+            created_by_customer_id,
+            created_by_system_user_id,
+            t.created_at,
+            t.remote_id
+        ],
     )?;
-    record_thread_event(conn, conversation_local, t, actor_type, actor_id)?;
+    record_thread_event(
+        conn,
+        conversation_local,
+        t,
+        from_type,
+        created_by_user_id,
+        created_by_customer_id,
+    )?;
     // SY-05 (C8): store the thread's recipients + attachment metadata (the
     // reference mirror keeps both; the port dropped them before).
     persist_thread_details(conn, t)?;
@@ -754,15 +797,22 @@ fn record_thread_event(
     conn: &Connection,
     conversation_local: i64,
     t: &HsThread,
-    actor_type: &str,
-    actor_id: i64,
+    from_type: &str,
+    created_by_user_id: Option<i64>,
+    created_by_customer_id: Option<i64>,
 ) -> Result<Option<&'static str>> {
     if t.state.as_deref() != Some("published") {
         return Ok(None); // drafts/scheduled replies are not history yet
     }
     let kind = t.kind.as_str();
+    // The event actor (reference conversation_events keeps the 2-field
+    // actor_type + actor_local_id) derives back from the threads 3-way
+    // split (DB-04): a user line carries its local user id, a customer
+    // line its local customer id, everything else (lineitems, system
+    // lines) the 'system_user'/'unknown' vocabulary with no id.
+    let event_actor_local_id = created_by_user_id.or(created_by_customer_id);
     let (event_type, actor_type, event_actor_id): (&'static str, &str, Option<i64>) = match kind {
-        "note" => ("internal_note", "user", Some(actor_id)),
+        "note" => ("internal_note", "user", created_by_user_id),
         "lineitem" => {
             // Help Scout action records — map conservatively; the raw text
             // stays in the thread mirror. Reference vocabulary: lineitems are
@@ -784,9 +834,9 @@ fn record_thread_event(
         }
         _ => {
             if t.created_by_customer_id.is_some() {
-                ("customer_message", actor_type, Some(actor_id))
+                ("customer_message", from_type, event_actor_local_id)
             } else if t.created_by_user_id.is_some() {
-                ("human_agent_message", actor_type, Some(actor_id))
+                ("human_agent_message", from_type, event_actor_local_id)
             } else {
                 ("customer_message", "unknown", None)
             }
@@ -1374,7 +1424,7 @@ impl SyncEngine {
                 conn.query_row(
                     "SELECT COUNT(*) FROM conversation_threads
                       WHERE (fts_indexed IS NULL OR fts_indexed = 0)
-                        AND body IS NOT NULL AND LENGTH(body) > 0",
+                        AND body_text IS NOT NULL AND LENGTH(body_text) > 0",
                     [],
                     |r| r.get(0),
                 )
@@ -1386,16 +1436,16 @@ impl SyncEngine {
                 let conn = self.lock();
                 conn.execute(
                     "INSERT INTO fts_threads (body, thread_id, conversation_id)
-                     SELECT t.body, t.id, t.conversation_id FROM conversation_threads t
+                     SELECT t.body_text, t.id, t.conversation_id FROM conversation_threads t
                       WHERE (t.fts_indexed IS NULL OR t.fts_indexed = 0)
-                        AND t.body IS NOT NULL AND LENGTH(t.body) > 0
+                        AND t.body_text IS NOT NULL AND LENGTH(t.body_text) > 0
                         AND NOT EXISTS (SELECT 1 FROM fts_threads f WHERE f.thread_id = t.id)",
                     [],
                 )?;
                 conn.execute(
                     "UPDATE conversation_threads SET fts_indexed = 1
                       WHERE (fts_indexed IS NULL OR fts_indexed = 0)
-                        AND body IS NOT NULL AND LENGTH(body) > 0",
+                        AND body_text IS NOT NULL AND LENGTH(body_text) > 0",
                     [],
                 )?;
                 result

@@ -2547,7 +2547,7 @@ mod tests {
         // Thread visible locally with the right shape.
         let (kind, body_text, actor_type): (String, String, String) = conn
             .query_row(
-                "SELECT thread_type, body, actor_type FROM conversation_threads
+                "SELECT type, body_text, from_type FROM conversation_threads
                   WHERE remote_id = ?1",
                 rusqlite::params![thread_remote_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -2585,7 +2585,7 @@ mod tests {
         // No phantom "[reply sent: ...]" note (the old double-write).
         let phantoms: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM conversation_threads WHERE body LIKE '[reply sent:%'",
+                "SELECT COUNT(*) FROM conversation_threads WHERE body_text LIKE '[reply sent:%'",
                 [],
                 |r| r.get(0),
             )
@@ -2885,7 +2885,7 @@ mod tests {
         let phantoms: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM conversation_threads
-                  WHERE thread_type = 'system' AND body LIKE 'Status changed to:%'",
+                  WHERE type = 'system' AND body_text LIKE 'Status changed to:%'",
                 [],
                 |r| r.get(0),
             )

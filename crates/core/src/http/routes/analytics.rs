@@ -192,7 +192,7 @@ pub async fn dashboard(
             &format!(
                 "SELECT COUNT(*) FROM conversation_threads t
                  JOIN conversations c ON c.id = t.conversation_id
-                 WHERE t.thread_type = 'reply' AND t.state = 'published' AND t.deleted_at IS NULL
+                 WHERE t.type = 'reply' AND t.state = 'published' AND t.deleted_at IS NULL
                    AND t.created_at >= ?1 AND t.created_at <= ?2{mailbox_in}{conv_channel}"
             ),
             rusqlite::params_from_iter(range_params(channel.is_some())),
@@ -201,7 +201,7 @@ pub async fn dashboard(
         .unwrap_or(0);
 
     // First-response / resolution averages (calendar minutes, rounded).
-    let first_reply_join = "LEFT JOIN (SELECT conversation_id, MIN(created_at) AS first_reply FROM conversation_threads WHERE thread_type = 'reply' AND state = 'published' AND deleted_at IS NULL GROUP BY conversation_id) fr ON fr.conversation_id = c.id";
+    let first_reply_join = "LEFT JOIN (SELECT conversation_id, MIN(created_at) AS first_reply FROM conversation_threads WHERE type = 'reply' AND state = 'published' AND deleted_at IS NULL GROUP BY conversation_id) fr ON fr.conversation_id = c.id";
     let first_response_avg_min: Option<f64> = conn
         .query_row(
             &format!(
@@ -1405,8 +1405,8 @@ pub async fn doc_gaps(
             // threads WHERE type='reply' AND state='published').
             let known_answer: Option<String> = conn
                 .query_row(
-                    "SELECT body FROM conversation_threads
-                      WHERE conversation_id = ?1 AND thread_type = 'reply' AND state = 'published'
+                    "SELECT body_text FROM conversation_threads
+                      WHERE conversation_id = ?1 AND type = 'reply' AND state = 'published'
                       ORDER BY created_at ASC LIMIT 1",
                     rusqlite::params![ids[0]],
                     |r| r.get::<_, Option<String>>(0),
@@ -1454,8 +1454,8 @@ pub async fn answer_reuse(
             // ORDER BY remote_created_at ASC LIMIT 1).
             let common_resolution: Option<String> = conn
                 .query_row(
-                    "SELECT body FROM conversation_threads
-                      WHERE conversation_id = ?1 AND thread_type = 'reply' AND state = 'published'
+                    "SELECT body_text FROM conversation_threads
+                      WHERE conversation_id = ?1 AND type = 'reply' AND state = 'published'
                       ORDER BY created_at ASC LIMIT 1",
                     rusqlite::params![ids[0]],
                     |r| r.get::<_, Option<String>>(0),
@@ -2208,7 +2208,7 @@ mod tests {
             ("reply", "2026-03-02T09:30:00Z"),
         ] {
             conn.execute(
-                "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+                "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
                  VALUES (?1, ?2, 'published', 'b', 'customer', ?3)",
                 rusqlite::params![conv, kind, at],
             )

@@ -1337,7 +1337,7 @@ pub async fn extract_memories(
         return 0;
     };
     let mut stmt = match conn.prepare(
-        "SELECT thread_type, from_name, body_html, body FROM conversation_threads
+        "SELECT type, from_name, body_html, body_text FROM conversation_threads
           WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY COALESCE(remote_created_at, created_at) ASC",
     ) {
         Ok(s) => s,
@@ -1614,6 +1614,18 @@ pub struct ClusterUpsert {
 /// The port's legacy `issue_clusters` table has a NOT NULL `name` column —
 /// the title doubles as the name (same convention as the demo seed).
 pub fn upsert_cluster(conn: &Connection, c: &ClusterUpsert) -> Result<i64> {
+    // DB-06: the known-issue FK — a model-emitted id that resolves to no
+    // known_issues row converges to NULL (the SET-NULL link semantics the
+    // reference enforced; the cluster still lands).
+    let known_issue_id = c.known_issue_id.filter(|id| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM known_issues WHERE id = ?1",
+            [id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    });
     let existing: Option<i64> = conn
         .query_row(
             "SELECT id FROM issue_clusters WHERE title = ?1",
@@ -1632,7 +1644,7 @@ pub fn upsert_cluster(conn: &Connection, c: &ClusterUpsert) -> Result<i64> {
                     c.category,
                     c.product,
                     c.feature,
-                    c.known_issue_id
+                    known_issue_id
                 ],
             )?;
             id
@@ -1647,7 +1659,7 @@ pub fn upsert_cluster(conn: &Connection, c: &ClusterUpsert) -> Result<i64> {
                     c.category,
                     c.product,
                     c.feature,
-                    c.known_issue_id,
+                    known_issue_id,
                     i64::from(c.ai_generated)
                 ],
             )?;
@@ -2053,6 +2065,7 @@ mod tests {
         crate::bootstrap::apply_all(&mut conn).expect("apply all migrations");
         conn.execute_batch(
             "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
+             INSERT INTO known_issues (id, name) VALUES (7, 'login loop');
              INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
                  VALUES (1, 101, 101, 'a', 'active', 1, 11, '2026-10-01 10:00:00');
              INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at, remote_created_at)
@@ -2401,7 +2414,7 @@ mod tests {
         .unwrap();
         assert_eq!(get_analysis_signature(&conn, 1), "0:0:");
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, remote_created_at, raw_json_hash)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, remote_created_at, raw_json_hash)
              VALUES (1, 'customer', 'hi', 'customer', '2026-10-01 10:00:00', 'abc')",
             [],
         )
@@ -2727,7 +2740,9 @@ mod tests {
             CREATE TABLE customers (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT);
             CREATE TABLE conversation_threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
-                thread_type TEXT NOT NULL, body TEXT, actor_type TEXT NOT NULL, actor_id INTEGER,
+                type TEXT NOT NULL, body_text TEXT, from_type TEXT,
+                created_by_user_id INTEGER, created_by_customer_id INTEGER,
+                created_by_system_user_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 state TEXT DEFAULT 'published', deleted_at TEXT, body_html TEXT,
                 from_name TEXT, remote_created_at TEXT, raw_json_hash TEXT
@@ -2992,9 +3007,9 @@ pub async fn analyze_interaction(
     let messages: Vec<(String, Option<i64>)> = {
         let mut stmt = conn
             .prepare(
-                "SELECT id, body_html, body FROM conversation_threads
+                "SELECT id, body_html, body_text FROM conversation_threads
                   WHERE conversation_id = ?1 AND deleted_at IS NULL
-                    AND thread_type = 'customer' AND state = 'published'
+                    AND type = 'customer' AND state = 'published'
                   ORDER BY remote_created_at ASC",
             )
             .map_err(|e| LmStudioError::new(e.to_string(), true))?;
@@ -3049,8 +3064,8 @@ pub async fn analyze_interaction(
         .map(|h| {
             let first_msg: Option<String> = conn
                 .query_row(
-                    "SELECT body_html, body FROM conversation_threads
-                      WHERE conversation_id = ?1 AND deleted_at IS NULL AND thread_type = 'customer'
+                    "SELECT body_html, body_text FROM conversation_threads
+                      WHERE conversation_id = ?1 AND deleted_at IS NULL AND type = 'customer'
                       ORDER BY remote_created_at ASC LIMIT 1",
                     params![h.id],
                     |r| {

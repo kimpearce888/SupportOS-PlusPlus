@@ -2115,8 +2115,10 @@ mod tests {
              CREATE TABLE users (id INTEGER PRIMARY KEY, remote_id INTEGER, first_name TEXT, last_name TEXT);
              CREATE TABLE conversation_threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
-                thread_type TEXT NOT NULL, body TEXT, actor_type TEXT NOT NULL,
-                actor_id INTEGER, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+                type TEXT NOT NULL, body_text TEXT, from_type TEXT,
+                created_by_user_id INTEGER, created_by_customer_id INTEGER,
+                created_by_system_user_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
              CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT,
                 actor TEXT, action TEXT, conversation_id INTEGER, before_state TEXT,
                 after_state TEXT, remote_operation TEXT, remote_result TEXT, ai_involvement INTEGER,
@@ -2288,7 +2290,7 @@ mod tests {
         let conn = fresh_db();
         let id = seed(&conn);
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, actor_type)
+            "INSERT INTO conversation_threads (conversation_id, type, from_type)
              VALUES (?1, 'reply', 'user')",
             params![id],
         )
@@ -2303,7 +2305,7 @@ mod tests {
         .unwrap();
         let other = conn.last_insert_rowid();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, actor_type)
+            "INSERT INTO conversation_threads (conversation_id, type, from_type)
              VALUES (?1, 'reply', 'user')",
             params![other],
         )

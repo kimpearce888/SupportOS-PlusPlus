@@ -57,19 +57,6 @@ async fn rebuild_all_admin_action_runs_the_real_rebuild() {
     )
     .expect("seed conversations");
     conn.execute(
-        "INSERT INTO conversation_threads
-            (conversation_id, remote_id, thread_type, state, body, actor_type, actor_id, created_at)
-         VALUES
-            (1, 7001, 'customer', 'published', 'I want a refund',   'customer', 10, '2026-01-01T10:00:00Z'),
-            (1, 7002, 'reply',    'published', 'We are on it',      'user',      2, '2026-01-01T10:05:00Z'),
-            (1, 7003, 'note',     'published', 'VIP customer',      'user',      2, '2026-01-01T10:06:00Z'),
-            (1, 7004, 'reply',    'draft',     'unsent draft',      'user',      2, '2026-01-01T11:00:00Z'),
-            (2, 7005, 'customer', 'published', 'It crashed',        'customer', 10, '2026-01-01T10:30:00Z'),
-            (2, 7006, 'reply',    'scheduled', 'hold the answer',   'user',      2, '2026-01-01T12:00:00Z')",
-        [],
-    )
-    .expect("seed threads");
-    conn.execute(
         "INSERT INTO customers (id, remote_id, first_name, last_name, email, created_at)
          VALUES (10, 3001, 'Ada', 'Lovelace', 'ada@example.com', '2026-01-01T08:00:00Z')",
         [],
@@ -81,6 +68,20 @@ async fn rebuild_all_admin_action_runs_the_real_rebuild() {
         [],
     )
     .expect("seed user");
+    conn.execute(
+        "INSERT INTO conversation_threads
+            (conversation_id, remote_id, type, state, body_text, from_type,
+             created_by_user_id, created_by_customer_id, created_at)
+         VALUES
+            (1, 7001, 'customer', 'published', 'I want a refund',   'customer', NULL, 10, '2026-01-01T10:00:00Z'),
+            (1, 7002, 'reply',    'published', 'We are on it',      'user',      2, NULL, '2026-01-01T10:05:00Z'),
+            (1, 7003, 'note',     'published', 'VIP customer',      'user',      2, NULL, '2026-01-01T10:06:00Z'),
+            (1, 7004, 'reply',    'draft',     'unsent draft',      'user',      2, NULL, '2026-01-01T11:00:00Z'),
+            (2, 7005, 'customer', 'published', 'It crashed',        'customer', NULL, 10, '2026-01-01T10:30:00Z'),
+            (2, 7006, 'reply',    'scheduled', 'hold the answer',   'user',      2, NULL, '2026-01-01T12:00:00Z')",
+        [],
+    )
+    .expect("seed threads");
 
     let http_conn = Arc::new(Mutex::new(conn));
     let bus = spp_core::http::EventBus::default();

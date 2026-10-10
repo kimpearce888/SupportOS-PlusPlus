@@ -439,7 +439,7 @@ mod tests {
             )
             .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, state, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, state, created_at)
              VALUES (?1, 'customer', 'Hola, no puedo entrar en mi cuenta de usuario desde ayer', 'customer', 'published', datetime('now'))",
             rusqlite::params![conv_id],
         )

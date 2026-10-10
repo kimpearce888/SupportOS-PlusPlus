@@ -237,10 +237,10 @@ pub fn ensure_sla_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS conversation_threads (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             conversation_id INTEGER NOT NULL,
-            thread_type     TEXT NOT NULL,
-            body            TEXT,
-            actor_type      TEXT NOT NULL,
-            actor_id        INTEGER,
+            type            TEXT NOT NULL,
+            body_text       TEXT,
+            from_type       TEXT,
+            created_by_customer_id INTEGER,
             created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );",
     )?;
@@ -468,7 +468,7 @@ fn first_response_pairs(
          FROM conversations c
          JOIN (SELECT conversation_id, MIN(created_at) AS first_reply
                FROM conversation_threads
-               WHERE thread_type = 'reply' AND state = 'published' AND deleted_at IS NULL
+               WHERE type = 'reply' AND state = 'published' AND deleted_at IS NULL
                GROUP BY conversation_id) fr
            ON fr.conversation_id = c.id
          WHERE c.mailbox_id = ?1 AND c.deleted_at IS NULL AND c.created_at >= ?2 AND c.created_at <= ?3",
@@ -720,10 +720,10 @@ pub fn sla_alerts(conn: &Connection) -> Result<SlaAlerts> {
                 "SELECT c.id, c.number, c.subject, c.status, c.assignee_id,
                         COALESCE(c.updated_at, c.created_at) AS since,
                         EXISTS (SELECT 1 FROM conversation_threads t
-                                WHERE t.conversation_id = c.id AND t.thread_type = 'reply'
+                                WHERE t.conversation_id = c.id AND t.type = 'reply'
                                   AND t.state = 'published' AND t.deleted_at IS NULL) AS replied,
                         (SELECT COUNT(*) FROM conversation_threads t
-                         WHERE t.conversation_id = c.id AND t.thread_type = 'customer'
+                         WHERE t.conversation_id = c.id AND t.type = 'customer'
                            AND t.deleted_at IS NULL) AS customer_threads
                  FROM conversations c
                  WHERE c.mailbox_id = ?1 AND c.status IN ('active','pending') AND c.deleted_at IS NULL
@@ -754,7 +754,7 @@ pub fn sla_alerts(conn: &Connection) -> Result<SlaAlerts> {
             let last_customer: Option<String> = conn
                 .query_row(
                     "SELECT created_at FROM conversation_threads
-                     WHERE conversation_id = ?1 AND thread_type = 'customer' AND deleted_at IS NULL
+                     WHERE conversation_id = ?1 AND type = 'customer' AND deleted_at IS NULL
                      ORDER BY created_at DESC LIMIT 1",
                     [r.id],
                     |row| row.get(0),
@@ -876,7 +876,7 @@ mod tests {
 
     fn seed_thread(conn: &Connection, conv_id: i64, kind: &str, at: &str) {
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
              VALUES (?1, ?2, 'published', 'body', 'customer', ?3)",
             params![conv_id, kind, at],
         )

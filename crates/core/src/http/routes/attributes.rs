@@ -378,8 +378,10 @@ mod tests {
                 mailbox_id INTEGER NOT NULL, customer_id INTEGER NOT NULL);
              CREATE TABLE conversation_threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
-                thread_type TEXT NOT NULL, body TEXT, actor_type TEXT NOT NULL,
-                actor_id INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')));
+                type TEXT NOT NULL, body_text TEXT, from_type TEXT,
+                created_by_user_id INTEGER, created_by_customer_id INTEGER,
+                created_by_system_user_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')));
              CREATE TABLE known_issues (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
              CREATE TABLE known_issue_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, known_issue_id INTEGER NOT NULL,
@@ -823,7 +825,7 @@ mod tests {
             let c = conn.lock().unwrap();
             insert_conversation(&c, 1, 101, "Urgent bug");
             c.execute(
-                "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type)
+                "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type)
                  VALUES (1, 'customer', 'This is urgent, production is down! When will this be fixed?', 'customer')",
                 [],
             )

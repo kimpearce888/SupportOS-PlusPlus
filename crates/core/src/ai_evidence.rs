@@ -8,7 +8,8 @@
 //!
 //! Port schema notes (same substitutions as the rest of the port):
 //! `threads`→`conversation_threads` (`type`→`thread_type`,
-//! `body_text`→`body`, `created_by_user_id`→`actor_id`+`actor_type`),
+//! `body_text`→`body`, `created_by_user_id`→`from_type` + the 3-way
+//! `created_by_*` split — DB-04/M045),
 //! `conversations.customer_local_id`→`customer_id`,
 //! `conversations.mailbox_local_id`→`mailbox_id`.
 
@@ -77,8 +78,10 @@ pub fn build(
     // Threads (oldest first, non-draft). The port's mirror stamps
     // `created_at` (the reference's remote_created_at); COALESCE covers both.
     let mut stmt = conn.prepare(
-        "SELECT thread_type, from_name, body_html, body,
-                COALESCE(remote_created_at, created_at), actor_type, actor_id
+        "SELECT type, from_name, body_html, body_text,
+                COALESCE(remote_created_at, created_at), from_type,
+                COALESCE(created_by_user_id, created_by_customer_id,
+                         created_by_system_user_id)
            FROM conversation_threads
           WHERE conversation_id = ?1 AND deleted_at IS NULL AND state != 'draft'
           ORDER BY COALESCE(remote_created_at, created_at) ASC, id ASC",
@@ -117,8 +120,8 @@ pub fn build(
         Some(cid) => {
             let mut stmt = conn.prepare(
                 "SELECT cv.number, cv.subject, cv.preview, COALESCE(cv.remote_created_at, cv.created_at),
-                        COALESCE((SELECT t2.body FROM conversation_threads t2
-                                   WHERE t2.conversation_id = cv.id AND t2.thread_type='reply'
+                        COALESCE((SELECT t2.body_text FROM conversation_threads t2
+                                   WHERE t2.conversation_id = cv.id AND t2.type='reply'
                                    ORDER BY COALESCE(t2.remote_created_at, t2.created_at) DESC LIMIT 1), '') AS last_reply
                    FROM conversations cv
                   WHERE cv.customer_id = ?1 AND cv.id != ?2 AND cv.deleted_at IS NULL
@@ -419,8 +422,8 @@ pub fn find_similar(
         }
         let last_reply: String = conn
             .query_row(
-                "SELECT body FROM conversation_threads
-                  WHERE conversation_id = ?1 AND thread_type='reply'
+                "SELECT body_text FROM conversation_threads
+                  WHERE conversation_id = ?1 AND type='reply'
                   ORDER BY COALESCE(remote_created_at, created_at) DESC LIMIT 1",
                 params![c.row.id],
                 |r| r.get(0),
@@ -648,7 +651,9 @@ mod tests {
             CREATE TABLE customers (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT);
             CREATE TABLE conversation_threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
-                thread_type TEXT NOT NULL, body TEXT, actor_type TEXT NOT NULL, actor_id INTEGER,
+                type TEXT NOT NULL, body_text TEXT, from_type TEXT,
+                created_by_user_id INTEGER, created_by_customer_id INTEGER,
+                created_by_system_user_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 state TEXT DEFAULT 'published', deleted_at TEXT, body_html TEXT,
                 from_name TEXT, remote_created_at TEXT
@@ -695,20 +700,20 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, from_name, remote_created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, from_name, remote_created_at)
              VALUES (1, 'customer', 'It fails every night', 'customer', 'Ada', '2026-10-01 10:05:00')",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body_html, body, actor_type, actor_id, from_name, remote_created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, body_html, body_text, from_type, created_by_user_id, from_name, remote_created_at)
              VALUES (1, 'note', NULL, 'internal finding', 'user', 3, 'Bob', '2026-10-01 11:00:00')",
             [],
         )
         .unwrap();
         // A draft thread must be excluded.
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, state)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, state)
              VALUES (1, 'reply', 'draft text', 'user', 'draft')",
             [],
         )
@@ -721,7 +726,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, remote_created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, remote_created_at)
              VALUES (2, 'reply', 'we re-indexed it for you', 'user', '2026-09-01 12:00:00')",
             [],
         )
@@ -868,7 +873,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, remote_created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, remote_created_at)
              VALUES (2, 'reply', 'we fixed the csv export', 'user', '2026-09-21 09:00:00')",
             [],
         )

@@ -378,15 +378,19 @@ pub fn get_conversation(
 
     // Load the thread.
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.conversation_id, t.thread_type, t.body,
-                t.actor_type, t.actor_id,
-                CASE WHEN t.actor_type = 'user' THEN u.first_name || ' ' || u.last_name
-                     WHEN t.actor_type = 'customer' THEN cu.first_name || ' ' || cu.last_name
+        "SELECT t.id, t.conversation_id, t.type, t.body_text,
+                t.from_type,
+                COALESCE(t.created_by_user_id, t.created_by_customer_id,
+                         t.created_by_system_user_id),
+                CASE WHEN t.created_by_user_id IS NOT NULL
+                     THEN u.first_name || ' ' || u.last_name
+                     WHEN t.created_by_customer_id IS NOT NULL
+                     THEN cu.first_name || ' ' || cu.last_name
                      ELSE NULL END,
                 t.created_at
          FROM conversation_threads t
-         LEFT JOIN users u ON u.id = t.actor_id AND t.actor_type = 'user'
-         LEFT JOIN customers cu ON cu.id = t.actor_id AND t.actor_type = 'customer'
+         LEFT JOIN users u ON u.id = t.created_by_user_id
+         LEFT JOIN customers cu ON cu.id = t.created_by_customer_id
          WHERE t.conversation_id = ?
          ORDER BY t.created_at ASC",
     )?;
@@ -447,6 +451,36 @@ mod tests {
         crate::outreach::apply_m023_to_m025(&conn).unwrap();
         crate::data_tools::apply_m026_to_m027(&conn).unwrap();
         apply_m028(&conn).unwrap();
+        // DB-04 (M045): the reference actor model. The slim chain can't run
+        // the full pre-M045 shape apply_m045's converging copy expects, so
+        // the fixture reproduces the rebuilt result directly (the FK clauses
+        // stay inert here — the seeded actor ids are NULL, which SQLite never
+        // checks).
+        conn.execute_batch(
+            "DROP TABLE conversation_threads;
+             CREATE TABLE conversation_threads (
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_id                 INTEGER,
+                conversation_id           INTEGER NOT NULL,
+                type                      TEXT,
+                state                     TEXT DEFAULT 'published',
+                body_text                 TEXT,
+                from_type                 TEXT,
+                created_by_user_id        INTEGER,
+                created_by_customer_id    INTEGER,
+                created_by_system_user_id INTEGER,
+                created_at                TEXT NOT NULL
+                                              DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                deleted_at                TEXT
+            );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_threads_remote
+                 ON conversation_threads (remote_id);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_conv
+                 ON conversation_threads (conversation_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_type
+                 ON conversation_threads (type);",
+        )
+        .unwrap();
         // DB-05: the boot-invariant soft-delete + merge columns (sla owns
         // deleted_at; m036 owns merged_into_conversation_id) — the list query
         // filters on both, so the fixture must match the booted schema. The
@@ -690,7 +724,8 @@ mod tests {
 
         // Add a thread entry directly.
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id)
+            "INSERT INTO conversation_threads
+                 (conversation_id, type, body_text, from_type, created_by_customer_id)
              VALUES (?1, 'customer_message', 'Hello world', 'customer', NULL)",
             params![conv_id],
         )

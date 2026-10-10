@@ -192,15 +192,15 @@ fn derive_recent_conversations(conn: &Connection) -> Result<usize> {
          SELECT c.customer_id, 'customer_message', t.created_at,
                 'Customer wrote in: ' || substr(COALESCE(c.subject, ''), 1, 80),
                 json_object('conversation_id', c.id, 'number', c.number, 'subject', c.subject,
-                            'excerpt', substr(COALESCE(t.body, ''), 1, 300)),
+                            'excerpt', substr(COALESCE(t.body_text, ''), 1, 300)),
                 'hs_sync', 'threads:' || t.remote_id,
                 'conv_first_message:' || c.id
          FROM conversations c
-         JOIN conversation_threads t ON t.conversation_id = c.id AND t.thread_type = 'customer'
+         JOIN conversation_threads t ON t.conversation_id = c.id AND t.type = 'customer'
            AND t.deleted_at IS NULL AND t.state = 'published'
            AND t.created_at = (
              SELECT MIN(t2.created_at) FROM conversation_threads t2
-             WHERE t2.conversation_id = c.id AND t2.thread_type = 'customer'
+             WHERE t2.conversation_id = c.id AND t2.type = 'customer'
                AND t2.deleted_at IS NULL AND t2.state = 'published'
            )
          WHERE c.customer_id IS NOT NULL AND c.deleted_at IS NULL
@@ -345,15 +345,15 @@ pub fn rebuild(conn: &Connection) -> Result<usize> {
          SELECT c.customer_id, 'customer_message', t.created_at,
                 'Customer wrote in: ' || substr(COALESCE(c.subject, ''), 1, 80),
                 json_object('conversation_id', c.id, 'number', c.number, 'subject', c.subject,
-                            'excerpt', substr(COALESCE(t.body, ''), 1, 300)),
+                            'excerpt', substr(COALESCE(t.body_text, ''), 1, 300)),
                 'hs_sync', 'threads:' || t.remote_id,
                 'conv_first_message:' || c.id
          FROM conversations c
-         JOIN conversation_threads t ON t.conversation_id = c.id AND t.thread_type = 'customer'
+         JOIN conversation_threads t ON t.conversation_id = c.id AND t.type = 'customer'
            AND t.deleted_at IS NULL AND t.state = 'published'
            AND t.created_at = (
              SELECT MIN(t2.created_at) FROM conversation_threads t2
-             WHERE t2.conversation_id = c.id AND t2.thread_type = 'customer'
+             WHERE t2.conversation_id = c.id AND t2.type = 'customer'
                AND t2.deleted_at IS NULL AND t2.state = 'published'
            )
          WHERE c.customer_id IS NOT NULL AND c.deleted_at IS NULL",
@@ -589,6 +589,35 @@ mod tests {
         crate::maintenance::apply_m037(&conn).unwrap();
         crate::connectors::apply_m038(&conn).unwrap();
         crate::mirror_tables::apply_m039(&conn).unwrap();
+        // DB-04 (M045): swap the M028-collapsed shape for the reference
+        // actor model (the slim chain predates mirror_parity; the sweep's
+        // reads use the reference column names).
+        conn.execute_batch(
+            "DROP TABLE conversation_threads;
+             CREATE TABLE conversation_threads (
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_id                 INTEGER,
+                conversation_id           INTEGER NOT NULL,
+                type                      TEXT,
+                state                     TEXT DEFAULT 'published',
+                body_text                 TEXT,
+                from_type                 TEXT,
+                created_by_user_id        INTEGER,
+                created_by_customer_id    INTEGER,
+                created_by_system_user_id INTEGER,
+                scheduled_for             TEXT,
+                created_at                TEXT NOT NULL
+                                              DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                deleted_at                TEXT
+            );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_threads_remote
+                 ON conversation_threads (remote_id);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_conv
+                 ON conversation_threads (conversation_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_type
+                 ON conversation_threads (type);",
+        )
+        .unwrap();
         conn
     }
 

@@ -971,7 +971,7 @@ async fn run_one_golden_test(
         let conv_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO conversation_threads
-                (conversation_id, thread_type, state, body, actor_type, created_at)
+                (conversation_id, type, state, body_text, from_type, created_at)
              VALUES (?1, 'customer_message', 'published', ?2, 'customer', ?3)",
             rusqlite::params![conv_id, body, now],
         )?;
@@ -1237,7 +1237,7 @@ mod tests {
             // one failed chunk (via a real document under a real source).
             for (body, emb) in [("hello", "indexed"), ("world", "not_indexed")] {
                 conn.execute(
-                    "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, embedding_state)
+                    "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, embedding_state)
                      VALUES (?1, 'customer', ?2, 'customer', ?3)",
                     rusqlite::params![conv, body, emb],
                 )

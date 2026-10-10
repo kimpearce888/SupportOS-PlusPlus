@@ -133,16 +133,18 @@ pub fn customer_timeline(
 
     // Thread entries from conversation_threads (M028).
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.conversation_id, c.number, t.thread_type,
-                t.body, t.actor_type,
-                CASE WHEN t.actor_type = 'user' THEN u.first_name || ' ' || u.last_name
-                     WHEN t.actor_type = 'customer' THEN cu.first_name || ' ' || cu.last_name
+        "SELECT t.id, t.conversation_id, c.number, t.type,
+                t.body_text, t.from_type,
+                CASE WHEN t.created_by_user_id IS NOT NULL
+                     THEN u.first_name || ' ' || u.last_name
+                     WHEN t.created_by_customer_id IS NOT NULL
+                     THEN cu.first_name || ' ' || cu.last_name
                      ELSE NULL END,
                 t.created_at
          FROM conversation_threads t
          JOIN conversations c ON c.id = t.conversation_id
-         LEFT JOIN users u ON u.id = t.actor_id AND t.actor_type = 'user'
-         LEFT JOIN customers cu ON cu.id = t.actor_id AND t.actor_type = 'customer'
+         LEFT JOIN users u ON u.id = t.created_by_user_id
+         LEFT JOIN customers cu ON cu.id = t.created_by_customer_id
          WHERE c.customer_id = ?
          ORDER BY t.created_at DESC
          LIMIT ?",

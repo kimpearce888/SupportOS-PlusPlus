@@ -672,7 +672,7 @@ mod tests {
                 )
                 .unwrap();
             conn.execute(
-                "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+                "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
                  VALUES (?1, 'customer', 'published', 'b', 'customer', ?2)",
                 params![id, at],
             )

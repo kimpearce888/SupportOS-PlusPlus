@@ -215,8 +215,8 @@ async fn dashboard_events_builder_batch() {
     // Threads: replies drive replies_sent + first-response averages.
     // - c1 reply A: published, in range (first reply after 30 minutes).
     conn.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at)
-         VALUES (?1, 'reply', 'published', 'Answering c1', 'user', 10, datetime('now', '-2 days', '+30 minutes'))",
+        "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
+         VALUES (?1, 'reply', 'published', 'Answering c1', 'user', datetime('now', '-2 days', '+30 minutes'))",
         rusqlite::params![c1],
     )
     .unwrap();
@@ -227,29 +227,29 @@ async fn dashboard_events_builder_batch() {
     .unwrap();
     // - c1 reply B: draft (NOT history).
     conn.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at)
-         VALUES (?1, 'reply', 'draft', 'draft only', 'user', 10, datetime('now', '-2 days'))",
+        "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
+         VALUES (?1, 'reply', 'draft', 'draft only', 'user', datetime('now', '-2 days'))",
         rusqlite::params![c1],
     )
     .unwrap();
     // - c2 reply C: deleted (excluded).
     conn.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at, deleted_at)
-         VALUES (?1, 'reply', 'published', 'deleted reply', 'user', 10, datetime('now', '-2 days'), datetime('now'))",
+        "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at, deleted_at)
+         VALUES (?1, 'reply', 'published', 'deleted reply', 'user', datetime('now', '-2 days'), datetime('now'))",
         rusqlite::params![c2],
     )
     .unwrap();
     // - c3 reply D: published, in range (first reply after 60 minutes).
     conn.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at)
-         VALUES (?1, 'reply', 'published', 'Answering c3', 'user', 11, datetime('now', '-2 days', '+60 minutes'))",
+        "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
+         VALUES (?1, 'reply', 'published', 'Answering c3', 'user', datetime('now', '-2 days', '+60 minutes'))",
         rusqlite::params![c3],
     )
     .unwrap();
     // - c5 reply E: published but 40 days old (outside the range).
     conn.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at)
-         VALUES (?1, 'reply', 'published', 'old reply', 'user', 11, datetime('now', '-40 days'))",
+        "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
+         VALUES (?1, 'reply', 'published', 'old reply', 'user', datetime('now', '-40 days'))",
         rusqlite::params![_c5],
     )
     .unwrap();
@@ -262,8 +262,8 @@ async fn dashboard_events_builder_batch() {
         (c2, "published", false),
     ] {
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at, deleted_at)
-             VALUES (?1, 'customer_message', ?2, 'customer text', 'customer', 100, datetime('now', '-2 days'), ?3)",
+            "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at, deleted_at)
+             VALUES (?1, 'customer_message', ?2, 'customer text', 'customer', datetime('now', '-2 days'), ?3)",
             rusqlite::params![conv, state, deleted.then(|| "datetime('now')".to_string())],
         )
         .unwrap();

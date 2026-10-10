@@ -422,8 +422,8 @@ pub fn chunk_conversation(conn: &Connection, conversation_id: i64) -> Result<()>
     };
 
     let mut stmt = conn.prepare(
-        "SELECT body FROM conversation_threads
-          WHERE conversation_id = ?1 AND body IS NOT NULL AND LENGTH(body) > 0
+        "SELECT body_text FROM conversation_threads
+          WHERE conversation_id = ?1 AND body_text IS NOT NULL AND LENGTH(body_text) > 0
           ORDER BY created_at ASC, id ASC",
     )?;
     let bodies: Vec<String> = stmt
@@ -1556,13 +1556,13 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at)
              VALUES (?1, 'customer', 'My refund is late.', 'customer', '2026-01-01T10:00:00Z')",
             params![id],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at)
              VALUES (?1, 'reply', 'Checking on it now.', 'user', '2026-01-01T11:00:00Z')",
             params![id],
         )
@@ -1636,14 +1636,14 @@ mod tests {
         .unwrap();
         for body in [Some(""), None] {
             conn.execute(
-                "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type)
+                "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type)
                  VALUES (9, 'note', ?1, 'user')",
                 params![body],
             )
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type)
              VALUES (9, 'customer', 'real body', 'customer')",
             [],
         )
@@ -1667,7 +1667,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at)
              VALUES (5, 'customer', 'A much longer follow-up message that adds text.', 'customer', '2026-01-02T10:00:00Z')",
             [],
         )
@@ -1699,7 +1699,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type)
              VALUES (11, 'customer', ?, 'customer')",
             params![format!("{} ", "word ".repeat(700))],
         )

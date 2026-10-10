@@ -1161,7 +1161,7 @@ pub fn refresh_replies(conn: &Connection, campaign_id: i64) -> Result<i64> {
         let customer_thread: Option<String> = tx
             .query_row(
                 "SELECT created_at FROM conversation_threads
-                  WHERE conversation_id = ?1 AND thread_type = 'customer'
+                  WHERE conversation_id = ?1 AND type = 'customer'
                     AND deleted_at IS NULL
                     AND julianday(created_at) > julianday(COALESCE(?2, '1970-01-01'))
                   ORDER BY created_at ASC LIMIT 1",
@@ -2527,7 +2527,33 @@ mod tests {
     /// deleted_at columns) the reply scan reads.
     fn or03_db() -> Connection {
         let conn = fresh_db();
-        crate::inbox::apply_m028(&conn).expect("apply M028");
+        // DB-04 (M045): the reference actor model — the slim chain's M028
+        // would create the collapsed shape, so the fixture creates the
+        // rebuilt result directly (actor ids stay NULL: the slim chain has
+        // no users row to resolve).
+        conn.execute_batch(
+            "CREATE TABLE conversation_threads (
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_id                 INTEGER,
+                conversation_id           INTEGER NOT NULL,
+                type                      TEXT,
+                state                     TEXT DEFAULT 'published',
+                body_text                 TEXT,
+                from_type                 TEXT,
+                created_by_user_id        INTEGER,
+                created_by_customer_id    INTEGER,
+                created_by_system_user_id INTEGER,
+                scheduled_for             TEXT,
+                created_at                TEXT NOT NULL
+                                              DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                deleted_at                TEXT
+            );
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_conv
+                 ON conversation_threads (conversation_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_type
+                 ON conversation_threads (type);",
+        )
+        .expect("M045 shape");
         crate::conversation_ops::apply_m030(&conn).expect("apply M030");
         crate::sla::ensure_sla_schema(&conn).expect("ensure SLA schema");
         apply_m031(&conn).expect("apply M031");
@@ -2570,8 +2596,8 @@ mod tests {
     fn add_thread(conn: &Connection, conversation: i64, kind: &str, at: &str) {
         conn.execute(
             "INSERT INTO conversation_threads
-                 (conversation_id, thread_type, state, body, actor_type, actor_id, created_at)
-             VALUES (?1, ?2, 'published', 'text', 'user', 1, ?3)",
+                 (conversation_id, type, state, body_text, from_type, created_at)
+             VALUES (?1, ?2, 'published', 'text', 'user', ?3)",
             params![conversation, kind, at],
         )
         .unwrap();

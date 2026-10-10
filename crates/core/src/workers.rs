@@ -1115,7 +1115,7 @@ impl WorkerManager {
             let last_thread_type: Option<String> = {
                 let conn = self.lock();
                 conn.query_row(
-                    "SELECT thread_type FROM conversation_threads
+                    "SELECT type FROM conversation_threads
                       WHERE conversation_id = ?1 AND deleted_at IS NULL
                       ORDER BY created_at DESC, id DESC LIMIT 1",
                     rusqlite::params![conversation_local_id],
@@ -1923,12 +1923,15 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO customers (id, remote_id, first_name, email)
              VALUES (1, 9001, 'Ada', 'ada@example.com');
+             INSERT INTO users (id, remote_id, first_name, email)
+             VALUES (1, 7001, 'Bob', 'bob@example.com');
              INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, status)
              VALUES (9, 105011, 5012, 'Refund question', 'I want a refund', 1, 1, 'active'),
                     (10, 105012, 5013, 'Bug report', 'It crashed', 1, 1, 'active');
-             INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id, created_at)
-             VALUES (9, 'customer', 'I want a refund', 'customer', 1, datetime('now')),
-                    (10, 'reply', 'We are on it', 'user', 1, datetime('now'));
+             INSERT INTO conversation_threads (conversation_id, type, body_text, from_type,
+                    created_by_customer_id, created_by_user_id, created_at)
+             VALUES (9, 'customer', 'I want a refund', 'customer', 1, NULL, datetime('now')),
+                    (10, 'reply', 'We are on it', 'user', NULL, 1, datetime('now'));
              INSERT INTO tags (id, remote_id, name, slug) VALUES (3, 3003, 'billing', 'billing');",
         )
         .unwrap();

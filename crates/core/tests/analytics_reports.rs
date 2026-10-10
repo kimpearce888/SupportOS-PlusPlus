@@ -84,7 +84,7 @@ fn insert_conv(
 
 fn seed_reply(conn: &rusqlite::Connection, conversation_id: i64, body: &str) {
     conn.execute(
-        "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, created_at)
+        "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at)
          VALUES (?1, 'reply', ?2, 'user', datetime('now'))",
         rusqlite::params![conversation_id, body],
     )

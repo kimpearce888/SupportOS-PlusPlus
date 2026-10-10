@@ -51,7 +51,7 @@ async fn people_timeline_parity() {
              VALUES (1, 101, 101, 'Export stuck at night', 'closed', 1, 11, '2026-10-01 10:00:00', '2026-10-03 13:00:00');
          INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
              VALUES (2, 102, 102, 'Belle question', 'active', 1, 12, '2026-10-02 12:00:00');
-         INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, created_at, state)
+         INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at, state)
              VALUES (1, 'customer', 'The export stalls after midnight', 'customer', '2026-10-02 11:00:00', 'published');
          INSERT INTO ratings (conversation_id, rating, customer_local_id, remote_id, remote_created_at)
              VALUES (1, 'great', 11, 551, '2026-10-06 14:00:00');",

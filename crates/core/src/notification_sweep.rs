@@ -876,7 +876,7 @@ fn thread_body(conn: &Connection, thread_local_id: Option<i64>) -> Result<Option
     };
     let body: Option<String> = conn
         .query_row(
-            "SELECT body FROM conversation_threads WHERE id = ?1",
+            "SELECT body_text FROM conversation_threads WHERE id = ?1",
             params![id],
             |r| r.get(0),
         )
@@ -1005,6 +1005,15 @@ mod tests {
         // (activity_events with metadata/source/thread_local_id, the
         // reference-shaped notifications table), never a partial one.
         crate::bootstrap::apply_all(&mut conn).unwrap();
+        // DB-06: the notification FKs — `insert_conversation` stamps
+        // customer 2001 (the notifications carry customer_local_id).
+        // Users stay test-owned: the mention/assignee fixtures seed their
+        // own (with mention names).
+        conn.execute_batch(
+            "INSERT INTO customers (id, remote_id, first_name)
+             VALUES (2001, 92001, 'Ada');",
+        )
+        .unwrap();
         conn
     }
 
@@ -1031,8 +1040,15 @@ mod tests {
         actor_id: Option<i64>,
     ) -> i64 {
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, actor_id, created_at)
-             VALUES (?1, ?2, 'published', ?3, ?4, ?5, datetime('now'))",
+            "INSERT INTO conversation_threads
+                 (conversation_id, type, state, body_text, from_type,
+                  created_by_user_id, created_by_customer_id,
+                  created_by_system_user_id, created_at)
+             VALUES (?1, ?2, 'published', ?3, ?4,
+                     CASE WHEN ?4 = 'user' THEN ?5 END,
+                     CASE WHEN ?4 = 'customer' THEN ?5 END,
+                     CASE WHEN ?4 IN ('system', 'system_user') THEN ?5 END,
+                     datetime('now'))",
             params![conversation_local, kind, body, actor_type, actor_id],
         )
         .unwrap();
@@ -1143,6 +1159,12 @@ mod tests {
     #[test]
     fn customer_message_event_notifies_the_assignee() {
         let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO users (id, remote_id, first_name, last_name, user_type)
+             VALUES (42, 42, 'Alex', 'Rivera', 'user')",
+            [],
+        )
+        .unwrap();
         let conv = insert_conversation(&conn, 1001, Some(42));
         mark_sync_settled(&conn);
         sweep(&conn, None).unwrap(); // init cursor
@@ -1319,6 +1341,12 @@ mod tests {
     #[test]
     fn sla_alerts_produce_risk_and_breach_notifications_with_day_dedup() {
         let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO users (id, remote_id, first_name, user_type)
+             VALUES (42, 42, 'Alex', 'user')",
+            [],
+        )
+        .unwrap();
         mark_sync_settled(&conn);
         sweep(&conn, None).unwrap();
 
@@ -1522,6 +1550,11 @@ mod tests {
             [],
         )
         .unwrap();
+        let emma: i64 = conn
+            .query_row("SELECT id FROM customers WHERE remote_id = 3001", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         conn.execute(
             "INSERT INTO outreach_campaigns (name, subject, body) VALUES ('Winter check-in', 'How is it going?', 'hello')",
             [],
@@ -1529,8 +1562,8 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO outreach_recipients (campaign_id, customer_local_id, state, replied_at)
-             VALUES (1, 1, 'replied', datetime('now', '+1 minute'))",
-            [],
+             VALUES (1, ?1, 'replied', datetime('now', '+1 minute'))",
+            [emma],
         )
         .unwrap();
         // An OLD reply (before the sweep stamp) must not notify — a second
@@ -1540,10 +1573,15 @@ mod tests {
             [],
         )
         .unwrap();
+        let old_timer: i64 = conn
+            .query_row("SELECT id FROM customers WHERE remote_id = 3002", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         conn.execute(
             "INSERT INTO outreach_recipients (campaign_id, customer_local_id, state, replied_at)
-             VALUES (1, 2, 'replied', datetime('now', '-2 days'))",
-            [],
+             VALUES (1, ?1, 'replied', datetime('now', '-2 days'))",
+            [old_timer],
         )
         .unwrap();
 
@@ -1567,7 +1605,7 @@ mod tests {
             "Campaign reply: Emma Lindqvist answered \"Winter check-in\""
         );
         assert_eq!(body.as_deref(), Some("How is it going?"));
-        assert_eq!(customer, Some(1));
+        assert_eq!(customer, Some(emma));
         assert_eq!(campaign, Some(1));
         assert_eq!(dedup, "n:campreply:1");
     }
@@ -1734,24 +1772,29 @@ mod tests {
             [],
         )
         .unwrap();
+        let chloe: i64 = conn
+            .query_row("SELECT id FROM customers WHERE remote_id = 3001", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         let conv = insert_conversation(&conn, 1001, None);
         conn.execute(
             "INSERT INTO ratings (remote_id, conversation_id, rating, comments, customer_local_id, remote_created_at)
-             VALUES (608, ?1, 'not-good', 'Still broken after the fix.', 1, datetime('now', '+1 minute'))",
-            params![conv],
+             VALUES (608, ?1, 'not-good', 'Still broken after the fix.', ?2, datetime('now', '+1 minute'))",
+            params![conv, chloe],
         )
         .unwrap();
         // A great rating + an OLD not-good rating stay silent.
         conn.execute(
             "INSERT INTO ratings (remote_id, conversation_id, rating, comments, customer_local_id, remote_created_at)
-             VALUES (609, ?1, 'great', NULL, 1, datetime('now', '+1 minute'))",
-            params![conv],
+             VALUES (609, ?1, 'great', NULL, ?2, datetime('now', '+1 minute'))",
+            params![conv, chloe],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO ratings (remote_id, conversation_id, rating, comments, customer_local_id, remote_created_at)
-             VALUES (610, ?1, 'not-good', 'old', 1, datetime('now', '-5 days'))",
-            params![conv],
+             VALUES (610, ?1, 'not-good', 'old', ?2, datetime('now', '-5 days'))",
+            params![conv, chloe],
         )
         .unwrap();
 
@@ -1766,7 +1809,7 @@ mod tests {
             .unwrap();
         assert_eq!(title, "Not-good rating received from Chloe Dubois");
         assert_eq!(body.as_deref(), Some("Still broken after the fix."));
-        assert_eq!(customer, Some(1));
+        assert_eq!(customer, Some(chloe));
         assert_eq!(dedup, "n:rating:608");
     }
 

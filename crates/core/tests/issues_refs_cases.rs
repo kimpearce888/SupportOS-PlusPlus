@@ -57,12 +57,12 @@ async fn issues_refs_cases_parity() {
          INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (1, 21), (1, 22);
          INSERT INTO ratings (conversation_id, rating, remote_created_at)
              VALUES (1, 'great', '2026-10-01 12:00:00');
-         INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id, created_at, state)
-             VALUES (1, 'reply', 'Older published reply', 'user', 7, '2026-10-01 11:00:00', 'published');
-         INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id, created_at, state)
-             VALUES (1, 'note', 'internal note body', 'user', 7, '2026-10-01 11:30:00', 'published');
-         INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id, created_at, state)
-             VALUES (1, 'reply', 'DRAFT never served', 'user', 7, '2026-10-01 11:45:00', 'draft');
+         INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at, state)
+             VALUES (1, 'reply', 'Older published reply', 'user', '2026-10-01 11:00:00', 'published');
+         INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at, state)
+             VALUES (1, 'note', 'internal note body', 'user', '2026-10-01 11:30:00', 'published');
+         INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at, state)
+             VALUES (1, 'reply', 'DRAFT never served', 'user', '2026-10-01 11:45:00', 'draft');
          INSERT INTO ai_runs (input_hash, prompt_version, model, response_json, type, conversation_id, status, created_at)
              VALUES ('is03-hash', 'v1', 'test-model',
                      '{\"customer_goal\": \"Fix the nightly export schedule\", \"primary_question\": \"Why does the export stall after midnight?\", \"product\": \"Reports\", \"feature\": \"Schedules\"}',
@@ -380,8 +380,8 @@ async fn issues_refs_cases_parity() {
     {
         let conn = http_conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type, actor_id, created_at, state)
-             VALUES (1, 'reply', ?1, 'user', 7, '2026-10-01 12:30:00', 'published')",
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at, state)
+             VALUES (1, 'reply', ?1, 'user', '2026-10-01 12:30:00', 'published')",
             rusqlite::params![format!("{}TAIL", "R".repeat(2495))],
         )
         .expect("long reply");

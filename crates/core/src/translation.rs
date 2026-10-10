@@ -626,10 +626,10 @@ pub fn conversation_languages(conn: &Connection, conversation_id: i64) -> Result
     }
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, html_stripped FROM (
-             SELECT id, COALESCE(body_html, body, '') AS html_stripped,
+             SELECT id, COALESCE(body_html, body_text, '') AS html_stripped,
                     COALESCE(remote_created_at, created_at) AS at
              FROM conversation_threads
-             WHERE conversation_id = ?1 AND thread_type = 'customer'
+             WHERE conversation_id = ?1 AND type = 'customer'
                AND deleted_at IS NULL AND state = 'published'
          ) ORDER BY at ASC LIMIT 100",
     ) else {

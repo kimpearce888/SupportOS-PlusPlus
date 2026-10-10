@@ -597,7 +597,34 @@ mod tests {
         crate::migrations::run_all(&mut conn).unwrap();
         crate::embeddings::apply_m008(&conn).unwrap();
         crate::ai_center::apply_m009(&conn).unwrap();
-        crate::inbox::apply_m028(&conn).unwrap();
+        // DB-04 (M045): the reference actor model (replaces the M028
+        // collapsed shape; actor ids stay NULL in these fixtures).
+        conn.execute_batch(
+            "CREATE TABLE conversation_threads (
+                id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_id                 INTEGER,
+                conversation_id           INTEGER NOT NULL,
+                type                      TEXT,
+                state                     TEXT DEFAULT 'published',
+                body_text                 TEXT,
+                from_type                 TEXT,
+                created_by_user_id        INTEGER,
+                created_by_customer_id    INTEGER,
+                created_by_system_user_id INTEGER,
+                scheduled_for             TEXT,
+                created_at                TEXT NOT NULL
+                                              DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                deleted_at                TEXT,
+                fts_indexed               INTEGER NOT NULL DEFAULT 0
+            );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_conv_threads_remote
+                 ON conversation_threads (remote_id);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_conv
+                 ON conversation_threads (conversation_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_conv_threads_type
+                 ON conversation_threads (type);",
+        )
+        .unwrap();
         crate::conversation_ops::apply_m030(&conn).unwrap();
         crate::intelligence_features::apply_m015_to_m019(&conn).unwrap();
         crate::sync_schema::apply_m029(&conn).unwrap();

@@ -1203,8 +1203,8 @@ pub async fn case_from_conversation(
     // adaptation — `body`/`thread_type` are the documented thread renames).
     let last_reply: Option<String> = conn
         .query_row(
-            "SELECT body FROM conversation_threads
-              WHERE conversation_id = ?1 AND thread_type = 'reply' AND state = 'published'
+            "SELECT body_text FROM conversation_threads
+              WHERE conversation_id = ?1 AND type = 'reply' AND state = 'published'
               ORDER BY COALESCE(remote_created_at, created_at) DESC LIMIT 1",
             rusqlite::params![conversation_id],
             |r| r.get(0),
@@ -1368,7 +1368,7 @@ mod tests {
             )
             .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
              VALUES (?1, 'customer', 'published', 'b', 'customer', ?2)",
             rusqlite::params![id, at],
         )

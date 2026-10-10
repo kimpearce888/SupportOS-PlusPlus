@@ -917,10 +917,10 @@ pub(crate) fn customer_messages(
     conversation_id: i64,
 ) -> Result<Vec<MessageForAnalysis>> {
     let mut stmt = conn.prepare(
-        "SELECT id, body_html, body, remote_created_at, created_at
+        "SELECT id, body_html, body_text, remote_created_at, created_at
            FROM conversation_threads
           WHERE conversation_id = ?1
-            AND thread_type = 'customer'
+            AND type = 'customer'
             AND state = 'published'
           ORDER BY remote_created_at ASC",
     )?;
@@ -1657,7 +1657,7 @@ mod tests {
             )
             .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
              VALUES (?1, 'customer', 'published', 'This is urgent, need you to fix the API today.', 'customer', datetime('now'))",
             params![cid],
         )
@@ -1676,7 +1676,7 @@ mod tests {
 
         // Re-record: upsert in place (still one row, goal may change).
         conn.execute(
-            "UPDATE conversation_threads SET body = 'Why does this happen? Please explain the cause.'
+            "UPDATE conversation_threads SET body_text = 'Why does this happen? Please explain the cause.'
              WHERE conversation_id = ?1",
             params![cid],
         )
@@ -1723,13 +1723,13 @@ mod tests {
             )
             .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
              VALUES (?1, 'customer', 'draft', 'urgent fix now', 'customer', datetime('now'))",
             params![cid],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
              VALUES (?1, 'reply', 'published', 'we are on it', 'user', datetime('now'))",
             params![cid],
         )
@@ -1768,7 +1768,7 @@ mod tests {
                 )
                 .unwrap();
             conn.execute(
-                "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+                "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
                  VALUES (?1, 'customer', 'published', 'hello, why is this broken?', 'customer', datetime('now'))",
                 params![cid],
             )
@@ -1857,7 +1857,7 @@ mod tests {
             )
             .unwrap();
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, state, body, actor_type, created_at)
+            "INSERT INTO conversation_threads (conversation_id, type, state, body_text, from_type, created_at)
              VALUES (?1, 'customer', 'published',
                 'This is STILL not working. I already called twice and nobody fixed it. Every time the same thing. Please walk me through step by step how to fix the API endpoint.',
                 'customer', datetime('now'))",
@@ -1916,7 +1916,7 @@ mod tests {
         // Re-record after the message changes: rows are REPLACED, never
         // accumulated (the table mirrors the live snapshot).
         conn.execute(
-            "UPDATE conversation_threads SET body = 'Thanks! This is great support.'
+            "UPDATE conversation_threads SET body_text = 'Thanks! This is great support.'
              WHERE conversation_id = ?1",
             params![cid],
         )

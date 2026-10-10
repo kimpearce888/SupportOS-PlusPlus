@@ -552,7 +552,7 @@ fn build_support_health_report(
                 "SELECT AVG(x.msgs) FROM (
                    SELECT c.id,
                           (SELECT COUNT(*) FROM conversation_threads t
-                            WHERE t.conversation_id = c.id AND t.thread_type = 'customer_message'
+                            WHERE t.conversation_id = c.id AND t.type = 'customer_message'
                               AND t.deleted_at IS NULL AND t.state = 'published') AS msgs
                    FROM conversations c
                    WHERE {conv_scope} AND c.deleted_at IS NULL
@@ -1104,8 +1104,8 @@ pub fn get_customer_detail(conn: &Connection, customer_id: i64) -> Result<Option
     // conversation, newest close first, 5 rows, resolution truncated to 400).
     let mut stmt = conn.prepare(
         "SELECT cv.number, cv.subject,
-                (SELECT t.body FROM conversation_threads t
-                  WHERE t.conversation_id = cv.id AND t.thread_type = 'reply'
+                (SELECT t.body_text FROM conversation_threads t
+                  WHERE t.conversation_id = cv.id AND t.type = 'reply'
                     AND t.state = 'published'
                   ORDER BY COALESCE(t.remote_created_at, t.created_at) DESC LIMIT 1) AS resolution,
                 cv.closed_at

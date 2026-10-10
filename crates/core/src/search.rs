@@ -31,7 +31,7 @@
 //! - Column renames: `customer_local_id` → `customer_id`,
 //!   `mailbox_local_id` → `mailbox_id`, `assignee_local_id` → `assignee_id`,
 //!   `remote_created_at` → `created_at`, `last_activity_at` → `updated_at`,
-//!   threads.`body_text` → `conversation_threads`.`body`,
+//!   threads.`body_text` → `conversation_threads`.`body_text` (DB-04),
 //!   `ct.tag_local_id` → `ct.tag_id`, `docs_articles` → `docs`,
 //!   custom_objects.`properties` → `data_json` (search_text is rebuilt from
 //!   the JSON values on rebuild).
@@ -1029,8 +1029,8 @@ pub fn index_conversation_fts(conn: &Connection, local_id: i64) -> Result<()> {
         if table_exists(conn, "conversation_threads")? {
             conn.execute(
                 "INSERT INTO fts_threads (body, thread_id, conversation_id)
-                 SELECT t.body, t.id, t.conversation_id FROM conversation_threads t
-                  WHERE t.conversation_id = ?1 AND t.body IS NOT NULL AND LENGTH(t.body) > 0
+                 SELECT t.body_text, t.id, t.conversation_id FROM conversation_threads t
+                  WHERE t.conversation_id = ?1 AND t.body_text IS NOT NULL AND LENGTH(t.body_text) > 0
                     AND t.deleted_at IS NULL",
                 params![local_id],
             )?;
@@ -1051,7 +1051,7 @@ pub fn index_thread_fts(conn: &Connection, thread_local_id: i64) -> Result<()> {
     )?;
     let row = conn
         .query_row(
-            "SELECT body, conversation_id FROM conversation_threads WHERE id = ?1",
+            "SELECT body_text, conversation_id FROM conversation_threads WHERE id = ?1",
             params![thread_local_id],
             |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
         )
@@ -1280,13 +1280,13 @@ fn rebuild_indexes_tx(conn: &Connection) -> Result<usize> {
     if table_exists(conn, "conversation_threads")? {
         conn.execute(
             "INSERT INTO fts_threads (body, thread_id, conversation_id)
-             SELECT t.body, t.id, t.conversation_id FROM conversation_threads t
-              WHERE t.body IS NOT NULL AND LENGTH(t.body) > 0 AND t.deleted_at IS NULL",
+             SELECT t.body_text, t.id, t.conversation_id FROM conversation_threads t
+              WHERE t.body_text IS NOT NULL AND LENGTH(t.body_text) > 0 AND t.deleted_at IS NULL",
             [],
         )?;
         conn.execute(
             "UPDATE conversation_threads SET fts_indexed = 1
-              WHERE body IS NOT NULL AND LENGTH(body) > 0",
+              WHERE body_text IS NOT NULL AND LENGTH(body_text) > 0",
             [],
         )?;
     }
@@ -1624,7 +1624,7 @@ mod tests {
 
     fn add_thread(conn: &Connection, conversation_id: i64, body: &str) -> i64 {
         conn.execute(
-            "INSERT INTO conversation_threads (conversation_id, thread_type, body, actor_type)
+            "INSERT INTO conversation_threads (conversation_id, type, body_text, from_type)
              VALUES (?1, 'customer', ?2, 'customer')",
             params![conversation_id, body],
         )
