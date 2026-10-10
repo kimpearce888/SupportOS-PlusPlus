@@ -1264,6 +1264,19 @@ mod tests {
         // teams / team_members / conversations mirrors and writes
         // reference-shaped notifications.
         crate::bootstrap::apply_all(&mut conn).unwrap();
+        // DB-06: the side-thread FKs — the local conversation ids the tests
+        // key their side threads on, and the creator user ids they stamp,
+        // must exist.
+        conn.execute_batch(
+            "INSERT INTO conversations (id, remote_id, number, status, mailbox_id, customer_id)
+             VALUES (1, 900001, 1, 'active', 201, 3001),
+                    (1001, 901001, 1001, 'active', 201, 3001),
+                    (1002, 901002, 1002, 'active', 201, 3001);
+             INSERT INTO users (id, remote_id, first_name, last_name, mention)
+             VALUES (42, 900042, 'Pat', 'True', 'pat'),
+                    (43, 900043, 'Vic', 'Vega', 'vic');",
+        )
+        .unwrap();
         conn
     }
 
@@ -1271,9 +1284,9 @@ mod tests {
     /// Priya (id 2, @priya), team "Tier 1" (id 1) with both members.
     fn seed_identities(conn: &Connection) {
         conn.execute(
-            "INSERT INTO users (remote_id, first_name, last_name, mention, user_type)
-             VALUES (1001, 'Alex', 'Rivera', 'alex', 'user'),
-                    (1002, 'Priya', 'Nair', 'priya', 'user')",
+            "INSERT INTO users (id, remote_id, first_name, last_name, mention, user_type)
+             VALUES (1, 1001, 'Alex', 'Rivera', 'alex', 'user'),
+                    (2, 1002, 'Priya', 'Nair', 'priya', 'user')",
             [],
         )
         .unwrap();
@@ -1288,8 +1301,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
-             VALUES (105000, 5001, 'active', 201, 3001)",
+            "INSERT INTO conversations (id, remote_id, number, status, mailbox_id, customer_id)
+             VALUES (105000, 105000, 5001, 'active', 201, 3001)",
             [],
         )
         .unwrap();

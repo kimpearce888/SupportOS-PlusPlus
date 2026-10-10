@@ -243,6 +243,11 @@ const BOOT_STEPS: &[BootStep] = &[
         label: "m045_threads_actor_model",
         apply: crate::mirror_parity::apply_m045,
     },
+    BootStep {
+        version: 37,
+        label: "m046_base_mirror_fks",
+        apply: crate::mirror_parity::apply_m046,
+    },
 ];
 
 /// Apply the pending boot steps, each in one transaction with its

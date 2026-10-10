@@ -577,6 +577,18 @@ mod tests {
         // (notifications with the reference's dedup_key + unique index),
         // never a partial one.
         crate::bootstrap::apply_all(&mut conn).unwrap();
+        // DB-06: the notification FKs — the users/conversation the shared
+        // `input` fixture stamps (target 42, conversation 7; user 43 for
+        // the not-visible-to cases) must exist. OR IGNORE: tests that seed
+        // their own identities (the me_user_local_id family) stay in
+        // control after a DELETE FROM users.
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO users (id, remote_id, first_name)
+             VALUES (42, 1001, 'Me'), (43, 1002, 'Other');
+             INSERT OR IGNORE INTO conversations (id, remote_id, number, status, mailbox_id, customer_id)
+             VALUES (7, 900007, 5001, 'active', 1, 1);",
+        )
+        .unwrap();
         conn
     }
 
@@ -735,12 +747,7 @@ mod tests {
     fn record_notification_emits_notification_received_sse() {
         let conn = fresh_db();
         // The SSE badge counts for the ME user (notificationSweep.ts:73) —
-        // seed me = local user 42, matching the notification's target.
-        conn.execute(
-            "INSERT INTO users (id, remote_id, first_name) VALUES (42, 1001, 'Me')",
-            [],
-        )
-        .unwrap();
+        // fresh_db already seeds me = local user 42 (remote 1001).
         crate::settings::set_string(&conn, "me_remote_id", "1001").unwrap();
         let bus = crate::http::EventBus::new(8);
         let mut rx = bus.subscribe();
@@ -1035,6 +1042,9 @@ mod tests {
     #[test]
     fn me_user_local_id_resolves_me_remote_id_then_first_user() {
         let conn = fresh_db();
+        // This family owns the users table (the fixture's shared identities
+        // would otherwise take the first-user slot).
+        conn.execute("DELETE FROM users", []).unwrap();
         conn.execute(
             "INSERT INTO users (remote_id, first_name) VALUES (1001, 'Alex')",
             [],
@@ -1058,6 +1068,7 @@ mod tests {
     #[test]
     fn me_user_local_id_is_none_without_users() {
         let conn = fresh_db();
+        conn.execute("DELETE FROM users", []).unwrap();
         assert_eq!(me_user_local_id(&conn).unwrap(), None);
     }
 }

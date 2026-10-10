@@ -14,6 +14,11 @@
 //!   `from_type` + `created_by_user_id` / `created_by_customer_id` /
 //!   `created_by_system_user_id` instead of the collapsed
 //!   `actor_id` + `actor_type`, plus the `type` / `body_text` column names.
+//! * **M046 (DB-06)** — foreign keys on the base mirror tables
+//!   (customers, attachments, activity_events, notifications,
+//!   side_threads, knowledge_gap_candidates, customer_memory,
+//!   issue_clusters, ai_runs, outreach_campaigns, state_transitions),
+//!   matching the reference's enforcement.
 //! * **M047 (DB-03)** — `conversations` restores the reference column
 //!   names (`mailbox_local_id` / `assignee_local_id` / `customer_local_id`),
 //!   `UNIQUE(number)` and the reference FK set.
@@ -548,6 +553,510 @@ pub fn apply_m045(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// M046 — DB-06: foreign keys on the base mirror tables, matching the
+/// reference's enforcement (001/002/003/009/011/012/015).
+///
+/// The port created these tables without their reference FK clauses
+/// (guard-less `CREATE TABLE`s from the pre-parity batches); M046
+/// rebuilds each one with the port's own column set plus the reference
+/// FK set. The converging copy enforces the invariants the reference
+/// always had: orphaned CASCADE rows drop, invalid SET-NULL-able
+/// references become NULL. Column names stay the port's documented ones
+/// (`notifications.target_user_id`, `customer_memory`'s port shape,
+/// `ticket_state_transitions`'s remote keying) — column parity is not
+/// DB-06's scope.
+///
+/// Pragma parity (WAL, `foreign_keys=ON`, `busy_timeout`) is enforced by
+/// [`crate::db::open`] — verified by test.
+pub fn apply_m046(conn: &Connection) -> Result<()> {
+    // customers: organization_id -> organizations (001: SET NULL).
+    if !fk_declared(conn, "customers", "organization_id")? {
+        rebuild_table(
+            conn,
+            "customers",
+            &Rebuild {
+                new_name: "customers",
+                new_ddl: "(
+                    id               INTEGER PRIMARY KEY,
+                    remote_id        INTEGER NOT NULL UNIQUE,
+                    first_name       TEXT,
+                    last_name        TEXT,
+                    email            TEXT,
+                    organization     TEXT,
+                    job_title        TEXT,
+                    phone            TEXT,
+                    created_at       TEXT,
+                    updated_at       TEXT,
+                    local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    deleted_at       TEXT,
+                    organization_id  INTEGER REFERENCES organizations (id) ON DELETE SET NULL,
+                    photo_url        TEXT,
+                    raw_json         TEXT,
+                    raw_json_hash    TEXT,
+                    remote_created_at TEXT,
+                    remote_updated_at TEXT,
+                    last_seen_at     TEXT,
+                    last_synced_at   TEXT,
+                    local_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    background       TEXT,
+                    age              TEXT,
+                    gender           TEXT,
+                    location         TEXT
+                )",
+                copy_sql: "INSERT INTO \"customers__rebuild\"
+                               (id, remote_id, first_name, last_name, email, organization,
+                                job_title, phone, created_at, updated_at, local_created_at,
+                                deleted_at, organization_id, photo_url, raw_json,
+                                raw_json_hash, remote_created_at, remote_updated_at,
+                                last_seen_at, last_synced_at, local_updated_at,
+                                background, age, gender, location)
+                           SELECT id, remote_id, first_name, last_name, email, organization,
+                                  job_title, phone, created_at, updated_at, local_created_at,
+                                  deleted_at,
+                                  CASE WHEN organization_id IN (SELECT id FROM organizations)
+                                       THEN organization_id END,
+                                  photo_url, raw_json, raw_json_hash, remote_created_at,
+                                  remote_updated_at, last_seen_at, last_synced_at,
+                                  local_updated_at, background, age, gender, location
+                             FROM customers",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // attachments: thread/conversation CASCADEs (001).
+    if !fk_declared(conn, "attachments", "thread_id")? {
+        rebuild_table(
+            conn,
+            "attachments",
+            &Rebuild {
+                new_name: "attachments",
+                new_ddl: "(
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id       INTEGER UNIQUE,
+                    thread_id       INTEGER NOT NULL
+                                        REFERENCES conversation_threads (id) ON DELETE CASCADE,
+                    conversation_id INTEGER NOT NULL
+                                        REFERENCES conversations (id) ON DELETE CASCADE,
+                    filename        TEXT,
+                    mime_type       TEXT,
+                    size            INTEGER,
+                    local_path       TEXT,
+                    hash            TEXT,
+                    downloaded_at   TEXT,
+                    state           TEXT DEFAULT 'metadata',
+                    raw_json        TEXT
+                )",
+                copy_sql: "INSERT INTO \"attachments__rebuild\"
+                               (id, remote_id, thread_id, conversation_id, filename,
+                                mime_type, size, local_path, hash, downloaded_at,
+                                state, raw_json)
+                           SELECT a.id, a.remote_id, a.thread_id, a.conversation_id,
+                                  a.filename, a.mime_type, a.size, a.local_path, a.hash,
+                                  a.downloaded_at, a.state, a.raw_json
+                             FROM attachments a
+                            WHERE a.conversation_id IN (SELECT id FROM conversations)
+                              AND a.thread_id IN (SELECT id FROM conversation_threads)",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // activity_events (the conversation_events mirror): conversation
+    // CASCADE + thread SET NULL (011).
+    if !fk_declared(conn, "activity_events", "thread_local_id")? {
+        rebuild_table(
+            conn,
+            "activity_events",
+            &Rebuild {
+                new_name: "activity_events",
+                new_ddl: "(
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id INTEGER NOT NULL
+                                        REFERENCES conversations (id) ON DELETE CASCADE,
+                    event_type      TEXT NOT NULL,
+                    actor_type      TEXT NOT NULL,
+                    actor_id        INTEGER,
+                    occurred_at     TEXT NOT NULL,
+                    dedup_key        TEXT NOT NULL UNIQUE,
+                    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    thread_local_id INTEGER REFERENCES conversation_threads (id) ON DELETE SET NULL,
+                    source          TEXT NOT NULL DEFAULT 'sync',
+                    metadata        TEXT
+                )",
+                copy_sql: "INSERT INTO \"activity_events__rebuild\"
+                               (id, conversation_id, event_type, actor_type, actor_id,
+                                occurred_at, dedup_key, created_at, thread_local_id,
+                                source, metadata)
+                           SELECT e.id, e.conversation_id, e.event_type, e.actor_type,
+                                  e.actor_id, e.occurred_at, e.dedup_key, e.created_at,
+                                  CASE WHEN e.thread_local_id IN (SELECT id FROM conversation_threads)
+                                       THEN e.thread_local_id END,
+                                  e.source, e.metadata
+                             FROM activity_events e
+                            WHERE e.conversation_id IN (SELECT id FROM conversations)",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // notifications: target CASCADE + actor/conversation/customer FKs (012).
+    if !fk_declared(conn, "notifications", "conversation_id")? {
+        rebuild_table(
+            conn,
+            "notifications",
+            &Rebuild {
+                new_name: "notifications",
+                new_ddl: "(
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type            TEXT NOT NULL,
+                    severity        TEXT NOT NULL DEFAULT 'info',
+                    title           TEXT NOT NULL DEFAULT '',
+                    body            TEXT,
+                    target_user_id  INTEGER REFERENCES users (id) ON DELETE CASCADE,
+                    actor_user_local_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
+                    conversation_id INTEGER REFERENCES conversations (id) ON DELETE CASCADE,
+                    conversation_number INTEGER,
+                    customer_local_id   INTEGER REFERENCES customers (id) ON DELETE SET NULL,
+                    issue_id        INTEGER,
+                    campaign_id     INTEGER,
+                    job_id          INTEGER,
+                    side_thread_id  INTEGER,
+                    dedup_key        TEXT NOT NULL DEFAULT '',
+                    payload         TEXT,
+                    read_at         TEXT,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                )",
+                copy_sql: "INSERT INTO \"notifications__rebuild\"
+                               (id, type, severity, title, body, target_user_id,
+                                actor_user_local_id, conversation_id, conversation_number,
+                                customer_local_id, issue_id, campaign_id, job_id,
+                                side_thread_id, dedup_key, payload, read_at, created_at)
+                           SELECT n.id, n.type, n.severity, n.title, n.body,
+                                  n.target_user_id,
+                                  CASE WHEN n.actor_user_local_id IN (SELECT id FROM users)
+                                       THEN n.actor_user_local_id END,
+                                  n.conversation_id, n.conversation_number,
+                                  CASE WHEN n.customer_local_id IN (SELECT id FROM customers)
+                                       THEN n.customer_local_id END,
+                                  n.issue_id, n.campaign_id, n.job_id, n.side_thread_id,
+                                  n.dedup_key, n.payload, n.read_at, n.created_at
+                             FROM notifications n
+                            WHERE (n.conversation_id IS NULL
+                                   OR n.conversation_id IN (SELECT id FROM conversations))
+                              AND (n.target_user_id IS NULL
+                                   OR n.target_user_id IN (SELECT id FROM users))",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // side_threads: conversation CASCADE + team/creator SET NULL (012).
+    if !fk_declared(conn, "side_threads", "conversation_id")? {
+        rebuild_table(
+            conn,
+            "side_threads",
+            &Rebuild {
+                new_name: "side_threads",
+                new_ddl: "(
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id     INTEGER NOT NULL
+                                            REFERENCES conversations (id) ON DELETE CASCADE,
+                    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    created_by_user_id   INTEGER REFERENCES users (id) ON DELETE SET NULL,
+                    title               TEXT NOT NULL DEFAULT '',
+                    team_local_id       INTEGER REFERENCES teams (id) ON DELETE SET NULL,
+                    status              TEXT NOT NULL DEFAULT 'open',
+                    updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                    resolved_at         TEXT
+                )",
+                copy_sql: "INSERT INTO \"side_threads__rebuild\"
+                               (id, conversation_id, created_at, created_by_user_id,
+                                title, team_local_id, status, updated_at, resolved_at)
+                           SELECT s.id, s.conversation_id, s.created_at,
+                                  CASE WHEN s.created_by_user_id IN (SELECT id FROM users)
+                                       THEN s.created_by_user_id END,
+                                  s.title,
+                                  CASE WHEN s.team_local_id IN (SELECT id FROM teams)
+                                       THEN s.team_local_id END,
+                                  s.status, s.updated_at, s.resolved_at
+                             FROM side_threads s
+                            WHERE s.conversation_id IN (SELECT id FROM conversations)",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // knowledge_gap_candidates (the knowledge_candidates mirror): the
+    // decider FK (015).
+    if !fk_declared(conn, "knowledge_gap_candidates", "decided_by_user_local_id")? {
+        rebuild_table(
+            conn,
+            "knowledge_gap_candidates",
+            &Rebuild {
+                new_name: "knowledge_gap_candidates",
+                new_ddl: "(
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query_text       TEXT NOT NULL,
+                    occurrence_count INTEGER NOT NULL DEFAULT 1,
+                    kind             TEXT,
+                    status           TEXT NOT NULL DEFAULT 'open'
+                                         CHECK (status IN ('open','approved','rejected')),
+                    decision_note    TEXT,
+                    decided_at       TEXT,
+                    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    dedup_key        TEXT,
+                    evidence_conversation_ids TEXT NOT NULL DEFAULT '[]',
+                    related_document_ids TEXT NOT NULL DEFAULT '[]',
+                    detail           TEXT,
+                    decided_by_user_local_id INTEGER REFERENCES users (id) ON DELETE SET NULL,
+                    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                    provenance       TEXT NOT NULL DEFAULT 'deterministic_local'
+                )",
+                copy_sql: "INSERT INTO \"knowledge_gap_candidates__rebuild\"
+                               (id, query_text, occurrence_count, kind, status,
+                                decision_note, decided_at, created_at, dedup_key,
+                                evidence_conversation_ids, related_document_ids,
+                                detail, decided_by_user_local_id, updated_at, provenance)
+                           SELECT k.id, k.query_text, k.occurrence_count, k.kind, k.status,
+                                  k.decision_note, k.decided_at, k.created_at, k.dedup_key,
+                                  k.evidence_conversation_ids, k.related_document_ids,
+                                  k.detail,
+                                  CASE WHEN k.decided_by_user_local_id IN (SELECT id FROM users)
+                                       THEN k.decided_by_user_local_id END,
+                                  k.updated_at, k.provenance
+                             FROM knowledge_gap_candidates k",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // customer_memory (the customer_memories mirror): customer CASCADE +
+    // origin conversation SET NULL (003).
+    if !fk_declared(conn, "customer_memory", "customer_id")? {
+        rebuild_table(
+            conn,
+            "customer_memory",
+            &Rebuild {
+                new_name: "customer_memory",
+                new_ddl: "(
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    customer_id     INTEGER NOT NULL
+                                        REFERENCES customers (id) ON DELETE CASCADE,
+                    memory_key      TEXT NOT NULL,
+                    memory_value    TEXT NOT NULL,
+                    evidence_excerpt TEXT NOT NULL,
+                    source_conversation_id INTEGER
+                                        REFERENCES conversations (id) ON DELETE SET NULL,
+                    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    source          TEXT NOT NULL DEFAULT 'ai',
+                    origin          TEXT DEFAULT 'conversation',
+                    first_seen_at   TEXT,
+                    last_seen_at    TEXT,
+                    confidence      TEXT DEFAULT 'unknown',
+                    provenance      TEXT DEFAULT 'ai_generated',
+                    kind            TEXT NOT NULL DEFAULT 'fact'
+                )",
+                copy_sql: "INSERT INTO \"customer_memory__rebuild\"
+                               (id, customer_id, memory_key, memory_value, evidence_excerpt,
+                                source_conversation_id, created_at, source, origin,
+                                first_seen_at, last_seen_at, confidence, provenance, kind)
+                           SELECT m.id, m.customer_id, m.memory_key, m.memory_value,
+                                  m.evidence_excerpt,
+                                  CASE WHEN m.source_conversation_id
+                                            IN (SELECT id FROM conversations)
+                                       THEN m.source_conversation_id END,
+                                  m.created_at, m.source, m.origin, m.first_seen_at,
+                                  m.last_seen_at, m.confidence, m.provenance, m.kind
+                             FROM customer_memory m
+                            WHERE m.customer_id IN (SELECT id FROM customers)",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // issue_clusters: the known-issue link SET NULLs (003).
+    if !fk_declared(conn, "issue_clusters", "known_issue_id")? {
+        rebuild_table(
+            conn,
+            "issue_clusters",
+            &Rebuild {
+                new_name: "issue_clusters",
+                new_ddl: "(
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT NOT NULL,
+                    conversation_count INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    last_seen_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    status          TEXT NOT NULL DEFAULT 'active',
+                    trend           TEXT NOT NULL DEFAULT 'stable',
+                    known_issue_id  INTEGER REFERENCES known_issues (id) ON DELETE SET NULL,
+                    product         TEXT,
+                    title           TEXT,
+                    summary         TEXT,
+                    category        TEXT,
+                    feature         TEXT,
+                    ai_generated    INTEGER DEFAULT 0,
+                    customer_count  INTEGER DEFAULT 0,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    provenance      TEXT DEFAULT 'ai_generated'
+                )",
+                copy_sql: "INSERT INTO \"issue_clusters__rebuild\"
+                               (id, name, conversation_count, first_seen_at, last_seen_at,
+                                status, trend, known_issue_id, product, title, summary,
+                                category, feature, ai_generated, customer_count,
+                                created_at, updated_at, provenance)
+                           SELECT i.id, i.name, i.conversation_count, i.first_seen_at,
+                                  i.last_seen_at, i.status, i.trend,
+                                  CASE WHEN i.known_issue_id IN (SELECT id FROM known_issues)
+                                       THEN i.known_issue_id END,
+                                  i.product, i.title, i.summary, i.category, i.feature,
+                                  i.ai_generated, i.customer_count, i.created_at,
+                                  i.updated_at, i.provenance
+                             FROM issue_clusters i",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // ai_runs: the conversation SET NULL (003).
+    if !fk_declared(conn, "ai_runs", "conversation_id")? {
+        rebuild_table(
+            conn,
+            "ai_runs",
+            &Rebuild {
+                new_name: "ai_runs",
+                new_ddl: "(
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    input_hash      TEXT NOT NULL,
+                    prompt_version  TEXT NOT NULL,
+                    model           TEXT NOT NULL,
+                    response_json   TEXT NOT NULL,
+                    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    type            TEXT NOT NULL DEFAULT 'analysis',
+                    conversation_id INTEGER REFERENCES conversations (id) ON DELETE SET NULL,
+                    status          TEXT NOT NULL DEFAULT 'queued',
+                    input_refs      TEXT,
+                    error           TEXT,
+                    latency_ms      INTEGER,
+                    token_usage     TEXT,
+                    started_at      TEXT,
+                    completed_at    TEXT,
+                    provenance      TEXT NOT NULL DEFAULT 'ai_generated'
+                )",
+                copy_sql: "INSERT INTO \"ai_runs__rebuild\"
+                               (id, input_hash, prompt_version, model, response_json,
+                                created_at, type, conversation_id, status, input_refs,
+                                error, latency_ms, token_usage, started_at, completed_at,
+                                provenance)
+                           SELECT r.id, r.input_hash, r.prompt_version, r.model,
+                                  r.response_json, r.created_at, r.type,
+                                  CASE WHEN r.conversation_id IN (SELECT id FROM conversations)
+                                       THEN r.conversation_id END,
+                                  r.status, r.input_refs, r.error, r.latency_ms,
+                                  r.token_usage, r.started_at, r.completed_at,
+                                  r.provenance
+                             FROM ai_runs r",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // outreach_campaigns: mailbox + segment FKs (009; segments is the
+    // port's saved_segments rename).
+    if !fk_declared(conn, "outreach_campaigns", "mailbox_local_id")? {
+        rebuild_table(
+            conn,
+            "outreach_campaigns",
+            &Rebuild {
+                new_name: "outreach_campaigns",
+                new_ddl: "(
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT NOT NULL,
+                    subject         TEXT NOT NULL,
+                    body            TEXT NOT NULL,
+                    mailbox_local_id INTEGER REFERENCES mailboxes (id),
+                    tags            TEXT NOT NULL DEFAULT '[]',
+                    status          TEXT NOT NULL DEFAULT 'draft',
+                    segment_id      INTEGER REFERENCES saved_segments (id),
+                    segment_snapshot TEXT,
+                    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    queued_at       TEXT,
+                    completed_at    TEXT,
+                    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+                )",
+                copy_sql: "INSERT INTO \"outreach_campaigns__rebuild\"
+                               (id, name, subject, body, mailbox_local_id, tags, status,
+                                segment_id, segment_snapshot, created_at, queued_at,
+                                completed_at, updated_at)
+                           SELECT o.id, o.name, o.subject, o.body,
+                                  CASE WHEN o.mailbox_local_id IN (SELECT id FROM mailboxes)
+                                       THEN o.mailbox_local_id END,
+                                  o.tags, o.status,
+                                  CASE WHEN o.segment_id IN (SELECT id FROM saved_segments)
+                                       THEN o.segment_id END,
+                                  o.segment_snapshot, o.created_at, o.queued_at,
+                                  o.completed_at, o.updated_at
+                             FROM outreach_campaigns o",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    // ticket_state_transitions: the port keys by the conversation's REMOTE
+    // id (a documented divergence; the reference's local-id column set
+    // does not exist here) — the FK rides the port's keying through
+    // conversations(remote_id), preserving the reference's cascade
+    // semantics (a deleted conversation takes its transitions with it).
+    if !fk_declared(conn, "ticket_state_transitions", "conversation_remote_id")? {
+        rebuild_table(
+            conn,
+            "ticket_state_transitions",
+            &Rebuild {
+                new_name: "ticket_state_transitions",
+                new_ddl: "(
+                    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_remote_id INTEGER NOT NULL
+                                               REFERENCES conversations (remote_id) ON DELETE CASCADE,
+                    from_state             TEXT,
+                    to_state               TEXT,
+                    from_priority          TEXT,
+                    to_priority            TEXT,
+                    actor_type             TEXT NOT NULL,
+                    actor_id               INTEGER,
+                    transitioned_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                )",
+                copy_sql: "INSERT INTO \"ticket_state_transitions__rebuild\"
+                               (id, conversation_remote_id, from_state, to_state,
+                                from_priority, to_priority, actor_type, actor_id,
+                                transitioned_at)
+                           SELECT t.id, t.conversation_remote_id, t.from_state, t.to_state,
+                                  t.from_priority, t.to_priority, t.actor_type, t.actor_id,
+                                  t.transitioned_at
+                             FROM ticket_state_transitions t
+                            WHERE t.conversation_remote_id IN (SELECT remote_id FROM conversations)",
+                replacement_indexes: &[],
+            },
+        )?;
+    }
+
+    let _ = conn.execute("UPDATE app_state SET schema_version = 46 WHERE id = 1", []);
+    Ok(())
+}
+
+/// Does `table`.`column` already declare an outgoing FK (the idempotence
+/// probe for M046 — a rebuilt table declares all of its reference FKs)?
+fn fk_declared(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+    let hits = stmt
+        .query_map([], |r| r.get::<_, String>(3))?
+        .filter_map(|r| r.ok())
+        .filter(|from| from == column)
+        .count();
+    Ok(hits > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1495,191 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    #[test]
+    fn m046_declares_the_reference_fks() {
+        let conn = booted();
+        // customers -> organizations (SET NULL).
+        assert!(fks(&conn, "customers").contains(&(
+            "organization_id".into(),
+            "organizations".into(),
+            "id".into()
+        )));
+        // attachments -> conversation_threads + conversations (CASCADE).
+        assert!(fks(&conn, "attachments").contains(&(
+            "thread_id".into(),
+            "conversation_threads".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "attachments").contains(&(
+            "conversation_id".into(),
+            "conversations".into(),
+            "id".into()
+        )));
+        // activity_events -> conversations (CASCADE) + threads (SET NULL).
+        assert!(fks(&conn, "activity_events").contains(&(
+            "conversation_id".into(),
+            "conversations".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "activity_events").contains(&(
+            "thread_local_id".into(),
+            "conversation_threads".into(),
+            "id".into()
+        )));
+        // notifications -> users (target CASCADE, actor SET NULL),
+        // conversations (CASCADE), customers (SET NULL).
+        assert!(fks(&conn, "notifications").contains(&(
+            "target_user_id".into(),
+            "users".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "notifications").contains(&(
+            "actor_user_local_id".into(),
+            "users".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "notifications").contains(&(
+            "conversation_id".into(),
+            "conversations".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "notifications").contains(&(
+            "customer_local_id".into(),
+            "customers".into(),
+            "id".into()
+        )));
+        // side_threads -> conversations (CASCADE), teams + users (SET NULL).
+        assert!(fks(&conn, "side_threads").contains(&(
+            "conversation_id".into(),
+            "conversations".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "side_threads").contains(&(
+            "team_local_id".into(),
+            "teams".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "side_threads").contains(&(
+            "created_by_user_id".into(),
+            "users".into(),
+            "id".into()
+        )));
+        // knowledge_gap_candidates -> users (SET NULL).
+        assert!(fks(&conn, "knowledge_gap_candidates").contains(&(
+            "decided_by_user_local_id".into(),
+            "users".into(),
+            "id".into()
+        )));
+        // customer_memory -> customers (CASCADE) + conversations (SET NULL).
+        assert!(fks(&conn, "customer_memory").contains(&(
+            "customer_id".into(),
+            "customers".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "customer_memory").contains(&(
+            "source_conversation_id".into(),
+            "conversations".into(),
+            "id".into()
+        )));
+        // issue_clusters -> known_issues (SET NULL).
+        assert!(fks(&conn, "issue_clusters").contains(&(
+            "known_issue_id".into(),
+            "known_issues".into(),
+            "id".into()
+        )));
+        // ai_runs -> conversations (SET NULL).
+        assert!(fks(&conn, "ai_runs").contains(&(
+            "conversation_id".into(),
+            "conversations".into(),
+            "id".into()
+        )));
+        // outreach_campaigns -> mailboxes + saved_segments.
+        assert!(fks(&conn, "outreach_campaigns").contains(&(
+            "mailbox_local_id".into(),
+            "mailboxes".into(),
+            "id".into()
+        )));
+        assert!(fks(&conn, "outreach_campaigns").contains(&(
+            "segment_id".into(),
+            "saved_segments".into(),
+            "id".into()
+        )));
+        // ticket_state_transitions -> conversations(remote_id) (CASCADE,
+        // the port's remote keying).
+        assert!(fks(&conn, "ticket_state_transitions").contains(&(
+            "conversation_remote_id".into(),
+            "conversations".into(),
+            "remote_id".into()
+        )));
+
+        // Enforcement: an activity event on a missing conversation is
+        // refused; deleting a customer cascades its memories.
+        assert!(conn
+            .execute(
+                "INSERT INTO activity_events
+                     (conversation_id, event_type, actor_type, occurred_at, dedup_key)
+                 VALUES (424242, 'x', 'user', 'now', 'db06-neg')",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO customers (remote_id, first_name) VALUES (701, 'Ada')",
+            [],
+        )
+        .unwrap();
+        let customer: i64 = conn
+            .query_row("SELECT id FROM customers WHERE remote_id = 701", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO customer_memory
+                 (customer_id, memory_key, memory_value, evidence_excerpt)
+             VALUES (?1, 'pref', 'dark mode', 'she said so')",
+            [customer],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM customers WHERE id = ?1", [customer])
+            .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM customer_memory WHERE customer_id = ?1",
+                [customer],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "memories cascade away with their customer");
+    }
+
+    #[test]
+    fn m046_is_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        apply_m046(&conn).unwrap();
+        apply_m046(&conn).unwrap();
+    }
+
+    /// DB-06 pragma parity: db::open enforces WAL, foreign_keys and a
+    /// busy_timeout (verified on a real file connection, the production
+    /// boot path).
+    #[test]
+    fn db06_pragma_parity_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("pragma.db")).unwrap();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(timeout >= 1000, "busy_timeout set, got {timeout}");
     }
 
     #[test]
