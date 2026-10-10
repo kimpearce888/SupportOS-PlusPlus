@@ -106,6 +106,22 @@ mod tests {
     }
 
     #[test]
+    fn enforces_foreign_keys_and_busy_timeout() {
+        // DB-06 pragma parity: db::open must leave the connection in the
+        // reference's enforced state (WAL is covered by opens_with_wal
+        // above; foreign_keys=ON and a busy_timeout are the other two).
+        let conn = fresh_db();
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign_keys must be ON");
+        let busy_ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_ms, 5000, "busy_timeout must be the 5s db::open sets");
+    }
+
+    #[test]
     fn migrations_table_idempotent() {
         let conn = fresh_db();
         ensure_migrations_table(&conn).unwrap(); // twice
