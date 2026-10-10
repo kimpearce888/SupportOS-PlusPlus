@@ -16,12 +16,13 @@
 //!   opened".
 //!
 //! Column-name adaptations (documented port-wide, see `db_breadth.rs` /
-//! `search.rs`): `mailbox_local_id`→`mailbox_id`, `assignee_local_id`→
-//! `assignee_id`, `customer_local_id`→`customer_id`, `tag_local_id`→`tag_id`,
+//! `search.rs`): `tag_local_id`→`tag_id`,
 //! `field_local_id`→`field_id`, `known_issue_conversations`→
 //! `known_issue_links`, `ai_runs.output`→`ai_runs.response_json`, and
 //! `conversations.remote_created_at`→`conversations.created_at` (the port's
-//! mirror stores the remote creation stamp in `created_at`).
+//! mirror stores the remote creation stamp in `created_at`). The three
+//! conversation FK columns keep the reference names after DB-03 (M047):
+//! `mailbox_local_id` / `assignee_local_id` / `customer_local_id`.
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -1902,13 +1903,13 @@ impl<'a> ViewEngine<'a> {
                 let mut params = SqlParams::new();
                 if !assignee_local_ids.is_empty() {
                     parts.push(format!(
-                        "c.assignee_id IN ({})",
+                        "c.assignee_local_id IN ({})",
                         placeholders(assignee_local_ids.len()).join(",")
                     ));
                     params.extend(assignee_local_ids.iter().map(|id| integer(*id)));
                 }
                 if *include_unassigned {
-                    parts.push("c.assignee_id IS NULL".to_string());
+                    parts.push("c.assignee_local_id IS NULL".to_string());
                 }
                 if parts.is_empty() {
                     return Ok(Fragment::empty());
@@ -1936,7 +1937,7 @@ impl<'a> ViewEngine<'a> {
                 }
                 Ok(Fragment {
                     sql: format!(
-                        "c.mailbox_id IN ({})",
+                        "c.mailbox_local_id IN ({})",
                         placeholders(mailbox_local_ids.len()).join(",")
                     ),
                     params: mailbox_local_ids.iter().map(|id| integer(*id)).collect(),
@@ -2023,10 +2024,10 @@ impl<'a> ViewEngine<'a> {
                 value,
             } => {
                 let def = "cp.definition_id = ?";
-                let cust_join = "cp.customer_id = c.customer_id";
+                let cust_join = "cp.customer_id = c.customer_local_id";
                 match op.as_str() {
                     "is_empty" => Ok(Fragment {
-                        sql: format!("c.customer_id IS NULL OR NOT EXISTS (SELECT 1 FROM customer_properties cp WHERE {cust_join} AND {def} AND cp.value IS NOT NULL AND cp.value <> '')"),
+                        sql: format!("c.customer_local_id IS NULL OR NOT EXISTS (SELECT 1 FROM customer_properties cp WHERE {cust_join} AND {def} AND cp.value IS NOT NULL AND cp.value <> '')"),
                         params: vec![integer(*definition_id)],
                     }),
                     "is_not_empty" => Ok(Fragment {
@@ -2079,23 +2080,23 @@ impl<'a> ViewEngine<'a> {
                             "TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, ''))";
                         match op.as_str() {
                             "is_empty" => Ok(Fragment {
-                                sql: format!("c.customer_id IS NULL OR NOT EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_id AND {name_expr} <> '')"),
+                                sql: format!("c.customer_local_id IS NULL OR NOT EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_local_id AND {name_expr} <> '')"),
                                 params: Vec::new(),
                             }),
                             "is_not_empty" => Ok(Fragment {
-                                sql: format!("EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_id AND {name_expr} <> '')"),
+                                sql: format!("EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_local_id AND {name_expr} <> '')"),
                                 params: Vec::new(),
                             }),
                             "contains" => Ok(Fragment {
-                                sql: format!("EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_id AND {name_expr} LIKE ? ESCAPE '\\')"),
+                                sql: format!("EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_local_id AND {name_expr} LIKE ? ESCAPE '\\')"),
                                 params: vec![text(&format!("%{}%", escape_like(v)))],
                             }),
                             "equals" => Ok(Fragment {
-                                sql: format!("EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_id AND {name_expr} = ?)"),
+                                sql: format!("EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_local_id AND {name_expr} = ?)"),
                                 params: vec![text(v)],
                             }),
                             "not_contains" => Ok(Fragment {
-                                sql: format!("c.customer_id IS NULL OR NOT EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_id AND {name_expr} LIKE ? ESCAPE '\\')"),
+                                sql: format!("c.customer_local_id IS NULL OR NOT EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_local_id AND {name_expr} LIKE ? ESCAPE '\\')"),
                                 params: vec![text(&format!("%{}%", escape_like(v)))],
                             }),
                             other => Err(ViewCompileError::new(format!(
@@ -2105,23 +2106,23 @@ impl<'a> ViewEngine<'a> {
                     }
                     "email" => match op.as_str() {
                         "is_empty" => Ok(Fragment {
-                            sql: "NOT EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_id)".to_string(),
+                            sql: "NOT EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_local_id)".to_string(),
                             params: Vec::new(),
                         }),
                         "is_not_empty" => Ok(Fragment {
-                            sql: "EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_id)".to_string(),
+                            sql: "EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_local_id)".to_string(),
                             params: Vec::new(),
                         }),
                         "contains" => Ok(Fragment {
-                            sql: "EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_id AND ce.value LIKE ? ESCAPE '\\')".to_string(),
+                            sql: "EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_local_id AND ce.value LIKE ? ESCAPE '\\')".to_string(),
                             params: vec![text(&format!("%{}%", escape_like(v)))],
                         }),
                         "equals" => Ok(Fragment {
-                            sql: "EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_id AND ce.value = ?)".to_string(),
+                            sql: "EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_local_id AND ce.value = ?)".to_string(),
                             params: vec![text(v)],
                         }),
                         "not_contains" => Ok(Fragment {
-                            sql: "c.customer_id IS NULL OR NOT EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_id AND ce.value LIKE ? ESCAPE '\\')".to_string(),
+                            sql: "c.customer_local_id IS NULL OR NOT EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_local_id AND ce.value LIKE ? ESCAPE '\\')".to_string(),
                             params: vec![text(&format!("%{}%", escape_like(v)))],
                         }),
                         other => Err(ViewCompileError::new(format!(
@@ -2130,23 +2131,23 @@ impl<'a> ViewEngine<'a> {
                     },
                     "organization" => match op.as_str() {
                         "is_empty" => Ok(Fragment {
-                            sql: "c.customer_id IS NULL OR NOT EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_id AND cu.organization_id IS NOT NULL AND EXISTS (SELECT 1 FROM organizations o WHERE o.id = cu.organization_id AND o.name <> ''))".to_string(),
+                            sql: "c.customer_local_id IS NULL OR NOT EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_local_id AND cu.organization_id IS NOT NULL AND EXISTS (SELECT 1 FROM organizations o WHERE o.id = cu.organization_id AND o.name <> ''))".to_string(),
                             params: Vec::new(),
                         }),
                         "is_not_empty" => Ok(Fragment {
-                            sql: "EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_id AND o.name <> '')".to_string(),
+                            sql: "EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_local_id AND o.name <> '')".to_string(),
                             params: Vec::new(),
                         }),
                         "contains" => Ok(Fragment {
-                            sql: "EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_id AND o.name LIKE ? ESCAPE '\\')".to_string(),
+                            sql: "EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_local_id AND o.name LIKE ? ESCAPE '\\')".to_string(),
                             params: vec![text(&format!("%{}%", escape_like(v)))],
                         }),
                         "equals" => Ok(Fragment {
-                            sql: "EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_id AND o.name = ?)".to_string(),
+                            sql: "EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_local_id AND o.name = ?)".to_string(),
                             params: vec![text(v)],
                         }),
                         "not_contains" => Ok(Fragment {
-                            sql: "c.customer_id IS NULL OR NOT EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_id AND o.name LIKE ? ESCAPE '\\')".to_string(),
+                            sql: "c.customer_local_id IS NULL OR NOT EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_local_id AND o.name LIKE ? ESCAPE '\\')".to_string(),
                             params: vec![text(&format!("%{}%", escape_like(v)))],
                         }),
                         other => Err(ViewCompileError::new(format!(
@@ -2471,7 +2472,7 @@ impl<'a> ViewEngine<'a> {
                 }
                 Ok(Fragment {
                     sql: format!(
-                        "c.customer_id IN ({})",
+                        "c.customer_local_id IN ({})",
                         placeholders(customer_local_ids.len()).join(",")
                     ),
                     params: customer_local_ids.iter().map(|id| integer(*id)).collect(),
@@ -2751,7 +2752,7 @@ mod tests {
         ));
         assert_eq!(
             c.where_sql,
-            "(c.assignee_id IN (?,?) OR c.assignee_id IS NULL)"
+            "(c.assignee_local_id IN (?,?) OR c.assignee_local_id IS NULL)"
         );
         assert_eq!(param_i64(&c, 0), 3);
         assert_eq!(param_i64(&c, 1), 7);
@@ -2763,7 +2764,7 @@ mod tests {
                 include_unassigned: false,
             }],
         ));
-        assert_eq!(only_ids.where_sql, "(c.assignee_id IN (?))");
+        assert_eq!(only_ids.where_sql, "(c.assignee_local_id IN (?))");
     }
 
     #[test]
@@ -2787,7 +2788,7 @@ mod tests {
         ));
         assert_eq!(
             c.where_sql,
-            "(c.assigned_team_local_id IN (?)) AND (c.mailbox_id IN (?,?)) AND (c.type IN (?)) AND (c.customer_id IN (?))"
+            "(c.assigned_team_local_id IN (?)) AND (c.mailbox_local_id IN (?,?)) AND (c.type IN (?)) AND (c.customer_local_id IN (?))"
         );
         assert_eq!(c.params.len(), 5);
     }
@@ -2884,7 +2885,7 @@ mod tests {
         ));
         assert_eq!(
             c.where_sql,
-            "(EXISTS (SELECT 1 FROM customer_properties cp WHERE cp.customer_id = c.customer_id AND cp.definition_id = ? AND CAST(cp.value AS REAL) >= ?))"
+            "(EXISTS (SELECT 1 FROM customer_properties cp WHERE cp.customer_id = c.customer_local_id AND cp.definition_id = ? AND CAST(cp.value AS REAL) >= ?))"
         );
         assert_eq!(param_i64(&c, 0), 2);
         assert_eq!(c.params[1], rusqlite::types::Value::Real(10.0));
@@ -2899,7 +2900,7 @@ mod tests {
         ));
         assert!(empty
             .where_sql
-            .starts_with("(c.customer_id IS NULL OR NOT EXISTS"));
+            .starts_with("(c.customer_local_id IS NULL OR NOT EXISTS"));
         assert_eq!(empty.params.len(), 1);
     }
 
@@ -2933,7 +2934,7 @@ mod tests {
         ));
         assert_eq!(
             name.where_sql,
-            "(EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_id AND TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')) LIKE ? ESCAPE '\\'))"
+            "(EXISTS (SELECT 1 FROM customers cu WHERE cu.id = c.customer_local_id AND TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')) LIKE ? ESCAPE '\\'))"
         );
         assert_eq!(param_str(&name, 0), "%Emma L%");
 
@@ -2947,7 +2948,7 @@ mod tests {
         ));
         assert_eq!(
             email_empty.where_sql,
-            "(NOT EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_id))"
+            "(NOT EXISTS (SELECT 1 FROM customer_emails ce WHERE ce.customer_id = c.customer_local_id))"
         );
 
         let org = compile(&def(
@@ -2960,7 +2961,7 @@ mod tests {
         ));
         assert_eq!(
             org.where_sql,
-            "(EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_id AND o.name = ?))"
+            "(EXISTS (SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id WHERE cu.id = c.customer_local_id AND o.name = ?))"
         );
         assert_eq!(param_str(&org, 0), "Acme");
     }
@@ -3968,9 +3969,22 @@ mod tests {
     fn compiled_sql_matches_expected_rows() {
         let conn = fresh_db();
         // Fixture: one waiting, one closed-urgent, one unassigned.
+        // DB-03 (M047): conversations.mailbox_local_id/customer_local_id are
+        // real FKs now (db::open sets foreign_keys=ON) — seed the parents the
+        // fixture's concrete ids point at.
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (101, 101, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (2001, 2001, 'Fixture')",
+            [],
+        )
+        .unwrap();
         let insert = |remote: i64, status: &str, subject: &str| {
             conn.execute(
-                "INSERT INTO conversations (remote_id, number, status, subject, mailbox_id, customer_id)
+                "INSERT INTO conversations (remote_id, number, status, subject, mailbox_local_id, customer_local_id)
                  VALUES (?1, ?1, ?2, ?3, 101, 2001)",
                 params![remote, status, subject],
             )

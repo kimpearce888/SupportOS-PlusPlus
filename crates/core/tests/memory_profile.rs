@@ -51,16 +51,16 @@ async fn memory_profile_composition() {
              VALUES (11, 110, 'Ada', 'Lovelace', 'ada@acme.com', 1, 'Chief Mathematician');
          INSERT INTO customers (id, remote_id, first_name, last_name, organization_id)
              VALUES (12, 120, 'Belle', 'Node', 1);
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id, created_at, updated_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id, created_at, updated_at)
              VALUES (1, 101, 101, 'Export stuck at night', 'closed', 1, 11, 7,
                      '2026-09-01T10:00:00.000Z', '2026-09-02T10:00:00.000Z');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id, created_at, updated_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id, created_at, updated_at)
              VALUES (2, 102, 102, 'Login loop', 'closed', 1, 11, 7,
                      '2026-09-10T10:00:00.000Z', '2026-09-11T10:00:00.000Z');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id, created_at, updated_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id, created_at, updated_at)
              VALUES (3, 103, 103, 'Follow-up question', 'active', 1, 11, 7,
                      '2026-10-01T10:00:00.000Z', '2026-10-02T10:00:00.000Z');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id)
              VALUES (4, 104, 104, 'Belle own thread', 'active', 1, 12, 7);
          INSERT INTO ratings (conversation_id, customer_local_id, rating, comments, remote_created_at)
              VALUES (1, 11, 'great', 'Fixed overnight', '2026-09-02T11:00:00.000Z');

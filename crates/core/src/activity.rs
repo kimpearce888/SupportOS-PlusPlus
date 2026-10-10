@@ -617,12 +617,36 @@ mod tests {
         crate::db::ensure_migrations_table(&conn).unwrap();
         crate::migrations::run_all(&mut conn).unwrap();
         apply_m003(&conn).unwrap();
+        // DB-03 (M047): the reference conversations column names — a
+        // test-local RENAME of the three port columns keeps this slim chain
+        // (run_all + m003) intact while the fixtures below insert the
+        // post-migration shape. Like the thread mirror below, the slim
+        // fixture carries no FKs; the real chain's M047 rebuild (with FKs +
+        // UNIQUE(number)) only runs on full boots.
+        conn.execute_batch(
+            "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id;
+             ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id;
+             ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id;",
+        )
+        .unwrap();
         conn
     }
 
     fn insert_conversation(conn: &Connection, remote_id: i64, status: &str) {
+        // Parent rows for the concrete ids (the slim chain declares no FKs,
+        // but the real M047 shape enforces them — keep the fixture honest).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (101, 101, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (2001, 2001, 'Cust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (?1, ?2, ?3, 101, 2001)",
             params![remote_id, remote_id, status],
         )
@@ -968,8 +992,20 @@ mod tests {
     fn rebuild_db() -> Connection {
         let conn = fresh_db();
         ensure_thread_mirror(&conn);
+        // Parent rows for the concrete ids (mailbox 1 / customer 1) — see
+        // the fresh_db note; the real M047 shape enforces the FKs.
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, status, mailbox_id, customer_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 1, 'Cust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (9, 5001, 101, 'active', 1, 1)",
             [],
         )

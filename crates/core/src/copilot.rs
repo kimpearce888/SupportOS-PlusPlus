@@ -713,7 +713,7 @@ fn context_block(conn: &Connection, conversation_id: Option<i64>) -> String {
             .query_row(
                 "SELECT c.number, c.subject,
                         (SELECT TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, ''))
-                           FROM customers cu WHERE cu.id = c.customer_id)
+                           FROM customers cu WHERE cu.id = c.customer_local_id)
                    FROM conversations c WHERE c.id = ?1 AND c.deleted_at IS NULL",
                 params![cid],
                 |r| {
@@ -862,7 +862,7 @@ pub fn starter_questions(conn: &Connection, conversation_id: i64) -> Vec<(String
     let facts: Option<i64> = conn
         .query_row(
             "SELECT (SELECT COUNT(*) FROM conversations c2
-                      WHERE c2.customer_id = c.customer_id
+                      WHERE c2.customer_local_id = c.customer_local_id
                         AND c2.deleted_at IS NULL AND c2.id != c.id)
                FROM conversations c WHERE c.id = ?1 AND c.deleted_at IS NULL",
             params![conversation_id],
@@ -938,7 +938,7 @@ mod copilot_service_tests {
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY, remote_id INTEGER UNIQUE, number INTEGER NOT NULL,
                 subject TEXT, preview TEXT, status TEXT NOT NULL DEFAULT 'active',
-                mailbox_id INTEGER, assignee_id INTEGER, customer_id INTEGER,
+                mailbox_local_id INTEGER, assignee_local_id INTEGER, customer_local_id INTEGER,
                 created_at TEXT, updated_at TEXT, closed_at TEXT, deleted_at TEXT,
                 remote_created_at TEXT
             );
@@ -952,7 +952,7 @@ mod copilot_service_tests {
     fn starter_questions_match_the_reference_list() {
         let conn = setup();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, customer_id, created_at)
+            "INSERT INTO conversations (id, remote_id, number, customer_local_id, created_at)
              VALUES (1, 1, 100, 5, datetime('now'))",
             [],
         )
@@ -966,7 +966,7 @@ mod copilot_service_tests {
 
         // With a prior ticket the history trio is inserted.
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, customer_id, created_at)
+            "INSERT INTO conversations (id, remote_id, number, customer_local_id, created_at)
              VALUES (2, 2, 101, 5, datetime('now'))",
             [],
         )
@@ -1017,7 +1017,7 @@ mod copilot_service_tests {
     fn citations_are_machine_generated_from_real_executions() {
         let conn = setup();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, customer_id, created_at)
+            "INSERT INTO conversations (id, remote_id, number, customer_local_id, created_at)
              VALUES (1, 1, 100, 5, datetime('now'))",
             [],
         )

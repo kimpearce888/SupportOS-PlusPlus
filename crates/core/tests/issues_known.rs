@@ -49,11 +49,14 @@ async fn issues_known_crud_parity() {
     // name-only known issue (the pre-IS-02 wire wrote only `name`).
     conn.execute_batch(
         "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (11, 110, 'Ada');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (12, 120, 'Belle');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (13, 130, 'Cleo');
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (1, 101, 101, 'Export stuck at night', 'active', 1, 11, '2026-10-01 10:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (2, 102, 102, 'Export stuck again', 'closed', 1, 12, '2026-10-06 08:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at, remote_created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, remote_created_at)
              VALUES (3, 103, 103, 'Export stuck on mobile', 'active', 1, 13, '2026-10-02 09:00:00', '2026-10-02 08:00:00');
          INSERT INTO known_issues (id, name, status, description)
              VALUES (90, 'Legacy login bug', 'active', 'pre-IS-02 row with only name');",

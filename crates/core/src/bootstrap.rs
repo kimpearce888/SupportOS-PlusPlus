@@ -248,6 +248,11 @@ const BOOT_STEPS: &[BootStep] = &[
         label: "m046_base_mirror_fks",
         apply: crate::mirror_parity::apply_m046,
     },
+    BootStep {
+        version: 38,
+        label: "m047_conversations_reference_shape",
+        apply: crate::mirror_parity::apply_m047,
+    },
 ];
 
 /// Apply the pending boot steps, each in one transaction with its

@@ -241,6 +241,17 @@ mod tests {
 
     fn seed_agent_with_open(state: &AppState, remote_id: i64, name: &str, opens: i64) -> i64 {
         let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // DB-03: M047 FKs (foreign_keys=ON) — parents for the fixture rows.
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (3001, 3001, 'Eve')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO users (remote_id, first_name, last_name) VALUES (?1, ?2, 'Agent')",
             rusqlite::params![remote_id, name],
@@ -250,7 +261,7 @@ mod tests {
         for i in 0..opens {
             conn.execute(
                 "INSERT INTO conversations
-                    (remote_id, number, status, mailbox_id, customer_id, assignee_id, created_at)
+                    (remote_id, number, status, mailbox_local_id, customer_local_id, assignee_local_id, created_at)
                  VALUES (?1, ?1, 'active', 1, 3001, ?2, '2026-10-01T00:00:00Z')",
                 rusqlite::params![9000 + i, uid],
             )
@@ -271,7 +282,7 @@ mod tests {
             let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
             conn.execute(
                 "INSERT INTO conversations
-                    (remote_id, number, status, mailbox_id, customer_id, created_at)
+                    (remote_id, number, status, mailbox_local_id, customer_local_id, created_at)
                  VALUES (9999, 9999, 'active', 1, 3001, '2026-10-01T00:00:00Z')",
                 [],
             )
@@ -351,7 +362,7 @@ mod tests {
         let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
             "INSERT INTO conversations
-                (remote_id, number, status, mailbox_id, customer_id, subject,
+                (remote_id, number, status, mailbox_local_id, customer_local_id, subject,
                  supportos_priority, customer_waiting_since, created_at)
              VALUES (8001, 8001, 'active', 1, 3001, 'Broken login',
                      'urgent', '2026-10-04T00:00:00Z', '2026-10-04T00:00:00Z')",

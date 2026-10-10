@@ -1017,7 +1017,7 @@ pub fn campaign_reconcile(conn: &Connection, campaign_id: i64) -> serde_json::Va
         let match_conv: Option<(i64, Option<i64>)> = conn
             .query_row(
                 "SELECT remote_id, number FROM conversations
-                  WHERE customer_id = (SELECT id FROM customers WHERE remote_id = ?1)
+                  WHERE customer_local_id = (SELECT id FROM customers WHERE remote_id = ?1)
                     AND LOWER(TRIM(COALESCE(subject, ''))) = LOWER(TRIM(COALESCE(?2, '')))
                   LIMIT 1",
                 rusqlite::params![customer_remote, subject],
@@ -2557,6 +2557,24 @@ mod tests {
         crate::conversation_ops::apply_m030(&conn).expect("apply M030");
         crate::sla::ensure_sla_schema(&conn).expect("ensure SLA schema");
         apply_m031(&conn).expect("apply M031");
+        // DB-03 (M047): the reference column names on conversations
+        // (mailbox_local_id/assignee_local_id/customer_local_id). The slim
+        // chain can't run m047's converging copy (it expects the full
+        // pre-M047 shape), so the fixture reproduces the renamed result
+        // directly — plain renames, no FK clauses (the slim chain never
+        // declared them; SQLite rewrites the m001 index defs itself).
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id",
+            [],
+        );
         conn
     }
 
@@ -2570,7 +2588,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id)
              VALUES (9, ?1, 1001, 'Reply tracking', 1, 10)",
             params![remote],
         )
@@ -2645,7 +2663,7 @@ mod tests {
         add_thread(&conn, 9, "user", "2026-01-04T10:00:00.000Z");
         // Recipient 2: customer thread but BEFORE our send (old conversation).
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id)
              VALUES (10, 5002, 1002, 'Old', 1, 10)",
             [],
         )

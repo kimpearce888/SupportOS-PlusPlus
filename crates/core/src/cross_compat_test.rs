@@ -26,6 +26,14 @@ const PASS: &str = "cross-compat-passphrase";
 fn reference_bundle_is_rejected_by_the_real_schema_guard() {
     // A minimal PORT-shaped local schema — the guard compares real DDL, not
     // fabricated migration numbers.
+    // DB-03 SWEEP AMBIGUITY: this synthetic conversations DDL keeps the
+    // mailbox_id/customer_id vocabulary on purpose — it is a fingerprint
+    // fixture (2 tables, no FKs, nothing production reads these columns),
+    // the same pattern as encrypted_sync.rs's synthetic `conversations
+    // (id, body)`. The reference bundle is rejected on the 123-table DDL
+    // mismatch regardless of these names, and the exported port bundle is
+    // only decrypted (never fingerprint-verified) by the reference side, so
+    // renaming would change nothing but the captured fingerprint bytes.
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE conversations (

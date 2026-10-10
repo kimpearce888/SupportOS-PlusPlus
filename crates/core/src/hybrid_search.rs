@@ -452,8 +452,9 @@ mod tests {
     fn hybrid_search_returns_fused_results() {
         let db_path = std::env::temp_dir().join(format!("test_hybrid_{}.db", std::process::id()));
         let mut conn = crate::db::open(&db_path).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
+        // DB-03 (M047): the full boot — the hybrid pipeline's people-scope
+        // SQL reads the reference conversations column names.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         crate::search::apply_fts_migration(&conn).unwrap();
 
         // We don't have FTS5 data in this test DB, so the sparse search returns
@@ -471,8 +472,9 @@ mod tests {
     fn hybrid_search_with_filter() {
         let db_path = std::env::temp_dir().join(format!("test_hybrid2_{}.db", std::process::id()));
         let mut conn = crate::db::open(&db_path).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
+        // DB-03 (M047): the full boot — the hybrid pipeline's people-scope
+        // SQL reads the reference conversations column names.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         crate::search::apply_fts_migration(&conn).unwrap();
 
         let store = InMemoryVectorStore::new();
@@ -520,8 +522,9 @@ mod tests {
     fn hybrid_search_returns_empty_for_nonexistent_collection() {
         let db_path = std::env::temp_dir().join(format!("test_hybrid3_{}.db", std::process::id()));
         let mut conn = crate::db::open(&db_path).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
+        // DB-03 (M047): the full boot — the hybrid pipeline's people-scope
+        // SQL reads the reference conversations column names.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         crate::search::apply_fts_migration(&conn).unwrap();
 
         let store = InMemoryVectorStore::new();

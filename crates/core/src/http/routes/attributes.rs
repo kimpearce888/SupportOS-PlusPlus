@@ -375,7 +375,7 @@ mod tests {
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY, remote_id INTEGER NOT NULL UNIQUE,
                 number INTEGER, subject TEXT, status TEXT NOT NULL DEFAULT 'active',
-                mailbox_id INTEGER NOT NULL, customer_id INTEGER NOT NULL);
+                mailbox_local_id INTEGER NOT NULL, customer_local_id INTEGER NOT NULL);
              CREATE TABLE conversation_threads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
                 type TEXT NOT NULL, body_text TEXT, from_type TEXT,
@@ -418,7 +418,7 @@ mod tests {
 
     fn insert_conversation(conn: &Connection, id: i64, number: i64, subject: &str) {
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id)
              VALUES (?1, ?1, ?2, ?3, 1, 1)",
             rusqlite::params![id, number, subject],
         )

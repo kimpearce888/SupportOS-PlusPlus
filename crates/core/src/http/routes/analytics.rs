@@ -28,8 +28,9 @@ use axum::response::IntoResponse;
 ///
 /// Port schema mappings (documented renames):
 /// - `remote_created_at` -> `conversations.created_at`
-/// - `customer_local_id`/`mailbox_local_id`/`assignee_local_id` ->
-///   `customer_id`/`mailbox_id`/`assignee_id`
+/// - `mailbox_local_id`/`assignee_local_id`/`customer_local_id` are the
+///   reference names (M047/DB-03 restored them; the port's legacy
+///   `mailbox_id`/`assignee_id`/`customer_id` are gone)
 /// - `threads` -> `conversation_threads` (`type` -> `thread_type`)
 /// - `first_activity_at` -> `COALESCE(c.first_customer_message_at, c.created_at)`
 ///   (the port's M003-derived first customer message stands in for MAIN's
@@ -121,7 +122,7 @@ pub async fn dashboard(
         String::new()
     } else {
         format!(
-            " AND c.mailbox_id IN ({})",
+            " AND c.mailbox_local_id IN ({})",
             mailbox_ids
                 .iter()
                 .map(|id| id.to_string())
@@ -158,7 +159,7 @@ pub async fn dashboard(
           COALESCE(SUM(CASE WHEN c.status = 'active' AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN c.status = 'pending' AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN c.closed_at IS NOT NULL AND c.closed_at >= ?1 AND c.closed_at <= ?2 THEN 1 ELSE 0 END), 0),
-          COALESCE(SUM(CASE WHEN c.status IN ('active','pending') AND c.assignee_id IS NULL AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN c.status IN ('active','pending') AND c.assignee_local_id IS NULL AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN c.status IN ('active','pending') AND (julianday('now') - COALESCE(julianday(c.updated_at), julianday(c.created_at))) >= 7 AND c.deleted_at IS NULL THEN 1 ELSE 0 END), 0)
          FROM conversations c WHERE c.deleted_at IS NULL{mailbox_in}{conv_channel}"
     );
@@ -262,7 +263,7 @@ pub async fn dashboard(
     let by_mailbox = name_count_rows(
         &format!(
             "SELECT m.name AS name, COUNT(*) AS count FROM conversations c
-             JOIN mailboxes m ON m.id = c.mailbox_id
+             JOIN mailboxes m ON m.id = c.mailbox_local_id
              WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{conv_channel}
              GROUP BY m.name ORDER BY count DESC"
         ),
@@ -282,7 +283,7 @@ pub async fn dashboard(
     let by_agent = name_count_rows(
         &format!(
             "SELECT TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS name, COUNT(*) AS count
-             FROM conversations c JOIN users u ON u.id = c.assignee_id
+             FROM conversations c JOIN users u ON u.id = c.assignee_local_id
              WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{mailbox_in}{conv_channel}
              GROUP BY u.id ORDER BY count DESC"
         ),
@@ -292,7 +293,7 @@ pub async fn dashboard(
         &format!(
             "SELECT tm.name AS name, COUNT(*) AS count
              FROM conversations c
-             JOIN users u ON u.id = c.assignee_id
+             JOIN users u ON u.id = c.assignee_local_id
              JOIN team_members tem ON tem.user_id = u.id
              JOIN teams tm ON tm.id = tem.team_id
              WHERE c.deleted_at IS NULL AND c.created_at >= ?1 AND c.created_at <= ?2{mailbox_in}{conv_channel}
@@ -376,11 +377,11 @@ pub async fn dashboard(
                     AVG((julianday(fr.first_reply) - julianday(COALESCE(c.first_customer_message_at, c.created_at))) * 1440) AS first_response_avg_min,
                     AVG((julianday(c.closed_at) - julianday(COALESCE(c.first_customer_message_at, c.created_at))) * 1440) AS resolution_avg_min,
                     (SELECT COUNT(*) FROM ratings r JOIN conversations c2 ON c2.id = r.conversation_id
-                      WHERE c2.mailbox_id = m.id AND r.rating = 'great' AND r.remote_created_at >= ?1 AND r.remote_created_at <= ?2{cmp_channel_sub}) AS great_ratings,
+                      WHERE c2.mailbox_local_id = m.id AND r.rating = 'great' AND r.remote_created_at >= ?1 AND r.remote_created_at <= ?2{cmp_channel_sub}) AS great_ratings,
                     (SELECT COUNT(*) FROM ratings r JOIN conversations c2 ON c2.id = r.conversation_id
-                      WHERE c2.mailbox_id = m.id AND r.remote_created_at >= ?1 AND r.remote_created_at <= ?2{cmp_channel_sub}) AS total_ratings
+                      WHERE c2.mailbox_local_id = m.id AND r.remote_created_at >= ?1 AND r.remote_created_at <= ?2{cmp_channel_sub}) AS total_ratings
              FROM mailboxes m
-             LEFT JOIN conversations c ON c.mailbox_id = m.id AND c.deleted_at IS NULL{cmp_channel_join}
+             LEFT JOIN conversations c ON c.mailbox_local_id = m.id AND c.deleted_at IS NULL{cmp_channel_join}
              {first_reply_join}
              WHERE 1 = 1{mailbox_in}
              GROUP BY m.id, m.name ORDER BY new_conversations DESC"
@@ -998,7 +999,7 @@ fn radar_clusters(conn: &rusqlite::Connection) -> Vec<RadarCluster> {
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "SELECT c.id, c.customer_id, c.mailbox_id, c.created_at, julianday(c.created_at) AS jd
+        "SELECT c.id, c.customer_local_id, c.mailbox_local_id, c.created_at, julianday(c.created_at) AS jd
            FROM conversations c WHERE c.id IN ({placeholders})"
     );
     let facts: Vec<ConvFacts> = conn
@@ -1096,7 +1097,7 @@ fn radar_extensions(conn: &rusqlite::Connection, clusters: &[RadarCluster]) -> V
     }
     let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT c.id, c.customer_id, c.mailbox_id, c.created_at, julianday(c.created_at) AS jd
+        "SELECT c.id, c.customer_local_id, c.mailbox_local_id, c.created_at, julianday(c.created_at) AS jd
            FROM conversations c WHERE c.id IN ({placeholders})"
     );
     let facts: Vec<ConvFacts> = conn
@@ -2191,7 +2192,12 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id, status, created_at, updated_at)
+            "INSERT INTO customers (id, remote_id, first_name) VALUES (3001, 3001, 'Eve')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, mailbox_local_id, customer_local_id, status, created_at, updated_at)
              VALUES (101, 101, 1, 3001, 'closed', '2026-03-02T09:00:00Z', '2026-03-02T10:00:00Z')",
             [],
         )

@@ -593,14 +593,16 @@ mod tests {
             .keep()
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        crate::embeddings::apply_m008(&conn).unwrap();
-        crate::ai_center::apply_m009(&conn).unwrap();
+        // DB-03 (M047): the full boot chain — the route's SQL needs the
+        // reference conversations shape (and M040's add pass needs every
+        // creator step before it), so the old curated partial chain grew
+        // to the whole boot.
+        crate::bootstrap::apply_all(&mut conn).unwrap();
         // DB-04 (M045): the reference actor model (replaces the M028
         // collapsed shape; actor ids stay NULL in these fixtures).
         conn.execute_batch(
-            "CREATE TABLE conversation_threads (
+            "DROP TABLE IF EXISTS conversation_threads;
+             CREATE TABLE conversation_threads (
                 id                        INTEGER PRIMARY KEY AUTOINCREMENT,
                 remote_id                 INTEGER,
                 conversation_id           INTEGER NOT NULL,
@@ -625,12 +627,13 @@ mod tests {
                  ON conversation_threads (type);",
         )
         .unwrap();
-        crate::conversation_ops::apply_m030(&conn).unwrap();
-        crate::intelligence_features::apply_m015_to_m019(&conn).unwrap();
-        crate::sync_schema::apply_m029(&conn).unwrap();
-        crate::customer_events::apply_m036(&conn).unwrap();
-        crate::mirror_tables::apply_m039(&conn).unwrap();
         crate::search::apply_fts_migration(&conn).unwrap();
+        // FK parents for the fixture conversations (mailbox 1 / customer 1).
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT OR IGNORE INTO customers (id, remote_id) VALUES (1, 201);",
+        )
+        .unwrap();
         conn
     }
 
@@ -677,7 +680,7 @@ mod tests {
 
     fn insert_conversation(conn: &Connection, id: i64, subject: &str) {
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id)
              VALUES (?1, ?1, ?2, ?3, ?4, 1, 1)",
             params![id, 100 + id, subject, format!("preview of {}", subject.to_lowercase())],
         )

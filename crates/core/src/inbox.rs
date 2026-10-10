@@ -87,11 +87,14 @@ pub struct ConversationListItem {
     pub subject: Option<String>,
     pub preview: Option<String>,
     pub status: String,
-    pub mailbox_id: i64,
+    /// M047: the reference columns are nullable — unresolved sync lookups
+    /// land NULL, serialized as JSON null (the reference's API serves null
+    /// too; the UI parses with `unwrap_or(0)`).
+    pub mailbox_id: Option<i64>,
     pub mailbox_name: Option<String>,
     pub assignee_id: Option<i64>,
     pub assignee_name: Option<String>,
-    pub customer_id: i64,
+    pub customer_id: Option<i64>,
     pub customer_name: Option<String>,
     pub priority: Option<String>,
     pub created_at: Option<String>,
@@ -164,11 +167,12 @@ pub struct ConversationDetail {
     pub subject: Option<String>,
     pub preview: Option<String>,
     pub status: String,
-    pub mailbox_id: i64,
+    /// M047: nullable reference columns (see ConversationListItem).
+    pub mailbox_id: Option<i64>,
     pub mailbox_name: Option<String>,
     pub assignee_id: Option<i64>,
     pub assignee_name: Option<String>,
-    pub customer_id: i64,
+    pub customer_id: Option<i64>,
     pub customer_name: Option<String>,
     pub customer_email: Option<String>,
     pub priority: Option<String>,
@@ -210,15 +214,15 @@ pub fn list_conversations(
         params_vec.push(status.clone().into());
     }
     if let Some(mailbox_id) = filters.mailbox_id {
-        where_parts.push("c.mailbox_id = ?".to_string());
+        where_parts.push("c.mailbox_local_id = ?".to_string());
         params_vec.push(mailbox_id.into());
     }
     if let Some(assignee_id) = filters.assignee_id {
-        where_parts.push("c.assignee_id = ?".to_string());
+        where_parts.push("c.assignee_local_id = ?".to_string());
         params_vec.push(assignee_id.into());
     }
     if let Some(customer_id) = filters.customer_id {
-        where_parts.push("c.customer_id = ?".to_string());
+        where_parts.push("c.customer_local_id = ?".to_string());
         params_vec.push(customer_id.into());
     }
     if let Some(ref priority) = filters.priority {
@@ -279,15 +283,15 @@ pub fn list_conversations(
     // List query — join with mailboxes, users, customers for display names.
     let list_sql = format!(
         "SELECT c.id, c.remote_id, c.number, c.subject, c.preview, c.status,
-                c.mailbox_id, m.name,
-                c.assignee_id, u.first_name || ' ' || u.last_name,
-                c.customer_id, cu.first_name || ' ' || cu.last_name,
+                c.mailbox_local_id, m.name,
+                c.assignee_local_id, u.first_name || ' ' || u.last_name,
+                c.customer_local_id, cu.first_name || ' ' || cu.last_name,
                 c.priority, c.created_at, c.updated_at, c.closed_at,
                 c.response_state
          FROM conversations c
-         LEFT JOIN mailboxes m ON m.id = c.mailbox_id
-         LEFT JOIN users u ON u.id = c.assignee_id
-         LEFT JOIN customers cu ON cu.id = c.customer_id
+         LEFT JOIN mailboxes m ON m.id = c.mailbox_local_id
+         LEFT JOIN users u ON u.id = c.assignee_local_id
+         LEFT JOIN customers cu ON cu.id = c.customer_local_id
          {where_clause}
          ORDER BY COALESCE(c.updated_at, c.local_created_at) DESC
          LIMIT ? OFFSET ?"
@@ -334,15 +338,15 @@ pub fn get_conversation(
 ) -> Result<Option<ConversationDetail>> {
     let row = conn.query_row(
         "SELECT c.id, c.remote_id, c.number, c.subject, c.preview, c.status,
-                    c.mailbox_id, m.name,
-                    c.assignee_id, u.first_name || ' ' || u.last_name,
-                    c.customer_id, cu.first_name || ' ' || cu.last_name, cu.email,
+                    c.mailbox_local_id, m.name,
+                    c.assignee_local_id, u.first_name || ' ' || u.last_name,
+                    c.customer_local_id, cu.first_name || ' ' || cu.last_name, cu.email,
                     c.priority, c.response_state,
                     c.created_at, c.updated_at, c.closed_at
              FROM conversations c
-             LEFT JOIN mailboxes m ON m.id = c.mailbox_id
-             LEFT JOIN users u ON u.id = c.assignee_id
-             LEFT JOIN customers cu ON cu.id = c.customer_id
+             LEFT JOIN mailboxes m ON m.id = c.mailbox_local_id
+             LEFT JOIN users u ON u.id = c.assignee_local_id
+             LEFT JOIN customers cu ON cu.id = c.customer_local_id
              WHERE c.id = ?",
         params![conversation_id],
         |row| {
@@ -490,6 +494,24 @@ mod tests {
             "ALTER TABLE conversations ADD COLUMN merged_into_conversation_id INTEGER",
             [],
         );
+        // DB-03 (M047): the reference column names on conversations
+        // (mailbox_local_id/assignee_local_id/customer_local_id). The slim
+        // chain can't run m047's converging copy (it expects the full
+        // pre-M047 shape), so the fixture reproduces the rebuilt result
+        // directly — plain renames, no FK clauses (the slim chain never
+        // declared them; SQLite rewrites the m001 index defs itself).
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id",
+            [],
+        );
         conn
     }
 
@@ -514,7 +536,7 @@ mod tests {
         .unwrap();
         let customer_id = conn.last_insert_rowid();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, preview, status, mailbox_id, assignee_id, customer_id, priority)
+            "INSERT INTO conversations (remote_id, number, subject, preview, status, mailbox_local_id, assignee_local_id, customer_local_id, priority)
              VALUES (1001, 1001, 'Test subject', 'Test preview', 'active', ?1, ?2, ?3, 'normal')",
             params![mailbox_id, user_id, customer_id],
         )
@@ -530,16 +552,18 @@ mod tests {
         let live = seed_test_data(&mut conn);
         // Two more conversations for the same customer.
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id)
-             VALUES (1002, 1002, 'To be deleted', 'active', 101,
-                      (SELECT customer_id FROM conversations WHERE id = ?1))",
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id)
+             VALUES (1002, 1002, 'To be deleted', 'active',
+                      (SELECT mailbox_local_id FROM conversations WHERE id = ?1),
+                      (SELECT customer_local_id FROM conversations WHERE id = ?1))",
             params![live],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id)
-             VALUES (1003, 1003, 'To be merged', 'active', 101,
-                      (SELECT customer_id FROM conversations WHERE id = ?1))",
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id)
+             VALUES (1003, 1003, 'To be merged', 'active',
+                      (SELECT mailbox_local_id FROM conversations WHERE id = ?1),
+                      (SELECT customer_local_id FROM conversations WHERE id = ?1))",
             params![live],
         )
         .unwrap();

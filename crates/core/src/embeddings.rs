@@ -404,7 +404,7 @@ pub fn chunk_conversation(conn: &Connection, conversation_id: i64) -> Result<()>
                     TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')) AS customer,
                     (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct
                       JOIN tags t ON t.id = ct.tag_id WHERE ct.conversation_id = c.id) AS tags
-             FROM conversations c LEFT JOIN customers cu ON cu.id = c.customer_id
+             FROM conversations c LEFT JOIN customers cu ON cu.id = c.customer_local_id
              WHERE c.id = ?1",
             params![conversation_id],
             |r| {
@@ -1182,6 +1182,13 @@ mod tests {
         // (chunk tables with embedding_attempts, mirror tables, guards),
         // never a partial one.
         crate::bootstrap::apply_all(&mut conn).unwrap();
+        // M047 conversations FK parent: the fixtures stamp mailbox 1 (the
+        // customers are inserted by insert_conv_with_threads itself,
+        // before its conversation row).
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');",
+        )
+        .unwrap();
         conn
     }
 
@@ -1540,7 +1547,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id)
              VALUES (?1, ?1, ?2, 'Refund question', 1, ?1)",
             params![id, 100 + id],
         )
@@ -1611,8 +1618,11 @@ mod tests {
     #[test]
     fn chunk_conversation_no_threads_is_header_only_chunk() {
         let conn = fresh_db();
+        // M047 FK parent (nameless: the chunk header asserts no customer).
+        conn.execute("INSERT INTO customers (id, remote_id) VALUES (1, 201)", [])
+            .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id)
              VALUES (7, 7, 107, null, 1, 1)",
             [],
         )
@@ -1628,8 +1638,11 @@ mod tests {
         // Reference filter: body_text IS NOT NULL AND LENGTH(body_text) > 0 —
         // a whitespace-only body still passes (SQLite LENGTH('   ') = 3).
         let conn = fresh_db();
+        // M047 FK parent (nameless: the header carries no customer).
+        conn.execute("INSERT INTO customers (id, remote_id) VALUES (1, 201)", [])
+            .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id)
              VALUES (9, 9, 109, 'S', 1, 1)",
             [],
         )
@@ -1692,8 +1705,11 @@ mod tests {
     #[test]
     fn chunk_conversation_long_threads_split_into_multiple_chunks() {
         let conn = fresh_db();
+        // M047 FK parent (nameless: the header carries no customer).
+        conn.execute("INSERT INTO customers (id, remote_id) VALUES (1, 201)", [])
+            .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id)
              VALUES (11, 11, 111, 'Long one', 1, 1)",
             [],
         )

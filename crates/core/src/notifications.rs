@@ -585,7 +585,9 @@ mod tests {
         conn.execute_batch(
             "INSERT OR IGNORE INTO users (id, remote_id, first_name)
              VALUES (42, 1001, 'Me'), (43, 1002, 'Other');
-             INSERT OR IGNORE INTO conversations (id, remote_id, number, status, mailbox_id, customer_id)
+             INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support');
+             INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 1, 'Cust');
+             INSERT OR IGNORE INTO conversations (id, remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (7, 900007, 5001, 'active', 1, 1);",
         )
         .unwrap();

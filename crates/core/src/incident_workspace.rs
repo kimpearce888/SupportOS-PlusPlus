@@ -7,8 +7,9 @@
 //! timeline). Affected counts are always DERIVED (distinct customers,
 //! never ticket counts) — there is no stored copy to drift.
 //!
-//! Port column mapping (reference → port): `customer_local_id` →
-//! `customer_id`, `mailbox_local_id` → `mailbox_id`, `remote_created_at`
+//! Port column mapping (reference → port): `customer_local_id` and
+//! `mailbox_local_id` keep the reference names after DB-03/M047,
+//! `remote_created_at`
 //! → `created_at`, `customer_emails` table → `customers.email` column,
 //! `cu.organization_id` (FK) → `cu.organization` (TEXT; resolved to an
 //! `organizations.id` by name match when one exists).
@@ -53,12 +54,12 @@ const INCIDENT_ROW_SQL: &str = "i.id, i.code, i.title, i.known_issue_id, i.statu
        i.known_cause, i.workaround, i.resolution, i.started_at, i.resolved_at,
        i.owner_user_local_id, i.product, i.feature, i.created_at, i.updated_at,
        (SELECT COUNT(*) FROM incident_conversations ic WHERE ic.incident_id = i.id) AS conversation_count,
-       (SELECT COUNT(DISTINCT c.customer_id) FROM incident_conversations ic
+       (SELECT COUNT(DISTINCT c.customer_local_id) FROM incident_conversations ic
           JOIN conversations c ON c.id = ic.conversation_id
-          WHERE ic.incident_id = i.id AND c.customer_id IS NOT NULL AND c.deleted_at IS NULL) AS customer_count,
+          WHERE ic.incident_id = i.id AND c.customer_local_id IS NOT NULL AND c.deleted_at IS NULL) AS customer_count,
        (SELECT COUNT(DISTINCT cu.organization) FROM incident_conversations ic
           JOIN conversations c ON c.id = ic.conversation_id
-          JOIN customers cu ON cu.id = c.customer_id
+          JOIN customers cu ON cu.id = c.customer_local_id
           WHERE ic.incident_id = i.id AND c.deleted_at IS NULL
             AND cu.organization IS NOT NULL AND TRIM(cu.organization) != '') AS organization_count,
        (SELECT NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')), '')
@@ -205,10 +206,10 @@ fn incident_row_from_db(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 #[must_use]
 pub fn list_conversations(conn: &Connection, incident_id: i64, limit: i64) -> Vec<Value> {
     let sql = "SELECT ic.conversation_id, c.number, c.subject, c.status,
-           (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_id) AS mailbox,
-           c.customer_id,
+           (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_local_id) AS mailbox,
+           c.customer_local_id,
            (SELECT NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '')
-              FROM customers cu WHERE cu.id = c.customer_id) AS customer_name,
+              FROM customers cu WHERE cu.id = c.customer_local_id) AS customer_name,
            c.created_at, ic.linked_by, ic.linked_at
          FROM incident_conversations ic
            JOIN conversations c ON c.id = ic.conversation_id
@@ -240,18 +241,18 @@ pub fn list_conversations(conn: &Connection, incident_id: i64, limit: i64) -> Ve
 /// linked conversations — a ticket count is never used as a customer count.
 #[must_use]
 pub fn affected_customers(conn: &Connection, incident_id: i64, limit: i64) -> Vec<Value> {
-    let sql = "SELECT c.customer_id,
+    let sql = "SELECT c.customer_local_id,
            (SELECT NULLIF(TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')), '')
-              FROM customers cu WHERE cu.id = c.customer_id) AS name,
-           (SELECT cu.email FROM customers cu WHERE cu.id = c.customer_id) AS email,
-           (SELECT NULLIF(cu.organization, '') FROM customers cu WHERE cu.id = c.customer_id) AS organization,
+              FROM customers cu WHERE cu.id = c.customer_local_id) AS name,
+           (SELECT cu.email FROM customers cu WHERE cu.id = c.customer_local_id) AS email,
+           (SELECT NULLIF(cu.organization, '') FROM customers cu WHERE cu.id = c.customer_local_id) AS organization,
            COUNT(*) AS conversations,
            SUM(CASE WHEN c.status = 'active' THEN 1 ELSE 0 END) AS open_conversations
          FROM incident_conversations ic
            JOIN conversations c ON c.id = ic.conversation_id
-         WHERE ic.incident_id = ?1 AND c.deleted_at IS NULL AND c.customer_id IS NOT NULL
-         GROUP BY c.customer_id
-         ORDER BY conversations DESC, c.customer_id
+         WHERE ic.incident_id = ?1 AND c.deleted_at IS NULL AND c.customer_local_id IS NOT NULL
+         GROUP BY c.customer_local_id
+         ORDER BY conversations DESC, c.customer_local_id
          LIMIT ?2";
     conn.prepare(sql)
         .and_then(|mut stmt| {
@@ -279,11 +280,11 @@ pub fn affected_customers(conn: &Connection, incident_id: i64, limit: i64) -> Ve
 pub fn affected_organizations(conn: &Connection, incident_id: i64, limit: i64) -> Vec<Value> {
     let sql = "SELECT (SELECT o.id FROM organizations o WHERE o.name = cu.organization LIMIT 1) AS organization_id,
            cu.organization AS name,
-           COUNT(DISTINCT c.customer_id) AS customers,
+           COUNT(DISTINCT c.customer_local_id) AS customers,
            COUNT(*) AS conversations
          FROM incident_conversations ic
            JOIN conversations c ON c.id = ic.conversation_id
-           JOIN customers cu ON cu.id = c.customer_id
+           JOIN customers cu ON cu.id = c.customer_local_id
          WHERE ic.incident_id = ?1 AND c.deleted_at IS NULL
            AND cu.organization IS NOT NULL AND TRIM(cu.organization) != ''
          GROUP BY cu.organization
@@ -511,7 +512,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (1, 1, 101, 'Login broken', 'active', 10, 1, '2026-10-01T10:00:00.000Z'),
                     (2, 2, 102, 'Login broken too', 'closed', 20, 2, '2026-10-02T10:00:00.000Z'),
                     (3, 3, 103, 'No org convo', 'active', 10, 3, '2026-10-03T10:00:00.000Z')",

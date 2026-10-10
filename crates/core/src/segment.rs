@@ -12,11 +12,11 @@
 //! recipient set is always this deterministic engine's output (spec #43).
 //!
 //! PORT COLUMN MAPPING (the port's mirror uses the HelpScout-idiomatic
-//! names; the reference uses `*_local_id` aliases — same convention as
-//! saved_views.rs):
-//! - `conversations.customer_local_id` → `customer_id`
-//! - `conversations.mailbox_local_id` → `mailbox_id`
-//! - `conversations.assignee_local_id` → `assignee_id`
+//! names where they still differ — same convention as saved_views.rs):
+//! - `conversations.customer_local_id` / `mailbox_local_id` /
+//!   `assignee_local_id` — the reference names, restored in place by
+//!   DB-03 (M047); the port's old `customer_id`/`mailbox_id`/`assignee_id`
+//!   aliases no longer exist
 //! - `remote_created_at` → `COALESCE(remote_created_at, created_at)`
 //! - `remote_updated_at` → `COALESCE(remote_updated_at, updated_at)`
 //! - `conversation_tags.tag_local_id` → `tag_id`
@@ -894,13 +894,13 @@ impl<'a> SegmentEngine<'a> {
                         "SELECT c.id, c.remote_id, c.first_name, c.last_name, c.job_title,
                                 o.name AS organization,
                                 (SELECT COUNT(*) FROM conversations cv
-                                  WHERE cv.customer_id = c.id AND cv.deleted_at IS NULL) AS total_tickets,
+                                  WHERE cv.customer_local_id = c.id AND cv.deleted_at IS NULL) AS total_tickets,
                                 (SELECT COUNT(*) FROM conversations cv
-                                  WHERE cv.customer_id = c.id AND cv.status = 'active'
+                                  WHERE cv.customer_local_id = c.id AND cv.status = 'active'
                                     AND cv.deleted_at IS NULL) AS open_tickets,
                                 (SELECT MAX(COALESCE(cv.last_activity_at, cv.remote_created_at, cv.created_at))
                                    FROM conversations cv
-                                  WHERE cv.customer_id = c.id AND cv.deleted_at IS NULL) AS last_contact
+                                  WHERE cv.customer_local_id = c.id AND cv.deleted_at IS NULL) AS last_contact
                            FROM customers c LEFT JOIN organizations o ON o.id = c.organization_id
                           WHERE c.id = ?1",
                         params![cid],
@@ -1246,7 +1246,7 @@ impl<'a> SegmentEngine<'a> {
         };
         let mut where_clauses = vec![
             "c.deleted_at IS NULL".to_string(),
-            "c.customer_id = ?N_CID".to_string(),
+            "c.customer_local_id = ?N_CID".to_string(),
         ];
         let mut p: SqlParams = vec![integer(cid)];
         let statuses: Vec<String> = statuses.iter().filter(|s| !s.is_empty()).cloned().collect();
@@ -1720,7 +1720,7 @@ impl<'a> SegmentEngine<'a> {
 
         let mut where_clauses: Vec<String> = vec![
             "c.deleted_at IS NULL".to_string(),
-            "c.customer_id IS NOT NULL".to_string(),
+            "c.customer_local_id IS NOT NULL".to_string(),
         ];
         let mut p: SqlParams = Vec::new();
 
@@ -1732,7 +1732,7 @@ impl<'a> SegmentEngine<'a> {
         let mailboxes: Vec<i64> = mailbox_ids.iter().copied().filter(|id| *id > 0).collect();
         if !mailboxes.is_empty() {
             where_clauses.push(format!(
-                "c.mailbox_id IN ({})",
+                "c.mailbox_local_id IN ({})",
                 placeholders(mailboxes.len())
             ));
             p.extend(mailboxes.iter().map(|id| integer(*id)));
@@ -1743,14 +1743,17 @@ impl<'a> SegmentEngine<'a> {
             let listed: Vec<i64> = assignees.iter().copied().filter(|a| *a != -1).collect();
             if unassigned && !listed.is_empty() {
                 where_clauses.push(format!(
-                    "(c.assignee_id IS NULL OR c.assignee_id IN ({}))",
+                    "(c.assignee_local_id IS NULL OR c.assignee_local_id IN ({}))",
                     placeholders(listed.len())
                 ));
                 p.extend(listed.iter().map(|id| integer(*id)));
             } else if unassigned {
-                where_clauses.push("c.assignee_id IS NULL".to_string());
+                where_clauses.push("c.assignee_local_id IS NULL".to_string());
             } else {
-                where_clauses.push(format!("c.assignee_id IN ({})", placeholders(listed.len())));
+                where_clauses.push(format!(
+                    "c.assignee_local_id IN ({})",
+                    placeholders(listed.len())
+                ));
                 p.extend(listed.iter().map(|id| integer(*id)));
             }
         }
@@ -2003,7 +2006,7 @@ impl<'a> SegmentEngine<'a> {
         // SQLite positional params (?NNN names above are placeholders that
         // must be renumbered): rebuild with sequential ? markers.
         let mut sql = format!(
-            "SELECT DISTINCT c.customer_id AS cid FROM conversations c WHERE {}",
+            "SELECT DISTINCT c.customer_local_id AS cid FROM conversations c WHERE {}",
             where_clauses.join(" AND ")
         );
         // Replace the named markers ?N_XX with sequential ?n in order.
@@ -2028,7 +2031,7 @@ impl<'a> SegmentEngine<'a> {
         };
         let count_cond = |status_filter: &str| {
             format!(
-                "(SELECT COUNT(*) FROM conversations cv WHERE cv.customer_id = c.id
+                "(SELECT COUNT(*) FROM conversations cv WHERE cv.customer_local_id = c.id
                        AND cv.deleted_at IS NULL{status_filter}) {cmp} ?1"
             )
         };
@@ -2049,24 +2052,24 @@ impl<'a> SegmentEngine<'a> {
                 &[real(*value)],
             ),
             "last_contact_within_days" => self.ids(
-                "SELECT DISTINCT c.customer_id AS cid FROM conversations c
-                   JOIN customers cu ON cu.id = c.customer_id
+                "SELECT DISTINCT c.customer_local_id AS cid FROM conversations c
+                   JOIN customers cu ON cu.id = c.customer_local_id
                   WHERE c.deleted_at IS NULL AND cu.deleted_at IS NULL
                     AND julianday(COALESCE(c.last_activity_at, c.remote_created_at, c.created_at))
                         >= julianday('now', ?1)",
                 &[text(&format!("-{} days", value.max(0.0) as i64))],
             ),
             "first_contact_before_days" => self.ids(
-                "SELECT DISTINCT c.customer_id AS cid FROM conversations c
-                   JOIN customers cu ON cu.id = c.customer_id
+                "SELECT DISTINCT c.customer_local_id AS cid FROM conversations c
+                   JOIN customers cu ON cu.id = c.customer_local_id
                   WHERE c.deleted_at IS NULL AND cu.deleted_at IS NULL
                     AND julianday(COALESCE(c.remote_created_at, c.created_at)) < julianday('now', ?1)",
                 &[text(&format!("-{} days", value.max(0.0) as i64))],
             ),
             "waited_over_hours_count" => {
                 let over = self.ids(
-                    "SELECT c.customer_id AS cid FROM conversations c
-                      WHERE c.deleted_at IS NULL AND c.customer_id IS NOT NULL
+                    "SELECT c.customer_local_id AS cid FROM conversations c
+                      WHERE c.deleted_at IS NULL AND c.customer_local_id IS NOT NULL
                         AND julianday(COALESCE(c.closed_at, datetime('now')))
                             - julianday(COALESCE(c.last_customer_reply_at, c.first_customer_message_at,
                                                  c.remote_created_at, c.created_at)) > ?1",
@@ -2095,20 +2098,20 @@ impl<'a> SegmentEngine<'a> {
         }
         if let Some(days) = within_days.filter(|d| d.is_finite()) {
             self.ids(
-                "SELECT DISTINCT c.customer_id AS cid FROM conversations c
+                "SELECT DISTINCT c.customer_local_id AS cid FROM conversations c
                    JOIN conversation_tags ct ON ct.conversation_id = c.id
                    JOIN tags tg ON tg.id = ct.tag_id
-                   JOIN customers cu ON cu.id = c.customer_id
+                   JOIN customers cu ON cu.id = c.customer_local_id
                  WHERE c.deleted_at IS NULL AND cu.deleted_at IS NULL AND LOWER(tg.name) = ?1
                    AND julianday(COALESCE(c.remote_created_at, c.created_at)) >= julianday('now', ?2)",
                 &[text(&tag), text(&format!("-{} days", days.max(0.0) as i64))],
             )
         } else {
             self.ids(
-                "SELECT DISTINCT c.customer_id AS cid FROM conversations c
+                "SELECT DISTINCT c.customer_local_id AS cid FROM conversations c
                    JOIN conversation_tags ct ON ct.conversation_id = c.id
                    JOIN tags tg ON tg.id = ct.tag_id
-                   JOIN customers cu ON cu.id = c.customer_id
+                   JOIN customers cu ON cu.id = c.customer_local_id
                  WHERE c.deleted_at IS NULL AND cu.deleted_at IS NULL AND LOWER(tg.name) = ?1",
                 &[text(&tag)],
             )
@@ -2357,10 +2360,10 @@ impl<'a> SegmentEngine<'a> {
         // Count DISTINCT linked conversations per customer (NOT ticket counts).
         let sql = renumber_placeholders(
             &format!(
-                "SELECT c.customer_id AS cid FROM conversations c
+                "SELECT c.customer_local_id AS cid FROM conversations c
                         JOIN {link_table} l ON l.conversation_id = c.id
-                      WHERE c.deleted_at IS NULL AND c.customer_id IS NOT NULL{issue_filter}
-                      GROUP BY c.customer_id HAVING COUNT(DISTINCT c.id) >= ?N_V"
+                      WHERE c.deleted_at IS NULL AND c.customer_local_id IS NOT NULL{issue_filter}
+                      GROUP BY c.customer_local_id HAVING COUNT(DISTINCT c.id) >= ?N_V"
             ),
             &mut 0,
         );
@@ -2402,10 +2405,10 @@ impl<'a> SegmentEngine<'a> {
             String::new()
         };
         let sql = renumber_placeholders(
-            &format!("SELECT DISTINCT c.customer_id AS cid FROM conversations c
+            &format!("SELECT DISTINCT c.customer_local_id AS cid FROM conversations c
                         JOIN incident_conversations ic ON ic.conversation_id = c.id
                         JOIN incidents inc ON inc.id = ic.incident_id
-                      WHERE c.deleted_at IS NULL AND c.customer_id IS NOT NULL{incident_filter}{time_filter}"),
+                      WHERE c.deleted_at IS NULL AND c.customer_local_id IS NOT NULL{incident_filter}{time_filter}"),
             &mut 0,
         );
         self.ids(&sql, &p)
@@ -2494,7 +2497,7 @@ impl<'a> SegmentEngine<'a> {
                 let convs: Vec<(i64, String)> = self
                     .conn
                     .prepare("SELECT c.id, c.status FROM conversations c
-                               WHERE c.deleted_at IS NULL AND c.customer_id IS NOT NULL")
+                               WHERE c.deleted_at IS NULL AND c.customer_local_id IS NOT NULL")
                     .and_then(|mut s| {
                         let rows = s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
                         Ok(rows.filter_map(|x| x.ok()).collect::<Vec<_>>())
@@ -2507,7 +2510,7 @@ impl<'a> SegmentEngine<'a> {
                     let Some(customer_id) = self
                         .conn
                         .query_row(
-                            "SELECT customer_id FROM conversations WHERE id = ?1",
+                            "SELECT customer_local_id FROM conversations WHERE id = ?1",
                             params![conv_id],
                             |r| r.get::<_, Option<i64>>(0),
                         )
@@ -3166,8 +3169,16 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute("INSERT INTO conversations (id, remote_id, number, subject, status, customer_id, mailbox_id) VALUES (10, 1001, 1, 'Help', 'closed', 1, 1)", []).unwrap();
-        conn.execute("INSERT INTO conversations (id, remote_id, number, subject, status, customer_id, mailbox_id) VALUES (11, 1002, 2, 'Bug', 'active', 2, 1)", []).unwrap();
+        // DB-03 (M047): conversations.mailbox_local_id is a real FK now
+        // (db::open sets foreign_keys=ON) — seed the parent for mailbox id 1
+        // (customers 1 + 2 are seeded above).
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO conversations (id, remote_id, number, subject, status, customer_local_id, mailbox_local_id) VALUES (10, 1001, 1, 'Help', 'closed', 1, 1)", []).unwrap();
+        conn.execute("INSERT INTO conversations (id, remote_id, number, subject, status, customer_local_id, mailbox_local_id) VALUES (11, 1002, 2, 'Bug', 'active', 2, 1)", []).unwrap();
         conn.execute(
             "INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (10, 1)",
             [],

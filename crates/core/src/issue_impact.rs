@@ -17,8 +17,9 @@
 //!   starting within 7 days after a release date. The note says so in
 //!   plain words; the service never claims causation.
 //!
-//! Port column mapping (reference → port): `customer_local_id` →
-//! `customer_id`, `mailbox_local_id` → `mailbox_id`, `remote_created_at`
+//! Port column mapping (reference → port): `customer_local_id` and
+//! `mailbox_local_id` keep the reference names after DB-03/M047,
+//! `remote_created_at`
 //! → `created_at`, `cu.organization_id` (FK) → `cu.organization` (TEXT,
 //! grouped by name), `ct.tag_local_id` → `ct.tag_id`.
 
@@ -110,9 +111,9 @@ fn compute(
         .query_row(
             &format!(
                 "SELECT COUNT(*) AS conversations,
-                   COUNT(DISTINCT c.customer_id) AS customers,
+                   COUNT(DISTINCT c.customer_local_id) AS customers,
                    (SELECT COUNT(DISTINCT cu.organization) FROM conversations c2
-                      JOIN customers cu ON cu.id = c2.customer_id
+                      JOIN customers cu ON cu.id = c2.customer_local_id
                       WHERE c2.id IN ({conv_ids_sql}) AND c2.deleted_at IS NULL
                         AND cu.organization IS NOT NULL AND TRIM(cu.organization) != '') AS organizations,
                    MIN(c.created_at) AS first_seen,
@@ -197,9 +198,9 @@ fn compute(
     let inboxes = collect_pairs(
         conn,
         &format!(
-            "SELECT (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_id) AS mailbox,
+            "SELECT (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_local_id) AS mailbox,
                     COUNT(*) AS conversations
-             {base} GROUP BY c.mailbox_id ORDER BY conversations DESC LIMIT 10"
+             {base} GROUP BY c.mailbox_local_id ORDER BY conversations DESC LIMIT 10"
         ),
         subject_id,
         "mailbox",
@@ -381,7 +382,12 @@ mod tests {
         waiting: bool,
     ) {
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at, customer_waiting_since)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (10, 10, 'Support'), (20, 20, 'Billing')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, customer_waiting_since)
              VALUES (?1, ?1, ?2, 's', ?3, ?4, ?5, ?6, ?7)",
             params![id, number, status, mailbox, customer, iso_days_ago(days_ago), if waiting { Some(iso_days_ago(1)) } else { None }],
         )

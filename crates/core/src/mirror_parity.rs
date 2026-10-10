@@ -1045,6 +1045,170 @@ pub fn apply_m046(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// M047 — DB-03: `conversations` restores the reference column names
+/// (`mailbox_local_id` / `assignee_local_id` / `customer_local_id` —
+/// reference 001), `UNIQUE(number)` and the reference FK set
+/// (mailboxes / folders / customers / users / teams / self /
+/// ticket_states).
+///
+/// The port's shipped base table (migrations.rs) created these as plain
+/// `mailbox_id` / `assignee_id` / `customer_id` with no FKs and a bare
+/// `number` column. M047 rebuilds in place with the port's full column
+/// set (the reference's 47 columns plus the port's additive extras
+/// `priority`, `created_at`, `updated_at`, `response_state`,
+/// `supportos_state`). The converging copy enforces the invariants the
+/// reference always had:
+///
+/// * reference rows that point at a missing mirror row become NULL
+///   (the NO ACTION FKs the reference declares on plain columns);
+/// * duplicate `number`s converge to the earliest row keeping its value
+///   (later duplicates become NULL — the UNIQUE(number) constraint).
+pub fn apply_m047(conn: &Connection) -> Result<()> {
+    if crate::sync_schema::column_exists(conn, "conversations", "mailbox_id")? {
+        rebuild_table(
+            conn,
+            "conversations",
+            &Rebuild {
+                new_name: "conversations",
+                new_ddl: "(
+                    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    remote_id                   INTEGER UNIQUE NOT NULL,
+                    number                      INTEGER UNIQUE,
+                    subject                     TEXT,
+                    preview                     TEXT,
+                    status                      TEXT NOT NULL DEFAULT 'active',
+                    state                       TEXT DEFAULT 'published',
+                    type                        TEXT,
+                    mailbox_local_id            INTEGER REFERENCES mailboxes (id),
+                    folder_local_id             INTEGER REFERENCES folders (id),
+                    customer_local_id           INTEGER REFERENCES customers (id),
+                    assignee_local_id           INTEGER REFERENCES users (id),
+                    assigned_team_local_id      INTEGER REFERENCES teams (id),
+                    closed_by                   INTEGER,
+                    closed_at                   TEXT,
+                    snoozed_until               TEXT,
+                    thread_count                INTEGER DEFAULT 0,
+                    is_unread                   INTEGER DEFAULT 0,
+                    hs_url                      TEXT,
+                    merged_into_conversation_id INTEGER REFERENCES conversations (id),
+                    remote_created_at           TEXT,
+                    remote_updated_at           TEXT,
+                    local_created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+                    local_updated_at            TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_seen_at                TEXT,
+                    last_synced_at              TEXT,
+                    first_activity_at            TEXT,
+                    last_activity_at            TEXT,
+                    raw_json                    TEXT,
+                    raw_json_hash               TEXT,
+                    deleted_at                 TEXT,
+                    source_type                 TEXT,
+                    source_via                  TEXT,
+                    first_customer_message_at   TEXT,
+                    first_response_at           TEXT,
+                    last_customer_reply_at      TEXT,
+                    last_human_agent_response_at TEXT,
+                    last_system_response_at     TEXT,
+                    last_note_at                TEXT,
+                    customer_waiting_since      TEXT,
+                    last_status_change_at       TEXT,
+                    last_assignment_change_at   TEXT,
+                    last_tag_change_at          TEXT,
+                    last_custom_field_change_at TEXT,
+                    activity_history_complete   INTEGER NOT NULL DEFAULT 0,
+                    supportos_priority          TEXT NOT NULL DEFAULT 'none',
+                    supportos_state_id          INTEGER REFERENCES ticket_states (id),
+                    priority                    TEXT,
+                    created_at                  TEXT,
+                    updated_at                  TEXT,
+                    response_state              TEXT NOT NULL DEFAULT 'needs_first_response',
+                    supportos_state             TEXT
+                )",
+                copy_sql: "INSERT INTO \"conversations__rebuild\"
+                               (id, remote_id, number, subject, preview, status,
+                                state, type, mailbox_local_id, folder_local_id,
+                                customer_local_id, assignee_local_id,
+                                assigned_team_local_id, closed_by, closed_at,
+                                snoozed_until, thread_count, is_unread, hs_url,
+                                merged_into_conversation_id, remote_created_at,
+                                remote_updated_at, local_created_at, local_updated_at,
+                                last_seen_at, last_synced_at, first_activity_at,
+                                last_activity_at, raw_json, raw_json_hash, deleted_at,
+                                source_type, source_via, first_customer_message_at,
+                                first_response_at, last_customer_reply_at,
+                                last_human_agent_response_at, last_system_response_at,
+                                last_note_at, customer_waiting_since,
+                                last_status_change_at, last_assignment_change_at,
+                                last_tag_change_at, last_custom_field_change_at,
+                                activity_history_complete, supportos_priority,
+                                supportos_state_id, priority, created_at, updated_at,
+                                response_state, supportos_state)
+                           SELECT c.id, c.remote_id,
+                                  CASE WHEN c.number IS NULL THEN NULL
+                                       WHEN EXISTS (SELECT 1 FROM conversations n
+                                                    WHERE n.number = c.number
+                                                      AND n.id < c.id)
+                                       THEN NULL ELSE c.number END,
+                                  c.subject, c.preview, c.status, c.state, c.type,
+                                  CASE WHEN c.mailbox_id IN (SELECT id FROM mailboxes)
+                                       THEN c.mailbox_id END,
+                                  CASE WHEN c.folder_local_id IN (SELECT id FROM folders)
+                                       THEN c.folder_local_id END,
+                                  CASE WHEN c.customer_id IN (SELECT id FROM customers)
+                                       THEN c.customer_id END,
+                                  CASE WHEN c.assignee_id IN (SELECT id FROM users)
+                                       THEN c.assignee_id END,
+                                  CASE WHEN c.assigned_team_local_id IN (SELECT id FROM teams)
+                                       THEN c.assigned_team_local_id END,
+                                  c.closed_by, c.closed_at, c.snoozed_until,
+                                  c.thread_count, c.is_unread, c.hs_url,
+                                  CASE WHEN c.merged_into_conversation_id
+                                            IN (SELECT id FROM conversations)
+                                       THEN c.merged_into_conversation_id END,
+                                  c.remote_created_at, c.remote_updated_at,
+                                  c.local_created_at, c.local_updated_at,
+                                  c.last_seen_at, c.last_synced_at,
+                                  c.first_activity_at, c.last_activity_at,
+                                  c.raw_json, c.raw_json_hash, c.deleted_at,
+                                  c.source_type, c.source_via,
+                                  c.first_customer_message_at, c.first_response_at,
+                                  c.last_customer_reply_at,
+                                  c.last_human_agent_response_at,
+                                  c.last_system_response_at, c.last_note_at,
+                                  c.customer_waiting_since,
+                                  c.last_status_change_at,
+                                  c.last_assignment_change_at,
+                                  c.last_tag_change_at,
+                                  c.last_custom_field_change_at,
+                                  COALESCE(c.activity_history_complete, 0),
+                                  COALESCE(c.supportos_priority, 'none'),
+                                  CASE WHEN c.supportos_state_id
+                                            IN (SELECT id FROM ticket_states)
+                                       THEN c.supportos_state_id END,
+                                  c.priority, c.created_at, c.updated_at,
+                                  c.response_state, c.supportos_state
+                             FROM conversations c",
+                replacement_indexes: &[
+                    // The captured expressions name the renamed columns
+                    // (written without IF NOT EXISTS — the replay adds it).
+                    "CREATE INDEX idx_conversations_mailbox
+                         ON conversations (mailbox_local_id, status)",
+                    "CREATE INDEX idx_conversations_assignee
+                         ON conversations (assignee_local_id, status)",
+                    "CREATE INDEX idx_conversations_customer
+                         ON conversations (customer_local_id)",
+                    "CREATE INDEX idx_conversations_customer_status
+                         ON conversations (customer_local_id, status)",
+                    "CREATE INDEX idx_conversations_customer_created
+                         ON conversations (customer_local_id, remote_created_at DESC)",
+                ],
+            },
+        )?;
+    }
+    let _ = conn.execute("UPDATE app_state SET schema_version = 47 WHERE id = 1", []);
+    Ok(())
+}
+
 /// Does `table`.`column` already declare an outgoing FK (the idempotence
 /// probe for M046 — a rebuilt table declares all of its reference FKs)?
 fn fk_declared(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -1300,8 +1464,13 @@ mod tests {
         )
         .unwrap();
         // A cluster with a live link and an orphaned link.
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT OR IGNORE INTO customers (id, remote_id) VALUES (1, 201);",
+        )
+        .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (501, 501, 'active', 1, 1)",
             [],
         )
@@ -1421,8 +1590,13 @@ mod tests {
         }
 
         // FK enforcement: a thread on a nonexistent conversation is refused.
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT OR IGNORE INTO customers (id, remote_id) VALUES (1, 201);",
+        )
+        .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (501, 501, 'active', 1, 1)",
             [],
         )
@@ -1461,7 +1635,7 @@ mod tests {
 
         // The actor FKs: a user id that does not exist is refused.
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (502, 502, 'active', 1, 1)",
             [],
         )
@@ -1661,6 +1835,237 @@ mod tests {
         apply_m046(&conn).unwrap();
     }
 
+    #[test]
+    fn m047_restores_the_reference_conversations_shape() {
+        let conn = booted();
+        let cols = columns(&conn, "conversations");
+        // The reference column names are in, the port's collapsed ones are
+        // gone.
+        for name in ["mailbox_local_id", "assignee_local_id", "customer_local_id"] {
+            assert!(cols.iter().any(|x| x == name), "column {name} missing");
+        }
+        for gone in ["mailbox_id", "assignee_id", "customer_id"] {
+            assert!(
+                !cols.iter().any(|x| x == gone),
+                "column {gone} must be gone"
+            );
+        }
+        // The reference's 47 columns plus the port's five additive extras.
+        assert_eq!(
+            cols.len(),
+            52,
+            "column count (reference 47 + port 5): {cols:?}"
+        );
+
+        // The reference FK set (001 + 011's supportos_state_id).
+        let fks = declared_fks(&conn, "conversations");
+        for (from, target) in [
+            ("mailbox_local_id", "mailboxes"),
+            ("folder_local_id", "folders"),
+            ("customer_local_id", "customers"),
+            ("assignee_local_id", "users"),
+            ("assigned_team_local_id", "teams"),
+            ("merged_into_conversation_id", "conversations"),
+            ("supportos_state_id", "ticket_states"),
+        ] {
+            assert!(
+                fks.iter()
+                    .any(|(f, t): &(String, String)| f == from && t == target),
+                "missing FK {from} -> {target}"
+            );
+        }
+
+        // UNIQUE(number) is enforced (reference 001) — seeding a live
+        // mailbox/customer pair first so the inserts reach the constraint.
+        seed_reference_parents(&conn);
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
+             VALUES (600, 11, 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
+             VALUES (601, 11, 'active', 1, 1)",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate number must be rejected");
+
+        // The reference indexes survive on the renamed columns.
+        for idx in [
+            "idx_conversations_mailbox",
+            "idx_conversations_assignee",
+            "idx_conversations_customer",
+            "idx_conversations_customer_status",
+            "idx_conversations_customer_created",
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "index {idx}");
+        }
+    }
+
+    #[test]
+    fn m047_is_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        apply_m047(&conn).unwrap();
+        apply_m047(&conn).unwrap();
+    }
+
+    #[test]
+    fn m047_adopts_pre_m047_rows_in_place() {
+        // Simulate a pre-M047 database: rebuild the port's old shape (the
+        // three collapsed reference columns), seed it (a duplicate number
+        // pair, an orphaned mailbox and assignee, valid refs), forget
+        // version 38, then re-boot — M047 must adopt the data in place with
+        // the converging copy.
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+        // The full pre-M047 boot-chain shape (52 columns, the three
+        // reference columns still under the port's collapsed names).
+        conn.execute_batch(
+            "DROP TABLE conversations;
+             DELETE FROM _migrations WHERE version >= 38;
+             CREATE TABLE conversations (
+                id              INTEGER PRIMARY KEY,
+                remote_id       INTEGER NOT NULL UNIQUE,
+                number          INTEGER,
+                subject         TEXT,
+                preview         TEXT,
+                status          TEXT NOT NULL DEFAULT 'active',
+                mailbox_id      INTEGER NOT NULL,
+                assignee_id     INTEGER,
+                customer_id     INTEGER NOT NULL,
+                priority        TEXT,
+                created_at      TEXT,
+                updated_at      TEXT,
+                closed_at       TEXT,
+                local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                deleted_at      TEXT,
+                merged_into_conversation_id INTEGER,
+                first_customer_message_at TEXT,
+                first_response_at TEXT,
+                last_customer_reply_at TEXT,
+                last_human_agent_response_at TEXT,
+                customer_waiting_since TEXT,
+                response_state  TEXT NOT NULL DEFAULT 'needs_first_response',
+                supportos_priority TEXT,
+                supportos_state TEXT,
+                snoozed_until   TEXT,
+                supportos_state_id INTEGER,
+                state           TEXT,
+                type            TEXT,
+                folder_local_id INTEGER,
+                assigned_team_local_id INTEGER,
+                closed_by       INTEGER,
+                thread_count    INTEGER DEFAULT 0,
+                is_unread       INTEGER DEFAULT 0,
+                hs_url          TEXT,
+                remote_created_at TEXT,
+                remote_updated_at TEXT,
+                local_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen_at    TEXT,
+                last_synced_at  TEXT,
+                first_activity_at TEXT,
+                last_activity_at TEXT,
+                raw_json        TEXT,
+                raw_json_hash   TEXT,
+                source_type     TEXT,
+                source_via      TEXT,
+                last_system_response_at TEXT,
+                last_note_at    TEXT,
+                last_status_change_at TEXT,
+                last_assignment_change_at TEXT,
+                last_tag_change_at TEXT,
+                last_custom_field_change_at TEXT,
+                activity_history_complete INTEGER
+            );",
+        )
+        .unwrap();
+        seed_reference_parents(&conn);
+        conn.execute_batch(
+            "INSERT INTO conversations (id, remote_id, number, status, mailbox_id, assignee_id, customer_id)
+             VALUES (1, 901, 11, 'active', 99, NULL, 1);
+             INSERT INTO conversations (id, remote_id, number, status, mailbox_id, assignee_id, customer_id)
+             VALUES (2, 902, 11, 'active', 1, 1, 1);
+             INSERT INTO conversations (id, remote_id, number, status, mailbox_id, assignee_id, customer_id)
+             VALUES (3, 903, 12, 'closed', 1, 77, 1);",
+        )
+        .unwrap();
+        crate::bootstrap::apply_all(&mut conn).unwrap();
+
+        // The renamed columns + convergence:
+        // row 1 — earliest of the number-11 pair keeps it; the orphaned
+        // mailbox 99 becomes NULL.
+        let (num, mailbox): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT number, mailbox_local_id FROM conversations WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(num, Some(11));
+        assert_eq!(mailbox, None, "orphaned mailbox converges to NULL");
+        // row 2 — the later duplicate number becomes NULL; valid refs stay.
+        let (num, mailbox, assignee): (Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT number, mailbox_local_id, assignee_local_id FROM conversations WHERE id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(num, None, "duplicate number converges to NULL");
+        assert_eq!(mailbox, Some(1));
+        assert_eq!(assignee, Some(1));
+        // row 3 — unique number stays; the orphaned assignee 77 becomes NULL.
+        let (num, assignee): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT number, assignee_local_id FROM conversations WHERE id = 3",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(num, Some(12));
+        assert_eq!(assignee, None, "orphaned assignee converges to NULL");
+        // The FK now rejects a fresh orphan.
+        let bad = conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
+             VALUES (604, 13, 'active', 1, 4242)",
+            [],
+        );
+        assert!(bad.is_err(), "FK enforcement on customer_local_id");
+    }
+
+    /// Seed the mirror parents the M047 tests key on (one of each).
+    fn seed_reference_parents(conn: &Connection) {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT OR IGNORE INTO customers (id, remote_id) VALUES (1, 201);
+             INSERT OR IGNORE INTO users (id, remote_id, first_name) VALUES (1, 301, 'Agent');",
+        )
+        .unwrap();
+    }
+
+    /// The declared outgoing FKs of a table as (from_column, target_table).
+    fn declared_fks(conn: &Connection, table: &str) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .unwrap();
+        // PRAGMA columns: 2 = target table, 3 = the local (from) column.
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(3)?, r.get::<_, String>(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    }
+
     /// DB-06 pragma parity: db::open enforces WAL, foreign_keys and a
     /// busy_timeout (verified on a real file connection, the production
     /// boot path).
@@ -1737,8 +2142,13 @@ mod tests {
             );",
         )
         .unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT OR IGNORE INTO customers (id, remote_id) VALUES (1, 201);",
+        )
+        .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (501, 501, 'active', 1, 1)",
             [],
         )
@@ -1775,7 +2185,8 @@ mod tests {
 
         // The valid actors land in their 3-way columns; the ghost actor and
         // the system 0 converge to NULL; the orphan converges away.
-        let rows: Vec<(String, String, Option<i64>, Option<i64>, Option<i64>)> = conn
+        type ActorRow = (String, String, Option<i64>, Option<i64>, Option<i64>);
+        let rows: Vec<ActorRow> = conn
             .prepare(
                 "SELECT body_text, from_type, created_by_user_id,
                         created_by_customer_id, created_by_system_user_id

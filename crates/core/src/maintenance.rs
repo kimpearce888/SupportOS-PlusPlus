@@ -218,6 +218,22 @@ mod tests {
         crate::maintenance::apply_m037(&conn).unwrap();
         crate::connectors::apply_m038(&conn).unwrap();
         crate::mirror_tables::apply_m039(&conn).unwrap();
+        // DB-03 (M047): the reference column names on conversations. The
+        // partial chain can't run m047's converging copy (it expects the
+        // m040-m046-era columns), so the fixture reproduces the renames
+        // directly.
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id",
+            [],
+        );
         conn
     }
 
@@ -264,9 +280,16 @@ mod tests {
             [],
         )
         .unwrap();
+        // DB-03 (M047): conversations.mailbox_local_id is a local FK id —
+        // seed the parent (customers id=1 already seeded above).
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
         for i in 1..=3i64 {
             conn.execute(
-                "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, created_at, updated_at)
+                "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, created_at, updated_at)
                  VALUES (?1, ?1, 'active', 1, 1, datetime('now', '-1 day'), datetime('now', '-1 day'))",
                 [i],
             )

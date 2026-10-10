@@ -427,8 +427,19 @@ mod tests {
     }
 
     fn seed_conversation(conn: &rusqlite::Connection, remote: i64, status: &str) {
+        // DB-03: M047 FKs (foreign_keys=ON) — parents for the fixture rows.
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, first_customer_message_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (2001, 2001, 'Eve')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, first_customer_message_at)
              VALUES (?1, ?1, ?2, 1, 2001, '2026-01-02T03:04:05.000Z')",
             rusqlite::params![remote, status],
         )

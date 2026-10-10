@@ -68,7 +68,7 @@ fn insert_conv(
 ) -> i64 {
     conn.execute(
         &format!(
-            "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id, status, created_at, updated_at)
+            "INSERT INTO conversations (remote_id, number, mailbox_local_id, customer_local_id, status, created_at, updated_at)
              VALUES ({remote}, {remote}, {mailbox}, {customer}, 'closed', {created_at_sql}, {created_at_sql})"
         ),
         [],
@@ -108,6 +108,18 @@ async fn analytics_reports_batch() {
     .unwrap();
     conn.execute(
         "INSERT INTO mailboxes (id, remote_id, name) VALUES (2, 202, 'Billing')",
+        [],
+    )
+    .unwrap();
+    // DB-03: M047 FKs (foreign_keys=ON) — the customer ids insert_conv keys on.
+    conn.execute(
+        "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES
+            (100, 2100, 'C100'), (101, 2101, 'C101'), (102, 2102, 'C102'),
+            (103, 2103, 'C103'), (104, 2104, 'C104'), (105, 2105, 'C105'),
+            (110, 2110, 'C110'), (120, 2120, 'C120'), (121, 2121, 'C121'),
+            (122, 2122, 'C122'), (123, 2123, 'C123'), (124, 2124, 'C124'),
+            (125, 2125, 'C125'), (126, 2126, 'C126'), (127, 2127, 'C127'),
+            (128, 2128, 'C128')",
         [],
     )
     .unwrap();

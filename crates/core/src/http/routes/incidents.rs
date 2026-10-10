@@ -1596,16 +1596,23 @@ mod tests {
     /// One mirror conversation with a customer in an organization.
     fn seed_conversation(state: &AppState, id: i64, customer: i64, mailbox: i64) {
         let conn = state.conn.lock().unwrap();
+        // DB-03: M047 gives conversations real FKs (foreign_keys=ON) — the
+        // parents must exist before the conversation row.
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
-             VALUES (?1, ?1, ?2, 'Broken checkout', 'active', ?3, ?4, '2026-10-01T10:00:00.000Z')",
-            rusqlite::params![id, id + 100, mailbox, customer],
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (?1, ?1, 'Support')",
+            rusqlite::params![mailbox],
         )
         .unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO customers (id, remote_id, first_name, last_name, email, organization)
              VALUES (?1, ?1, 'Ada', 'Lovelace', 'ada@example.com', 'Acme')",
             rusqlite::params![customer],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
+             VALUES (?1, ?1, ?2, 'Broken checkout', 'active', ?3, ?4, '2026-10-01T10:00:00.000Z')",
+            rusqlite::params![id, id + 100, mailbox, customer],
         )
         .unwrap();
     }

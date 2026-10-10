@@ -64,7 +64,7 @@ pub fn list_organizations(
                          OR (cu.organization_id IS NULL AND cu.organization = o.name))
                     AND cu.deleted_at IS NULL) AS customer_count,
                 (SELECT COUNT(*) FROM conversations c
-                  JOIN customers cu ON cu.id = c.customer_id
+                  JOIN customers cu ON cu.id = c.customer_local_id
                   WHERE (cu.organization_id = o.id
                          OR (cu.organization_id IS NULL AND cu.organization = o.name))
                     AND cu.deleted_at IS NULL) AS conversation_count
@@ -124,7 +124,7 @@ pub fn get_organization_detail(conn: &Connection, org_id: i64) -> Result<Option<
                              OR (cu.organization_id IS NULL AND cu.organization = o.name))
                         AND cu.deleted_at IS NULL) AS customer_count,
                     (SELECT COUNT(*) FROM conversations c
-                      JOIN customers cu ON cu.id = c.customer_id
+                      JOIN customers cu ON cu.id = c.customer_local_id
                       WHERE (cu.organization_id = o.id
                              OR (cu.organization_id IS NULL AND cu.organization = o.name))
                         AND cu.deleted_at IS NULL) AS conversation_count
@@ -146,11 +146,11 @@ pub fn get_organization_detail(conn: &Connection, org_id: i64) -> Result<Option<
     let mut stmt = conn.prepare(&format!(
         "SELECT cu.id, cu.first_name, cu.last_name, cu.email, cu.job_title,
                 (SELECT COUNT(*) FROM conversations c
-                  WHERE c.customer_id = cu.id AND c.deleted_at IS NULL) AS conversation_count,
+                  WHERE c.customer_local_id = cu.id AND c.deleted_at IS NULL) AS conversation_count,
                 (SELECT COUNT(*) FROM conversations c
-                  WHERE c.customer_id = cu.id AND c.status = 'active' AND c.deleted_at IS NULL) AS open_count,
+                  WHERE c.customer_local_id = cu.id AND c.status = 'active' AND c.deleted_at IS NULL) AS open_count,
                 (SELECT MAX(COALESCE(c.updated_at, c.local_created_at)) FROM conversations c
-                  WHERE c.customer_id = cu.id AND c.deleted_at IS NULL) AS last_activity_at
+                  WHERE c.customer_local_id = cu.id AND c.deleted_at IS NULL) AS last_activity_at
          FROM customers cu
          WHERE {ORG_MEMBERS_SQL} AND cu.deleted_at IS NULL
          ORDER BY COALESCE(cu.last_name, cu.last_name, cu.first_name, cu.email, cu.id)
@@ -286,8 +286,10 @@ fn health_flag(
 /// signals into one number about a person invites psychological reading,
 /// which the plan forbids.
 ///
-/// Port schema mappings (documented renames): `c.customer_local_id` ->
-/// `c.customer_id`, `c.remote_created_at` -> `c.created_at`, `threads` ->
+/// Post-M047 the `conversations` table carries the reference column names
+/// (`customer_local_id` / `mailbox_local_id` / `assignee_local_id`), so the
+/// former port-side `c.customer_id` rename no longer applies. Remaining
+/// documented renames: `c.remote_created_at` -> `c.created_at`, `threads` ->
 /// `conversation_threads` (`type='customer'` -> `thread_type='customer_message'`),
 /// `conversation_tags.tag_local_id` -> `conversation_tags.tag_id`,
 /// `issue_cluster_conversations` -> `issue_cluster_conversations`,
@@ -840,18 +842,18 @@ pub fn list_customers_summary(
                 (SELECT GROUP_CONCAT(ce.value) FROM customer_emails ce WHERE ce.customer_id = c.id) AS emails_csv,
                 (SELECT GROUP_CONCAT(cp.value) FROM customer_phones cp WHERE cp.customer_id = c.id) AS phones_csv,
                 (SELECT COUNT(*) FROM conversations cv
-                  WHERE cv.customer_id = c.id AND cv.deleted_at IS NULL) AS conversation_count,
+                  WHERE cv.customer_local_id = c.id AND cv.deleted_at IS NULL) AS conversation_count,
                 (SELECT COUNT(*) FROM conversations cv
-                  WHERE cv.customer_id = c.id AND cv.status IN ('active','pending')
+                  WHERE cv.customer_local_id = c.id AND cv.status IN ('active','pending')
                     AND cv.deleted_at IS NULL) AS open_conversation_count,
                 (SELECT MAX(cv.last_activity_at) FROM conversations cv
-                  WHERE cv.customer_id = c.id) AS last_activity_at,
+                  WHERE cv.customer_local_id = c.id) AS last_activity_at,
                 (SELECT AVG(CASE r.rating WHEN 'great' THEN 5 WHEN 'okay' THEN 3 WHEN 'not-good' THEN 1 END)
                    FROM ratings r WHERE r.customer_local_id = c.id) AS average_rating
          FROM customers c
          {where_sql}
          ORDER BY COALESCE(
-             (SELECT MAX(cv.last_activity_at) FROM conversations cv WHERE cv.customer_id = c.id),
+             (SELECT MAX(cv.last_activity_at) FROM conversations cv WHERE cv.customer_local_id = c.id),
              c.local_created_at,
              c.created_at) DESC
          LIMIT ?2 OFFSET ?3"
@@ -943,12 +945,12 @@ pub fn get_customer_detail(conn: &Connection, customer_id: i64) -> Result<Option
                 (SELECT GROUP_CONCAT(ce.value) FROM customer_emails ce WHERE ce.customer_id = c.id) AS emails_csv,
                 (SELECT GROUP_CONCAT(cp.value) FROM customer_phones cp WHERE cp.customer_id = c.id) AS phones_csv,
                 (SELECT COUNT(*) FROM conversations cv
-                  WHERE cv.customer_id = c.id AND cv.deleted_at IS NULL) AS conversation_count,
+                  WHERE cv.customer_local_id = c.id AND cv.deleted_at IS NULL) AS conversation_count,
                 (SELECT COUNT(*) FROM conversations cv
-                  WHERE cv.customer_id = c.id AND cv.status IN ('active','pending')
+                  WHERE cv.customer_local_id = c.id AND cv.status IN ('active','pending')
                     AND cv.deleted_at IS NULL) AS open_conversation_count,
                 (SELECT MAX(cv.last_activity_at) FROM conversations cv
-                  WHERE cv.customer_id = c.id) AS last_activity_at,
+                  WHERE cv.customer_local_id = c.id) AS last_activity_at,
                 (SELECT AVG(CASE r.rating WHEN 'great' THEN 5 WHEN 'okay' THEN 3 WHEN 'not-good' THEN 1 END)
                    FROM ratings r WHERE r.customer_local_id = c.id) AS average_rating
          FROM customers c WHERE c.id = ?1",
@@ -960,11 +962,11 @@ pub fn get_customer_detail(conn: &Connection, customer_id: i64) -> Result<Option
     // Conversations (reference: 50 newest with assignee names).
     let mut stmt = conn.prepare(
         "SELECT cv.id, cv.number, cv.subject, cv.status, cv.preview,
-                cv.remote_created_at, cv.closed_at, cv.assignee_id,
+                cv.remote_created_at, cv.closed_at, cv.assignee_local_id,
                 TRIM(COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS assignee
          FROM conversations cv
-         LEFT JOIN users u ON u.id = cv.assignee_id
-         WHERE cv.customer_id = ?1 AND cv.deleted_at IS NULL
+         LEFT JOIN users u ON u.id = cv.assignee_local_id
+         WHERE cv.customer_local_id = ?1 AND cv.deleted_at IS NULL
          ORDER BY COALESCE(cv.remote_created_at, cv.created_at) DESC LIMIT 50",
     )?;
     let conversations: Vec<Value> = stmt
@@ -1110,7 +1112,7 @@ pub fn get_customer_detail(conn: &Connection, customer_id: i64) -> Result<Option
                   ORDER BY COALESCE(t.remote_created_at, t.created_at) DESC LIMIT 1) AS resolution,
                 cv.closed_at
          FROM conversations cv
-         WHERE cv.customer_id = ?1 AND cv.status = 'closed' AND cv.deleted_at IS NULL
+         WHERE cv.customer_local_id = ?1 AND cv.status = 'closed' AND cv.deleted_at IS NULL
          ORDER BY cv.closed_at DESC LIMIT 5",
     )?;
     let resolutions: Vec<Value> = stmt
@@ -1176,9 +1178,9 @@ pub fn customer_support_health(conn: &Connection, customer_id: i64) -> Result<Op
         "customer",
         id,
         &label,
-        "c.customer_id = ?1",
+        "c.customer_local_id = ?1",
         "r.customer_local_id = ?1",
-        "c.customer_id = ?1",
+        "c.customer_local_id = ?1",
     )
     .map(Some)
 }
@@ -1209,7 +1211,7 @@ pub fn organization_support_health(conn: &Connection, org_id: i64) -> Result<Opt
     let members = format!(
         "(SELECT cu.id FROM customers cu WHERE {ORG_MEMBERS_SQL} AND cu.deleted_at IS NULL)"
     );
-    let conv_scope = format!("c.customer_id IN {members}");
+    let conv_scope = format!("c.customer_local_id IN {members}");
     let rating_scope = format!("r.customer_local_id IN {members}");
     build_support_health_report(
         conn,
@@ -1789,9 +1791,15 @@ mod tests {
         .unwrap();
         // One active conversation waiting 10 days + a second active one (plus
         // a third closed conversation for the repeated-issue cluster below).
+        // M047 FK: conversations.mailbox_local_id -> mailboxes(id).
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
         for (remote, status) in [(1i64, "active"), (2, "active"), (3, "closed")] {
             conn.execute(
-                "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id,
+                "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id,
                                             created_at, updated_at, customer_waiting_since)
                  VALUES (?1, ?1, 'Q', ?2, 1, ?3,
                          datetime('now', '-12 days'), datetime('now', '-12 days'), datetime('now', '-10 days'))",
@@ -1968,8 +1976,14 @@ mod tests {
             params![org_id, cid],
         )
         .unwrap();
+        // M047 FK: conversations.mailbox_local_id -> mailboxes(id).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (1, 1, 'Q', 'closed', 1, ?1, datetime('now', '-2 days'))",
             params![cid],
         )
@@ -2011,8 +2025,14 @@ mod tests {
         )
         .unwrap();
         // One conversation so the sweep has something to derive.
+        // M047 FK: conversations.mailbox_local_id -> mailboxes(id).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id, created_at, updated_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, updated_at)
              VALUES (1, 1, 'Help', 'closed', 1, ?1, '2026-10-01T10:00:00.000Z', '2026-10-01T11:00:00.000Z')",
             params![cid],
         )

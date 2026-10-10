@@ -44,7 +44,7 @@ async fn graph_read_layer_parity() {
          INSERT INTO users (id, remote_id, first_name, last_name, email) VALUES (7, 70, 'Dana', 'Reyes', 'dana@example.com');
          INSERT INTO customers (id, remote_id, first_name, last_name, organization_id) VALUES (11, 110, 'Ada', 'Lovelace', 1);
          INSERT INTO customers (id, remote_id, first_name, last_name, organization_id) VALUES (12, 120, 'Belle', 'Node', 1);
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id)
              VALUES (1, 101, 101, 'Export stuck at night', 'active', 1, 11, 7);
          INSERT INTO known_issues (id, name, status, description, title)
              VALUES (1, 'Login loop', 'investigating', 'legacy name row', 'Login loop after password reset');

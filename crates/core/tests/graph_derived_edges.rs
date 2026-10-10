@@ -6,8 +6,8 @@
 //! Branches exercised by the seeded world:
 //!
 //! - belongs_to          customer -> organization        (customers.organization_id)
-//! - involves            conversation -> customer        (conversations.customer_id)
-//! - assigned_to         conversation -> agent           (conversations.assignee_id)
+//! - involves            conversation -> customer        (conversations.customer_local_id)
+//! - assigned_to         conversation -> agent           (conversations.assignee_local_id)
 //! - owns                incident -> agent                (incidents.owner_user_local_id)
 //! - linked_to_issue     conversation -> known_issue      (per-row ai/human provenance)
 //! - clustered_into      conversation -> issue_cluster   (issue_cluster_conversations)
@@ -55,9 +55,9 @@ async fn graph_derived_edge_layer() {
          INSERT INTO users (id, remote_id, first_name, last_name, email) VALUES (8, 80, 'Grace', 'Hopper', 'grace@example.com');
          INSERT INTO customers (id, remote_id, first_name, last_name, organization_id) VALUES (11, 110, 'Ada', 'Lovelace', 1);
          INSERT INTO customers (id, remote_id, first_name, last_name) VALUES (12, 120, 'Belle', 'Node');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id)
              VALUES (1, 101, 101, 'Export stuck at night', 'active', 1, 11, 7);
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id)
              VALUES (2, 102, 102, 'Widget question', 'active', 1, 12);
          INSERT INTO products (id, name, description) VALUES (1, 'Reports widget', 'The reports module');
          INSERT INTO known_issues (id, name, status, product) VALUES (1, 'Login loop', 'investigating', 'Reports widget');

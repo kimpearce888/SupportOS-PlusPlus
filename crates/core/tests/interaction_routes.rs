@@ -45,10 +45,16 @@ async fn interaction_routes_serve_the_reference_card_contract() {
         [],
     )
     .expect("seed customer");
+    // DB-03: M047 FKs (foreign_keys=ON) — mailbox 1 must exist.
+    conn.execute(
+        "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 99001, 'Support')",
+        [],
+    )
+    .expect("seed mailbox");
     // One CLOSED historical conversation (baseline material).
     conn.execute(
         "INSERT INTO conversations
-            (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+            (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
          VALUES (699, 99699, 6999, 'API token expired', 'closed', 1, 500, datetime('now', '-20 days'))",
         [],
     )
@@ -81,7 +87,7 @@ async fn interaction_routes_serve_the_reference_card_contract() {
     // Conversation 700 (remote 99700) — today's ticket, owned by customer 500.
     conn.execute(
         "INSERT INTO conversations
-            (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+            (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
          VALUES (700, 99700, 7001, 'API returns 401 again', 'active', 1, 500, datetime('now', '-1 day'))",
         [],
     )

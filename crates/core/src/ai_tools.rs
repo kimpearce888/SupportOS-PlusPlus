@@ -12,8 +12,8 @@
 //! - `threads` → `conversation_threads` (`type`→`thread_type`,
 //!   `body_text`→`body`, `remote_created_at`→`COALESCE(remote_created_at,
 //!   created_at)`)
-//! - `customer_local_id`/`mailbox_local_id`/`assignee_local_id` →
-//!   `customer_id`/`mailbox_id`/`assignee_id`
+//! - `customer_local_id`/`mailbox_local_id`/`assignee_local_id` keep the
+//!   reference names after DB-03/M047
 //! - `conversation_tags.tag_local_id` → `tag_id`
 //! - `knowledge_candidates` → `knowledge_gap_candidates`
 //!   (`question`→`query_text`)
@@ -353,7 +353,7 @@ fn red_chars(conn: &Connection, text: &str, n: usize) -> String {
 /// number = ? AND deleted_at IS NULL`).
 fn conv_by_number(conn: &Connection, number: i64) -> Option<(i64, Option<i64>)> {
     conn.query_row(
-        "SELECT id, customer_id FROM conversations WHERE number = ?1 AND deleted_at IS NULL",
+        "SELECT id, customer_local_id FROM conversations WHERE number = ?1 AND deleted_at IS NULL",
         params![number],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
@@ -547,11 +547,11 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                 .query_row(
                     "SELECT c.id, c.number, c.subject, c.status, c.type,
                             COALESCE(c.remote_created_at, c.created_at), c.remote_updated_at,
-                            (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_id) AS mailbox,
+                            (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_local_id) AS mailbox,
                             (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct
                                JOIN tags t ON t.id = ct.tag_id WHERE ct.conversation_id = c.id) AS tags,
                             (SELECT TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, ''))
-                               FROM customers cu WHERE cu.id = c.customer_id) AS customer
+                               FROM customers cu WHERE cu.id = c.customer_local_id) AS customer
                        FROM conversations c WHERE c.number = ?1 AND c.deleted_at IS NULL",
                     params![num],
                     |r| {
@@ -629,7 +629,7 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             };
             let Some(customer) = conn
                 .query_row(
-                    "SELECT customer_id FROM conversations WHERE number = ?1 AND deleted_at IS NULL",
+                    "SELECT customer_local_id FROM conversations WHERE number = ?1 AND deleted_at IS NULL",
                     params![num],
                     |r| r.get::<_, Option<i64>>(0),
                 )
@@ -649,7 +649,7 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                                 AND t.type='reply'
                               ORDER BY COALESCE(t.remote_created_at, t.created_at) DESC LIMIT 1)
                        FROM conversations c
-                      WHERE c.customer_id = ?1 AND c.deleted_at IS NULL
+                      WHERE c.customer_local_id = ?1 AND c.deleted_at IS NULL
                         AND c.id != (SELECT id FROM conversations WHERE number = ?2)
                       ORDER BY COALESCE(c.remote_created_at, c.created_at) DESC LIMIT ?3",
                 )
@@ -817,8 +817,8 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                     "SELECT c.number, c.supportos_priority, c.supportos_state_id,
                             (SELECT ts.name FROM ticket_states ts WHERE ts.id = c.supportos_state_id),
                             (SELECT TRIM(COALESCE(u2.first_name, '') || ' ' || COALESCE(u2.last_name, ''))
-                               FROM users u2 WHERE u2.id = c.assignee_id),
-                            (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_id),
+                               FROM users u2 WHERE u2.id = c.assignee_local_id),
+                            (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_local_id),
                             c.closed_at, c.first_customer_message_at, c.first_response_at,
                             c.last_customer_reply_at, c.last_human_agent_response_at, c.customer_waiting_since,
                             (SELECT kic.known_issue_id FROM known_issue_conversations kic
@@ -912,9 +912,9 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                 .prepare(
                     "SELECT i.id, i.code, i.title, i.status, i.severity, i.product, i.feature,
                             (SELECT COUNT(*) FROM incident_conversations ic WHERE ic.incident_id = i.id),
-                            (SELECT COUNT(DISTINCT c.customer_id) FROM incident_conversations ic
+                            (SELECT COUNT(DISTINCT c.customer_local_id) FROM incident_conversations ic
                                JOIN conversations c ON c.id = ic.conversation_id
-                              WHERE ic.incident_id = i.id AND c.customer_id IS NOT NULL AND c.deleted_at IS NULL)
+                              WHERE ic.incident_id = i.id AND c.customer_local_id IS NOT NULL AND c.deleted_at IS NULL)
                        FROM incidents i
                       ORDER BY CASE i.status WHEN 'resolved' THEN 1 ELSE 0 END, i.updated_at DESC LIMIT 20",
                 )
@@ -1040,7 +1040,7 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             };
             let Some(customer) = conn
                 .query_row(
-                    "SELECT customer_id FROM conversations WHERE number = ?1 AND deleted_at IS NULL",
+                    "SELECT customer_local_id FROM conversations WHERE number = ?1 AND deleted_at IS NULL",
                     params![num],
                     |r| r.get::<_, Option<i64>>(0),
                 )
@@ -1329,7 +1329,7 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
             };
             let Some(customer) = conn
                 .query_row(
-                    "SELECT customer_id FROM conversations WHERE number = ?1 AND deleted_at IS NULL",
+                    "SELECT customer_local_id FROM conversations WHERE number = ?1 AND deleted_at IS NULL",
                     params![num],
                     |r| r.get::<_, Option<i64>>(0),
                 )
@@ -1355,7 +1355,7 @@ pub fn execute(conn: &Connection, name: &str, args_json: &str) -> Value {
                        FROM known_issue_conversations kic
                        JOIN known_issues ki ON ki.id = kic.known_issue_id
                        JOIN conversations c ON c.id = kic.conversation_id
-                      WHERE c.customer_id = ?1
+                      WHERE c.customer_local_id = ?1
                       GROUP BY ki.id ORDER BY 3 DESC LIMIT 5",
                 )
                 .and_then(|mut stmt| {
@@ -1532,8 +1532,8 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY, number INTEGER, subject TEXT, preview TEXT,
-                status TEXT NOT NULL DEFAULT 'active', mailbox_id INTEGER, assignee_id INTEGER,
-                customer_id INTEGER, created_at TEXT, closed_at TEXT, deleted_at TEXT,
+                status TEXT NOT NULL DEFAULT 'active', mailbox_local_id INTEGER, assignee_local_id INTEGER,
+                customer_local_id INTEGER, created_at TEXT, closed_at TEXT, deleted_at TEXT,
                 remote_created_at TEXT
             );",
         )

@@ -72,16 +72,16 @@ async fn customers_routes_serve_the_reference_contract() {
                      'quote', 'ai', 'medium');
          -- Conversation 1: Ada's CLOSED ticket with a published agent reply
          -- (the resolution material).
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id, created_at, closed_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id, created_at, closed_at)
              VALUES (699, 99699, 6999, 'API token expired', 'closed', 1, 500, 7,
                      '2026-10-01 10:00:00', '2026-10-03 13:00:00');
          INSERT INTO conversation_threads (conversation_id, type, body_text, from_type, created_at, state)
              VALUES (699, 'reply', 'Rotated the token for you in two steps.', 'user', '2026-10-02 11:00:00', 'published');
          -- Conversation 2: Ada's ACTIVE ticket (the open count).
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at, last_activity_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, last_activity_at)
              VALUES (700, 99700, 7001, 'API returns 401 again', 'active', 1, 500, '2026-10-05 12:00:00', '2026-10-06 08:00:00');
          -- Hank's chat conversation (the channel filter material).
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, type, created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, type, created_at)
              VALUES (701, 99701, 7002, 'Beacon chat question', 'active', 1, 502, 'chat', '2026-10-06 09:00:00');
          INSERT INTO tags (id, remote_id, name) VALUES (3, 33, 'billing');
          INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (699, 3);

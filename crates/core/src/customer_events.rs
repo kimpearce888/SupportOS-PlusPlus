@@ -161,13 +161,13 @@ fn derive_recent_conversations(conn: &Connection) -> Result<usize> {
         conn,
         "INSERT OR IGNORE INTO customer_events
            (customer_local_id, event_kind, occurred_at, title, detail, source, source_ref, dedup_key)
-         SELECT c.customer_id, 'support_conversation', c.created_at,
+         SELECT c.customer_local_id, 'support_conversation', c.created_at,
                 'Support conversation #' || c.number || ' started',
                 json_object('conversation_id', c.id, 'number', c.number, 'subject', c.subject, 'status', c.status),
                 'hs_sync', 'conversations:' || c.remote_id,
                 'conv_created:' || c.id
          FROM conversations c
-         WHERE c.customer_id IS NOT NULL AND c.created_at IS NOT NULL AND c.deleted_at IS NULL
+         WHERE c.customer_local_id IS NOT NULL AND c.created_at IS NOT NULL AND c.deleted_at IS NULL
            AND julianday(c.updated_at) >= julianday('now', '-7 days')",
         &[],
     )?;
@@ -175,13 +175,13 @@ fn derive_recent_conversations(conn: &Connection) -> Result<usize> {
         conn,
         "INSERT OR IGNORE INTO customer_events
            (customer_local_id, event_kind, occurred_at, title, detail, source, source_ref, dedup_key)
-         SELECT c.customer_id, 'support_conversation', c.closed_at,
+         SELECT c.customer_local_id, 'support_conversation', c.closed_at,
                 'Support conversation #' || c.number || ' closed',
                 json_object('conversation_id', c.id, 'number', c.number, 'subject', c.subject, 'status', 'closed'),
                 'hs_sync', 'conversations:' || c.remote_id,
                 'conv_closed:' || c.id
          FROM conversations c
-         WHERE c.customer_id IS NOT NULL AND c.closed_at IS NOT NULL AND c.deleted_at IS NULL
+         WHERE c.customer_local_id IS NOT NULL AND c.closed_at IS NOT NULL AND c.deleted_at IS NULL
            AND julianday(c.updated_at) >= julianday('now', '-7 days')",
         &[],
     )?;
@@ -189,7 +189,7 @@ fn derive_recent_conversations(conn: &Connection) -> Result<usize> {
         conn,
         "INSERT OR IGNORE INTO customer_events
            (customer_local_id, event_kind, occurred_at, title, detail, source, source_ref, dedup_key)
-         SELECT c.customer_id, 'customer_message', t.created_at,
+         SELECT c.customer_local_id, 'customer_message', t.created_at,
                 'Customer wrote in: ' || substr(COALESCE(c.subject, ''), 1, 80),
                 json_object('conversation_id', c.id, 'number', c.number, 'subject', c.subject,
                             'excerpt', substr(COALESCE(t.body_text, ''), 1, 300)),
@@ -203,7 +203,7 @@ fn derive_recent_conversations(conn: &Connection) -> Result<usize> {
              WHERE t2.conversation_id = c.id AND t2.type = 'customer'
                AND t2.deleted_at IS NULL AND t2.state = 'published'
            )
-         WHERE c.customer_id IS NOT NULL AND c.deleted_at IS NULL
+         WHERE c.customer_local_id IS NOT NULL AND c.deleted_at IS NULL
            AND julianday(c.created_at) >= julianday('now', '-7 days')",
         &[],
     )?;
@@ -266,16 +266,16 @@ fn derive_incident_exposure(conn: &Connection) -> Result<usize> {
         conn,
         "INSERT OR IGNORE INTO customer_events
            (customer_local_id, event_kind, occurred_at, title, detail, source, source_ref, dedup_key)
-         SELECT DISTINCT c.customer_id, 'incident_exposure', ic.linked_at,
+         SELECT DISTINCT c.customer_local_id, 'incident_exposure', ic.linked_at,
                 'Affected by incident ' || i.code || ': ' || substr(i.title, 1, 80),
                 json_object('incident_id', i.id, 'code', i.code, 'title', i.title,
                             'severity', i.severity, 'status', i.status, 'conversation_id', c.id),
                 'local_derived', 'incidents:' || i.id,
-                'incident_exposure:' || i.id || ':' || c.customer_id
+                'incident_exposure:' || i.id || ':' || c.customer_local_id
          FROM incidents i
          JOIN incident_conversations ic ON ic.incident_id = i.id
          JOIN conversations c ON c.id = ic.conversation_id
-         WHERE i.status != 'resolved' AND c.customer_id IS NOT NULL AND c.deleted_at IS NULL",
+         WHERE i.status != 'resolved' AND c.customer_local_id IS NOT NULL AND c.deleted_at IS NULL",
         &[],
     )
 }
@@ -316,33 +316,33 @@ pub fn rebuild(conn: &Connection) -> Result<usize> {
         conn,
         "INSERT OR IGNORE INTO customer_events
            (customer_local_id, event_kind, occurred_at, title, detail, source, source_ref, dedup_key)
-         SELECT c.customer_id, 'support_conversation', c.created_at,
+         SELECT c.customer_local_id, 'support_conversation', c.created_at,
                 'Support conversation #' || c.number || ' started',
                 json_object('conversation_id', c.id, 'number', c.number, 'subject', c.subject, 'status', c.status),
                 'hs_sync', 'conversations:' || c.remote_id,
                 'conv_created:' || c.id
          FROM conversations c
-         WHERE c.customer_id IS NOT NULL AND c.created_at IS NOT NULL AND c.deleted_at IS NULL",
+         WHERE c.customer_local_id IS NOT NULL AND c.created_at IS NOT NULL AND c.deleted_at IS NULL",
         &[],
     )?;
     created += counted(
         conn,
         "INSERT OR IGNORE INTO customer_events
            (customer_local_id, event_kind, occurred_at, title, detail, source, source_ref, dedup_key)
-         SELECT c.customer_id, 'support_conversation', c.closed_at,
+         SELECT c.customer_local_id, 'support_conversation', c.closed_at,
                 'Support conversation #' || c.number || ' closed',
                 json_object('conversation_id', c.id, 'number', c.number, 'subject', c.subject, 'status', 'closed'),
                 'hs_sync', 'conversations:' || c.remote_id,
                 'conv_closed:' || c.id
          FROM conversations c
-         WHERE c.customer_id IS NOT NULL AND c.closed_at IS NOT NULL AND c.deleted_at IS NULL",
+         WHERE c.customer_local_id IS NOT NULL AND c.closed_at IS NOT NULL AND c.deleted_at IS NULL",
         &[],
     )?;
     created += counted(
         conn,
         "INSERT OR IGNORE INTO customer_events
            (customer_local_id, event_kind, occurred_at, title, detail, source, source_ref, dedup_key)
-         SELECT c.customer_id, 'customer_message', t.created_at,
+         SELECT c.customer_local_id, 'customer_message', t.created_at,
                 'Customer wrote in: ' || substr(COALESCE(c.subject, ''), 1, 80),
                 json_object('conversation_id', c.id, 'number', c.number, 'subject', c.subject,
                             'excerpt', substr(COALESCE(t.body_text, ''), 1, 300)),
@@ -356,7 +356,7 @@ pub fn rebuild(conn: &Connection) -> Result<usize> {
              WHERE t2.conversation_id = c.id AND t2.type = 'customer'
                AND t2.deleted_at IS NULL AND t2.state = 'published'
            )
-         WHERE c.customer_id IS NOT NULL AND c.deleted_at IS NULL",
+         WHERE c.customer_local_id IS NOT NULL AND c.deleted_at IS NULL",
         &[],
     )?;
     created += counted(
@@ -589,6 +589,10 @@ mod tests {
         crate::maintenance::apply_m037(&conn).unwrap();
         crate::connectors::apply_m038(&conn).unwrap();
         crate::mirror_tables::apply_m039(&conn).unwrap();
+        // DB-03 (M047) prep: M040 supplies the reference conversations
+        // columns this slim chain never added (state/type/thread_count/...),
+        // exactly like the boot chain order (m039 -> m040 -> ... -> m047).
+        crate::db_breadth::apply_m040(&conn).unwrap();
         // DB-04 (M045): swap the M028-collapsed shape for the reference
         // actor model (the slim chain predates mirror_parity; the sweep's
         // reads use the reference column names).
@@ -618,6 +622,10 @@ mod tests {
                  ON conversation_threads (type);",
         )
         .unwrap();
+        // DB-03 (M047): conversations carries the reference column names
+        // (mailbox_local_id / customer_local_id / assignee_local_id) with
+        // real FKs — the sweep's SELECTs and the fixtures below use them.
+        crate::mirror_parity::apply_m047(&conn).unwrap();
         conn
     }
 
@@ -631,8 +639,19 @@ mod tests {
     fn sweep_is_silent_before_first_sync_settles() {
         let conn = fresh_db();
         // No sync_state setting → treated as NEW → sweep is a no-op.
+        // M047 FKs: mailbox_local_id -> mailboxes(id), customer_local_id -> customers(id).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id, created_at, updated_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO customers (remote_id, first_name, last_name) VALUES (7, 'A', 'B')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, updated_at)
              VALUES (1, 101, 's', 'active', 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
             [],
         )
@@ -653,8 +672,14 @@ mod tests {
             [],
         )
         .unwrap();
+        // M047 FK: mailbox_local_id -> mailboxes(id).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id, created_at, updated_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, updated_at)
              VALUES (1, 101, 'sub', 'active', 1, 1, datetime('now', '-1 day'), datetime('now', '-1 day'))",
             [],
         )
@@ -680,8 +705,14 @@ mod tests {
             [],
         )
         .unwrap();
+        // M047 FK: mailbox_local_id -> mailboxes(id).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id, created_at, updated_at, closed_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, updated_at, closed_at)
              VALUES (1, 101, 'sub', 'closed', 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
             [],
         )

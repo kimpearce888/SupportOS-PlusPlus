@@ -45,7 +45,7 @@ async fn graph_human_edges_parity() {
          UPDATE customers SET organization_id = 5 WHERE id = 9;
          INSERT INTO customers (id, remote_id, first_name, last_name) VALUES (10, 100, 'Carol', 'Client');
          INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id)
              VALUES (3, 33, 33, 'Refund please', 'active', 1, 9);
          INSERT INTO known_issues (id, name, status) VALUES (7, 'Login bug', 'active');
          INSERT INTO incidents (id, code, title, status, severity, source)

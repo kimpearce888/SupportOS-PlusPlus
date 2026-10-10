@@ -40,13 +40,13 @@ async fn inbox_saved_views_and_ai_filters() {
          INSERT INTO customers (id, remote_id, first_name, email) VALUES (11, 110, 'Ada', 'ada@example.com');
          INSERT INTO customers (id, remote_id, first_name, email) VALUES (12, 120, 'Belle', 'belle@example.com');
          INSERT INTO customers (id, remote_id, first_name, email) VALUES (13, 130, 'Carlos', 'carlos@example.com');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id, updated_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id, updated_at)
              VALUES (1, 101, 101, 'Billing bug', 'active', 1, 11, 7, '2026-10-05 10:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id, updated_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id, updated_at)
              VALUES (2, 102, 102, 'Billing question', 'active', 1, 12, 7, '2026-10-06 11:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, updated_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, updated_at)
              VALUES (3, 103, 103, 'Old export issue', 'closed', 2, 13, '2026-10-04 09:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, updated_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, updated_at)
              VALUES (4, 104, 104, 'Bare active', 'active', 2, 11, '2026-10-03 08:00:00');
          INSERT INTO tags (id, remote_id, name) VALUES (21, 210, 'billing'), (22, 220, 'export');
          INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (1, 21), (2, 21), (2, 22), (3, 22);

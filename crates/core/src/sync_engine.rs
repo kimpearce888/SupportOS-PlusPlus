@@ -2260,8 +2260,8 @@ mod tests {
         let dangling: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM conversations c
-                 LEFT JOIN customers cu ON cu.id = c.customer_id
-                 WHERE c.customer_id IS NOT NULL AND cu.id IS NULL",
+                 LEFT JOIN customers cu ON cu.id = c.customer_local_id
+                 WHERE c.customer_local_id IS NOT NULL AND cu.id IS NULL",
                 [],
                 |r| r.get(0),
             )
@@ -2273,8 +2273,8 @@ mod tests {
         let dangling_assignee: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM conversations c
-                 LEFT JOIN users u ON u.id = c.assignee_id
-                 WHERE c.assignee_id IS NOT NULL AND u.id IS NULL",
+                 LEFT JOIN users u ON u.id = c.assignee_local_id
+                 WHERE c.assignee_local_id IS NOT NULL AND u.id IS NULL",
                 [],
                 |r| r.get(0),
             )
@@ -2526,8 +2526,21 @@ mod tests {
     #[test]
     fn upsert_thread_persists_recipients_and_attachments() {
         let conn = fresh_conn();
+        // M047 (DB-03): conversations.mailbox_local_id/customer_local_id
+        // are real FKs now (db::open sets foreign_keys=ON) — seed the
+        // parents the fixture's concrete ids point at.
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 1, 'Seed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (7001, 7001, 'active', 1, 1)",
             [],
         )
@@ -2679,8 +2692,21 @@ mod tests {
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
         crate::bootstrap::apply_all(&mut conn).unwrap();
+        // M047 (DB-03): seed the parents for the fixture's concrete
+        // mailbox/customer ids (the rebuilt conversations table carries
+        // real FKs and db::open sets foreign_keys=ON).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (301, 301, 'Seed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (12345, 12345, 'active', 1, 301)",
             [],
         )

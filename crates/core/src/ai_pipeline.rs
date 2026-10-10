@@ -1325,9 +1325,9 @@ pub async fn extract_memories(
 ) -> usize {
     let conv = conn
         .query_row(
-            "SELECT c.customer_id,
+            "SELECT c.customer_local_id,
                     (SELECT TRIM(COALESCE(cu.first_name,'') || ' ' || COALESCE(cu.last_name,''))
-                       FROM customers cu WHERE cu.id = c.customer_id)
+                       FROM customers cu WHERE cu.id = c.customer_local_id)
                FROM conversations c WHERE c.id = ?1",
             params![conversation_local_id],
             |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
@@ -1680,9 +1680,9 @@ pub fn upsert_cluster(conn: &Connection, c: &ClusterUpsert) -> Result<i64> {
     conn.execute(
         "UPDATE issue_clusters SET
             conversation_count = (SELECT COUNT(*) FROM issue_cluster_conversations WHERE cluster_id = ?1),
-            customer_count = (SELECT COUNT(DISTINCT c.customer_id) FROM issue_cluster_conversations m
+            customer_count = (SELECT COUNT(DISTINCT c.customer_local_id) FROM issue_cluster_conversations m
                                JOIN conversations c ON c.id = m.conversation_id
-                              WHERE m.cluster_id = ?1 AND c.customer_id IS NOT NULL),
+                              WHERE m.cluster_id = ?1 AND c.customer_local_id IS NOT NULL),
             first_seen_at = COALESCE((SELECT MIN(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_conversations m
                                JOIN conversations c ON c.id = m.conversation_id WHERE m.cluster_id = ?1), first_seen_at),
             last_seen_at = COALESCE((SELECT MAX(COALESCE(c.remote_created_at, c.created_at)) FROM issue_cluster_conversations m
@@ -2066,11 +2066,12 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
              INSERT INTO known_issues (id, name) VALUES (7, 'login loop');
-             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+             INSERT INTO customers (id, remote_id, first_name, last_name) VALUES (11, 1011, 'Ann', 'Lee'), (12, 1012, 'Bob', 'Ng');
+             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
                  VALUES (1, 101, 101, 'a', 'active', 1, 11, '2026-10-01 10:00:00');
-             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at, remote_created_at)
+             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, remote_created_at)
                  VALUES (2, 102, 102, 'b', 'active', 1, 11, '2026-10-03 09:00:00', '2026-10-02 09:00:00');
-             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
                  VALUES (3, 103, 103, 'c', 'active', 1, 12, '2026-10-05 11:00:00');",
         )
         .expect("seed");
@@ -2408,7 +2409,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         setup_tables(&conn);
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, mailbox_id) VALUES (1, 1, 10, 1)",
+            "INSERT INTO conversations (id, remote_id, number, mailbox_local_id) VALUES (1, 1, 10, 1)",
             [],
         )
         .unwrap();
@@ -2429,7 +2430,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         setup_tables(&conn);
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, mailbox_id) VALUES (1, 1, 10, 1)",
+            "INSERT INTO conversations (id, remote_id, number, mailbox_local_id) VALUES (1, 1, 10, 1)",
             [],
         )
         .unwrap();
@@ -2597,7 +2598,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         setup_tables(&conn);
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, mailbox_id) VALUES (1, 1, 10, 1)",
+            "INSERT INTO conversations (id, remote_id, number, mailbox_local_id) VALUES (1, 1, 10, 1)",
             [],
         )
         .unwrap();
@@ -2732,7 +2733,7 @@ mod tests {
             CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY, remote_id INTEGER UNIQUE, number INTEGER NOT NULL,
                 subject TEXT, preview TEXT, status TEXT NOT NULL DEFAULT 'active',
-                mailbox_id INTEGER NOT NULL, assignee_id INTEGER, customer_id INTEGER,
+                mailbox_local_id INTEGER NOT NULL, assignee_local_id INTEGER, customer_local_id INTEGER,
                 priority TEXT, created_at TEXT, updated_at TEXT, closed_at TEXT,
                 local_created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 remote_created_at TEXT, deleted_at TEXT
@@ -2977,7 +2978,7 @@ pub async fn analyze_interaction(
     }
     let customer_id: Option<i64> = conn
         .query_row(
-            "SELECT customer_id FROM conversations WHERE id = ?1",
+            "SELECT customer_local_id FROM conversations WHERE id = ?1",
             params![conversation_local_id],
             |r| r.get(0),
         )

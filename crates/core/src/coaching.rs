@@ -341,7 +341,7 @@ fn load_thread_rows(conn: &Connection, conversation_id: i64) -> Vec<ThreadRow> {
 
 fn load_conv(conn: &Connection, conversation_id: i64) -> Option<ConvRow> {
     conn.query_row(
-        "SELECT id, number, subject, customer_id FROM conversations
+        "SELECT id, number, subject, customer_local_id FROM conversations
           WHERE id = ?1 AND deleted_at IS NULL",
         params![conversation_id],
         |r| {
@@ -1037,7 +1037,7 @@ fn check_wrong_context(
     for r in number_refs {
         let row: Option<(i64, Option<i64>)> = conn
             .query_row(
-                "SELECT c.id, c.customer_id FROM conversations c
+                "SELECT c.id, c.customer_local_id FROM conversations c
                   WHERE c.number = ?1 AND c.deleted_at IS NULL",
                 params![r],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1653,8 +1653,13 @@ mod tests {
         closed: bool,
     ) -> i64 {
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id,
-                                        customer_id, created_at, closed_at, remote_created_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 9001, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id,
+                                        customer_local_id, created_at, closed_at, remote_created_at)
              VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?6)",
             params![
                 remote,

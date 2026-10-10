@@ -31,7 +31,8 @@ pub struct CustomerConversation {
     pub number: i64,
     pub subject: Option<String>,
     pub status: String,
-    pub mailbox_id: i64,
+    /// M047: nullable reference column (unresolved sync lookups land NULL).
+    pub mailbox_id: Option<i64>,
     pub mailbox_name: Option<String>,
     pub priority: Option<String>,
     pub created_at: Option<String>,
@@ -92,11 +93,11 @@ pub fn list_customer_conversations(
     let limit = limit.unwrap_or(50).min(200);
     let mut stmt = conn.prepare(
         "SELECT c.id, c.remote_id, c.number, c.subject, c.status,
-                c.mailbox_id, m.name, c.priority,
+                c.mailbox_local_id, m.name, c.priority,
                 c.created_at, c.updated_at, c.closed_at, c.response_state
          FROM conversations c
-         LEFT JOIN mailboxes m ON m.id = c.mailbox_id
-         WHERE c.customer_id = ?
+         LEFT JOIN mailboxes m ON m.id = c.mailbox_local_id
+         WHERE c.customer_local_id = ?
          ORDER BY COALESCE(c.updated_at, c.local_created_at) DESC
          LIMIT ?",
     )?;
@@ -145,7 +146,7 @@ pub fn customer_timeline(
          JOIN conversations c ON c.id = t.conversation_id
          LEFT JOIN users u ON u.id = t.created_by_user_id
          LEFT JOIN customers cu ON cu.id = t.created_by_customer_id
-         WHERE c.customer_id = ?
+         WHERE c.customer_local_id = ?
          ORDER BY t.created_at DESC
          LIMIT ?",
     )?;
@@ -224,6 +225,17 @@ mod tests {
         crate::activity::apply_m003(&conn).unwrap();
         // M004 adds supportos_priority + supportos_state columns.
         crate::ticket_states::apply_m004(&conn).unwrap();
+        // DB-03 (M047): the reference conversations column names — a
+        // test-local RENAME of the three port columns keeps this slim chain
+        // (run_all + m003 + m004) intact while the read paths exercise the
+        // post-migration shape (the real chain's M047 rebuild runs on full
+        // boots).
+        conn.execute_batch(
+            "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id;
+             ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id;
+             ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id;",
+        )
+        .unwrap();
         conn
     }
 

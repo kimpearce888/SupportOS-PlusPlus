@@ -28,8 +28,8 @@
 //!
 //! # Deviations from the reference (forced by port schema differences)
 //!
-//! - Column renames: `customer_local_id` → `customer_id`,
-//!   `mailbox_local_id` → `mailbox_id`, `assignee_local_id` → `assignee_id`,
+//! - Column renames: `customer_local_id`, `mailbox_local_id` and
+//!   `assignee_local_id` keep the reference names after DB-03/M047,
 //!   `remote_created_at` → `created_at`, `last_activity_at` → `updated_at`,
 //!   threads.`body_text` → `conversation_threads`.`body_text` (DB-04),
 //!   `ct.tag_local_id` → `ct.tag_id`, `docs_articles` → `docs`,
@@ -514,7 +514,7 @@ pub fn search_conversations(
     }
     if let Some(mailbox) = filters.mailbox_id.filter(|v| *v != 0) {
         let idx = args.len() + 1;
-        where_sql.push(format!("c.mailbox_id = ?{idx}"));
+        where_sql.push(format!("c.mailbox_local_id = ?{idx}"));
         args.push(Box::new(mailbox));
     }
     if let Some(tag) = filters.tag.clone().filter(|t| !t.is_empty()) {
@@ -534,7 +534,7 @@ pub fn search_conversations(
     }
     if let Some(assignee) = filters.assignee_id.filter(|v| *v != 0) {
         let idx = args.len() + 1;
-        where_sql.push(format!("c.assignee_id = ?{idx}"));
+        where_sql.push(format!("c.assignee_local_id = ?{idx}"));
         args.push(Box::new(assignee));
     }
     // Exact conversation number match wins.
@@ -577,7 +577,7 @@ pub fn search_conversations(
            COALESCE((SELECT ce.value FROM customer_emails ce WHERE ce.customer_id = cu.id LIMIT 1), '') AS customer_email,
            {rank_expr} AS rank
          FROM conversations c
-         LEFT JOIN customers cu ON cu.id = c.customer_id
+         LEFT JOIN customers cu ON cu.id = c.customer_local_id
          {join_fts}
          WHERE {}
          ORDER BY rank ASC, c.created_at DESC
@@ -677,7 +677,7 @@ pub fn search_customers(conn: &Connection, query: &str, limit: i64) -> Result<Ve
         "SELECT c.id, c.first_name, c.last_name,
            (SELECT ce.value FROM customer_emails ce WHERE ce.customer_id = c.id LIMIT 1) AS email,
            o.name AS org,
-           (SELECT COUNT(*) FROM conversations cv WHERE cv.customer_id = c.id) AS conv_count
+           (SELECT COUNT(*) FROM conversations cv WHERE cv.customer_local_id = c.id) AS conv_count
          FROM customers c LEFT JOIN organizations o ON o.id = c.organization_id
          WHERE c.deleted_at IS NULL AND (
            c.first_name LIKE ?1 ESCAPE '\\' OR c.last_name LIKE ?1 ESCAPE '\\' OR
@@ -993,7 +993,7 @@ pub fn index_conversation_fts(conn: &Connection, local_id: i64) -> Result<()> {
                TRIM(COALESCE(cu.first_name, '') || ' ' || COALESCE(cu.last_name, '')) AS customer,
                (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct
                   JOIN tags t ON t.id = ct.tag_id WHERE ct.conversation_id = c.id) AS tags
-             FROM conversations c LEFT JOIN customers cu ON cu.id = c.customer_id
+             FROM conversations c LEFT JOIN customers cu ON cu.id = c.customer_local_id
             WHERE c.id = ?1",
             params![local_id],
             |r| {
@@ -1494,6 +1494,20 @@ mod tests {
         // apply_all; this fixture predates it and hand-copied the steps,
         // which stopped at M029's `docs` name before DB-02's m044).
         crate::bootstrap::apply_all(&mut conn).unwrap();
+        // DB-03 (M047): conversations carries real FKs
+        // (mailbox_local_id→mailboxes, customer_local_id→customers,
+        // assignee_local_id→users); the Conv fixture below defaults to
+        // mailbox 1 / customer 2001 and the filter test uses mailbox 2 /
+        // assignee 7, so the parents must exist.
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES
+               (1, 1, 'Support'), (2, 2, 'Billing'), (101, 101, 'Legacy');
+             INSERT OR IGNORE INTO customers (id, remote_id, first_name, last_name)
+               VALUES (2001, 2001, 'Default', 'Customer');
+             INSERT OR IGNORE INTO users (id, remote_id, first_name, last_name)
+               VALUES (7, 7, 'Agent', 'Seven');",
+        )
+        .unwrap();
         conn
     }
 
@@ -1509,6 +1523,23 @@ mod tests {
         crate::db::ensure_migrations_table(&conn).unwrap();
         crate::migrations::run_all(&mut conn).unwrap();
         apply_fts_migration(&conn).unwrap();
+        // DB-03 (M047): the reference column names on conversations. The
+        // slim chain can't run m047's converging copy (it expects the full
+        // pre-M047 shape), so the fixture reproduces the renamed result
+        // directly — plain renames, no FK clauses (the slim chain never
+        // declared them; SQLite rewrites the m001 index defs itself).
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id",
+            [],
+        );
         conn
     }
 
@@ -1518,8 +1549,10 @@ mod tests {
         status: &'a str,
         mailbox_id: i64,
         assignee_id: Option<i64>,
-        // NOT NULL in the base schema (no FK, so a non-existent id is fine —
-        // the reference's LEFT JOIN then just yields an empty customer).
+        // FK'd to customers(id) after M047 — fresh_db() seeds the default
+        // customer 2001 (and add_customer-created ids exist by construction);
+        // the reference's LEFT JOIN then just yields an empty customer for
+        // conversations without one.
         customer_id: i64,
         created_at: &'a str,
         updated_at: &'a str,
@@ -1556,8 +1589,8 @@ mod tests {
             seed.number
         };
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, preview, status, mailbox_id,
-                                        assignee_id, customer_id, created_at, updated_at)
+            "INSERT INTO conversations (remote_id, number, subject, preview, status, mailbox_local_id,
+                                        assignee_local_id, customer_local_id, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 remote_id,
@@ -1803,7 +1836,7 @@ mod tests {
         );
         // Whitespace-only body: not indexable.
         conn.execute(
-            "UPDATE conversation_threads SET body = '   ' WHERE id = ?1",
+            "UPDATE conversation_threads SET body_text = '   ' WHERE id = ?1",
             params![thread],
         )
         .unwrap();
@@ -2670,7 +2703,7 @@ mod tests {
     fn legacy_index_conversation_feeds_reference_engine() {
         let conn = fresh_db();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, subject, preview)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, subject, preview)
              VALUES (1001, 1001, 'active', 101, 2001, 'Billing issue', 'wrong amount')",
             [],
         )

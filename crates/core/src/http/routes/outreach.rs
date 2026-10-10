@@ -869,7 +869,7 @@ pub async fn render_route(State(state): State<AppState>, body: Option<Json<Value
                 "SELECT c.id, c.number, c.subject, c.status, c.created_at,
                         (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct
                           JOIN tags t ON t.id = ct.tag_id WHERE ct.conversation_id = c.id)
-                   FROM conversations c WHERE c.customer_id = ?1
+                   FROM conversations c WHERE c.customer_local_id = ?1
                   ORDER BY c.created_at DESC LIMIT 3",
             )
             .ok()

@@ -311,13 +311,14 @@ fn try_export_csv(conn: &Connection, backups_dir: &Path) -> Result<Value> {
         "supportos-conversations-{}.csv",
         chrono::Utc::now().timestamp_millis()
     ));
-    // Column names adapted to the port's mirror schema (mailbox_id/
-    // customer_id/created_at; the port mirror has no soft-delete column).
+    // Column names adapted to the mirror schema (mailbox_local_id/
+    // customer_local_id/created_at; the port mirror has no soft-delete
+    // column).
     let sql = "SELECT c.number, c.subject, c.status, m.name AS mailbox,
              TRIM(COALESCE(cu.first_name,'') || ' ' || COALESCE(cu.last_name,'')) AS customer,
              cu.email AS email, c.created_at AS created_at, c.closed_at
-           FROM conversations c LEFT JOIN customers cu ON cu.id = c.customer_id
-           LEFT JOIN mailboxes m ON m.id = c.mailbox_id";
+           FROM conversations c LEFT JOIN customers cu ON cu.id = c.customer_local_id
+           LEFT JOIN mailboxes m ON m.id = c.mailbox_local_id";
     let header = [
         "number",
         "subject",
@@ -384,7 +385,7 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE application_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO application_settings VALUES ('theme','dark'), ('oauth_token','abc'), ('webhook_secret','x');
-             CREATE TABLE conversations (id INTEGER PRIMARY KEY, number INTEGER, subject TEXT, status TEXT, customer_id INTEGER, mailbox_id INTEGER, created_at TEXT, closed_at TEXT);
+             CREATE TABLE conversations (id INTEGER PRIMARY KEY, number INTEGER, subject TEXT, status TEXT, customer_local_id INTEGER, mailbox_local_id INTEGER, created_at TEXT, closed_at TEXT);
              CREATE TABLE customers (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, email TEXT);
              CREATE TABLE organizations (id INTEGER PRIMARY KEY);
              CREATE TABLE mailboxes (id INTEGER PRIMARY KEY, name TEXT);

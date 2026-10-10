@@ -48,20 +48,27 @@ async fn rebuild_all_admin_action_runs_the_real_rebuild() {
     // events exist and the derived columns sit at their defaults.
     // Conversation 2 (local) / remote 5002: customer wrote last, plus a
     // draft the rebuild must skip.
+    // DB-03: M047 FKs (foreign_keys=ON) — parents first, then the rows that
+    // key on them.
     conn.execute(
-        "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
-         VALUES
-            (1, 5001, 101, 'Refund question',  'active', 1, 10, '2026-01-01T09:00:00Z'),
-            (2, 5002, 102, 'Bug report',       'active', 1, 10, '2026-01-01T09:30:00Z')",
+        "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support')",
         [],
     )
-    .expect("seed conversations");
+    .expect("seed mailbox");
     conn.execute(
         "INSERT INTO customers (id, remote_id, first_name, last_name, email, created_at)
          VALUES (10, 3001, 'Ada', 'Lovelace', 'ada@example.com', '2026-01-01T08:00:00Z')",
         [],
     )
     .expect("seed customer");
+    conn.execute(
+        "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
+         VALUES
+            (1, 5001, 101, 'Refund question',  'active', 1, 10, '2026-01-01T09:00:00Z'),
+            (2, 5002, 102, 'Bug report',       'active', 1, 10, '2026-01-01T09:30:00Z')",
+        [],
+    )
+    .expect("seed conversations");
     conn.execute(
         "INSERT INTO users (id, remote_id, first_name, last_name, email, created_at)
          VALUES (2, 2001, 'Grace', 'Hopper', 'grace@example.com', '2026-01-01T08:00:00Z')",

@@ -159,7 +159,7 @@ fn execute_assign(
 
     let tx = conn.transaction()?;
     tx.execute(
-        "UPDATE conversations SET assignee_id = ?1 WHERE remote_id = ?2",
+        "UPDATE conversations SET assignee_local_id = ?1 WHERE remote_id = ?2",
         params![assignee_id, remote_id],
     )?;
 
@@ -337,12 +337,39 @@ mod tests {
         crate::migrations::run_all(&mut conn).unwrap();
         crate::activity::apply_m003(&conn).unwrap();
         crate::ticket_states::apply_m004(&conn).unwrap();
+        // DB-03 (M047): the reference column names on conversations. The slim
+        // chain can't run m047's converging copy (it expects the full
+        // pre-M047 shape), so the fixture reproduces the renames directly.
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id",
+            [],
+        );
         conn
     }
 
     fn insert_conversation(conn: &Connection, remote_id: i64) {
+        // DB-03 (M047): the columns are local FK ids — seed the parents for
+        // the fixture's concrete ids (db::open sets foreign_keys=ON).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (101, 101, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (2001, 2001, 'Fixture')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (?1, ?1, 'active', 101, 2001)",
             params![remote_id],
         )
@@ -366,7 +393,7 @@ mod tests {
 
         let assignee: Option<i64> = conn
             .query_row(
-                "SELECT assignee_id FROM conversations WHERE remote_id = 1001",
+                "SELECT assignee_local_id FROM conversations WHERE remote_id = 1001",
                 [],
                 |r| r.get(0),
             )

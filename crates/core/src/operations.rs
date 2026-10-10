@@ -8,8 +8,10 @@
 //! `tile count == drill-down list total` is structural here.
 //!
 //! Port column adapters (documented renames, values otherwise verbatim):
-//! - `assignee_local_id`→`assignee_id`, `mailbox_local_id`→`mailbox_id`,
-//!   `customer_local_id`→`customer_id` (the port's mirror column names);
+//! - since M047 the `conversations` table carries the reference names
+//!   `assignee_local_id`/`mailbox_local_id`/`customer_local_id` directly (the
+//!   former port-side `assignee_id`/`mailbox_id`/`customer_id` renames are
+//!   gone);
 //! - `known_issue_conversations`→`known_issue_links` (the port's link table
 //!   the demo world + issues routes populate);
 //! - `ai_runs.output`→`ai_runs.response_json`;
@@ -83,7 +85,7 @@ pub fn tile_fragment(
 ) -> Option<(String, Vec<rusqlite::types::Value>)> {
     let sql: String = match key {
         "unassigned" => {
-            format!("{NOT_DELETED} AND c.status IN ('active','pending') AND c.assignee_id IS NULL")
+            format!("{NOT_DELETED} AND c.status IN ('active','pending') AND c.assignee_local_id IS NULL")
         }
         "needs_first_response" => {
             format!("{NOT_DELETED} AND ({RESPONSE_STATE_SQL}) = 'needs_first_response'")
@@ -129,7 +131,7 @@ pub fn tile_fragment(
             AND (SELECT COUNT(*) FROM known_issue_links kic2
                  JOIN conversations c2 ON c2.id = kic2.conversation_id
                  WHERE kic2.known_issue_id = kic.known_issue_id
-                   AND c2.customer_id = c.customer_id
+                   AND c2.customer_local_id = c.customer_local_id
                    AND c2.deleted_at IS NULL) >= 2
         )"
             )
@@ -267,7 +269,7 @@ pub fn snapshot(conn: &Connection, mailbox_ids: Option<&[i64]>) -> Result<Operat
     let scope = sanitize_scope(mailbox_ids);
     let scope_sql = scope.as_ref().map(|ids| {
         format!(
-            "c.mailbox_id IN ({})",
+            "c.mailbox_local_id IN ({})",
             ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
         )
     });
@@ -626,10 +628,31 @@ mod tests {
         assignee_id: Option<i64>,
         priority: Option<&str>,
     ) {
+        // M047 conversations FKs: mailbox_local_id -> mailboxes(id),
+        // customer_local_id -> customers(id), assignee_local_id -> users(id)
+        // — seed the parents so the fixture keeps its concrete ids (Rust
+        // param names unchanged).
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (?1, ?1, 'Mailbox ' || ?1)",
+            params![mailbox_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id) VALUES (2001, 2001)",
+            [],
+        )
+        .unwrap();
+        if let Some(assignee) = assignee_id {
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, remote_id, first_name) VALUES (?1, ?1, 'Agent')",
+                params![assignee],
+            )
+            .unwrap();
+        }
         conn.execute(
             "INSERT INTO conversations
-                (remote_id, number, status, mailbox_id, customer_id, assignee_id, supportos_priority)
-             VALUES (?1, ?2, ?3, ?4, 2001, ?5, ?6)",
+                (remote_id, number, status, mailbox_local_id, customer_local_id, assignee_local_id, supportos_priority)
+             VALUES (?1, ?2, ?3, ?4, 2001, ?5, COALESCE(?6, 'none'))",
             params![remote_id, remote_id, status, mailbox_id, assignee_id, priority],
         )
         .unwrap();
@@ -663,8 +686,14 @@ mod tests {
         .unwrap();
         for (remote, mins) in [(5001, breached_mins_ago), (5002, at_risk_mins_ago)] {
             let at = minutes_ago_iso(mins);
+            // M047 conversations FK: customer_local_id -> customers(id).
             conn.execute(
-                "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, created_at, updated_at)
+                "INSERT OR IGNORE INTO customers (id, remote_id) VALUES (2001, 2001)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, created_at, updated_at)
                  VALUES (?1, ?1, 'active', 101, 2001, ?2, ?2)",
                 params![remote, at],
             )

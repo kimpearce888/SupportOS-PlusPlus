@@ -10,8 +10,8 @@
 //! `threads`→`conversation_threads` (`type`→`thread_type`,
 //! `body_text`→`body`, `created_by_user_id`→`from_type` + the 3-way
 //! `created_by_*` split — DB-04/M045),
-//! `conversations.customer_local_id`→`customer_id`,
-//! `conversations.mailbox_local_id`→`mailbox_id`.
+//! `conversations.customer_local_id`/`mailbox_local_id` keep the reference
+//! names after DB-03/M047.
 
 use rusqlite::{params, Connection};
 
@@ -44,7 +44,7 @@ pub fn build(
     include_internal: bool,
 ) -> Result<Option<EvidenceContext>> {
     let conv = match conn.query_row(
-        "SELECT number, subject, preview, customer_id
+        "SELECT number, subject, preview, customer_local_id
            FROM conversations WHERE id = ?1",
         params![conversation_local_id],
         |r| {
@@ -124,7 +124,7 @@ pub fn build(
                                    WHERE t2.conversation_id = cv.id AND t2.type='reply'
                                    ORDER BY COALESCE(t2.remote_created_at, t2.created_at) DESC LIMIT 1), '') AS last_reply
                    FROM conversations cv
-                  WHERE cv.customer_id = ?1 AND cv.id != ?2 AND cv.deleted_at IS NULL
+                  WHERE cv.customer_local_id = ?1 AND cv.id != ?2 AND cv.deleted_at IS NULL
                   ORDER BY COALESCE(cv.remote_created_at, cv.created_at) DESC LIMIT 5",
             )?;
             let rows: Vec<HistoryEntry> = stmt
@@ -281,7 +281,7 @@ pub fn find_similar(
     semantic_hits: &[(i64, f64)],
 ) -> Result<Vec<SimilarConversation>> {
     let me = match conn.query_row(
-        "SELECT c.id, c.number, c.subject, c.preview, c.status, c.customer_id,
+        "SELECT c.id, c.number, c.subject, c.preview, c.status, c.customer_local_id,
                 COALESCE(c.remote_created_at, c.created_at),
                 (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct JOIN tags t ON t.id = ct.tag_id
                   WHERE ct.conversation_id = c.id) AS tags
@@ -320,7 +320,7 @@ pub fn find_similar(
     );
     let fts_rows: Vec<CandidateRow> = if keywords != "\"\"" {
         let mut stmt = conn.prepare(
-        "SELECT c.id, c.number, c.subject, c.preview, c.status, c.customer_id,
+        "SELECT c.id, c.number, c.subject, c.preview, c.status, c.customer_local_id,
                 COALESCE(c.remote_created_at, c.created_at),
                 (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct JOIN tags t ON t.id = ct.tag_id
                   WHERE ct.conversation_id = c.id) AS tags, MIN(rank) AS rank
@@ -365,7 +365,7 @@ pub fn find_similar(
             }
             None => {
                 if let Ok(row) = conn.query_row(
-                    "SELECT c.id, c.number, c.subject, c.preview, c.status, c.customer_id,
+                    "SELECT c.id, c.number, c.subject, c.preview, c.status, c.customer_local_id,
                             COALESCE(c.remote_created_at, c.created_at),
                             (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct JOIN tags t ON t.id = ct.tag_id
                               WHERE ct.conversation_id = c.id) AS tags, 0 AS rank
@@ -643,7 +643,7 @@ mod tests {
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY, remote_id INTEGER UNIQUE, number INTEGER NOT NULL,
                 subject TEXT, preview TEXT, status TEXT NOT NULL DEFAULT 'active',
-                mailbox_id INTEGER NOT NULL, assignee_id INTEGER, customer_id INTEGER,
+                mailbox_local_id INTEGER NOT NULL, assignee_local_id INTEGER, customer_local_id INTEGER,
                 priority TEXT, created_at TEXT, updated_at TEXT, closed_at TEXT,
                 local_created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 remote_created_at TEXT, deleted_at TEXT
@@ -689,7 +689,7 @@ mod tests {
     fn build_assembles_the_reference_sections() {
         let conn = setup();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, remote_created_at)
+            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id, remote_created_at)
              VALUES (1, 1, 100, 'Export broken', 'Export fails at night', 1, 5, '2026-10-01 10:00:00')",
             [],
         )
@@ -720,7 +720,7 @@ mod tests {
         .unwrap();
         // History: an older conversation of the same customer with a reply.
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, remote_created_at)
+            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id, remote_created_at)
              VALUES (2, 2, 90, 'Old question', 'old', 1, 5, '2026-09-01 09:00:00')",
             [],
         )
@@ -770,7 +770,7 @@ mod tests {
     fn build_respects_knowledge_visibility() {
         let conn = setup();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id)
              VALUES (1, 1, 10, 'Export broken', 'How do I export data', 1)",
             [],
         )
@@ -824,20 +824,20 @@ mod tests {
         let conn = setup();
         // Me.
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, remote_created_at)
+            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id, remote_created_at)
              VALUES (1, 1, 1, 'export broken csv', 'csv export fails', 1, 7, '2026-10-01 09:00:00')",
             [],
         )
         .unwrap();
         // Candidate A: keyword + same customer + shared tag + recent.
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, remote_created_at)
+            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id, remote_created_at)
              VALUES (2, 2, 2, 'csv export issue', 'export csv fails', 1, 7, '2026-09-20 09:00:00')",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, remote_created_at)
+            "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id, remote_created_at)
              VALUES (3, 3, 3, 'billing question', 'invoice', 1, 8, '2026-09-25 09:00:00')",
             [],
         )
@@ -901,7 +901,7 @@ mod tests {
     fn sources_for_labels_provenance() {
         let conn = setup();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id)
              VALUES (2, 2, 90, 'Old question', 1)",
             [],
         )

@@ -44,11 +44,11 @@ async fn issues_refs_cases_parity() {
          INSERT INTO users (id, remote_id, first_name, last_name) VALUES (7, 70, 'Dana', 'Reyes');
          INSERT INTO customers (id, remote_id, first_name, email) VALUES (11, 110, 'Ada', 'ada@example.com');
          INSERT INTO customers (id, remote_id, first_name, email) VALUES (12, 120, 'Belle', 'belle@example.com');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id, created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id, created_at)
              VALUES (1, 101, 101, 'Export stuck at night', 'closed', 1, 11, 7, '2026-10-01 10:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (2, 102, 102, 'Bare question', 'active', 1, 12, '2026-10-02 10:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at, remote_created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, remote_created_at)
              VALUES (3, 103, 103, 'Timezone drift', 'active', 1, 12, '2026-10-03 10:00:00', '2026-10-03 09:00:00');
          INSERT INTO known_issues (id, name, status, description)
              VALUES (90, 'Legacy login bug', 'active', 'pre-IS-02 row');

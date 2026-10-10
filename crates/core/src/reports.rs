@@ -149,7 +149,7 @@ pub fn get_dashboard_metrics(
 ) -> Result<DashboardMetrics> {
     let days_back = days_back.max(1) as i64;
     let mailbox_clause = mailbox_id
-        .map(|mid| format!("AND mailbox_id = {mid}"))
+        .map(|mid| format!("AND mailbox_local_id = {mid}"))
         .unwrap_or_default();
 
     // Total conversations.
@@ -287,9 +287,9 @@ pub fn build_report(
             "strftime('%Y-%m', local_created_at)".to_string(),
             "month".to_string(),
         ),
-        ReportDimensionKey::Mailbox => ("mailbox_id".to_string(), "mailbox".to_string()),
+        ReportDimensionKey::Mailbox => ("mailbox_local_id".to_string(), "mailbox".to_string()),
         ReportDimensionKey::Status => ("status".to_string(), "status".to_string()),
-        ReportDimensionKey::Assignee => ("assignee_id".to_string(), "assignee".to_string()),
+        ReportDimensionKey::Assignee => ("assignee_local_id".to_string(), "assignee".to_string()),
         _ => ("'all'".to_string(), "all".to_string()), // fallback for dimensions not yet mapped
     };
 
@@ -353,8 +353,8 @@ pub fn build_report(
 fn metric_info(metric: ReportMetricKey) -> (&'static str, &'static str, &'static str) {
     match metric {
         ReportMetricKey::Conversations => ("COUNT(*)", "Total number of conversations.", "Does not include deleted conversations."),
-        ReportMetricKey::UniqueCustomers => ("COUNT(DISTINCT customer_id)", "Number of unique customers who contacted support.", "A customer with multiple conversations is counted once."),
-        ReportMetricKey::Organizations => ("COUNT(DISTINCT customer_id)", "Approximate organization count (proxy via distinct customers).", "True organization count requires the customers table's organization field; this is a proxy."),
+        ReportMetricKey::UniqueCustomers => ("COUNT(DISTINCT customer_local_id)", "Number of unique customers who contacted support.", "A customer with multiple conversations is counted once."),
+        ReportMetricKey::Organizations => ("COUNT(DISTINCT customer_local_id)", "Approximate organization count (proxy via distinct customers).", "True organization count requires the customers table's organization field; this is a proxy."),
         ReportMetricKey::FirstResponses => ("COUNT(CASE WHEN first_response_at IS NOT NULL THEN 1 END)", "Number of conversations that received a first response.", "Only counts conversations with a recorded first_response_at."),
         ReportMetricKey::AgentReplies => ("COUNT(*)", "Total conversations (proxy for agent reply count).", "True agent reply count requires message-level data; this is a proxy at conversation level."),
         ReportMetricKey::CustomerReplies => ("COUNT(*)", "Total conversations (proxy for customer reply count).", "True customer reply count requires message-level data."),
@@ -558,8 +558,9 @@ fn attribute_unknown_expr() -> &'static str {
 
 /// The metric spec table, mapped onto the port's schema:
 /// - reference `remote_created_at` → port `conversations.created_at`
-/// - `customer_local_id`/`mailbox_local_id`/`assignee_local_id` → `customer_id`/
-///   `mailbox_id`/`assignee_id`
+/// - post-M047 the conversations table carries the reference names
+///   `customer_local_id`/`mailbox_local_id`/`assignee_local_id` (the former
+///   port-side `customer_id`/`mailbox_id`/`assignee_id` renames are gone)
 /// - `threads` → `conversation_threads` (`type` → `thread_type`;
 ///   `deleted_at` + `state` filtered like the reference since the mirror
 ///   carries both columns)
@@ -584,7 +585,7 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
             anchor: MetricAnchor::Conversations,
             from: "conversations c",
             date_expr: "c.created_at",
-            value_expr: "COUNT(DISTINCT c.customer_id)",
+            value_expr: "COUNT(DISTINCT c.customer_local_id)",
             extra_where: NO_WHERE,
             requires_attribute: false,
             requires_state: false,
@@ -597,7 +598,7 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
             // Organizations live on customers, not conversations: resolve
             // through the conversation's customer so DISTINCT counts distinct
             // customer orgs (the port stores the org NAME on customers).
-            value_expr: "COUNT(DISTINCT (SELECT cu.organization FROM customers cu WHERE cu.id = c.customer_id))",
+            value_expr: "COUNT(DISTINCT (SELECT cu.organization FROM customers cu WHERE cu.id = c.customer_local_id))",
             extra_where: NO_WHERE,
             requires_attribute: false,
             requires_state: false,
@@ -692,7 +693,7 @@ fn metric_spec(metric: ReportMetricKey) -> MetricSpec {
             value_expr: "COUNT(*)",
             extra_where: &[
                 "c.first_response_at IS NOT NULL AND c.created_at IS NOT NULL",
-                "(julianday(c.first_response_at) - julianday(c.created_at)) * 1440 > (SELECT mbh.first_response_target_min FROM mailbox_business_hours mbh WHERE mbh.mailbox_local_id = c.mailbox_id AND mbh.first_response_target_min IS NOT NULL)",
+                "(julianday(c.first_response_at) - julianday(c.created_at)) * 1440 > (SELECT mbh.first_response_target_min FROM mailbox_business_hours mbh WHERE mbh.mailbox_local_id = c.mailbox_local_id AND mbh.first_response_target_min IS NOT NULL)",
             ],
             requires_attribute: false,
             requires_state: false,
@@ -831,8 +832,8 @@ fn dimension_spec(dimension: ReportDimensionKey) -> DimensionSpec {
             joins: NO_JOINS,
         },
         ReportDimensionKey::Mailbox => DimensionSpec {
-            expr: "COALESCE((SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_id), '(no mailbox)')",
-            group_by: "c.mailbox_id",
+            expr: "COALESCE((SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_local_id), '(no mailbox)')",
+            group_by: "c.mailbox_local_id",
             joins: NO_JOINS,
         },
         ReportDimensionKey::Channel => DimensionSpec {
@@ -852,8 +853,8 @@ fn dimension_spec(dimension: ReportDimensionKey) -> DimensionSpec {
             ],
         },
         ReportDimensionKey::Assignee => DimensionSpec {
-            expr: "COALESCE((SELECT (u.first_name || ' ' || u.last_name) FROM users u WHERE u.id = c.assignee_id), '(unassigned)')",
-            group_by: "c.assignee_id",
+            expr: "COALESCE((SELECT (u.first_name || ' ' || u.last_name) FROM users u WHERE u.id = c.assignee_local_id), '(unassigned)')",
+            group_by: "c.assignee_local_id",
             joins: NO_JOINS,
         },
         ReportDimensionKey::Team => DimensionSpec {
@@ -863,8 +864,8 @@ fn dimension_spec(dimension: ReportDimensionKey) -> DimensionSpec {
             // membership the sync populates) — the same resolution MAIN's
             // report builder uses for its `team` dimension
             // (reportBuilder.ts:184-187).
-            expr: "COALESCE((SELECT tm2.name FROM team_members tm JOIN teams tm2 ON tm2.id = tm.team_id WHERE tm.user_id = c.assignee_id LIMIT 1), '(no team)')",
-            group_by: "COALESCE((SELECT tm.team_id FROM team_members tm WHERE tm.user_id = c.assignee_id LIMIT 1), -1)",
+            expr: "COALESCE((SELECT tm2.name FROM team_members tm JOIN teams tm2 ON tm2.id = tm.team_id WHERE tm.user_id = c.assignee_local_id LIMIT 1), '(no team)')",
+            group_by: "COALESCE((SELECT tm.team_id FROM team_members tm WHERE tm.user_id = c.assignee_local_id LIMIT 1), -1)",
             joins: NO_JOINS,
         },
         ReportDimensionKey::Status => DimensionSpec {
@@ -935,7 +936,7 @@ fn apply_conversation_filters(
         let ids: Vec<i64> = ids.iter().copied().filter(|n| *n > 0).collect();
         if !ids.is_empty() {
             let marks: Vec<&str> = ids.iter().map(|_| "?").collect();
-            where_sql.push(format!("c.mailbox_id IN ({})", marks.join(",")));
+            where_sql.push(format!("c.mailbox_local_id IN ({})", marks.join(",")));
             params.extend(ids.iter().copied().map(SqlParam::Integer));
         }
     }
@@ -982,7 +983,7 @@ fn apply_conversation_filters(
         let ids: Vec<i64> = ids.to_vec();
         if !ids.is_empty() {
             let marks: Vec<&str> = ids.iter().map(|_| "?").collect();
-            where_sql.push(format!("c.assignee_id IN ({})", marks.join(",")));
+            where_sql.push(format!("c.assignee_local_id IN ({})", marks.join(",")));
             params.extend(ids.iter().copied().map(SqlParam::Integer));
         }
     }
@@ -2369,10 +2370,22 @@ mod tests {
         apply_m020_to_m022(&conn).unwrap();
         crate::outreach::apply_m023_to_m025(&conn).unwrap();
         crate::inbox::apply_m028(&conn).unwrap();
+        crate::sync_schema::apply_m029(&conn).unwrap();
         crate::conversation_ops::apply_m030(&conn).unwrap();
         crate::outreach::apply_m031(&conn).unwrap();
         crate::ticket_states::apply_m032(&conn).unwrap();
         apply_m034(&conn).unwrap();
+        crate::intelligence_features::apply_m035(&conn).unwrap();
+        crate::customer_events::apply_m036(&conn).unwrap();
+        crate::mirror_tables::apply_m039(&conn).unwrap();
+        // DB-03 (M047): conversations carries the reference column names
+        // (mailbox_local_id / customer_local_id / assignee_local_id) with real
+        // FKs. M029 + M040 first supply the reference tables/columns this
+        // slim chain never added (organizations/saved_replies/docs; then
+        // state/type/thread_count/... on conversations), exactly like the
+        // boot chain order (m029 -> ... -> m040 -> ... -> m047).
+        crate::db_breadth::apply_m040(&conn).unwrap();
+        crate::mirror_parity::apply_m047(&conn).unwrap();
         conn
     }
 
@@ -2383,8 +2396,21 @@ mod tests {
         mailbox_id: i64,
         customer_id: i64,
     ) {
+        // M047 conversations FKs: mailbox_local_id -> mailboxes(id),
+        // customer_local_id -> customers(id) — seed the parents so the
+        // fixture keeps its concrete ids (Rust param names unchanged).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (?1, ?1, 'Mailbox ' || ?1)",
+            params![mailbox_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (?1, ?1, 'Customer ' || ?1)",
+            params![customer_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (?1, ?1, ?2, ?3, ?4)",
             params![remote_id, status, mailbox_id, customer_id],
         )
@@ -2688,8 +2714,20 @@ mod tests {
         // Human edges now address mirror rows by (kind, local id), so the
         // neighbor reader needs real mirror rows, not graph_nodes surrogates
         // (GR-02: the surrogate edge model is gone).
+        // M047 conversations FKs: mailbox_local_id -> mailboxes(id),
+        // customer_local_id -> customers(id).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 1, 'Cust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id)
              VALUES (1001, 1001, 'Bug', 'active', 1, 1)",
             [],
         )

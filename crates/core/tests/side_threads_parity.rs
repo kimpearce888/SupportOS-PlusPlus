@@ -49,7 +49,9 @@ async fn side_threads_list_and_detail_match_the_reference_contract() {
              (1, 501, 'Ada',  'Lovelace', 'ada',    'ada@example.com'),
              (2, 502, 'Grace', 'Hopper',  'grace', 'grace@example.com');
          INSERT INTO teams (id, remote_id, name) VALUES (7, 71, 'Support');
-         INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+         INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 201, 'Ada');
+         INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id, status)
              VALUES (9, 100001, 4242, 'Refund question', 1, 1, 'active');
          INSERT INTO side_threads (conversation_id, created_by_user_id, title, team_local_id, status, updated_at)
              VALUES (9, 1, 'Refund question', 7, 'open', '2026-10-05 10:00:00');
@@ -338,7 +340,9 @@ async fn side_thread_create_matches_the_reference_contract() {
              (1, 501, 'Ada',  'Lovelace', 'ada',   'ada@example.com'),
              (2, 502, 'Grace', 'Hopper',  'grace', 'grace@example.com');
          INSERT INTO teams (id, remote_id, name) VALUES (7, 71, 'Support');
-         INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+         INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 201, 'Ada');
+         INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id, status)
              VALUES (9, 100001, 4242, 'Refund question', 1, 1, 'active');",
     )
     .expect("seed fixtures");
@@ -579,7 +583,9 @@ async fn side_thread_participants_add_matches_the_reference_contract() {
         "INSERT INTO users (id, remote_id, first_name, last_name, mention, email) VALUES
              (1, 501, 'Ada',  'Lovelace', 'ada',   'ada@example.com'),
              (2, 502, 'Grace', 'Hopper',  'grace', 'grace@example.com');
-         INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+         INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 201, 'Ada');
+         INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id, status)
              VALUES (9, 100001, 4242, 'Refund question', 1, 1, 'active');
          INSERT INTO side_threads (id, conversation_id, title, created_by_user_id)
              VALUES (30, 9, 'Refund question', 1);

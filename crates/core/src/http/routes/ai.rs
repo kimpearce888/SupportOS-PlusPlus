@@ -962,10 +962,18 @@ async fn run_one_golden_test(
             |r| r.get::<_, i64>(0),
         )?);
         conn.execute(
+            // DB-03: M047 renamed mailbox_id/customer_id and added real FKs
+            // (foreign_keys=ON). The synthetic row is temporary and cleaned
+            // up, so the ids resolve to NULL when the mirror lacks id 1 /
+            // 3001 — the same NO ACTION semantics M047's converging copy
+            // applies to reference rows pointing at missing mirror rows.
             "INSERT INTO conversations
-                (remote_id, number, subject, status, mailbox_id, customer_id,
+                (remote_id, number, subject, status, mailbox_local_id, customer_local_id,
                  priority, created_at, updated_at)
-             VALUES (?1, ?1, ?2, 'active', 1, 3001, 'normal', ?3, ?3)",
+             VALUES (?1, ?1, ?2, 'active',
+                     (SELECT id FROM mailboxes WHERE id = 1),
+                     (SELECT id FROM customers WHERE id = 3001),
+                     'normal', ?3, ?3)",
             rusqlite::params![remote_id, subject, now],
         )?;
         let conv_id = conn.last_insert_rowid();
@@ -1048,6 +1056,18 @@ mod tests {
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
         crate::bootstrap::apply_all(&mut conn).unwrap();
+        // DB-03: M047 gives conversations real FKs (foreign_keys=ON); the
+        // fixtures below insert concrete mailbox 1 / customer 3001 rows.
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (3001, 3001, 'Eve')",
+            [],
+        )
+        .unwrap();
         AppState {
             conn: Arc::new(Mutex::new(conn)),
             data_dir: std::path::PathBuf::from("/tmp"),
@@ -1080,7 +1100,7 @@ mod tests {
     fn seed_conversation(state: &AppState, remote_id: i64) -> i64 {
         let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, created_at)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (?1, ?1, 'active', 1, 3001, '2026-10-01T00:00:00Z')",
             rusqlite::params![remote_id],
         )
@@ -1154,7 +1174,7 @@ mod tests {
                         .unwrap();
                     let wrote = conn
                         .execute(
-                            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, created_at)
+                            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, created_at)
                              VALUES (987_655, 987_655, 'active', 1, 3001, '2026-10-01T00:00:00Z')",
                             [],
                         )
@@ -1194,7 +1214,7 @@ mod tests {
         let conv = {
             let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
             conn.execute(
-                "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, created_at)
+                "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, created_at)
                  VALUES (9001, 9001, 'active', 1, 3001, '2026-10-01T00:00:00Z')",
                 [],
             )

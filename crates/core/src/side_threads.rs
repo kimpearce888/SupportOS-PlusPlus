@@ -1268,7 +1268,9 @@ mod tests {
         // key their side threads on, and the creator user ids they stamp,
         // must exist.
         conn.execute_batch(
-            "INSERT INTO conversations (id, remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO mailboxes (id, remote_id, name) VALUES (201, 201, 'Main');
+             INSERT INTO customers (id, remote_id) VALUES (3001, 3001);
+             INSERT INTO conversations (id, remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (1, 900001, 1, 'active', 201, 3001),
                     (1001, 901001, 1001, 'active', 201, 3001),
                     (1002, 901002, 1002, 'active', 201, 3001);
@@ -1300,8 +1302,13 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (201, 201, 'Main');
+             INSERT OR IGNORE INTO customers (id, remote_id) VALUES (3001, 3001);",
+        )
+        .unwrap();
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (105000, 105000, 5001, 'active', 201, 3001)",
             [],
         )

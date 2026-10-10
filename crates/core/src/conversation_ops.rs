@@ -266,14 +266,15 @@ pub fn set_outbound_status(conn: &Connection, id: i64, status: &str, error: Opti
 pub struct ConvRef {
     pub id: i64,
     pub remote_id: i64,
-    pub mailbox_id: i64,
+    /// M047: nullable reference column.
+    pub mailbox_id: Option<i64>,
 }
 
 /// `getConversationByLocalId` — the reference ops work on the LOCAL id and
 /// require a remote mapping.
 pub fn conv_by_local_id(conn: &Connection, id: i64) -> Option<ConvRef> {
     conn.query_row(
-        "SELECT id, remote_id, mailbox_id FROM conversations WHERE id = ?1",
+        "SELECT id, remote_id, mailbox_local_id FROM conversations WHERE id = ?1",
         params![id],
         |r| {
             Ok(ConvRef {
@@ -339,7 +340,7 @@ pub fn op_move_to_inbox(
         .ok();
     let before_mailbox = conv.mailbox_id;
     let updated = conn.execute(
-        "UPDATE conversations SET mailbox_id =
+        "UPDATE conversations SET mailbox_local_id =
              (SELECT id FROM mailboxes WHERE remote_id = ?1),
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
            WHERE id = ?2",
@@ -971,7 +972,7 @@ pub fn op_run_workflow(
     if let Some(name) = wf_name.as_deref() {
         if name.contains("Tier 1") {
             let _ = conn.execute(
-                "UPDATE conversations SET assignee_id =
+                "UPDATE conversations SET assignee_local_id =
                      (SELECT id FROM users WHERE remote_id = 1001)
                    WHERE id = ?1",
                 params![conv.id],
@@ -1274,7 +1275,7 @@ pub struct ConvFull {
 /// remote mapping (operations.ts conv checks).
 pub fn conv_full_by_local_id(conn: &Connection, id: i64) -> Option<ConvFull> {
     conn.query_row(
-        "SELECT id, remote_id, status, subject, closed_at, assignee_id,
+        "SELECT id, remote_id, status, subject, closed_at, assignee_local_id,
                 merged_into_conversation_id
            FROM conversations WHERE id = ?1",
         params![id],
@@ -1919,7 +1920,7 @@ pub async fn op_assign(
             };
             let resolved = local_user.or(local_team).or(user_id);
             let _ = conn.execute(
-                "UPDATE conversations SET assignee_id = ?1,
+                "UPDATE conversations SET assignee_local_id = ?1,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                    WHERE id = ?2",
                 params![resolved, conv.id],
@@ -2107,7 +2108,7 @@ mod tests {
                 id INTEGER PRIMARY KEY, remote_id INTEGER NOT NULL UNIQUE,
                 number INTEGER, subject TEXT, preview TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
-                mailbox_id INTEGER NOT NULL, assignee_id INTEGER, customer_id INTEGER NOT NULL,
+                mailbox_local_id INTEGER NOT NULL, assignee_local_id INTEGER, customer_local_id INTEGER NOT NULL,
                 priority TEXT, created_at TEXT, updated_at TEXT, closed_at TEXT,
                 local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
              CREATE TABLE mailboxes (id INTEGER PRIMARY KEY, remote_id INTEGER, name TEXT);
@@ -2157,8 +2158,10 @@ mod tests {
     }
 
     fn seed(conn: &Connection) -> i64 {
+        // (Hermetic fixture: the conversations DDL above declares no FK
+        // clauses, so the concrete mailbox/customer ids need no parents.)
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, mailbox_local_id, customer_local_id)
              VALUES (9001, 101, 1, 1)",
             [],
         )
@@ -2197,7 +2200,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let mailbox: i64 = conn
             .query_row(
-                "SELECT mailbox_id FROM conversations WHERE id = ?1",
+                "SELECT mailbox_local_id FROM conversations WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )
@@ -2298,7 +2301,7 @@ mod tests {
         let thread = conn.last_insert_rowid();
         // other conversation's thread
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, mailbox_local_id, customer_local_id)
              VALUES (9002, 102, 1, 1)",
             [],
         )

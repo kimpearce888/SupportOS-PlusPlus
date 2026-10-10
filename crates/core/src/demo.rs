@@ -216,7 +216,7 @@ struct ConvRow {
 
 fn conversations_snapshot(conn: &Connection) -> Vec<ConvRow> {
     let mut stmt = match conn.prepare(
-        "SELECT id, number, subject, customer_id FROM conversations WHERE deleted_at IS NULL",
+        "SELECT id, number, subject, customer_local_id FROM conversations WHERE deleted_at IS NULL",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return Vec::new(),
@@ -596,7 +596,7 @@ fn seed_interaction_outcomes(conn: &Connection) -> usize {
     let mut written = 0;
     for local in ids {
         let Ok((remote_id, status, customer_local)) = conn.query_row(
-            "SELECT remote_id, status, customer_id FROM conversations WHERE id = ?1",
+            "SELECT remote_id, status, customer_local_id FROM conversations WHERE id = ?1",
             rusqlite::params![local],
             |r| {
                 Ok((
@@ -1618,9 +1618,9 @@ pub fn seed_demo_data(conn: &Connection, demo_mode: bool) -> bool {
     }
     let top_customer: Option<i64> = conn
         .query_row(
-            "SELECT c.customer_id AS cid, COUNT(*) AS n FROM conversations c
-              WHERE c.customer_id IS NOT NULL AND c.deleted_at IS NULL
-              GROUP BY c.customer_id ORDER BY n DESC LIMIT 1",
+            "SELECT c.customer_local_id AS cid, COUNT(*) AS n FROM conversations c
+              WHERE c.customer_local_id IS NOT NULL AND c.deleted_at IS NULL
+              GROUP BY c.customer_local_id ORDER BY n DESC LIMIT 1",
             [],
             |r| r.get(0),
         )

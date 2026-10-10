@@ -1753,7 +1753,7 @@ mod tests {
                 id INTEGER PRIMARY KEY, remote_id INTEGER NOT NULL UNIQUE,
                 number INTEGER, subject TEXT, preview TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
-                mailbox_id INTEGER NOT NULL, assignee_id INTEGER, customer_id INTEGER NOT NULL,
+                mailbox_local_id INTEGER NOT NULL, assignee_local_id INTEGER, customer_local_id INTEGER NOT NULL,
                 priority TEXT, created_at TEXT, updated_at TEXT, closed_at TEXT,
                 local_created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
              CREATE TABLE conversation_threads (
@@ -1796,7 +1796,7 @@ mod tests {
              CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY, remote_id INTEGER NOT NULL UNIQUE,
                 number INTEGER, subject TEXT, status TEXT NOT NULL DEFAULT 'active',
-                mailbox_id INTEGER NOT NULL, customer_id INTEGER NOT NULL);
+                mailbox_local_id INTEGER NOT NULL, customer_local_id INTEGER NOT NULL);
              CREATE TABLE ai_attributes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id INTEGER NOT NULL,
@@ -1820,7 +1820,7 @@ mod tests {
 
     fn insert_conversation(conn: &Connection, id: i64, number: i64, subject: &str) {
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id)
+            "INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id)
              VALUES (?1, ?1, ?2, ?3, 1, 1)",
             params![id, number, subject],
         )

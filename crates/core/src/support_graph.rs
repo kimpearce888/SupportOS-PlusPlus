@@ -526,8 +526,8 @@ struct DerivedEdge {
 /// the human-asserted provenance tables). Branch map by relation:
 ///
 /// * belongs_to           customer -> organization         (customers.organization_id)
-/// * involves             conversation -> customer         (conversations.customer_id)
-/// * assigned_to          conversation -> agent           (conversations.assignee_id)
+/// * involves             conversation -> customer         (conversations.customer_local_id)
+/// * assigned_to          conversation -> agent           (conversations.assignee_local_id)
 /// * owns                 incident -> agent                (incidents.owner_user_local_id)
 /// * linked_to_issue      conversation -> known_issue      (known_issue_links, per-row ai/human)
 /// * clustered_into       conversation -> issue_cluster    (issue_cluster_conversations)
@@ -613,7 +613,7 @@ fn derived_edges_touching(
             }
             // involves in: the customer's conversations.
             for conv in many_i64(
-                "SELECT id FROM conversations WHERE customer_id = ?1 AND deleted_at IS NULL
+                "SELECT id FROM conversations WHERE customer_local_id = ?1 AND deleted_at IS NULL
                  LIMIT ?2",
                 &[&local_id, &BRANCH_CAP],
             ) {
@@ -659,8 +659,8 @@ fn derived_edges_touching(
         GraphNodeKind::Conversation => {
             // involves out: the conversation's customer.
             if let Some(cust) = one_i64(
-                "SELECT customer_id FROM conversations
-                 WHERE id = ?1 AND deleted_at IS NULL AND customer_id IS NOT NULL",
+                "SELECT customer_local_id FROM conversations
+                 WHERE id = ?1 AND deleted_at IS NULL AND customer_local_id IS NOT NULL",
                 &[&local_id],
             ) {
                 push(mirror(
@@ -673,8 +673,8 @@ fn derived_edges_touching(
             }
             // assigned_to out: the conversation's assignee.
             if let Some(agent) = one_i64(
-                "SELECT assignee_id FROM conversations
-                 WHERE id = ?1 AND deleted_at IS NULL AND assignee_id IS NOT NULL",
+                "SELECT assignee_local_id FROM conversations
+                 WHERE id = ?1 AND deleted_at IS NULL AND assignee_local_id IS NOT NULL",
                 &[&local_id],
             ) {
                 push(mirror(
@@ -1112,7 +1112,7 @@ fn derived_edges_touching(
             }
             // assigned_to in: the agent's conversations.
             for conv in many_i64(
-                "SELECT id FROM conversations WHERE assignee_id = ?1 AND deleted_at IS NULL LIMIT ?2",
+                "SELECT id FROM conversations WHERE assignee_local_id = ?1 AND deleted_at IS NULL LIMIT ?2",
                 &[&local_id, &BRANCH_CAP],
             ) {
                 push(mirror(
@@ -1559,8 +1559,8 @@ fn kind_label(kind: GraphNodeKind) -> &'static str {
 /// known_issue_conversations→known_issue_links,
 /// issue_cluster_conversations→issue_cluster_conversations,
 /// knowledge_candidates→knowledge_gap_candidates,
-/// support_graph_edges→graph_edges, customer_local_id→customer_id,
-/// assignee_local_id→assignee_id (DB-04).
+/// support_graph_edges→graph_edges, customer_local_id and
+/// assignee_local_id keep the reference names (DB-03/M047).
 pub fn graph_stats(conn: &Connection) -> Result<Value> {
     let count = |sql: &str| -> i64 {
         conn.query_row(&format!("SELECT COUNT(*) AS n FROM ({sql})"), [], |r| {
@@ -1606,8 +1606,8 @@ pub fn graph_stats(conn: &Connection) -> Result<Value> {
         .collect();
     let edge_specs: [(&str, &str, &str); 18] = [
         ("belongs_to", "helpscout_mirror", "SELECT 1 FROM customers cu JOIN organizations o ON o.id = cu.organization_id"),
-        ("involves", "helpscout_mirror", "SELECT 1 FROM conversations c WHERE c.customer_id IS NOT NULL AND c.deleted_at IS NULL"),
-        ("assigned_to", "helpscout_mirror", "SELECT 1 FROM conversations c WHERE c.assignee_id IS NOT NULL AND c.deleted_at IS NULL"),
+        ("involves", "helpscout_mirror", "SELECT 1 FROM conversations c WHERE c.customer_local_id IS NOT NULL AND c.deleted_at IS NULL"),
+        ("assigned_to", "helpscout_mirror", "SELECT 1 FROM conversations c WHERE c.assignee_local_id IS NOT NULL AND c.deleted_at IS NULL"),
         ("owns", "helpscout_mirror", "SELECT 1 FROM incidents i WHERE i.owner_user_local_id IS NOT NULL"),
         ("linked_to_issue", "ai_derived", "SELECT 1 FROM known_issue_links"),
         ("clustered_into", "deterministic_local", "SELECT 1 FROM issue_cluster_conversations"),
@@ -2178,7 +2178,7 @@ mod tests {
              INSERT INTO customers (id, remote_id, first_name, last_name, organization) VALUES (9, 99, 'Ada', 'Lovelace', 'Acme');
              UPDATE customers SET organization_id = 5 WHERE id = 9;
              INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
-             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id)
+             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id)
                  VALUES (3, 33, 33, 'Refund please', 'active', 1, 9);
              INSERT INTO known_issues (id, name, status) VALUES (7, 'Login bug', 'resolved');
              UPDATE known_issues SET title = 'Login bug (titled)' WHERE id = 7;
@@ -2297,7 +2297,7 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO customers (id, remote_id, first_name, last_name) VALUES (9, 99, 'Ada', 'Lovelace');
              INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
-             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id)
+             INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id)
                  VALUES (3, 33, 33, 'Refund please', 'active', 1, 9);",
         )
         .unwrap();

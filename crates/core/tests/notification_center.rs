@@ -33,7 +33,8 @@ async fn notification_center_contracts() {
     conn.execute_batch(
         "INSERT INTO users (id, remote_id, first_name, last_name, email) VALUES (7, 70, 'Dana', 'Reyes', 'dana@example.com');
          INSERT INTO customers (id, remote_id, first_name, last_name) VALUES (11, 110, 'Ada', 'Lovelace');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id)
+         INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id)
              VALUES (1, 101, 101, 'Export stuck', 'active', 1, 11, 7);
          INSERT INTO notifications (id, type, severity, title, body, target_user_id,
                                     conversation_id, conversation_number, created_at, read_at, dedup_key)

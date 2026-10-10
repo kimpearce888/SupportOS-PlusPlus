@@ -77,7 +77,7 @@ pub fn count_conversations_with_state_in_mailbox(
 ) -> Result<u32> {
     let sql = match mailbox_id {
         Some(mid) => format!(
-            "SELECT COUNT(*) FROM conversations WHERE response_state = '{}' AND mailbox_id = {}",
+            "SELECT COUNT(*) FROM conversations WHERE response_state = '{}' AND mailbox_local_id = {}",
             state.as_str(),
             mid
         ),
@@ -108,12 +108,29 @@ mod tests {
         crate::db::ensure_migrations_table(&conn).unwrap();
         crate::migrations::run_all(&mut conn).unwrap();
         apply_m003(&conn).unwrap();
+        // DB-03 (M047): the reference column names on conversations. The
+        // slim chain can't run m047's converging copy (it expects the full
+        // pre-M047 shape), so the fixture reproduces the renamed result
+        // directly — plain renames, no FK clauses (the slim chain never
+        // declared them; SQLite rewrites the m001 index defs itself).
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id",
+            [],
+        );
         conn
     }
 
     fn insert_conversation(conn: &Connection, remote_id: i64, status: &str, mailbox_id: i64) {
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (?1, ?2, ?3, ?4, 2001)",
             params![remote_id, remote_id, status, mailbox_id],
         )

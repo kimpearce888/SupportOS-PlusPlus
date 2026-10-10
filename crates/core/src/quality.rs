@@ -15,8 +15,9 @@
 //! - `threads` → `conversation_threads` (`type`→`thread_type`,
 //!   `body_text`→`body`; `body_html` preferred exactly like the reference's
 //!   `t.body_html ?? t.body_text`)
-//! - `customer_local_id` → `customer_id` on conversations (the
-//!   friction_findings CUSTOMER column keeps the reference name)
+//! - since M047 the conversations table carries the reference
+//!   `customer_local_id` directly (the former port-side `customer_id` rename
+//!   is gone; the friction_findings CUSTOMER column keeps the reference name)
 //! - `knowledge_candidates` → `knowledge_gap_candidates`
 //!   (`question`→`query_text`; the undecided status 'candidate' → the port's
 //!   documented 'open' vocabulary)
@@ -1063,7 +1064,7 @@ fn direct_complaint_re() -> &'static regex::Regex {
 pub fn analyze_friction(conn: &Connection, conversation_id: i64) -> Vec<Value> {
     let conv: Option<(i64, Option<i64>)> = conn
         .query_row(
-            "SELECT number, customer_id FROM conversations
+            "SELECT number, customer_local_id FROM conversations
              WHERE id = ?1 AND deleted_at IS NULL",
             params![conversation_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1265,7 +1266,7 @@ pub fn analyze_friction(conn: &Connection, conversation_id: i64) -> Vec<Value> {
                 "SELECT c2.id, c2.number, c2.subject, c2.status,
                         COALESCE(c2.remote_created_at, c2.created_at)
                  FROM conversations c2
-                 WHERE c2.customer_id = ?1 AND c2.deleted_at IS NULL AND c2.id <> ?2
+                 WHERE c2.customer_local_id = ?1 AND c2.deleted_at IS NULL AND c2.id <> ?2
                    AND COALESCE(c2.remote_created_at, c2.created_at) >= datetime('now', '-90 days')
                    AND EXISTS (SELECT 1 FROM conversation_tags ct1
                                JOIN conversation_tags ct2 ON ct2.conversation_id = c2.id
@@ -2536,6 +2537,13 @@ mod tests {
             [],
         )
         .unwrap();
+        // M047 conversations FK: mailbox_local_id -> mailboxes(id) — the
+        // fixtures stamp mailbox 1.
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
         conn
     }
 
@@ -2548,8 +2556,8 @@ mod tests {
         closed: bool,
     ) -> i64 {
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id,
-                                        customer_id, created_at, closed_at, remote_created_at)
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id,
+                                        customer_local_id, created_at, closed_at, remote_created_at)
              VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?6)",
             params![
                 remote,
@@ -3029,8 +3037,9 @@ mod tests {
 
     #[test]
     fn ensure_quality_tables_upgrades_and_is_idempotent() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        crate::bootstrap::apply_all(&mut conn).unwrap();
+        // fresh_db: booted + seeded parents (the M047 conversations FKs
+        // need mailboxes/customers rows for insert_conversation below).
+        let conn = fresh_db();
         // Simulate an older friction_findings shape (no detail column, no
         // unique index) like the pre-quality ai_tools creator.
         conn.execute_batch(

@@ -759,7 +759,7 @@ fn compose_memory_profile(conn: &rusqlite::Connection, customer_id: i64) -> Comp
              FROM known_issues ki
              JOIN known_issue_links kil ON kil.known_issue_id = ki.id
              JOIN conversations cv ON cv.id = kil.conversation_id
-             WHERE cv.customer_id = ?1
+             WHERE cv.customer_local_id = ?1
              GROUP BY ki.id
              ORDER BY ki.updated_at DESC",
         )
@@ -792,7 +792,7 @@ fn compose_memory_profile(conn: &rusqlite::Connection, customer_id: i64) -> Comp
              FROM issue_clusters ic
              JOIN issue_cluster_conversations icm ON icm.cluster_id = ic.id
              JOIN conversations cv ON cv.id = icm.conversation_id
-             WHERE cv.customer_id = ?1
+             WHERE cv.customer_local_id = ?1
              GROUP BY ic.id
              ORDER BY ic.last_seen_at DESC",
         )
@@ -834,7 +834,7 @@ fn compose_memory_profile(conn: &rusqlite::Connection, customer_id: i64) -> Comp
             "SELECT cv.id, cv.number, cv.subject, cv.status, r.rating, r.comments
              FROM conversations cv
              LEFT JOIN ratings r ON r.conversation_id = cv.id
-             WHERE cv.customer_id = ?1 AND cv.deleted_at IS NULL AND cv.status = 'closed'
+             WHERE cv.customer_local_id = ?1 AND cv.deleted_at IS NULL AND cv.status = 'closed'
              ORDER BY COALESCE(cv.updated_at, cv.created_at) DESC LIMIT 25",
         )
         .ok()
@@ -990,7 +990,7 @@ fn compose_memory_profile(conn: &rusqlite::Connection, customer_id: i64) -> Comp
     // ── Notes + freshness summary ──────────────────────────────────────
     let conversation_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM conversations WHERE customer_id = ?1 AND deleted_at IS NULL",
+            "SELECT COUNT(*) FROM conversations WHERE customer_local_id = ?1 AND deleted_at IS NULL",
             rusqlite::params![customer_id],
             |r| r.get(0),
         )

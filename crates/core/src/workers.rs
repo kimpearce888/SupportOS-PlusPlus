@@ -1064,7 +1064,7 @@ impl WorkerManager {
         let conn = self.lock();
         let row: Option<(i64, i64, Option<i64>, Option<String>)> = conn
             .query_row(
-                "SELECT id, number, mailbox_id, subject FROM conversations WHERE remote_id = ?1",
+                "SELECT id, number, mailbox_local_id, subject FROM conversations WHERE remote_id = ?1",
                 rusqlite::params![remote_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -1584,14 +1584,14 @@ impl WorkerManager {
                     if action == "assign" {
                         if let Some(local) = assignee_local {
                             tx.execute(
-                                "UPDATE conversations SET assignee_id = ?1 WHERE id = ?2",
+                                "UPDATE conversations SET assignee_local_id = ?1 WHERE id = ?2",
                                 rusqlite::params![local, conv_id],
                             )?;
                         }
                     }
                     if action == "unassign" {
                         tx.execute(
-                            "UPDATE conversations SET assignee_id = NULL WHERE id = ?1",
+                            "UPDATE conversations SET assignee_local_id = NULL WHERE id = ?1",
                             rusqlite::params![conv_id],
                         )?;
                     }
@@ -1925,7 +1925,8 @@ mod tests {
              VALUES (1, 9001, 'Ada', 'ada@example.com');
              INSERT INTO users (id, remote_id, first_name, email)
              VALUES (1, 7001, 'Bob', 'bob@example.com');
-             INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, status)
+             INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id, status)
              VALUES (9, 105011, 5012, 'Refund question', 'I want a refund', 1, 1, 'active'),
                     (10, 105012, 5013, 'Bug report', 'It crashed', 1, 1, 'active');
              INSERT INTO conversation_threads (conversation_id, type, body_text, from_type,
@@ -2057,7 +2058,8 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO customers (id, remote_id, first_name, email)
              VALUES (1, 9001, 'Ada', 'ada@example.com');
-             INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+             INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id, status)
              VALUES (11, 105021, 5011, 'A', 1, 1, 'active'),
                     (12, 105022, 5012, 'B', 1, 1, 'active'),
                     (13, 105023, 5013, 'C', 1, 1, 'active');
@@ -2135,7 +2137,8 @@ mod tests {
             let remote = 100000 + i;
             let number = 6000 + i;
             seed.push_str(&format!(
-                "INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+                "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id, status)
                  VALUES ({i}, {remote}, {number}, 'S{i}', 1, 1, 'active');"
             ));
         }
@@ -2177,7 +2180,8 @@ mod tests {
         conn2.execute_batch(
             "INSERT INTO customers (id, remote_id, first_name, email)
              VALUES (1, 9001, 'Ada', 'ada@example.com');
-             INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+             INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id, status)
              VALUES (21, 105121, 5021, 'A', 1, 1, 'active');",
         )
         .unwrap();
@@ -2219,7 +2223,8 @@ mod tests {
         conn3.execute_batch(
             "INSERT INTO customers (id, remote_id, first_name, email)
              VALUES (1, 9001, 'Ada', 'ada@example.com');
-             INSERT INTO conversations (id, remote_id, number, subject, mailbox_id, customer_id, status)
+             INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Main');
+             INSERT INTO conversations (id, remote_id, number, subject, mailbox_local_id, customer_local_id, status)
              VALUES (31, 105131, 5031, 'A', 1, 1, 'active');",
         )
         .unwrap();
@@ -2476,7 +2481,7 @@ mod tests {
         assert_eq!(
             col(
                 &shared,
-                "SELECT CAST(assignee_id AS TEXT) FROM conversations WHERE id = ?1",
+                "SELECT CAST(assignee_local_id AS TEXT) FROM conversations WHERE id = ?1",
                 conv
             )
             .as_deref(),
@@ -2497,7 +2502,7 @@ mod tests {
         assert!(
             col(
                 &shared,
-                "SELECT CAST(assignee_id AS TEXT) FROM conversations WHERE id = ?1",
+                "SELECT CAST(assignee_local_id AS TEXT) FROM conversations WHERE id = ?1",
                 conv
             )
             .is_none(),

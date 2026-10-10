@@ -424,9 +424,15 @@ mod tests {
             })
             .unwrap();
         let thread_remote = 5001;
+        // DB-03: M047 FKs (foreign_keys=ON) — mailbox 1 must exist.
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id,
-                                        customer_id, created_at, closed_at, remote_created_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 201, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id,
+                                        customer_local_id, created_at, closed_at, remote_created_at)
              VALUES (?1, 5001, 'Ayuda', 'closed', 1, ?2, datetime('now'), datetime('now'), datetime('now'))",
             rusqlite::params![thread_remote, customer],
         )

@@ -2923,7 +2923,7 @@ mod tests {
         let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
         let assigned: Option<i64> = conn
             .query_row(
-                "SELECT assignee_id FROM conversations WHERE id = ?1",
+                "SELECT assignee_local_id FROM conversations WHERE id = ?1",
                 rusqlite::params![id],
                 |r| r.get(0),
             )
@@ -2945,7 +2945,7 @@ mod tests {
         let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
         let assigned: Option<i64> = conn
             .query_row(
-                "SELECT assignee_id FROM conversations WHERE id = ?1",
+                "SELECT assignee_local_id FROM conversations WHERE id = ?1",
                 rusqlite::params![id],
                 |r| r.get(0),
             )

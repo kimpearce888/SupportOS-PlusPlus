@@ -144,11 +144,12 @@ pub fn upsert_tag(conn: &Connection, t: &HsTag) -> Result<()> {
 ///
 /// Reference `conversationRepo.upsertConversation` maps every remote id to
 /// its LOCAL mirror id before writing (`localIds.mailbox/customer/user`) —
-/// `conversations.customer_id` etc. are local foreign keys, and the
-/// customer/search/event-timeline queries join on them. The port maps the
-/// same way; when a mirror row is missing (the reference writes NULL, the
-/// port's columns are NOT NULL) the remote id is kept so the landing never
-/// drops a conversation.
+/// `conversations.customer_local_id` etc. are local foreign keys, and the
+/// customer/search/event-timeline queries join on them. M047 (DB-03)
+/// renamed the port columns to the reference names and made them real,
+/// nullable FK columns (`mailbox_local_id` REFERENCES mailboxes, etc.), so
+/// an unresolved lookup lands NULL exactly like the reference — the FK
+/// enforces local ids and the landing never drops a conversation.
 ///
 /// The v1.3.0 channel columns (`type`, `source_type`, `source_via`), the
 /// `state`, `thread_count` and `snoozed_until` columns persist with the row
@@ -170,14 +171,15 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
     // events for a brand-new conversation).
     let previous: Option<Option<i64>> = conn
         .query_row(
-            "SELECT assignee_id FROM conversations WHERE remote_id = ?1",
+            "SELECT assignee_local_id FROM conversations WHERE remote_id = ?1",
             params![c.remote_id],
             |r| r.get(0),
         )
         .ok();
     conn.execute(
         "INSERT INTO conversations (remote_id, number, subject, preview, status, state, type,
-            source_type, source_via, mailbox_id, assignee_id, customer_id, priority, created_at,
+            source_type, source_via, mailbox_local_id, assignee_local_id, customer_local_id,
+            priority, created_at,
             updated_at, closed_at, snoozed_until, thread_count)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(remote_id) DO UPDATE SET
@@ -189,9 +191,9 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
             type = excluded.type,
             source_type = excluded.source_type,
             source_via = excluded.source_via,
-            mailbox_id = excluded.mailbox_id,
-            assignee_id = excluded.assignee_id,
-            customer_id = excluded.customer_id,
+            mailbox_local_id = excluded.mailbox_local_id,
+            assignee_local_id = excluded.assignee_local_id,
+            customer_local_id = excluded.customer_local_id,
             priority = excluded.priority,
             created_at = excluded.created_at,
             updated_at = excluded.updated_at,
@@ -212,9 +214,9 @@ pub fn upsert_conversation(conn: &Connection, c: &HsConversation) -> Result<()> 
             c.kind,
             c.source_type,
             c.source_via,
-            mailbox_local.unwrap_or(c.mailbox_id),
+            mailbox_local,
             assignee_local,
-            customer_local.unwrap_or(c.customer_id),
+            customer_local,
             c.priority,
             c.created_at,
             c.updated_at,
@@ -669,7 +671,7 @@ mod tests {
         // customer/search/timeline queries rely on resolves.
         let (mailbox, assignee, customer): (i64, Option<i64>, i64) = conn
             .query_row(
-                "SELECT mailbox_id, assignee_id, customer_id
+                "SELECT mailbox_local_id, assignee_local_id, customer_local_id
                  FROM conversations WHERE remote_id = 1001",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -695,7 +697,7 @@ mod tests {
         let joined: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM conversations c
-                 JOIN customers cu ON cu.id = c.customer_id
+                 JOIN customers cu ON cu.id = c.customer_local_id
                  WHERE cu.remote_id = 2001",
                 [],
                 |r| r.get(0),
@@ -705,10 +707,11 @@ mod tests {
     }
 
     #[test]
-    fn upsert_conversation_keeps_remote_ids_when_mirror_missing() {
+    fn upsert_conversation_lands_null_when_mirror_missing() {
         let conn = fresh_db();
         // No customer/mailbox/user rows: the landing must not drop the
-        // conversation (NOT NULL columns keep the remote id).
+        // conversation — M047 (DB-03) made the reference columns nullable
+        // FKs, so unresolved lookups land NULL (never a remote id).
         upsert_conversation(
             &conn,
             &HsConversation {
@@ -738,15 +741,15 @@ mod tests {
             },
         )
         .unwrap();
-        let (mailbox, customer): (i64, i64) = conn
+        let (mailbox, customer): (Option<i64>, Option<i64>) = conn
             .query_row(
-                "SELECT mailbox_id, customer_id FROM conversations WHERE remote_id = 1002",
+                "SELECT mailbox_local_id, customer_local_id FROM conversations WHERE remote_id = 1002",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(mailbox, 101);
-        assert_eq!(customer, 2002);
+        assert_eq!(mailbox, None);
+        assert_eq!(customer, None);
     }
 
     #[test]

@@ -1862,7 +1862,7 @@ fn load_fire_context(conn: &Connection, conversation_id: i64) -> Result<Option<F
                     (SELECT GROUP_CONCAT(t.name) FROM conversation_tags ct
                       JOIN tags t ON t.id = ct.tag_id
                      WHERE ct.conversation_id = c.id),
-                    (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_id)
+                    (SELECT m.name FROM mailboxes m WHERE m.id = c.mailbox_local_id)
                FROM conversations c WHERE c.id = ?1",
             params![conversation_id],
             |r| {
@@ -3221,11 +3221,11 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO customers (id, remote_id, first_name, email)
              VALUES (1, 9001, 'Ada', 'ada@example.com');
-             INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, status)
+             INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
+             INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id, status)
              VALUES (9, 105011, 5012, 'Refund question', 'I want a refund for the export feature', 1, 1, 'active');
              INSERT INTO tags (id, remote_id, name, slug) VALUES (3, 3003, 'billing', 'billing');
              INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (9, 3);
-             INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
              INSERT INTO ai_attributes (conversation_id, attribute, value, value_type, confidence, source, schema_version)
              VALUES (9, 'urgency', 'high', 'enum', 'high', 'deterministic', 'attributes_v1'),
                     (9, 'question_count', '3', 'number', 'high', 'deterministic', 'attributes_v1'),

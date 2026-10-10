@@ -98,9 +98,15 @@ async fn reports_intelligence_batch() {
         [],
     )
     .unwrap();
+    // DB-03: M047 FKs (foreign_keys=ON) — customer 100 must exist.
+    conn.execute(
+        "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (100, 2100, 'Eve')",
+        [],
+    )
+    .unwrap();
     let insert_conv = |remote: i64| {
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id, status, created_at, updated_at)
+            "INSERT INTO conversations (remote_id, number, mailbox_local_id, customer_local_id, status, created_at, updated_at)
              VALUES (?1, ?1, 1, 100, 'closed', datetime('now'), datetime('now'))",
             rusqlite::params![remote],
         )

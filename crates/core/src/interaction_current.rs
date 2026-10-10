@@ -970,7 +970,7 @@ pub fn compute_current_interaction(
 ) -> Result<Option<CurrentInteraction>> {
     let conv = conn
         .query_row(
-            "SELECT customer_id, subject FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
+            "SELECT customer_local_id, subject FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
             params![conversation_id],
             |row| {
                 Ok((
@@ -999,7 +999,7 @@ pub fn compute_current_interaction(
     let is_returning_client = customer_local_id
         .map(|cid| {
             conn.query_row(
-                "SELECT COUNT(*) FROM conversations WHERE customer_id = ?1 AND id != ?2",
+                "SELECT COUNT(*) FROM conversations WHERE customer_local_id = ?1 AND id != ?2",
                 params![cid, conversation_id],
                 |r| r.get::<_, i64>(0),
             )
@@ -1377,6 +1377,13 @@ mod tests {
             .unwrap();
         let mut conn = crate::db::open(&f).unwrap();
         crate::bootstrap::apply_all(&mut conn).unwrap();
+        // M047: conversations.mailbox_local_id references mailboxes(id);
+        // the fixtures below insert mailbox 1 rows.
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
         conn
     }
 
@@ -1644,7 +1651,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (1001, 1001, 'active', 1, 2001)",
             [],
         )
@@ -1710,7 +1717,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (1002, 1002, 'active', 1, 2001)",
             [],
         )
@@ -1755,7 +1762,7 @@ mod tests {
         .unwrap();
         for remote in [1001, 1002] {
             conn.execute(
-                "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+                "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
                  VALUES (?1, ?1, 'active', 1, 2001)",
                 params![remote],
             )
@@ -1844,7 +1851,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (1001, 1001, 'active', 1, 2001)",
             [],
         )

@@ -44,16 +44,27 @@ async fn issues_clusters_serving_parity() {
     // member.
     conn.execute_batch(
         "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (11, 110, 'Ada');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (12, 120, 'Belle');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (13, 130, 'Cleo');
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (1, 101, 101, 'Cannot log in since morning', 'active',  1, 11, '2026-10-01 10:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at, remote_created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at, remote_created_at)
              VALUES (2, 102, 102, 'Login page 500', 'closed', 1, 11, '2026-10-03 09:00:00', '2026-10-02 09:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (3, 103, 103, 'Password reset loop', 'active',  1, 12, '2026-10-05 11:00:00');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (4, 104, 104, 'Invoice VAT wrong', 'closed', 1, 13, '2026-10-06 08:00:00');",
     )
     .expect("seed world");
+
+    // M046: issue_clusters.known_issue_id is FK-enforced — the known
+    // issue the cluster links to must exist before the upsert.
+    conn.execute(
+        "INSERT INTO known_issues (id, name, status) VALUES (7, 'Login 500s', 'active')",
+        [],
+    )
+    .expect("seed known issue 7");
 
     // The cluster the reference's demo seed would recognize: three login
     // conversations from two customers, linked to a known issue.

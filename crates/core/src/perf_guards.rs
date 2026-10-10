@@ -32,6 +32,23 @@ pub fn populate_synthetic_dataset(conn: &Connection) -> Result<()> {
     crate::activity::apply_m003(conn)?;
     crate::ticket_states::apply_m004(conn)?;
     crate::search::apply_fts_migration(conn)?;
+    // DB-03 (M047): the reference column names on conversations. The slim
+    // chains this dataset runs on (base migrations + the guards above)
+    // can't run m047's converging copy, so reproduce the renamed result
+    // directly — plain renames, no FK clauses; on a full (M047) chain the
+    // renames are no-ops that simply fail and get swallowed.
+    let _ = conn.execute(
+        "ALTER TABLE conversations RENAME COLUMN mailbox_id TO mailbox_local_id",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE conversations RENAME COLUMN assignee_id TO assignee_local_id",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE conversations RENAME COLUMN customer_id TO customer_local_id",
+        [],
+    );
 
     // Insert conversations.
     for i in 1..=DATASET_SIZE as i64 {
@@ -46,7 +63,7 @@ pub fn populate_synthetic_dataset(conn: &Connection) -> Result<()> {
         let preview = format!("Customer reports issue #{i} with product feature...");
 
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, subject, preview)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, subject, preview)
              VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6)",
             params![i, status, mailbox_id, customer_id, subject, preview],
         )?;

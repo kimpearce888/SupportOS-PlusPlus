@@ -49,11 +49,12 @@ async fn conversation_mutations_never_report_fake_success_on_db_errors() {
     let db_path = data_dir.join("c2-tx.db");
     let mut conn = spp_core::db::open(&db_path).expect("open DB");
     spp_core::bootstrap::apply_all(&mut conn).expect("apply all migrations");
-    conn.execute(
-        "INSERT INTO conversations
-            (id, remote_id, number, subject, status, mailbox_id, customer_id)
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 201, 'Ada');
+         INSERT INTO conversations
+            (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id)
          VALUES (1, 105000, 1, 'C2 transaction error test', 'active', 1, 1)",
-        [],
     )
     .expect("seed conversation");
 

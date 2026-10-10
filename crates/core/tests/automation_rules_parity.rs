@@ -48,7 +48,9 @@ async fn automation_rule_crud_matches_the_reference_contract() {
 
     // Fixture: one conversation (local id 9) with a billing tag.
     conn.execute_batch(
-        "INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_id, customer_id, status)
+        "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 101, 'Support');
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (1, 201, 'Ada');
+         INSERT INTO conversations (id, remote_id, number, subject, preview, mailbox_local_id, customer_local_id, status)
              VALUES (9, 105011, 5012, 'Refund question', 'I want a refund for...', 1, 1, 'active');
          INSERT INTO tags (id, remote_id, name, slug) VALUES (3, 3003, 'billing', 'billing');
          INSERT INTO conversation_tags (conversation_id, tag_id) VALUES (9, 3);",

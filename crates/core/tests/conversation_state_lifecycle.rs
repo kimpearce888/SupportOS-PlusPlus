@@ -35,7 +35,8 @@ async fn conversation_state_lifecycle_parity() {
     conn.execute_batch(
         "INSERT INTO mailboxes (id, remote_id, name) VALUES (1, 11, 'Support');
          INSERT INTO users (id, remote_id, first_name, last_name) VALUES (7, 70, 'Dana', 'Reyes');
-         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, assignee_id, created_at)
+         INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (11, 110, 'Ada');
+         INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id, created_at)
              VALUES (1, 101, 101, 'Export stuck at night', 'active', 1, 11, 7, '2026-10-01 10:00:00');
          INSERT INTO state_transitions (conversation_id, previous_state_id, new_state_id, actor_type, actor_local_id, reason, occurred_at, source)
              VALUES (1, NULL, 1, 'user', 7, 'initial triage', '2026-10-01 10:05:00', 'local');
@@ -234,7 +235,7 @@ async fn conversation_state_lifecycle_parity() {
     {
         let conn = http_conn.lock().unwrap_or_else(|p| p.into_inner());
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (2, 102, 102, 'Untouched', 'active', 1, 11, '2026-10-03 10:00:00')",
             [],
         )

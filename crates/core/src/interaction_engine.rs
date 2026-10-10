@@ -1135,7 +1135,7 @@ pub fn get_customer_conversations(
            (SELECT COUNT(*) FROM conversation_threads t
              WHERE t.conversation_id = c.id AND t.deleted_at IS NULL) AS thread_count
            FROM conversations c
-          WHERE c.customer_id = ?1 AND c.deleted_at IS NULL AND c.id != ?2
+          WHERE c.customer_local_id = ?1 AND c.deleted_at IS NULL AND c.id != ?2
           ORDER BY c.created_at DESC",
     )?;
     let rows = stmt
@@ -1172,7 +1172,7 @@ struct ConversationInfo {
 
 fn conversation_info(conn: &Connection, conversation_id: i64) -> Option<ConversationInfo> {
     conn.query_row(
-        "SELECT customer_id, subject, number, status
+        "SELECT customer_local_id, subject, number, status
            FROM conversations WHERE id = ?1 AND deleted_at IS NULL",
         params![conversation_id],
         |r| {
@@ -2065,7 +2065,7 @@ fn ensure_history_backfill(conn: &Connection, customer_id: Option<i64>) -> Resul
         return Ok(());
     };
     let conv_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM conversations WHERE customer_id = ?1 AND deleted_at IS NULL",
+        "SELECT COUNT(*) FROM conversations WHERE customer_local_id = ?1 AND deleted_at IS NULL",
         params![customer_id],
         |r| r.get(0),
     )?;
@@ -2503,7 +2503,12 @@ mod tests {
         status: &str,
     ) {
         conn.execute(
-            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_id, customer_id, created_at)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 9001, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, remote_id, number, subject, status, mailbox_local_id, customer_local_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, datetime('now', '-10 days'))",
             params![id, remote, 7000 + id, subject, status, customer],
         )

@@ -1181,12 +1181,11 @@ pub async fn case_from_conversation(
     Path(conversation_id): Path<i64>,
 ) -> axum::response::Response {
     let conn = state.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // getConversationByLocalId — subject/customer_id/assignee_id are the
-    // documented port renames of the reference's
-    // subject/customer_local_id/assignee_local_id.
+    // getConversationByLocalId — M047 (DB-03) restored the reference
+    // column names, so the read is direct.
     let conv: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
         .query_row(
-            "SELECT subject, customer_id, assignee_id FROM conversations WHERE id = ?1",
+            "SELECT subject, customer_local_id, assignee_local_id FROM conversations WHERE id = ?1",
             rusqlite::params![conversation_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -1355,7 +1354,12 @@ mod tests {
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id, status, created_at, updated_at)
+            "INSERT INTO customers (id, remote_id, first_name) VALUES (3001, 3001, 'Eve')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, mailbox_local_id, customer_local_id, status, created_at, updated_at)
              VALUES (101, 101, 1, 3001, 'active', ?1, ?1)",
             rusqlite::params![at],
         )

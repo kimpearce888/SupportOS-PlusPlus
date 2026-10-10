@@ -159,7 +159,7 @@ struct ConversationFacts {
 fn load_conversation(conn: &Connection, id_or_remote: i64) -> Result<Option<ConversationFacts>> {
     let row = conn
         .query_row(
-            "SELECT id, number, subject, assignee_id, customer_id
+            "SELECT id, number, subject, assignee_local_id, customer_local_id
              FROM conversations
              WHERE id = ?1 OR remote_id = ?1
              ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END
@@ -1022,8 +1022,15 @@ mod tests {
     }
 
     fn insert_conversation(conn: &Connection, remote_id: i64, assignee_local: Option<i64>) -> i64 {
+        // M047 conversations FKs: mailbox_local_id -> mailboxes(id) (customer
+        // 2001 is seeded by fresh_db; assignee users are test-owned).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_id, customer_id, assignee_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (101, 101, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, subject, status, mailbox_local_id, customer_local_id, assignee_local_id)
              VALUES (?1, ?1, 'Printer on fire', 'active', 101, 2001, ?2)",
             params![remote_id, assignee_local],
         )
@@ -1373,7 +1380,7 @@ mod tests {
         // stamp — so the thread carries the -3-days time).
         let c1 = insert_conversation(&conn, 1001, Some(42));
         conn.execute(
-            "UPDATE conversations SET mailbox_id = 101, created_at = datetime('now', '-3 days'), updated_at = datetime('now', '-3 days') WHERE id = ?1",
+            "UPDATE conversations SET mailbox_local_id = 101, created_at = datetime('now', '-3 days'), updated_at = datetime('now', '-3 days') WHERE id = ?1",
             params![c1],
         )
         .unwrap();
@@ -1386,7 +1393,7 @@ mod tests {
         // At risk: waited ~half the 60-minute target.
         let c2 = insert_conversation(&conn, 1002, Some(42));
         conn.execute(
-            "UPDATE conversations SET mailbox_id = 101, created_at = datetime('now', '-50 minutes'), updated_at = datetime('now', '-50 minutes') WHERE id = ?1",
+            "UPDATE conversations SET mailbox_local_id = 101, created_at = datetime('now', '-50 minutes'), updated_at = datetime('now', '-50 minutes') WHERE id = ?1",
             params![c2],
         )
         .unwrap();

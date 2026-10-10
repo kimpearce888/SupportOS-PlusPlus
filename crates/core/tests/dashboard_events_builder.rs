@@ -44,8 +44,8 @@ fn insert_conv(
     conn.execute(
         &format!(
             "INSERT INTO conversations
-                (remote_id, number, mailbox_id, customer_id, status, type, source_type,
-                 assignee_id, created_at, updated_at)
+                (remote_id, number, mailbox_local_id, customer_local_id, status, type, source_type,
+                 assignee_local_id, created_at, updated_at)
              VALUES ({remote}, {remote}, {mailbox}, {customer}, '{status}', '{channel}',
                      '{channel}', {assignee_sql}, {created_at_sql}, {updated_at_sql})"
         ),
@@ -220,6 +220,9 @@ async fn dashboard_events_builder_batch() {
         rusqlite::params![c1],
     )
     .unwrap();
+    // M046: activity_events.thread_local_id is FK-enforced now — the
+    // dangling hardcoded 31 is replaced by the real row id.
+    let c1_reply_a = conn.last_insert_rowid();
     conn.execute(
         "UPDATE conversations SET first_customer_message_at = datetime('now', '-2 days') WHERE id = ?1",
         rusqlite::params![c1],
@@ -746,7 +749,7 @@ async fn dashboard_events_builder_batch() {
             Some(10),
             "2026-01-01T11:00:00Z",
             json!({"thread_remote_id": 901}),
-            Some(31),
+            Some(c1_reply_a),
         );
         ev(
             "status_changed",
@@ -792,7 +795,7 @@ async fn dashboard_events_builder_batch() {
         json!("Ada Lovelace"),
         "user actor name resolved"
     );
-    assert_eq!(events[1]["thread_local_id"], json!(31));
+    assert_eq!(events[1]["thread_local_id"], json!(c1_reply_a));
     assert_eq!(
         events[2]["actor_name"],
         json!("Sibyl System"),

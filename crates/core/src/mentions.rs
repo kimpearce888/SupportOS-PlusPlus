@@ -455,8 +455,20 @@ mod tests {
     }
 
     fn insert_conversation(conn: &Connection, remote_id: i64) {
+        // M047 FKs: mailbox_local_id -> mailboxes(id), customer_local_id ->
+        // customers(id); seed the parents (idempotent for repeat calls).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id)
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (101, 101, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name, last_name) VALUES (2001, 2001, 'Ada', 'Lovelace')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id)
              VALUES (?1, ?1, 'active', 101, 2001)",
             params![remote_id],
         )

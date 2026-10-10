@@ -20,11 +20,12 @@
 //!   `unconfigured`, never guessed.
 //!
 //! Port mapping notes (port column <- reference column):
-//! - `conversations.mailbox_id` <- `mailbox_local_id`
+//! - since M047 the `conversations` table carries the reference names
+//!   `mailbox_local_id`/`assignee_local_id` directly (the former port-side
+//!   `mailbox_id`/`assignee_id` renames are gone)
 //! - `conversations.created_at` <- `remote_created_at`
 //! - `conversations.updated_at` <- `last_activity_at` (the search module
 //!   established this mapping)
-//! - `conversations.assignee_id` <- `assignee_local_id`
 //! - `conversation_threads` <- `threads` (`thread_type`/`created_at` instead
 //!   of `type`/`remote_created_at`; `state` exists via M030 with the same
 //!   'published' default)
@@ -441,7 +442,7 @@ pub fn sla_report(
 fn count_conversations(conn: &Connection, mailbox_local_id: i64, from: &str, to: &str) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM conversations
-         WHERE mailbox_id = ?1 AND deleted_at IS NULL AND created_at >= ?2 AND created_at <= ?3",
+         WHERE mailbox_local_id = ?1 AND deleted_at IS NULL AND created_at >= ?2 AND created_at <= ?3",
         rusqlite::params![mailbox_local_id, from, to],
         |r| r.get(0),
     )
@@ -471,7 +472,7 @@ fn first_response_pairs(
                WHERE type = 'reply' AND state = 'published' AND deleted_at IS NULL
                GROUP BY conversation_id) fr
            ON fr.conversation_id = c.id
-         WHERE c.mailbox_id = ?1 AND c.deleted_at IS NULL AND c.created_at >= ?2 AND c.created_at <= ?3",
+         WHERE c.mailbox_local_id = ?1 AND c.deleted_at IS NULL AND c.created_at >= ?2 AND c.created_at <= ?3",
     )?;
     let rows = stmt.query_map(rusqlite::params![mailbox_local_id, from, to], |r| {
         Ok(Pair {
@@ -492,7 +493,7 @@ fn resolution_pairs(
     let mut stmt = conn.prepare(
         "SELECT c.created_at AS start, c.closed_at AS end
          FROM conversations c
-         WHERE c.mailbox_id = ?1 AND c.deleted_at IS NULL AND c.closed_at IS NOT NULL
+         WHERE c.mailbox_local_id = ?1 AND c.deleted_at IS NULL AND c.closed_at IS NOT NULL
            AND c.closed_at >= ?2 AND c.closed_at <= ?3",
     )?;
     let rows = stmt.query_map(rusqlite::params![mailbox_local_id, from, to], |r| {
@@ -611,7 +612,7 @@ fn waiting_stats(
     let mut stmt = conn.prepare(
         "SELECT COALESCE(c.updated_at, c.created_at) AS since
          FROM conversations c
-         WHERE c.mailbox_id = ?1 AND c.status IN ('active','pending') AND c.deleted_at IS NULL",
+         WHERE c.mailbox_local_id = ?1 AND c.status IN ('active','pending') AND c.deleted_at IS NULL",
     )?;
     let rows = stmt.query_map([mailbox_local_id], |r| r.get::<_, Option<String>>(0))?;
     let mut sinces: Vec<Option<String>> = Vec::new();
@@ -696,7 +697,7 @@ pub fn sla_alerts(conn: &Connection) -> Result<SlaAlerts> {
             let open: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM conversations
-                     WHERE mailbox_id = ?1 AND status IN ('active','pending') AND deleted_at IS NULL",
+                     WHERE mailbox_local_id = ?1 AND status IN ('active','pending') AND deleted_at IS NULL",
                     [id],
                     |r| r.get(0),
                 )
@@ -717,7 +718,7 @@ pub fn sla_alerts(conn: &Connection) -> Result<SlaAlerts> {
         // Waiting conversations + whether an agent reply exists.
         let candidates: Vec<AlertCandidate> = {
             let mut stmt = conn.prepare(
-                "SELECT c.id, c.number, c.subject, c.status, c.assignee_id,
+                "SELECT c.id, c.number, c.subject, c.status, c.assignee_local_id,
                         COALESCE(c.updated_at, c.created_at) AS since,
                         EXISTS (SELECT 1 FROM conversation_threads t
                                 WHERE t.conversation_id = c.id AND t.type = 'reply'
@@ -726,7 +727,7 @@ pub fn sla_alerts(conn: &Connection) -> Result<SlaAlerts> {
                          WHERE t.conversation_id = c.id AND t.type = 'customer'
                            AND t.deleted_at IS NULL) AS customer_threads
                  FROM conversations c
-                 WHERE c.mailbox_id = ?1 AND c.status IN ('active','pending') AND c.deleted_at IS NULL
+                 WHERE c.mailbox_local_id = ?1 AND c.status IN ('active','pending') AND c.deleted_at IS NULL
                    AND NOT (c.snoozed_until IS NOT NULL AND c.snoozed_until > ?2)",
             )?;
             let rows = stmt.query_map(rusqlite::params![id, now], |r| {
@@ -860,8 +861,14 @@ mod tests {
     }
 
     fn seed_conversation(conn: &Connection, remote_id: i64, status: &str, created_at: &str) -> i64 {
+        // M047 conversations FK: customer_local_id -> customers(id).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, mailbox_id, customer_id, status, created_at, updated_at, closed_at)
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (3001, 3001, 'Cust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (remote_id, number, mailbox_local_id, customer_local_id, status, created_at, updated_at, closed_at)
              VALUES (?1, ?1, 1, 3001, ?2, ?3, ?3, ?4)",
             params![remote_id, status, created_at, if status == "closed" { Some(created_at) } else { None }],
         )

@@ -90,12 +90,12 @@ pub struct CapacityMetrics {
 ///
 /// Returns `Error::Sqlite` if any of the underlying queries fail.
 pub fn agent_workload(conn: &Connection, agent_remote_id: i64) -> Result<AgentWorkload> {
-    // Assigned = conversations where assignee_id = ? AND status != 'closed'.
-    // Note: conversations.assignee_id stores the Help Scout user's *remote_id*
-    // (set from sync), not the local row id.
+    // Assigned = conversations where assignee_local_id = ? AND status != 'closed'.
+    // Note: post-M047 the column is the reference `assignee_local_id` (FK ->
+    // users.id); the caller passes the id the sync resolved into that column.
     let assigned: i64 = conn.query_row(
         "SELECT COUNT(*) FROM conversations
-         WHERE assignee_id = ?1 AND status != 'closed'",
+         WHERE assignee_local_id = ?1 AND status != 'closed'",
         params![agent_remote_id],
         |r| r.get(0),
     )?;
@@ -103,7 +103,7 @@ pub fn agent_workload(conn: &Connection, agent_remote_id: i64) -> Result<AgentWo
     // Active = subset of assigned with status = 'active'.
     let active: i64 = conn.query_row(
         "SELECT COUNT(*) FROM conversations
-         WHERE assignee_id = ?1 AND status = 'active'",
+         WHERE assignee_local_id = ?1 AND status = 'active'",
         params![agent_remote_id],
         |r| r.get(0),
     )?;
@@ -113,7 +113,7 @@ pub fn agent_workload(conn: &Connection, agent_remote_id: i64) -> Result<AgentWo
     // Per KNOWN PITFALLS: no lexical ISO-8601 comparison against datetime('now').
     let resolved_today: i64 = conn.query_row(
         "SELECT COUNT(*) FROM conversations
-         WHERE assignee_id = ?1
+         WHERE assignee_local_id = ?1
            AND status = 'closed'
            AND closed_at IS NOT NULL
            AND julianday(closed_at) >= julianday('now', 'start of day')
@@ -217,10 +217,11 @@ pub fn capacity_metrics(conn: &Connection) -> Result<CapacityMetrics> {
 // - Suggested assignee is a READ-ONLY recommendation with its reasoning
 //   exposed — nothing reassigns automatically.
 //
-// Column mapping: the reference's `conversations.assignee_local_id` is the
-// port's `assignee_id` (the sync resolves remote user ids to local rows
-// before the upsert, and the SLA/notification sweeps already read it as a
-// local id).
+// Column mapping: since M047 the `conversations` table carries the
+// reference `assignee_local_id` directly (FK -> users.id); the former
+// port-side `assignee_id` rename is gone. The sync resolves remote user ids
+// to local rows before the upsert, and the SLA/notification sweeps already
+// read it as a local id.
 
 /// The settings key the capacity model is stored under.
 pub const CAPACITY_SETTING_KEY: &str = "capacity_model";
@@ -572,7 +573,7 @@ pub fn snapshot(conn: &Connection) -> Result<WorkloadSnapshot> {
     let unassigned: i64 = conn.query_row(
         "SELECT COUNT(*) FROM conversations c
           WHERE c.deleted_at IS NULL AND c.merged_into_conversation_id IS NULL
-            AND c.status IN ('active','pending') AND c.assignee_id IS NULL",
+            AND c.status IN ('active','pending') AND c.assignee_local_id IS NULL",
         [],
         |r| r.get(0),
     )?;
@@ -610,14 +611,14 @@ fn agent_counts(conn: &Connection, user_id: i64) -> Result<AgentCounts> {
              SUM(CASE WHEN c.status IN ('active','pending') AND c.supportos_priority IN ('high','urgent') THEN 1 ELSE 0 END)
            FROM conversations c
           WHERE c.deleted_at IS NULL AND c.merged_into_conversation_id IS NULL
-            AND c.assignee_id = ?1",
+            AND c.assignee_local_id = ?1",
         params![user_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )
     .unwrap_or((0, 0, 0, 0));
     let closed7d: i64 = conn.query_row(
         "SELECT COUNT(*) FROM conversations c
-          WHERE c.deleted_at IS NULL AND c.assignee_id = ?1 AND c.status = 'closed'
+          WHERE c.deleted_at IS NULL AND c.assignee_local_id = ?1 AND c.status = 'closed'
             AND c.closed_at IS NOT NULL
             AND julianday(c.closed_at) >= julianday('now', '-7 days')",
         params![user_id],
@@ -646,7 +647,7 @@ fn weighted_load(
         "SELECT c.id, c.supportos_priority, c.status, c.customer_waiting_since
            FROM conversations c
           WHERE c.deleted_at IS NULL AND c.merged_into_conversation_id IS NULL
-            AND c.assignee_id = ?1 AND c.status IN ('active','pending')",
+            AND c.assignee_local_id = ?1 AND c.status IN ('active','pending')",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return 0.0,
@@ -688,7 +689,7 @@ fn avg_active_load_7d(conn: &Connection, user_id: i64) -> Option<f64> {
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM conversations c
-                  WHERE c.deleted_at IS NULL AND c.assignee_id = ?1
+                  WHERE c.deleted_at IS NULL AND c.assignee_local_id = ?1
                     AND date(COALESCE(c.remote_created_at, c.created_at, c.local_created_at)) <= date(?2)
                     AND (c.closed_at IS NULL OR date(c.closed_at) > date(?2))",
                 params![user_id, day],
@@ -825,7 +826,7 @@ pub fn suggested_assignees(conn: &Connection, limit: u32) -> Result<Vec<Suggeste
         "SELECT c.id, c.number, c.subject, c.supportos_priority, c.customer_waiting_since
            FROM conversations c
           WHERE c.deleted_at IS NULL AND c.merged_into_conversation_id IS NULL
-            AND c.status IN ('active','pending') AND c.assignee_id IS NULL
+            AND c.status IN ('active','pending') AND c.assignee_local_id IS NULL
           ORDER BY CASE c.supportos_priority
                      WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
                      WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
@@ -922,23 +923,15 @@ pub fn suggested_assignees(conn: &Connection, limit: u32) -> Result<Vec<Suggeste
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::apply_m003;
-    use crate::ticket_states::apply_m004;
     use rusqlite::params;
     use tempfile::NamedTempFile;
 
     fn fresh_db() -> Connection {
-        let f = NamedTempFile::new()
-            .unwrap()
-            .into_temp_path()
-            .keep()
-            .unwrap();
-        let mut conn = crate::db::open(&f).unwrap();
-        crate::db::ensure_migrations_table(&conn).unwrap();
-        crate::migrations::run_all(&mut conn).unwrap();
-        apply_m003(&conn).unwrap();
-        apply_m004(&conn).unwrap();
-        conn
+        // DB-03 (M047): the workload queries read the reference conversations
+        // column names (assignee_local_id, with the FK to users) — the slim
+        // m003+m004 chain no longer has that shape, so boot the full chain
+        // exactly like full_db() below.
+        full_db()
     }
 
     fn insert_conversation(
@@ -949,9 +942,30 @@ mod tests {
         assignee_id: Option<i64>,
         closed_at: Option<&str>,
     ) {
+        // M047 conversations FKs: mailbox_local_id -> mailboxes(id),
+        // customer_local_id -> customers(id), assignee_local_id -> users(id)
+        // — seed the parents so the fixture keeps its concrete ids (Rust
+        // param names unchanged).
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (?1, ?1, 'Mailbox ' || ?1)",
+            params![mailbox_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (2001, 2001, 'Cust')",
+            [],
+        )
+        .unwrap();
+        if let Some(assignee) = assignee_id {
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, remote_id, first_name) VALUES (?1, ?1, 'Agent')",
+                params![assignee],
+            )
+            .unwrap();
+        }
         conn.execute(
             "INSERT INTO conversations
-                (remote_id, number, status, mailbox_id, customer_id, assignee_id, closed_at)
+                (remote_id, number, status, mailbox_local_id, customer_local_id, assignee_local_id, closed_at)
              VALUES (?1, ?2, ?3, ?4, 2001, ?5, ?6)",
             params![
                 remote_id,
@@ -1217,11 +1231,24 @@ mod tests {
         priority: Option<&str>,
         waiting: bool,
     ) -> i64 {
+        // M047 conversations FKs: mailbox_local_id -> mailboxes(id),
+        // customer_local_id -> customers(id) — seed the parents (assignee is
+        // a users row from seed_user).
+        conn.execute(
+            "INSERT OR IGNORE INTO mailboxes (id, remote_id, name) VALUES (1, 1, 'Support')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO customers (id, remote_id, first_name) VALUES (3001, 3001, 'Cust')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO conversations
-                (remote_id, number, status, mailbox_id, customer_id, assignee_id, supportos_priority,
+                (remote_id, number, status, mailbox_local_id, customer_local_id, assignee_local_id, supportos_priority,
                  customer_waiting_since, created_at)
-             VALUES (?1, ?2, 'active', 1, 3001, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, 'active', 1, 3001, ?3, COALESCE(?4, 'none'), ?5, ?6)",
             params![
                 number,
                 number,
@@ -1311,7 +1338,7 @@ mod tests {
         seed_open_conversation(&conn, 104, None, None, false);
         // One closed 2 days ago for u1 (recent_closed_7d).
         conn.execute(
-            "INSERT INTO conversations (remote_id, number, status, mailbox_id, customer_id, assignee_id, closed_at, created_at)
+            "INSERT INTO conversations (remote_id, number, status, mailbox_local_id, customer_local_id, assignee_local_id, closed_at, created_at)
              VALUES (105, 105, 'closed', 1, 3001, ?1, ?2, ?3)",
             params![u1, iso_days_ago(2), iso_days_ago(5)],
         )
