@@ -376,7 +376,7 @@ fn sweep_automation_approvals(
         let mut stmt = conn.prepare(
             "SELECT id, payload FROM jobs
              WHERE type = 'automation_action_awaiting_approval'
-               AND status IN ('queued', 'parked')
+               AND status IN ('queued', 'awaiting_approval')
              ORDER BY id LIMIT 100",
         )?;
         let mapped = stmt
@@ -1466,6 +1466,51 @@ mod tests {
         assert_eq!(dedup, "n:approval:1");
 
         // Re-sweep: same job → no duplicate (the job is still parked).
+        let out = sweep(&conn, None).unwrap();
+        assert_eq!(out.created, 0);
+    }
+
+    #[test]
+    fn automation_approval_jobs_parked_by_the_worker_still_notify() {
+        // OP-04: jobs::park_job writes status 'awaiting_approval' — the
+        // pre-fix sweep counted the stale ('queued','parked') vocabulary and
+        // a job went SILENT the moment the worker parked it.
+        let conn = fresh_db();
+        let conv = insert_conversation(&conn, 1002, None);
+        mark_sync_settled(&conn);
+        sweep(&conn, None).unwrap();
+
+        conn.execute(
+            "INSERT INTO jobs (queue, type, priority, status, payload, run_at)
+             VALUES ('ai', 'automation_action_awaiting_approval', 2, 'awaiting_approval',
+                     ?1, datetime('now'))",
+            params![format!(
+                r#"{{"ruleId":2,"conversationId":{conv},"action":{{"kind":"set_status"}}}}"#
+            )],
+        )
+        .unwrap();
+        let out = sweep(&conn, None).unwrap();
+        assert_eq!(out.created, 1, "a worker-parked job must still notify");
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM notifications WHERE type = 'automation_approval'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            title.starts_with("Automation approval required: set_status on #1002"),
+            "{title}"
+        );
+
+        // Approve (the queue retry route) → done → no further notifications,
+        // and the re-sweep does not resurrect the deduped one.
+        conn.execute(
+            "UPDATE jobs SET status = 'done', completed_at = datetime('now')
+             WHERE type = 'automation_action_awaiting_approval'",
+            [],
+        )
+        .unwrap();
         let out = sweep(&conn, None).unwrap();
         assert_eq!(out.created, 0);
     }

@@ -524,9 +524,14 @@ fn count_issue_spikes(conn: &Connection) -> Result<u32> {
 /// Parked automation actions awaiting explicit human approval (reference
 /// `countAutomationApprovals` — the JOBS table, not a phantom approvals
 /// table; this is the audited F-069 divergence fix).
+/// OP-04: the reference's own SQL counts the stale `('queued','parked')`
+/// vocabulary while its park path writes `awaiting_approval`
+/// (jobRepo.ts parkJob — `UPDATE jobs SET status='awaiting_approval'`),
+/// so a job stops counting the moment the worker parks it and the tile
+/// sits at 0; the port counts the real park vocabulary instead.
 fn count_automation_approvals(conn: &Connection) -> Result<u32> {
     let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM jobs WHERE type = 'automation_action_awaiting_approval' AND status IN ('queued','parked')",
+        "SELECT COUNT(*) FROM jobs WHERE type = 'automation_action_awaiting_approval' AND status IN ('queued','awaiting_approval')",
         [],
         |r| r.get(0),
     )?;
@@ -1095,8 +1100,10 @@ mod tests {
     fn automation_approvals_counts_parked_jobs_not_the_phantom_table() {
         let conn = fresh_db();
         // The F-069 fix: the JOBS table is the source, not automation_approvals.
+        // OP-04: 'awaiting_approval' is what jobs::park_job actually writes —
+        // the stale 'parked' literal never exists, so a pre-fix tile saw 0.
         conn.execute(
-            "INSERT INTO jobs (queue, type, status) VALUES ('automation', 'automation_action_awaiting_approval', 'parked')",
+            "INSERT INTO jobs (queue, type, status) VALUES ('ai', 'automation_action_awaiting_approval', 'awaiting_approval')",
             [],
         )
         .unwrap();
